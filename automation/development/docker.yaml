@@ -1,0 +1,92 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: docker_automation
+  path: automation/development/docker
+  description: Build and manage local NoETL Docker images
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help # build, noetl-image-build, cleanup-all, images-clear, status
+  noetl_repo_dir: "../noetl"
+
+workflow:
+  - step: run
+    desc: Run selected action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          ACTION="{{ workload.action }}"
+          NOETL_REPO="{{ workload.noetl_repo_dir }}"
+
+          ensure_repo() {
+            if [ ! -d "$NOETL_REPO" ]; then
+              echo "ERROR: NoETL repository not found: $NOETL_REPO"
+              exit 1
+            fi
+          }
+
+          case "$ACTION" in
+            build)
+              ensure_repo
+              IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
+              docker build -t "local/noetl:$IMAGE_TAG" -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
+              echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
+              echo "Built local/noetl:$IMAGE_TAG"
+              ;;
+
+            noetl-image-build)
+              ensure_repo
+              IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
+              DOCKER_BUILDKIT=0 docker build -t "local/noetl:$IMAGE_TAG" -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
+              echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
+              echo "Built local/noetl:$IMAGE_TAG"
+              ;;
+
+            cleanup-all)
+              docker builder prune --all --force
+              docker image prune --all --force
+              docker volume prune --force
+              ;;
+
+            images-clear)
+              docker images "local/noetl" --format "{{.ID}}" | xargs -r docker rmi -f
+              ;;
+
+            status)
+              docker version
+              echo ""
+              docker images | head -20
+              echo ""
+              docker ps -a | head -20
+              echo ""
+              docker system df
+              ;;
+
+            help|*)
+              echo "Usage:"
+              echo "  noetl run automation/development/docker.yaml --runtime local --set action=<action>"
+              echo ""
+              echo "Actions:"
+              echo "  build              Build NoETL image"
+              echo "  noetl-image-build  Build without BuildKit"
+              echo "  cleanup-all        Remove builders/images/volumes"
+              echo "  images-clear       Remove local/noetl images"
+              echo "  status             Show Docker status"
+              echo ""
+              echo "Optional:"
+              echo "  --set noetl_repo_dir=../noetl"
+              ;;
+          esac
+    next:
+      - step: end
+
+  - step: end
+    desc: End workflow
+    tool:
+      kind: noop

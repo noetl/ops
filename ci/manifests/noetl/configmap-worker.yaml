@@ -1,0 +1,46 @@
+# Worker-specific configuration
+# Contains no database credentials - workers only need NATS and server URL
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noetl-worker-config
+  namespace: noetl
+  labels:
+    app: noetl-worker
+data:
+  # Timezone - Must match Postgres timezone for correct timestamp handling
+  TZ: "UTC"
+  LOG_LEVEL: "DEBUG"
+  PYTHONPATH: "/opt/noetl"
+  NOETL_RUN_MODE: "worker"
+  NOETL_DATA_DIR: "/opt/noetl/data"
+  NOETL_DEBUG: "true"
+  NOETL_HTTP_MOCK_LOCAL: "false"
+  PAGINATION_API_URL: "http://paginated-api.test-server.svc.cluster.local:5555"
+  NOETL_SERVER_URL: "http://noetl.noetl.svc.cluster.local:8082"
+  NOETL_DISABLE_METRICS: "true"
+  NOETL_VICTORIALOGS_URL: "http://vmlogs-single-server.vmlogs.svc.cluster.local:9428"
+  NOETL_LOG_FORMAT: ""
+  # NATS Configuration for worker command distribution
+  NATS_URL: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
+  NATS_USER: "noetl"
+  NATS_PASSWORD: "noetl"
+  NATS_STREAM: "NOETL_COMMANDS"
+  NATS_CONSUMER: "noetl_worker_pool"
+  NATS_SUBJECT: "noetl.commands"
+  # Keychain cache refresh threshold (15 minutes - prevents expiration during long loops)
+  NOETL_KEYCHAIN_REFRESH_THRESHOLD: "900"
+  # Result Storage Configuration (output_select pattern)
+  # Threshold for inline vs external storage (64KB default)
+  NOETL_INLINE_MAX_BYTES: "65536"
+  # Preview size for large results
+  NOETL_PREVIEW_MAX_BYTES: "1024"
+  # Default storage tier: kv, object, s3, gcs
+  NOETL_DEFAULT_STORAGE_TIER: "kv"
+  # S3/MinIO configuration (optional - for large blob storage)
+  # S3_ENDPOINT_URL: ""
+  NOETL_S3_BUCKET: "noetl-results"
+  NOETL_S3_REGION: "us-east-1"
+  # GCS configuration
+  NOETL_GCS_BUCKET: "noetl-demo-output"
+  NOETL_GCS_PREFIX: "results/"

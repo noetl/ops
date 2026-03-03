@@ -1,0 +1,117 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: noetl_development_deploy
+  path: automation/development/noetl
+  description: Build/load/deploy helpers for NoETL in local kind
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help # build, load, deploy, redeploy, status
+  registry: local
+  image_name: noetl
+  noetl_repo_dir: "../noetl"
+
+workflow:
+  - step: run
+    desc: Run selected action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          ACTION="{{ workload.action }}"
+          NOETL_REPO="{{ workload.noetl_repo_dir }}"
+          REGISTRY="{{ workload.registry }}"
+          IMAGE_NAME="{{ workload.image_name }}"
+
+          ensure_repo() {
+            if [ ! -d "$NOETL_REPO" ]; then
+              echo "ERROR: NoETL repository not found: $NOETL_REPO"
+              exit 1
+            fi
+          }
+
+          build() {
+            ensure_repo
+            IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
+            echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
+            docker buildx build --load --platform linux/amd64 \
+              -t "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" \
+              -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
+            echo "Built $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+          }
+
+          load() {
+            if [ ! -f .noetl_last_build_tag.txt ]; then
+              echo "ERROR: .noetl_last_build_tag.txt not found. Run action=build first."
+              exit 1
+            fi
+            IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
+            IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+            kind load docker-image "$IMAGE" --name noetl
+            echo "Loaded $IMAGE into kind"
+          }
+
+          deploy() {
+            if [ ! -f .noetl_last_build_tag.txt ]; then
+              echo "ERROR: .noetl_last_build_tag.txt not found. Run action=build first."
+              exit 1
+            fi
+            kubectl apply -f ci/manifests/noetl/namespace/
+            IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
+            IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+            for manifest in ci/manifests/noetl/*.yaml; do
+              if [ -f "$manifest" ]; then
+                sed "s|image_name:image_tag|$IMAGE|g" "$manifest" | kubectl apply -f -
+              fi
+            done
+            kubectl rollout restart deployment/noetl-server -n noetl 2>/dev/null || true
+            kubectl rollout restart deployment/noetl-worker -n noetl 2>/dev/null || true
+            kubectl wait --for=condition=ready pod -l app=noetl-server -n noetl --timeout=90s || true
+            kubectl wait --for=condition=ready pod -l app=noetl-worker -n noetl --timeout=90s || true
+          }
+
+          status() {
+            kubectl get pods -n noetl
+            echo ""
+            kubectl get svc -n noetl
+          }
+
+          case "$ACTION" in
+            build)
+              build
+              ;;
+            load)
+              load
+              ;;
+            deploy)
+              deploy
+              ;;
+            redeploy)
+              build
+              load
+              deploy
+              status
+              ;;
+            status)
+              status
+              ;;
+            help|*)
+              echo "Usage:"
+              echo "  noetl run automation/development/noetl.yaml --runtime local --set action=<action>"
+              echo ""
+              echo "Actions: build, load, deploy, redeploy, status"
+              echo "Optional: --set noetl_repo_dir=../noetl"
+              ;;
+          esac
+    next:
+      - step: end
+
+  - step: end
+    desc: End workflow
+    tool:
+      kind: noop
