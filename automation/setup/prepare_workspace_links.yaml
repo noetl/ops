@@ -1,0 +1,92 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: prepare_workspace_links
+  path: automation/setup/prepare_workspace_links
+  description: Create optional compatibility symlinks for split-repo workspace
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: create # create, check, clean, help
+  noetl_repo_dir: ../noetl
+  gateway_repo_dir: ../gateway
+  cli_repo_dir: ../cli
+
+workflow:
+  - step: run
+    desc: Run selected action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+
+          ACTION="{{ workload.action }}"
+          NOETL_REPO="{{ workload.noetl_repo_dir }}"
+          GATEWAY_REPO="{{ workload.gateway_repo_dir }}"
+          CLI_REPO="{{ workload.cli_repo_dir }}"
+
+          case "$ACTION" in
+            create)
+              for path in "$NOETL_REPO" "$GATEWAY_REPO" "$CLI_REPO"; do
+                if [ ! -d "$path" ]; then
+                  echo "ERROR: required repo not found: $path"
+                  exit 1
+                fi
+              done
+
+              NOETL_ABS="$(cd "$NOETL_REPO" && pwd)"
+              GATEWAY_ABS="$(cd "$GATEWAY_REPO" && pwd)"
+              CLI_ABS="$(cd "$CLI_REPO" && pwd)"
+
+              mkdir -p crates
+              ln -sfn "$GATEWAY_ABS" crates/gateway
+              ln -sfn "$CLI_ABS" crates/noetlctl
+              ln -sfn "$NOETL_ABS/docker" docker
+              ln -sfn "$NOETL_ABS/tests" tests
+              ln -sfn "$NOETL_ABS/scripts" scripts
+              echo "Created compatibility links:"
+              ls -ld crates/gateway crates/noetlctl docker tests scripts
+              ;;
+
+            check)
+              for link in crates/gateway crates/noetlctl docker tests scripts; do
+                if [ -L "$link" ]; then
+                  printf "OK   %s -> %s\n" "$link" "$(readlink "$link")"
+                elif [ -e "$link" ]; then
+                  printf "WARN %s exists but is not a symlink\n" "$link"
+                else
+                  printf "MISS %s is missing\n" "$link"
+                fi
+              done
+              ;;
+
+            clean)
+              for link in crates/gateway crates/noetlctl docker tests scripts; do
+                if [ -L "$link" ]; then
+                  rm -f "$link"
+                  echo "Removed $link"
+                fi
+              done
+              rmdir crates 2>/dev/null || true
+              ;;
+
+            help|*)
+              echo "Usage:"
+              echo "  noetl run automation/setup/prepare_workspace_links.yaml --runtime local --set action=<create|check|clean>"
+              echo ""
+              echo "Examples:"
+              echo "  noetl run automation/setup/prepare_workspace_links.yaml --runtime local --set action=create"
+              echo "  noetl run automation/setup/prepare_workspace_links.yaml --runtime local --set action=check"
+              ;;
+          esac
+    next:
+      - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

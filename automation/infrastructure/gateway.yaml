@@ -1,0 +1,126 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: gateway_automation
+  path: automation/infrastructure/gateway
+  description: Build and deploy Gateway API/UI in local kind
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help # build-image, load-image, deploy, deploy-all, remove, redeploy, restart, status, logs, test
+  gateway_repo_dir: "../gateway"
+
+workflow:
+  - step: run
+    desc: Run selected action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          ACTION="{{ workload.action }}"
+          GATEWAY_REPO="{{ workload.gateway_repo_dir }}"
+
+          ensure_gateway_repo() {
+            if [ ! -d "$GATEWAY_REPO" ]; then
+              echo "ERROR: Gateway repository not found: $GATEWAY_REPO"
+              exit 1
+            fi
+          }
+
+          build() {
+            ensure_gateway_repo
+            docker buildx build --load --platform linux/amd64 \
+              -t noetl-gateway:latest \
+              -f "$GATEWAY_REPO/Dockerfile" "$GATEWAY_REPO"
+          }
+
+          load() {
+            if ! docker image inspect noetl-gateway:latest >/dev/null 2>&1; then
+              echo "ERROR: noetl-gateway:latest image not found in Docker"
+              exit 1
+            fi
+            kind load docker-image noetl-gateway:latest --name noetl
+          }
+
+          deploy_api() {
+            kubectl apply -f ci/manifests/gateway/namespace.yaml
+            kubectl apply -f ci/manifests/gateway/deployment.yaml
+            kubectl apply -f ci/manifests/gateway/service.yaml
+          }
+
+          deploy_ui() {
+            kubectl apply -f ci/manifests/gateway/configmap-ui.yaml
+            kubectl apply -f ci/manifests/gateway/configmap-ui-files.yaml
+            kubectl apply -f ci/manifests/gateway/deployment-ui.yaml
+            kubectl apply -f ci/manifests/gateway/service-ui.yaml
+          }
+
+          case "$ACTION" in
+            build-image)
+              build
+              load
+              ;;
+
+            load-image)
+              load
+              ;;
+
+            deploy)
+              deploy_api
+              ;;
+
+            deploy-all)
+              build
+              load
+              deploy_api
+              deploy_ui
+              ;;
+
+            remove)
+              kubectl delete namespace gateway --ignore-not-found=true
+              ;;
+
+            redeploy)
+              build
+              load
+              kubectl rollout restart deployment/gateway -n gateway
+              kubectl rollout status deployment/gateway -n gateway --timeout=60s
+              ;;
+
+            restart)
+              kubectl rollout restart deployment/gateway -n gateway
+              kubectl rollout restart deployment/gateway-ui -n gateway
+              ;;
+
+            status)
+              kubectl get all -n gateway
+              ;;
+
+            logs)
+              kubectl logs -n gateway -l app=gateway --tail=100 -f
+              ;;
+
+            test)
+              curl -s http://localhost:8090/graphql | head -20 || true
+              curl -s http://localhost:8080/health || true
+              ;;
+
+            help|*)
+              echo "Usage:"
+              echo "  noetl run automation/infrastructure/gateway.yaml --runtime local --set action=<action>"
+              echo ""
+              echo "Actions: build-image, load-image, deploy, deploy-all, remove, redeploy, restart, status, logs, test"
+              echo "Optional: --set gateway_repo_dir=../gateway"
+              ;;
+          esac
+    next:
+      - step: end
+
+  - step: end
+    desc: End workflow
+    tool:
+      kind: noop
