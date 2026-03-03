@@ -1,0 +1,105 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: publish_distribution_repos
+  path: automation/release/publish_distribution_repos
+  description: Build multi-arch CLI artifacts and publish Homebrew/APT repos from split cli repository
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help
+  version: "2.8.7"
+  ops_repo_dir: "."
+  cli_repo_dir: "./vendor/cli"
+  cli_remote: "git@github.com:noetl/cli.git"
+  homebrew_repo: "./vendor/homebrew-tap"
+  apt_repo: "./vendor/apt"
+  homebrew_remote: "git@github.com:noetl/homebrew-tap.git"
+  apt_remote: "git@github.com:noetl/apt.git"
+  artifacts_dir: "./build/release"
+  apt_arches: "amd64,arm64"
+  macos_arches: "arm64,x86_64"
+  codenames: "jammy noble"
+  build_artifacts: "true"
+  prefer_release_assets: "true"
+  sync_cli: "false"
+  push_changes: "true"
+
+workflow:
+  - step: route_action
+    desc: Route requested action
+    tool:
+      kind: shell
+      cmds:
+        - echo "publish_distribution_repos action={{ workload.action }} version={{ workload.version }}"
+    next:
+      - step: publish
+        when: '{{ action == ''publish'' }}'
+      - step: show_help
+        when: '{{ action == ''help'' }}'
+      - step: show_help
+
+  - step: publish
+    desc: Build artifacts and publish updates to homebrew-tap and apt repositories
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          "{{ workload.ops_repo_dir }}/scripts/publish_distribution_repos.sh" \
+            "{{ workload.version }}" \
+            "{{ workload.ops_repo_dir }}" \
+            "{{ workload.cli_repo_dir }}" \
+            "{{ workload.homebrew_repo }}" \
+            "{{ workload.apt_repo }}" \
+            "{{ workload.artifacts_dir }}" \
+            "{{ workload.apt_arches }}" \
+            "{{ workload.macos_arches }}" \
+            "{{ workload.build_artifacts }}" \
+            "{{ workload.prefer_release_assets }}" \
+            "{{ workload.push_changes }}" \
+            "{{ workload.homebrew_remote }}" \
+            "{{ workload.apt_remote }}" \
+            "{{ workload.cli_remote }}" \
+            "{{ workload.sync_cli }}" \
+            "{{ workload.codenames }}"
+    next:
+      - step: end
+
+  - step: show_help
+    desc: Show usage
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo "Usage:"
+          echo "  noetl run automation/release/publish_distribution_repos.yaml --runtime local --set action=publish --set version=2.8.7"
+          echo ""
+          echo "Workload variables:"
+          echo "  action=help|publish"
+          echo "  version=<release-version>"
+          echo "  ops_repo_dir=<ops-repo-root>"
+          echo "  cli_repo_dir=./vendor/cli"
+          echo "  cli_remote=git@github.com:noetl/cli.git"
+          echo "  homebrew_repo=./vendor/homebrew-tap"
+          echo "  apt_repo=./vendor/apt"
+          echo "  homebrew_remote=git@github.com:noetl/homebrew-tap.git"
+          echo "  apt_remote=git@github.com:noetl/apt.git"
+          echo "  artifacts_dir=./build/release"
+          echo "  apt_arches=amd64,arm64"
+          echo "  macos_arches=arm64,x86_64"
+          echo "  codenames='jammy noble'"
+          echo "  build_artifacts=true|false"
+          echo "  prefer_release_assets=true|false"
+          echo "  sync_cli=true|false"
+          echo "  push_changes=true|false"
+    next:
+      - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

@@ -17,28 +17,24 @@ cd /Volumes/X10/projects/noetl/ops
 
 ## Supported source layouts
 
-### 1) Sibling repos (default)
+### 1) Ops submodules (default)
 
-Expected sibling directories:
+This repo now tracks release/dependency repos as submodules:
 
-- `../noetl`
-- `../gateway`
-- `../gui`
-- `../cli`
+- `vendor/cli`
+- `vendor/homebrew-tap`
+- `vendor/apt`
 
-### 2) Submodules (optional)
-
-If you prefer pinning sources in this repo, add submodules and override playbook paths:
+Initialize/update:
 
 ```bash
-git submodule add https://github.com/noetl/noetl.git vendor/noetl
-git submodule add https://github.com/noetl/gateway.git vendor/gateway
-git submodule add https://github.com/noetl/gui.git vendor/gui
-git submodule add https://github.com/noetl/cli.git vendor/cli
+git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-Then pass `--set ..._repo_dir=vendor/...` to playbooks.
+### 2) External sibling repos (optional override)
+
+You can still override playbook inputs with explicit paths (`--set cli_repo_dir=...`, etc.) when needed.
 
 ## One-time compatibility links
 
@@ -125,3 +121,20 @@ kubectl get svc -n gui gui
 curl -i https://gateway.mestumre.dev/health
 curl -i https://mestumre.dev/
 ```
+
+## Distribution publishing (CLI/Homebrew/APT)
+
+Run release publishing from this repo using submodule defaults:
+
+```bash
+noetl run automation/release/publish_distribution_repos.yaml --runtime local \
+  --set action=publish \
+  --set version=2.8.7
+```
+
+By default this uses:
+
+- `cli_repo_dir=./vendor/cli`
+- `homebrew_repo=./vendor/homebrew-tap`
+- `apt_repo=./vendor/apt`
+- `artifacts_dir=./build/release`

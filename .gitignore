@@ -223,11 +223,16 @@ PublishScripts/
 /crates/
 /docker
 /tests
-/scripts
 
 # Generated local/state artifacts copied from monorepo workflows
 /ci/kind/cache/
 /automation/gcp_gke/snapshots/
+
+# Keep release automation and local release scripts tracked
+!/automation/release/
+!/automation/release/**
+!/scripts/
+!/scripts/**
 # NuGet v3's project.json files produces more ignorable files
 *.nuget.props
 *.nuget.targets
