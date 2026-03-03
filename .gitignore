@@ -227,6 +227,7 @@ PublishScripts/
 # Generated local/state artifacts copied from monorepo workflows
 /ci/kind/cache/
 /automation/gcp_gke/snapshots/
+/.noetl_last_build_tag.txt
 
 # Keep release automation and local release scripts tracked
 !/automation/release/
