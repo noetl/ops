@@ -1,0 +1,9 @@
+[submodule "vendor/cli"]
+	path = vendor/cli
+	url = https://github.com/noetl/cli.git
+[submodule "vendor/homebrew-tap"]
+	path = vendor/homebrew-tap
+	url = https://github.com/noetl/homebrew-tap.git
+[submodule "vendor/apt"]
+	path = vendor/apt
+	url = https://github.com/noetl/apt.git
