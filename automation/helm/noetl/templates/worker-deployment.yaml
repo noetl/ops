@@ -10,6 +10,8 @@ metadata:
     worker-pool: worker-cpu-01
 spec:
   replicas: {{ .Values.worker.replicas }}
+  strategy:
+{{- toYaml .Values.worker.strategy | nindent 4 }}
   selector:
     matchLabels:
       app: noetl-worker

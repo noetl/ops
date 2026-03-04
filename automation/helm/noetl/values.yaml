@@ -6,6 +6,11 @@ image:
   pullPolicy: Always
 
 server:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
   resources:
     limits:
       cpu: "2"
@@ -16,6 +21,11 @@ server:
 
 worker:
   replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
   resources:
     requests:
       cpu: "100m"
@@ -29,6 +39,11 @@ workerPool:
   enabled: false
   poolName: worker-rust-pool
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
   image:
     repository: ""
     tag: "latest"

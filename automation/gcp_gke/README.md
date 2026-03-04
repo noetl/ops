@@ -42,6 +42,11 @@ If you use submodules, override these with `--set ..._repo_dir=<submodule-path>`
 - `build_images=false` (no on-the-fly image build)
 - `noetl_image_repository=ghcr.io/noetl/noetl`
 - `noetl_image_tag=v2.8.9`
+- conservative rollout strategy for NoETL deployments on constrained clusters:
+  - `noetl_server_rollout_max_surge=0`
+  - `noetl_server_rollout_max_unavailable=1`
+  - `noetl_worker_rollout_max_surge=0`
+  - `noetl_worker_rollout_max_unavailable=1`
 
 You can still override image repository/tag per deployment with `--set`.
 

@@ -130,6 +130,10 @@ workload:
 
   # NoETL settings
   noetl_worker_replicas: 2
+  noetl_server_rollout_max_surge: 0
+  noetl_server_rollout_max_unavailable: 1
+  noetl_worker_rollout_max_surge: 0
+  noetl_worker_rollout_max_unavailable: 1
   noetl_enable_worker_pool: false
   noetl_data_persistence: false
   noetl_logs_persistence: false
@@ -1406,6 +1410,12 @@ workflow:
             --set image.repository="$NOETL_IMAGE" \
             --set image.tag={{ workload.noetl_image_tag }} \
             --set worker.replicas={{ workload.noetl_worker_replicas }} \
+            --set server.strategy.type=RollingUpdate \
+            --set server.strategy.rollingUpdate.maxSurge={{ workload.noetl_server_rollout_max_surge }} \
+            --set server.strategy.rollingUpdate.maxUnavailable={{ workload.noetl_server_rollout_max_unavailable }} \
+            --set worker.strategy.type=RollingUpdate \
+            --set worker.strategy.rollingUpdate.maxSurge={{ workload.noetl_worker_rollout_max_surge }} \
+            --set worker.strategy.rollingUpdate.maxUnavailable={{ workload.noetl_worker_rollout_max_unavailable }} \
             --set workerPool.enabled={{ workload.noetl_enable_worker_pool }} \
             --set persistence.data.enabled={{ workload.noetl_data_persistence }} \
             --set persistence.logs.enabled={{ workload.noetl_logs_persistence }} \

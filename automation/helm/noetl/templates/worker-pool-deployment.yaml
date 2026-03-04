@@ -11,6 +11,8 @@ metadata:
     worker-pool: {{ .Values.workerPool.poolName }}
 spec:
   replicas: {{ .Values.workerPool.replicas }}
+  strategy:
+{{- toYaml .Values.workerPool.strategy | nindent 4 }}
   selector:
     matchLabels:
       app: noetl-worker-pool
