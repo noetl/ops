@@ -28,11 +28,11 @@ workload:
   repository_id: noetl
   delete_cluster_on_destroy: false
 
-  # Build controls
-  build_images: true
-  build_noetl_image: true
-  build_gateway_image: true
-  build_gui_image: true
+  # Build controls (deploy defaults to published images; no on-the-fly build)
+  build_images: false
+  build_noetl_image: false
+  build_gateway_image: false
+  build_gui_image: false
   # Source repositories (split-repo workspace or submodules)
   # Defaults expect this layout:
   #   ../noetl   ../gateway   ../gui
@@ -43,13 +43,15 @@ workload:
   gui_repo_dir: "../gui"
   auth_playbooks_dir: "../noetl/tests/fixtures/playbooks/api_integration/auth0"
 
-  # Optional explicit image repositories. If empty, defaults to Artifact Registry:
+  # Image repositories.
+  # NoETL defaults to published GHCR release images.
+  # Gateway/GUI can be set explicitly; if empty they default to Artifact Registry:
   # {region}-docker.pkg.dev/{project_id}/{repository_id}/{image-name}
-  noetl_image_repository: ""
+  noetl_image_repository: ghcr.io/noetl/noetl
   gateway_image_repository: ""
   gui_image_repository: ""
 
-  noetl_image_tag: latest
+  noetl_image_tag: v2.8.9
   gateway_image_tag: latest
   gui_image_tag: latest
 
@@ -241,6 +243,7 @@ workflow:
           echo "  noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \\"
           echo "    --set action=provision-deploy \\"
           echo "    --set project_id=my-gcp-project \\"
+          echo "    --set build_images=false \\"
           echo "    --set gui_gateway_public_url=https://gateway.example.com \\"
           echo "    --set noetl_public_host=api.example.com \\"
           echo "    --set gateway_public_host=gateway.example.com \\"
@@ -273,7 +276,9 @@ workflow:
           echo "  noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \\"
           echo "    --set action=deploy \\"
           echo "    --set project_id=my-gcp-project \\"
-          echo "    --set build_images=false"
+          echo "    --set build_images=false \\"
+          echo "    --set noetl_image_repository=ghcr.io/noetl/noetl \\"
+          echo "    --set noetl_image_tag=v2.8.9"
           echo ""
           echo "  # Destroy stack (and optionally cluster)"
           echo "  noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \\"

@@ -19,7 +19,7 @@ It does **not** modify existing kind-based automation and does not use `ci/` ass
 ## Assets in this folder
 
 - `automation/gcp_gke/helm/gui/*` - Helm chart for GUI deployment
-- `automation/gcp_gke/assets/noetl/cloudbuild.yaml` - NoETL image build config (`docker/noetl/dev/Dockerfile`)
+- `automation/gcp_gke/assets/noetl/cloudbuild.yaml` - NoETL image build config (`docker/noetl/dev/Dockerfile`) for explicit build runs
 - `automation/gcp_gke/assets/gui/Dockerfile` - GUI image build (gateway-only)
 - `automation/gcp_gke/assets/gui/nginx.conf` - SPA nginx config
 
@@ -35,6 +35,16 @@ It does **not** modify existing kind-based automation and does not use `ci/` ass
 
 If you use submodules, override these with `--set ..._repo_dir=<submodule-path>`.
 
+## Published image defaults
+
+`noetl_gke_fresh_stack.yaml` now deploys using published images by default:
+
+- `build_images=false` (no on-the-fly image build)
+- `noetl_image_repository=ghcr.io/noetl/noetl`
+- `noetl_image_tag=v2.8.9`
+
+You can still override image repository/tag per deployment with `--set`.
+
 ## Quick start
 
 ```bash
@@ -44,6 +54,9 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set project_id=<gcp-project-id> \
   --set region=us-central1 \
   --set cluster_name=noetl-cluster \
+  --set build_images=false \
+  --set noetl_image_repository=ghcr.io/noetl/noetl \
+  --set noetl_image_tag=v2.8.9 \
   --set gateway_service_type=LoadBalancer \
   --set gateway_load_balancer_ip=34.71.6.63 \
   --set gui_gateway_public_url=https://gateway.example.com \
@@ -67,6 +80,8 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set project_id=noetl-demo-19700101 \
   --set cluster_name=noetl-cluster \
   --set build_images=false \
+  --set noetl_image_repository=ghcr.io/noetl/noetl \
+  --set noetl_image_tag=v2.8.9 \
   --set use_cloud_sql=true \
   --set cloud_sql_enable_private_ip=true \
   --set cloud_sql_enable_public_ip=false \

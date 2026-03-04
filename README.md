@@ -97,10 +97,9 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set project_id=noetl-demo-19700101 \
   --set region=us-central1 \
   --set cluster_name=noetl-cluster \
-  --set build_images=true \
-  --set build_noetl_image=true \
-  --set build_gateway_image=true \
-  --set build_gui_image=true \
+  --set build_images=false \
+  --set noetl_image_repository=ghcr.io/noetl/noetl \
+  --set noetl_image_tag=v2.8.9 \
   --set deploy_ingress=false \
   --set gateway_service_type=LoadBalancer \
   --set gateway_load_balancer_ip=34.46.180.136 \
