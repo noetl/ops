@@ -14,6 +14,7 @@ workload:
   registry: local
   image_name: noetl
   noetl_repo_dir: "../noetl"
+  expected_kube_context: "kind-noetl"
 
 workflow:
   - step: run
@@ -27,10 +28,26 @@ workflow:
           NOETL_REPO="{{ workload.noetl_repo_dir }}"
           REGISTRY="{{ workload.registry }}"
           IMAGE_NAME="{{ workload.image_name }}"
+          EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
 
           ensure_repo() {
             if [ ! -d "$NOETL_REPO" ]; then
               echo "ERROR: NoETL repository not found: $NOETL_REPO"
+              exit 1
+            fi
+          }
+
+          ensure_kind_context() {
+            CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+            if [ -z "$CURRENT_CONTEXT" ]; then
+              echo "ERROR: No active kubectl context found."
+              echo "Set context to $EXPECTED_CONTEXT before deploy/status actions."
+              exit 1
+            fi
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: Refusing to run local kind deploy against context '$CURRENT_CONTEXT'."
+              echo "Expected context: '$EXPECTED_CONTEXT'"
+              echo "Run: kubectl config use-context $EXPECTED_CONTEXT"
               exit 1
             fi
           }
@@ -57,6 +74,7 @@ workflow:
           }
 
           deploy() {
+            ensure_kind_context
             if [ ! -f .noetl_last_build_tag.txt ]; then
               echo "ERROR: .noetl_last_build_tag.txt not found. Run action=build first."
               exit 1
@@ -76,6 +94,7 @@ workflow:
           }
 
           status() {
+            ensure_kind_context
             kubectl get pods -n noetl
             echo ""
             kubectl get svc -n noetl
