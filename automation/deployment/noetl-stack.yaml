@@ -17,6 +17,8 @@ workload:
   worker_pool_image: "noetl-worker-pool"
   enable_rust_workers: "true"
   enable_python_workers: "true"
+  noetl_tempstore_max_ref_cache_entries: "50000"
+  noetl_tempstore_max_memory_cache_entries: "20000"
 
 workflow:
   - step: start
@@ -124,6 +126,16 @@ workflow:
             HELM_ARGS="$HELM_ARGS --set worker.replicas=3"
           else
             HELM_ARGS="$HELM_ARGS --set worker.replicas=0"
+          fi
+
+          # TempStore cache limits (applied to both server and worker)
+          if [ -n "{{ workload.noetl_tempstore_max_ref_cache_entries }}" ]; then
+            HELM_ARGS="$HELM_ARGS --set config.server.NOETL_TEMPSTORE_MAX_REF_CACHE_ENTRIES={{ workload.noetl_tempstore_max_ref_cache_entries }}"
+            HELM_ARGS="$HELM_ARGS --set config.worker.NOETL_TEMPSTORE_MAX_REF_CACHE_ENTRIES={{ workload.noetl_tempstore_max_ref_cache_entries }}"
+          fi
+          if [ -n "{{ workload.noetl_tempstore_max_memory_cache_entries }}" ]; then
+            HELM_ARGS="$HELM_ARGS --set config.server.NOETL_TEMPSTORE_MAX_MEMORY_CACHE_ENTRIES={{ workload.noetl_tempstore_max_memory_cache_entries }}"
+            HELM_ARGS="$HELM_ARGS --set config.worker.NOETL_TEMPSTORE_MAX_MEMORY_CACHE_ENTRIES={{ workload.noetl_tempstore_max_memory_cache_entries }}"
           fi
 
           echo "Helm args: $HELM_ARGS"
@@ -310,6 +322,10 @@ workflow:
           echo "  --set namespace=<ns>                - Kubernetes namespace (default: noetl)"
           echo "  --set enable_rust_workers=true      - Enable Rust worker pool (default: true)"
           echo "  --set enable_python_workers=true    - Enable Python workers (default: true)"
+          echo "  --set noetl_tempstore_max_ref_cache_entries=50000"
+          echo "                                      - TempRef metadata cache size for server/worker"
+          echo "  --set noetl_tempstore_max_memory_cache_entries=20000"
+          echo "                                      - Temp payload memory cache size for server/worker"
           echo ""
           echo "Examples:"
           echo "  # Deploy full stack"

@@ -163,6 +163,25 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set postgres_primary_memory_limit=1Gi
 ```
 
+## TempStore Cache Limits
+
+The playbook exposes TempStore in-memory cache controls and wires them to both
+NoETL server and worker pods:
+
+- `noetl_tempstore_max_ref_cache_entries` (default: `50000`)
+- `noetl_tempstore_max_memory_cache_entries` (default: `20000`)
+
+Example:
+
+```bash
+noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
+  --runtime local \
+  --set action=deploy \
+  --set project_id=<gcp-project-id> \
+  --set noetl_tempstore_max_ref_cache_entries=50000 \
+  --set noetl_tempstore_max_memory_cache_entries=20000
+```
+
 ## DB Access Notes
 
 - `demo/demo` is intended for `demo_noetl` application schemas (`public`, `auth`).

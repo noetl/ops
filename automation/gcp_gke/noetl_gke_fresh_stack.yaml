@@ -162,6 +162,8 @@ workload:
   noetl_worker_postgres_pool_timeout_seconds: 60
   noetl_worker_max_inflight_commands: 4
   noetl_worker_max_inflight_db_commands: 3
+  noetl_tempstore_max_ref_cache_entries: 50000
+  noetl_tempstore_max_memory_cache_entries: 20000
   demo_can_read_noetl_schema: true
 
   # Gateway settings
@@ -1435,6 +1437,10 @@ workflow:
             --set config.worker.NOETL_POSTGRES_POOL_TIMEOUT_SECONDS={{ workload.noetl_worker_postgres_pool_timeout_seconds }} \
             --set config.worker.NOETL_WORKER_MAX_INFLIGHT_COMMANDS={{ workload.noetl_worker_max_inflight_commands }} \
             --set config.worker.NOETL_WORKER_MAX_INFLIGHT_DB_COMMANDS={{ workload.noetl_worker_max_inflight_db_commands }} \
+            --set config.server.NOETL_TEMPSTORE_MAX_REF_CACHE_ENTRIES={{ workload.noetl_tempstore_max_ref_cache_entries }} \
+            --set config.server.NOETL_TEMPSTORE_MAX_MEMORY_CACHE_ENTRIES={{ workload.noetl_tempstore_max_memory_cache_entries }} \
+            --set config.worker.NOETL_TEMPSTORE_MAX_REF_CACHE_ENTRIES={{ workload.noetl_tempstore_max_ref_cache_entries }} \
+            --set config.worker.NOETL_TEMPSTORE_MAX_MEMORY_CACHE_ENTRIES={{ workload.noetl_tempstore_max_memory_cache_entries }} \
             --set secrets.postgresPassword={{ workload.postgres_password }} \
             --set secrets.noetlPassword={{ workload.noetl_password }} \
             $INGRESS_ARGS
