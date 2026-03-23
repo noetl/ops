@@ -57,8 +57,13 @@ workflow:
             ensure_kind_context
 
             SCHEMA_DDL="$NOETL_REPO/noetl/database/ddl/postgres/schema_ddl.sql"
+            TEST_SERVER_DOCKERFILE="$NOETL_REPO/docker/test-server/Dockerfile"
             if [ ! -f "$SCHEMA_DDL" ]; then
               echo "ERROR: PostgreSQL schema DDL not found at $SCHEMA_DDL"
+              exit 1
+            fi
+            if [ ! -f "$TEST_SERVER_DOCKERFILE" ]; then
+              echo "ERROR: Test server Dockerfile not found at $TEST_SERVER_DOCKERFILE"
               exit 1
             fi
 
@@ -83,8 +88,18 @@ workflow:
             kubectl apply -f ci/manifests/nats/namespace.yaml
             kubectl apply -f ci/manifests/nats/nats.yaml
 
+            if ! docker image inspect local/test-server:latest >/dev/null 2>&1; then
+              docker buildx build --load --platform linux/amd64 \
+                -t local/test-server:latest \
+                -f "$TEST_SERVER_DOCKERFILE" "$NOETL_REPO"
+            fi
+            kind load docker-image local/test-server:latest --name noetl
+            kubectl apply -f ci/manifests/test-server/namespace.yaml
+            kubectl apply -f ci/manifests/test-server/deployment.yaml
+
             kubectl rollout status deployment/postgres -n postgres --timeout=180s
             kubectl rollout status statefulset/nats -n nats --timeout=180s
+            kubectl rollout status deployment/paginated-api -n test-server --timeout=180s
           }
 
           build() {
