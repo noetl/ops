@@ -23,7 +23,7 @@ spec:
           args:
             - postgres
             - "-c"
-            - "max_connections=100"
+            - "max_connections=200"
             - "-c"
             - "shared_buffers=128MB"
             - "-c"

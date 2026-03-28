@@ -28,6 +28,9 @@ data:
   NATS_STREAM: "NOETL_COMMANDS"
   NATS_CONSUMER: "noetl_worker_pool"
   NATS_SUBJECT: "noetl.commands"
+  NOETL_POSTGRES_POOL_MIN_SIZE: "1"
+  NOETL_POSTGRES_POOL_MAX_SIZE: "8"
+  NOETL_POSTGRES_POOL_MAX_WAITING: "100"
   # Keychain cache refresh threshold (15 minutes - prevents expiration during long loops)
   NOETL_KEYCHAIN_REFRESH_THRESHOLD: "900"
   # Result Storage Configuration (output_select pattern)
