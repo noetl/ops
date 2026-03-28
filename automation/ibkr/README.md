@@ -327,7 +327,7 @@ Verify kind port mapping exists in `ci/kind/config.yaml`:
 ```yaml
 - containerPort: 30500
   hostPort: 15000
-  listenAddress: "127.0.0.1"
+  listenAddress: "0.0.0.0"
   protocol: TCP
 ```
 

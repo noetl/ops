@@ -48,6 +48,25 @@ workflow:
           echo ""
           echo "Creating Kind cluster 'noetl'..."
           kind create cluster --config=ci/kind/config.yaml
+          detect_lan_host() {
+            local host=""
+            if command -v scutil >/dev/null 2>&1; then
+              host="$(scutil --get LocalHostName 2>/dev/null || true)"
+            fi
+            if [ -z "$host" ]; then
+              host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+            fi
+            if [ -z "$host" ]; then
+              echo "localhost"
+            elif echo "$host" | grep -q '\.'; then
+              echo "$host"
+            else
+              echo "${host}.local"
+            fi
+          }
+          LAN_HOST="$(detect_lan_host)"
+          echo "Kind cluster created with host port mappings on 0.0.0.0"
+          echo "Preferred NoETL endpoint: http://${LAN_HOST}:8082"
     next:
       spec:
         mode: exclusive
@@ -139,6 +158,27 @@ workflow:
           echo ""
           echo "=== Cluster Nodes ==="
           kubectl get nodes --context kind-noetl 2>/dev/null || echo "No nodes (cluster not running)"
+          echo ""
+          echo "=== Host Access Endpoint ==="
+          detect_lan_host() {
+            local host=""
+            if command -v scutil >/dev/null 2>&1; then
+              host="$(scutil --get LocalHostName 2>/dev/null || true)"
+            fi
+            if [ -z "$host" ]; then
+              host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+            fi
+            if [ -z "$host" ]; then
+              echo "localhost"
+            elif echo "$host" | grep -q '\.'; then
+              echo "$host"
+            else
+              echo "${host}.local"
+            fi
+          }
+          LAN_HOST="$(detect_lan_host)"
+          echo "  Preferred: http://${LAN_HOST}:8082"
+          echo "  Local fallback: http://localhost:8082"
     next:
       spec:
         mode: exclusive
@@ -196,6 +236,10 @@ workflow:
           echo ""
           echo "  # List clusters"
           echo "  noetl run automation/infrastructure/kind.yaml --set action=list"
+          echo ""
+          echo "LAN access:"
+          echo "  Kind host mappings are configured with listenAddress=0.0.0.0"
+          echo "  Recreate cluster after config changes to apply port binding updates."
           echo ""
     next:
       spec:
