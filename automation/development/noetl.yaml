@@ -30,6 +30,27 @@ workflow:
           IMAGE_NAME="{{ workload.image_name }}"
           EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
 
+          detect_lan_host() {
+            local host=""
+            if [ -n "${NOETL_HOST:-}" ]; then
+              echo "$NOETL_HOST"
+              return
+            fi
+            if command -v scutil >/dev/null 2>&1; then
+              host="$(scutil --get LocalHostName 2>/dev/null || true)"
+            fi
+            if [ -z "$host" ]; then
+              host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+            fi
+            if [ -z "$host" ]; then
+              echo "localhost"
+            elif echo "$host" | grep -q '\.'; then
+              echo "$host"
+            else
+              echo "${host}.local"
+            fi
+          }
+
           ensure_repo() {
             if [ ! -d "$NOETL_REPO" ]; then
               echo "ERROR: NoETL repository not found: $NOETL_REPO"
@@ -98,6 +119,10 @@ workflow:
             kubectl get pods -n noetl
             echo ""
             kubectl get svc -n noetl
+            echo ""
+            LAN_HOST="$(detect_lan_host)"
+            echo "Preferred NoETL endpoint: http://${LAN_HOST}:8082"
+            echo "Local fallback endpoint: http://localhost:8082"
           }
 
           case "$ACTION" in
@@ -125,6 +150,10 @@ workflow:
               echo ""
               echo "Actions: build, load, deploy, redeploy, status"
               echo "Optional: --set noetl_repo_dir=../noetl"
+              echo ""
+              echo "LAN access:"
+              echo "  This workflow expects kind config listenAddress=0.0.0.0"
+              echo "  Recreate kind cluster after changing port mappings."
               ;;
           esac
     next:

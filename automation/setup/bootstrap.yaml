@@ -425,7 +425,25 @@ workflow:
 
       echo "=== Checking NoETL server health ==="
 
-      curl -f http://localhost:8082/api/health || echo "NoETL server not ready"
+      detect_lan_host() {
+        local host=""
+        if command -v scutil >/dev/null 2>&1; then
+          host="$(scutil --get LocalHostName 2>/dev/null || true)"
+        fi
+        if [ -z "$host" ]; then
+          host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+        fi
+        if [ -z "$host" ]; then
+          echo "localhost"
+        elif echo "$host" | grep -q "\."; then
+          echo "$host"
+        else
+          echo "${host}.local"
+        fi
+      }
+      LAN_HOST="$(detect_lan_host)"
+      LAN_HEALTH_URL="http://${LAN_HOST}:8082/api/health"
+      curl -f "$LAN_HEALTH_URL" || curl -f http://localhost:8082/api/health || echo "NoETL server not ready"
 
       echo "\n=== Checking PostgreSQL connection ==="
 
@@ -454,6 +472,24 @@ workflow:
 
       echo ""
 
+      detect_lan_host() {
+        local host=""
+        if command -v scutil >/dev/null 2>&1; then
+          host="$(scutil --get LocalHostName 2>/dev/null || true)"
+        fi
+        if [ -z "$host" ]; then
+          host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+        fi
+        if [ -z "$host" ]; then
+          echo "localhost"
+        elif echo "$host" | grep -q "\."; then
+          echo "$host"
+        else
+          echo "${host}.local"
+        fi
+      }
+      LAN_HOST="$(detect_lan_host)"
+
       echo "Environment Status:"
 
       echo "  Kind cluster: noetl"
@@ -478,29 +514,29 @@ workflow:
 
       echo "Endpoints:"
 
-      echo "  NoETL API: http://localhost:8082"
+      echo "  NoETL API: http://${LAN_HOST}:8082 (local fallback http://localhost:8082)"
 
-      echo "  Gateway API: http://localhost:8080"
+      echo "  Gateway API: http://${LAN_HOST}:8080"
 
-      echo "  PostgreSQL: localhost:54321"
+      echo "  PostgreSQL: ${LAN_HOST}:54321"
 
-      echo "  Grafana: http://localhost:3000"
+      echo "  Grafana: http://${LAN_HOST}:3000"
 
-      echo "  VictoriaLogs: http://localhost:39428"
+      echo "  VictoriaLogs: http://${LAN_HOST}:39428"
 
-      echo "  ClickHouse HTTP: http://localhost:30123"
+      echo "  ClickHouse HTTP: http://${LAN_HOST}:30123"
 
-      echo "  ClickHouse Native: localhost:30900"
+      echo "  ClickHouse Native: ${LAN_HOST}:30900"
 
-      echo "  Qdrant HTTP: http://localhost:30633"
+      echo "  Qdrant HTTP: http://${LAN_HOST}:30633"
 
-      echo "  Qdrant gRPC: localhost:30634"
+      echo "  Qdrant gRPC: ${LAN_HOST}:30634"
 
-      echo "  NATS Client: localhost:30422"
+      echo "  NATS Client: ${LAN_HOST}:30422"
 
-      echo "  NATS Monitoring: http://localhost:30822"
+      echo "  NATS Monitoring: http://${LAN_HOST}:30822"
 
-      echo "  Test Server: http://localhost:30555"
+      echo "  Test Server: http://${LAN_HOST}:30555"
 
       echo ""
 
