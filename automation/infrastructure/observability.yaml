@@ -48,11 +48,13 @@ workflow:
 
   - step: activate_clickhouse
     desc: Activate ClickHouse
+    input:
+      action: deploy
     tool:
       kind: playbook
       path: ./clickhouse.yaml
-      args:
-        action: deploy
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -61,11 +63,13 @@ workflow:
 
   - step: activate_qdrant
     desc: Activate Qdrant
+    input:
+      action: deploy
     tool:
       kind: playbook
       path: ./qdrant.yaml
-      args:
-        action: deploy
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -74,11 +78,13 @@ workflow:
 
   - step: activate_nats
     desc: Activate NATS
+    input:
+      action: deploy
     tool:
       kind: playbook
       path: ./nats.yaml
-      args:
-        action: deploy
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -114,11 +120,13 @@ workflow:
 
   - step: deactivate_nats
     desc: Deactivate NATS
+    input:
+      action: undeploy
     tool:
       kind: playbook
       path: ./nats.yaml
-      args:
-        action: undeploy
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -127,11 +135,13 @@ workflow:
 
   - step: deactivate_qdrant
     desc: Deactivate Qdrant
+    input:
+      action: undeploy
     tool:
       kind: playbook
       path: ./qdrant.yaml
-      args:
-        action: undeploy
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -140,11 +150,13 @@ workflow:
 
   - step: deactivate_clickhouse
     desc: Deactivate ClickHouse
+    input:
+      action: undeploy
     tool:
       kind: playbook
       path: ./clickhouse.yaml
-      args:
-        action: undeploy
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -181,11 +193,13 @@ workflow:
 
   - step: status_clickhouse
     desc: Check ClickHouse status
+    input:
+      action: status
     tool:
       kind: playbook
       path: ./clickhouse.yaml
-      args:
-        action: status
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -194,11 +208,13 @@ workflow:
 
   - step: status_qdrant
     desc: Check Qdrant status
+    input:
+      action: status
     tool:
       kind: playbook
       path: ./qdrant.yaml
-      args:
-        action: status
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -207,11 +223,13 @@ workflow:
 
   - step: status_nats
     desc: Check NATS status
+    input:
+      action: status
     tool:
       kind: playbook
       path: ./nats.yaml
-      args:
-        action: status
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -234,11 +252,13 @@ workflow:
 
   - step: health_clickhouse
     desc: Check ClickHouse health
+    input:
+      action: health
     tool:
       kind: playbook
       path: ./clickhouse.yaml
-      args:
-        action: health
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -247,11 +267,13 @@ workflow:
 
   - step: health_qdrant
     desc: Check Qdrant health
+    input:
+      action: health
     tool:
       kind: playbook
       path: ./qdrant.yaml
-      args:
-        action: health
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -260,11 +282,13 @@ workflow:
 
   - step: health_nats
     desc: Check NATS health
+    input:
+      action: health
     tool:
       kind: playbook
       path: ./nats.yaml
-      args:
-        action: health
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -287,11 +311,13 @@ workflow:
 
   - step: restart_clickhouse
     desc: Restart ClickHouse
+    input:
+      action: restart
     tool:
       kind: playbook
       path: ./clickhouse.yaml
-      args:
-        action: restart
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -300,11 +326,13 @@ workflow:
 
   - step: restart_qdrant
     desc: Restart Qdrant
+    input:
+      action: restart
     tool:
       kind: playbook
       path: ./qdrant.yaml
-      args:
-        action: restart
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -313,11 +341,13 @@ workflow:
 
   - step: restart_nats
     desc: Restart NATS
+    input:
+      action: restart
     tool:
       kind: playbook
       path: ./nats.yaml
-      args:
-        action: restart
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive

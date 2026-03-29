@@ -161,47 +161,57 @@ workflow:
   - step: deploy_postgres
 - step: deploy_postgres
   desc: Deploy PostgreSQL to cluster
+  input:
+    action: deploy
   tool:
     kind: playbook
     path: ../infrastructure/postgres.yaml
-    args:
-      action: deploy
+    input:
+      action: "{{ input.action }}"
   next:
   - step: deploy_nats
 - step: deploy_nats
   desc: Deploy NATS JetStream (required dependency)
+  input:
+    action: deploy
   tool:
     kind: playbook
     path: ../infrastructure/nats.yaml
-    args:
-      action: deploy
+    input:
+      action: "{{ input.action }}"
   next:
   - step: deploy_qdrant
 - step: deploy_qdrant
   desc: Deploy Qdrant vector database
+  input:
+    action: deploy
   tool:
     kind: playbook
     path: ../infrastructure/qdrant.yaml
-    args:
-      action: deploy
+    input:
+      action: "{{ input.action }}"
   next:
   - step: deploy_clickhouse
 - step: deploy_clickhouse
   desc: Deploy ClickHouse observability stack
+  input:
+    action: deploy
   tool:
     kind: playbook
     path: ../infrastructure/clickhouse.yaml
-    args:
-      action: deploy
+    input:
+      action: "{{ input.action }}"
   next:
   - step: deploy_monitoring
 - step: deploy_monitoring
   desc: Deploy monitoring stack (VictoriaMetrics, Grafana)
+  input:
+    action: deploy
   tool:
     kind: playbook
     path: ../infrastructure/monitoring.yaml
-    args:
-      action: deploy
+    input:
+      action: "{{ input.action }}"
   next:
   - step: wait_for_dependencies
 - step: wait_for_dependencies
@@ -240,20 +250,24 @@ workflow:
   - step: provision_auth_schema
 - step: provision_auth_schema
   desc: Provision Gateway auth schema (users, roles, permissions)
+  input:
+    action: provision
   tool:
     kind: playbook
     path: ./provision_auth.yaml
-    args:
-      action: provision
+    input:
+      action: "{{ input.action }}"
   next:
   - step: deploy_test_server
 - step: deploy_test_server
   desc: Deploy pagination test server for integration tests
+  input:
+    action: full
   tool:
     kind: playbook
     path: ../test/pagination-server.yaml
-    args:
-      action: full
+    input:
+      action: "{{ input.action }}"
   next:
   - step: maybe_deploy_gateway
 - step: maybe_deploy_gateway

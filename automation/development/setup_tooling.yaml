@@ -139,11 +139,13 @@ workflow:
 
   - step: run_macos_setup
     desc: Run macOS setup via tooling_macos.yaml
+    input:
+      action: setup
     tool:
       kind: playbook
       path: tooling_macos.yaml
-      args:
-        action: setup
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -152,11 +154,13 @@ workflow:
 
   - step: run_linux_setup
     desc: Run Linux/WSL2 setup via tooling_linux.yaml
+    input:
+      action: setup
     tool:
       kind: playbook
       path: tooling_linux.yaml
-      args:
-        action: setup
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -198,11 +202,13 @@ workflow:
 
   - step: run_macos_validate
     desc: Run macOS validation via tooling_macos.yaml
+    input:
+      action: validate-install
     tool:
       kind: playbook
       path: tooling_macos.yaml
-      args:
-        action: validate-install
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -211,11 +217,13 @@ workflow:
 
   - step: run_linux_validate
     desc: Run Linux/WSL2 validation via tooling_linux.yaml
+    input:
+      action: validate-install
     tool:
       kind: playbook
       path: tooling_linux.yaml
-      args:
-        action: validate-install
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -257,11 +265,13 @@ workflow:
 
   - step: run_macos_validate_devtools
     desc: Run macOS dev tools validation
+    input:
+      action: validate-devtools
     tool:
       kind: playbook
       path: tooling_macos.yaml
-      args:
-        action: validate-devtools
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -270,11 +280,13 @@ workflow:
 
   - step: run_linux_validate_devtools
     desc: Run Linux/WSL2 dev tools validation
+    input:
+      action: validate-devtools
     tool:
       kind: playbook
       path: tooling_linux.yaml
-      args:
-        action: validate-devtools
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -316,11 +328,13 @@ workflow:
 
   - step: run_macos_install_base
     desc: Run macOS base tools installation
+    input:
+      action: install-base
     tool:
       kind: playbook
       path: tooling_macos.yaml
-      args:
-        action: install-base
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -329,11 +343,13 @@ workflow:
 
   - step: run_linux_install_base
     desc: Run Linux/WSL2 base tools installation
+    input:
+      action: install-base
     tool:
       kind: playbook
       path: tooling_linux.yaml
-      args:
-        action: install-base
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -375,11 +391,13 @@ workflow:
 
   - step: run_macos_install_devtools
     desc: Run macOS dev tools installation
+    input:
+      action: install-devtools
     tool:
       kind: playbook
       path: tooling_macos.yaml
-      args:
-        action: install-devtools
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive
@@ -388,11 +406,13 @@ workflow:
 
   - step: run_linux_install_devtools
     desc: Run Linux/WSL2 dev tools installation
+    input:
+      action: install-devtools
     tool:
       kind: playbook
       path: tooling_linux.yaml
-      args:
-        action: install-devtools
+      input:
+        action: "{{ input.action }}"
     next:
       spec:
         mode: exclusive

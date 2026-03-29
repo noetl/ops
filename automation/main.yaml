@@ -150,36 +150,56 @@ workflow:
   - step: end
 - step: gke_fresh
   desc: Run fresh GKE stack orchestration
+  input:
+    action: '{{ workload.gke_action }}'
+    project_id: '{{ workload.gke_project_id }}'
+    region: '{{ workload.gke_region }}'
+    cluster_name: '{{ workload.gke_cluster_name }}'
+    build_images: '{{ workload.gke_build_images }}'
+    deploy_ingress: '{{ workload.gke_deploy_ingress }}'
+    gateway_service_type: '{{ workload.gke_gateway_service_type }}'
+    gateway_load_balancer_ip: '{{ workload.gke_gateway_static_ip }}'
+    gateway_public_host: '{{ workload.gke_gateway_public_host }}'
+    noetl_public_host: '{{ workload.gke_noetl_public_host }}'
+    gui_public_host: '{{ workload.gke_gui_public_host }}'
+    gui_gateway_public_url: '{{ workload.gke_gui_gateway_public_url }}'
   tool:
     kind: playbook
     path: gcp_gke/noetl_gke_fresh_stack.yaml
-    args:
-      action: '{{ workload.gke_action }}'
-      project_id: '{{ workload.gke_project_id }}'
-      region: '{{ workload.gke_region }}'
-      cluster_name: '{{ workload.gke_cluster_name }}'
-      build_images: '{{ workload.gke_build_images }}'
-      deploy_ingress: '{{ workload.gke_deploy_ingress }}'
-      gateway_service_type: '{{ workload.gke_gateway_service_type }}'
-      gateway_load_balancer_ip: '{{ workload.gke_gateway_static_ip }}'
-      gateway_public_host: '{{ workload.gke_gateway_public_host }}'
-      noetl_public_host: '{{ workload.gke_noetl_public_host }}'
-      gui_public_host: '{{ workload.gke_gui_public_host }}'
-      gui_gateway_public_url: '{{ workload.gke_gui_gateway_public_url }}'
+    input:
+      action: '{{ input.action }}'
+      project_id: '{{ input.project_id }}'
+      region: '{{ input.region }}'
+      cluster_name: '{{ input.cluster_name }}'
+      build_images: '{{ input.build_images }}'
+      deploy_ingress: '{{ input.deploy_ingress }}'
+      gateway_service_type: '{{ input.gateway_service_type }}'
+      gateway_load_balancer_ip: '{{ input.gateway_load_balancer_ip }}'
+      gateway_public_host: '{{ input.gateway_public_host }}'
+      noetl_public_host: '{{ input.noetl_public_host }}'
+      gui_public_host: '{{ input.gui_public_host }}'
+      gui_gateway_public_url: '{{ input.gui_gateway_public_url }}'
   next:
   - step: end
 - step: gke_cluster
   desc: Run standalone GKE cluster lifecycle playbook
+  input:
+    action: '{{ workload.gke_cluster_action }}'
+    project_id: '{{ workload.gke_project_id }}'
+    region: '{{ workload.gke_region }}'
+    cluster_name: '{{ workload.gke_cluster_name }}'
+    use_blueprint: '{{ workload.gke_cluster_use_blueprint }}'
+    skip_snapshot: '{{ workload.gke_cluster_skip_snapshot }}'
   tool:
     kind: playbook
     path: gcp_gke/gke_cluster_recreate.yaml
-    args:
-      action: '{{ workload.gke_cluster_action }}'
-      project_id: '{{ workload.gke_project_id }}'
-      region: '{{ workload.gke_region }}'
-      cluster_name: '{{ workload.gke_cluster_name }}'
-      use_blueprint: '{{ workload.gke_cluster_use_blueprint }}'
-      skip_snapshot: '{{ workload.gke_cluster_skip_snapshot }}'
+    input:
+      action: '{{ input.action }}'
+      project_id: '{{ input.project_id }}'
+      region: '{{ input.region }}'
+      cluster_name: '{{ input.cluster_name }}'
+      use_blueprint: '{{ input.use_blueprint }}'
+      skip_snapshot: '{{ input.skip_snapshot }}'
   next:
   - step: end
 - step: unknown_target

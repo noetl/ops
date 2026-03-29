@@ -24,12 +24,15 @@ workflow:
 
   - step: call_build
     desc: "Call build playbook"
+    input:
+      image_tag: "{{ workload.version }}"
+      build_env: "{{ workload.environment }}"
     tool:
       kind: playbook
       path: ./build_child.yaml
-      args:
-        image_tag: "{{ workload.version }}"
-        build_env: "{{ workload.environment }}"
+      input:
+        image_tag: "{{ input.image_tag }}"
+        build_env: "{{ input.build_env }}"
     next:
       spec:
         mode: exclusive
@@ -38,12 +41,15 @@ workflow:
 
   - step: call_deploy
     desc: "Call deploy playbook"
+    input:
+      image_tag: "{{ workload.version }}"
+      target_env: "{{ workload.environment }}"
     tool:
       kind: playbook
       path: ./deploy_child.yaml
-      args:
-        image_tag: "{{ workload.version }}"
-        target_env: "{{ workload.environment }}"
+      input:
+        image_tag: "{{ input.image_tag }}"
+        target_env: "{{ input.target_env }}"
     next:
       spec:
         mode: exclusive
