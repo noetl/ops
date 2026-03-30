@@ -54,11 +54,11 @@ spec:
               readOnly: true
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "500m"
+              cpu: "250m"
               memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
       volumes:
         - name: noetl-data
           persistentVolumeClaim:
