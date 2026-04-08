@@ -12,6 +12,7 @@ executor:
 workload:
   action: help # build, noetl-image-build, cleanup-all, images-clear, status
   noetl_repo_dir: "../noetl"
+  gui_repo_dir: "../gui"
 
 workflow:
   - step: run
@@ -23,6 +24,7 @@ workflow:
           set -euo pipefail
           ACTION="{{ workload.action }}"
           NOETL_REPO="{{ workload.noetl_repo_dir }}"
+          GUI_REPO="{{ workload.gui_repo_dir }}"
 
           ensure_repo() {
             if [ ! -d "$NOETL_REPO" ]; then
@@ -40,12 +42,34 @@ workflow:
               echo "Built local/noetl:$IMAGE_TAG"
               ;;
 
+            build-gui)
+              if [ ! -d "$GUI_REPO" ]; then
+                echo "ERROR: GUI repository not found: $GUI_REPO"
+                exit 1
+              fi
+              IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
+              docker build --build-arg VITE_API_MODE=direct -t "local/gui:$IMAGE_TAG" -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
+              echo "$IMAGE_TAG" > .gui_last_build_tag.txt
+              echo "Built local/gui:$IMAGE_TAG"
+              ;;
+
             noetl-image-build)
               ensure_repo
               IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
               DOCKER_BUILDKIT=0 docker build -t "local/noetl:$IMAGE_TAG" -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
               echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
               echo "Built local/noetl:$IMAGE_TAG"
+              ;;
+
+            build-gui)
+              if [ ! -d "$GUI_REPO" ]; then
+                echo "ERROR: GUI repository not found: $GUI_REPO"
+                exit 1
+              fi
+              IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
+              docker build --build-arg VITE_API_MODE=direct -t "local/gui:$IMAGE_TAG" -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
+              echo "$IMAGE_TAG" > .gui_last_build_tag.txt
+              echo "Built local/gui:$IMAGE_TAG"
               ;;
 
             cleanup-all)
@@ -74,6 +98,7 @@ workflow:
               echo ""
               echo "Actions:"
               echo "  build              Build NoETL image"
+              echo "  build-gui          Build GUI image"
               echo "  noetl-image-build  Build without BuildKit"
               echo "  cleanup-all        Remove builders/images/volumes"
               echo "  images-clear       Remove local/noetl images"
