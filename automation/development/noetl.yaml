@@ -73,6 +73,56 @@ workflow:
             fi
           }
 
+          ensure_local_dependencies() {
+            ensure_repo
+            ensure_kind_context
+
+            SCHEMA_DDL="$NOETL_REPO/noetl/database/ddl/postgres/schema_ddl.sql"
+            TEST_SERVER_DOCKERFILE="$NOETL_REPO/docker/test-server/Dockerfile"
+            if [ ! -f "$SCHEMA_DDL" ]; then
+              echo "ERROR: PostgreSQL schema DDL not found at $SCHEMA_DDL"
+              exit 1
+            fi
+            if [ ! -f "$TEST_SERVER_DOCKERFILE" ]; then
+              echo "ERROR: Test server Dockerfile not found at $TEST_SERVER_DOCKERFILE"
+              exit 1
+            fi
+
+            kubectl apply -f ci/manifests/noetl/namespace/
+
+            if ! kubectl get secret gcs-credentials -n noetl >/dev/null 2>&1; then
+              kubectl create secret generic gcs-credentials -n noetl \
+                --from-literal=gcs-key.json='{}'
+            fi
+
+            kubectl apply -f ci/manifests/postgres/namespace/namespace.yaml
+            kubectl create configmap postgres-schema-ddl --namespace postgres \
+              --from-file=schema_ddl.sql.norun="$SCHEMA_DDL" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -f ci/manifests/postgres/config-files.yaml
+            kubectl apply -f ci/manifests/postgres/configmap.yaml
+            kubectl apply -f ci/manifests/postgres/secret.yaml
+            kubectl apply -f ci/manifests/postgres/persistent-volume.yaml
+            kubectl apply -f ci/manifests/postgres/service.yaml
+            kubectl apply -f ci/manifests/postgres/deployment.yaml
+
+            kubectl apply -f ci/manifests/nats/namespace.yaml
+            kubectl apply -f ci/manifests/nats/nats.yaml
+
+            if ! docker image inspect local/test-server:latest >/dev/null 2>&1; then
+              docker buildx build --load --platform linux/amd64 \
+                -t local/test-server:latest \
+                -f "$TEST_SERVER_DOCKERFILE" "$NOETL_REPO"
+            fi
+            kind load docker-image local/test-server:latest --name noetl
+            kubectl apply -f ci/manifests/test-server/namespace.yaml
+            kubectl apply -f ci/manifests/test-server/deployment.yaml
+
+            kubectl rollout status deployment/postgres -n postgres --timeout=180s
+            kubectl rollout status statefulset/nats -n nats --timeout=180s
+            kubectl rollout status deployment/paginated-api -n test-server --timeout=180s
+          }
+
           build() {
             ensure_repo
             IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
@@ -96,6 +146,7 @@ workflow:
 
           deploy() {
             ensure_kind_context
+            ensure_local_dependencies
             if [ ! -f .noetl_last_build_tag.txt ]; then
               echo "ERROR: .noetl_last_build_tag.txt not found. Run action=build first."
               exit 1
