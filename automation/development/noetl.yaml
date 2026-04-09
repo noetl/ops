@@ -104,6 +104,7 @@ workflow:
             kubectl apply -f ci/manifests/postgres/secret.yaml
             kubectl apply -f ci/manifests/postgres/persistent-volume.yaml
             kubectl apply -f ci/manifests/postgres/service.yaml
+            kubectl apply -f ci/manifests/postgres/service-external.yaml
             kubectl apply -f ci/manifests/postgres/deployment.yaml
 
             kubectl apply -f ci/manifests/nats/namespace.yaml
