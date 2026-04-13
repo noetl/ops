@@ -111,7 +111,7 @@ workflow:
             kubectl apply -f ci/manifests/nats/nats.yaml
 
             if ! docker image inspect local/test-server:latest >/dev/null 2>&1; then
-              docker buildx build --load --platform linux/amd64 \
+              docker buildx build --no-cache --load --platform linux/amd64 \
                 -t local/test-server:latest \
                 -f "$TEST_SERVER_DOCKERFILE" "$NOETL_REPO"
             fi
@@ -128,7 +128,7 @@ workflow:
             ensure_repo
             IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
             echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
-            docker buildx build --load --platform linux/amd64 \
+            docker buildx build --no-cache --load --platform linux/amd64 \
               -t "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" \
               -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
             echo "Built $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
