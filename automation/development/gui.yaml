@@ -58,6 +58,7 @@ workflow:
             echo "$IMAGE_TAG" > .gui_last_build_tag.txt
             docker buildx build --load --platform linux/amd64 \
               --build-arg VITE_API_MODE=direct \
+              --build-arg VITE_ALLOW_SKIP_AUTH=true \
               -t "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" \
               -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
             echo "Built $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
