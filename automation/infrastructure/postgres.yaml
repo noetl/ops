@@ -46,8 +46,23 @@ workflow:
           kubectl config use-context kind-noetl
           kubectl apply -f ci/manifests/postgres/namespace/namespace.yaml
           sleep 2
+          SCHEMA_PATH=""
+          for p in \
+            "noetl/database/ddl/postgres/schema_ddl.sql" \
+            "../noetl/noetl/database/ddl/postgres/schema_ddl.sql" \
+            "repos/noetl/noetl/database/ddl/postgres/schema_ddl.sql"; do
+            if [ -f "$p" ]; then
+              SCHEMA_PATH="$p"
+              break
+            fi
+          done
+          if [ -z "$SCHEMA_PATH" ]; then
+            echo "ERROR: schema_ddl.sql not found from current working directory."
+            echo "Tried: noetl/... , ../noetl/... , repos/noetl/..."
+            exit 1
+          fi
           kubectl create configmap postgres-schema-ddl --namespace postgres \
-            --from-file=schema_ddl.sql.norun=noetl/database/ddl/postgres/schema_ddl.sql \
+            --from-file=schema_ddl.sql.norun="$SCHEMA_PATH" \
             --dry-run=client -o yaml | kubectl apply -f -
           kubectl apply -f ci/manifests/postgres/
     next:
@@ -101,7 +116,17 @@ workflow:
             echo "Schema applied using packaged DDL."
           else
             echo "noetl CLI apply-schema failed; trying local DDL fallback..."
-            if [ -f noetl/database/ddl/postgres/schema_ddl.sql ]; then
+            SCHEMA_PATH=""
+            for p in \
+              "noetl/database/ddl/postgres/schema_ddl.sql" \
+              "../noetl/noetl/database/ddl/postgres/schema_ddl.sql" \
+              "repos/noetl/noetl/database/ddl/postgres/schema_ddl.sql"; do
+              if [ -f "$p" ]; then
+                SCHEMA_PATH="$p"
+                break
+              fi
+            done
+            if [ -n "$SCHEMA_PATH" ]; then
               NOETL_SCHEMA=${NOETL_SCHEMA:-noetl}
               NOETL_USER=${NOETL_USER:-noetl}
               psql -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS ${NOETL_SCHEMA} AUTHORIZATION ${NOETL_USER};"
@@ -110,7 +135,7 @@ workflow:
               psql -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${NOETL_SCHEMA} TO ${NOETL_USER};"
               psql -v ON_ERROR_STOP=1 -c "ALTER DEFAULT PRIVILEGES IN SCHEMA ${NOETL_SCHEMA} GRANT ALL ON TABLES TO ${NOETL_USER};"
               psql -v ON_ERROR_STOP=1 -c "ALTER DEFAULT PRIVILEGES IN SCHEMA ${NOETL_SCHEMA} GRANT ALL ON SEQUENCES TO ${NOETL_USER};"
-              psql -v ON_ERROR_STOP=1 -f noetl/database/ddl/postgres/schema_ddl.sql
+              psql -v ON_ERROR_STOP=1 -f "$SCHEMA_PATH"
             else
               echo "Could not apply schema (no CLI and no local DDL)."; exit 1
             fi
