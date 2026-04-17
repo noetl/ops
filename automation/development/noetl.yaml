@@ -68,6 +68,29 @@ workflow:
             fi
           }
 
+          ensure_colima_running() {
+            if ! command -v colima >/dev/null 2>&1; then
+              echo "ERROR: Colima is required for local kind workflow but is not installed."
+              echo "Install Colima and start it before running this playbook."
+              exit 1
+            fi
+
+            COLIMA_STATUS="$(colima status 2>/dev/null | awk -F': *' '/^Status:/ {print tolower($2)}' | tr -d '\r')"
+            if [ "$COLIMA_STATUS" != "running" ]; then
+              echo "ERROR: Colima is not running."
+              echo "Start it first: colima start --runtime docker"
+              exit 1
+            fi
+
+            DOCKER_CONTEXT="$(docker context show 2>/dev/null || true)"
+            if [ "$DOCKER_CONTEXT" != "colima" ]; then
+              echo "ERROR: Docker context must be 'colima' for this workflow."
+              echo "Current context: ${DOCKER_CONTEXT:-<none>}"
+              echo "Run: docker context use colima"
+              exit 1
+            fi
+          }
+
           ensure_kind_context() {
             CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
             if [ -z "$CURRENT_CONTEXT" ]; then
@@ -85,6 +108,7 @@ workflow:
 
           ensure_local_dependencies() {
             ensure_repo
+            ensure_colima_running
             ensure_kind_context
 
             SCHEMA_DDL="$NOETL_REPO/noetl/database/ddl/postgres/schema_ddl.sql"
@@ -136,6 +160,7 @@ workflow:
 
           build() {
             ensure_repo
+            ensure_colima_running
             prepare_docker_storage
             PREV_TAG=""
             if [ -f .noetl_last_build_tag.txt ]; then
@@ -170,6 +195,7 @@ workflow:
           }
 
           load() {
+            ensure_colima_running
             if [ ! -f .noetl_last_build_tag.txt ]; then
               FALLBACK_TAG="$(resolve_latest_local_tag)"
               if [ -z "$FALLBACK_TAG" ]; then
@@ -242,6 +268,7 @@ workflow:
               echo ""
               echo "Actions: build, load, deploy, redeploy, status"
               echo "Optional: --set noetl_repo_dir=../noetl"
+              echo "Requirement: Colima must be running and Docker context set to 'colima'"
               echo ""
               echo "LAN access:"
               echo "  This workflow expects kind config listenAddress=0.0.0.0"
