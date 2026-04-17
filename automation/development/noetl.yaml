@@ -75,8 +75,8 @@ workflow:
               exit 1
             fi
 
-            COLIMA_STATUS="$(colima status 2>/dev/null | awk -F': *' '/^Status:/ {print tolower($2)}' | tr -d '\r')"
-            if [ "$COLIMA_STATUS" != "running" ]; then
+            # colima v0.10+ uses log-style output: msg="colima is running ..."
+            if ! colima status 2>&1 | grep -qi "is running"; then
               echo "ERROR: Colima is not running."
               echo "Start it first: colima start --runtime docker"
               exit 1
