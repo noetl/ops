@@ -202,6 +202,17 @@ workflow:
     input:
       action: "{{ input.action }}"
   next:
+  - step: deploy_minio
+- step: deploy_minio
+  desc: Deploy MinIO object storage
+  input:
+    action: deploy
+  tool:
+    kind: playbook
+    path: ../infrastructure/minio.yaml
+    input:
+      action: "{{ input.action }}"
+  next:
   - step: deploy_monitoring
 - step: deploy_monitoring
   desc: Deploy monitoring stack (VictoriaMetrics, Grafana)
@@ -240,6 +251,12 @@ workflow:
       echo "Waiting for Qdrant..."
 
       kubectl wait --for=condition=ready pod -l app=qdrant -n qdrant --timeout=90s
+      || true
+
+
+      echo "Waiting for MinIO..."
+
+      kubectl wait --for=condition=ready pod -l app=minio -n minio --timeout=90s
       || true
 
 
@@ -533,6 +550,8 @@ workflow:
       echo "  Gateway API: http://${LAN_HOST}:8080"
 
       echo "  PostgreSQL: ${LAN_HOST}:54321"
+
+      echo "  MinIO API: http://${LAN_HOST}:9000 (Console: http://${LAN_HOST}:9001)"
 
       echo "  Grafana: http://${LAN_HOST}:3000"
 
