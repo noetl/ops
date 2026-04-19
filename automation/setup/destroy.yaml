@@ -70,9 +70,8 @@ workflow:
   tool:
     kind: shell
     cmds:
-    - "rm -rf ci/kind/cache/pg-data/*\nrm -rf ci/kind/cache/noetl-data/*\nrm -rf ci/kind/cache/noetl-logs/*\n\
-      echo \"\u2713 All cache directories cleared\" || echo \"Cache clear skipped\
-      \ or failed\"\n"
+    - "rm -rf ci/kind/cache/pg-data/*\nrm -rf ci/kind/cache/noetl-data/*\nrm -rf ci/kind/cache/minio-data/*\nrm\
+      \ -rf ci/kind/cache/noetl-logs/*\n"
   next:
   - step: clear_noetl_data
 - step: clear_noetl_data
