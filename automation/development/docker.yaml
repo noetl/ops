@@ -1,9 +1,9 @@
 apiVersion: noetl.io/v2
 kind: Playbook
 metadata:
-  name: docker_automation
+  name: podman_automation
   path: automation/development/docker
-  description: Build and manage local NoETL Docker images
+  description: Build and manage local NoETL container images via Podman
 
 executor:
   profile: local
@@ -37,7 +37,7 @@ workflow:
             build)
               ensure_repo
               IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
-              docker build -t "local/noetl:$IMAGE_TAG" -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
+              podman build -t "local/noetl:$IMAGE_TAG" -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
               echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
               echo "Built local/noetl:$IMAGE_TAG"
               ;;
@@ -48,7 +48,7 @@ workflow:
                 exit 1
               fi
               IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
-              docker build --build-arg VITE_API_MODE=direct -t "local/gui:$IMAGE_TAG" -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
+              podman build --build-arg VITE_API_MODE=direct -t "local/gui:$IMAGE_TAG" -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
               echo "$IMAGE_TAG" > .gui_last_build_tag.txt
               echo "Built local/gui:$IMAGE_TAG"
               ;;
@@ -56,40 +56,28 @@ workflow:
             noetl-image-build)
               ensure_repo
               IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
-              DOCKER_BUILDKIT=0 docker build -t "local/noetl:$IMAGE_TAG" -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
+              podman build -t "local/noetl:$IMAGE_TAG" -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
               echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
               echo "Built local/noetl:$IMAGE_TAG"
               ;;
 
-            build-gui)
-              if [ ! -d "$GUI_REPO" ]; then
-                echo "ERROR: GUI repository not found: $GUI_REPO"
-                exit 1
-              fi
-              IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
-              docker build --build-arg VITE_API_MODE=direct -t "local/gui:$IMAGE_TAG" -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
-              echo "$IMAGE_TAG" > .gui_last_build_tag.txt
-              echo "Built local/gui:$IMAGE_TAG"
-              ;;
-
             cleanup-all)
-              docker builder prune --all --force
-              docker image prune --all --force
-              docker volume prune --force
+              podman system prune --all --force
+              podman volume prune --force
               ;;
 
             images-clear)
-              docker images "local/noetl" --format "{{.ID}}" | xargs -r docker rmi -f
+              podman images "local/noetl" --format "{{.ID}}" | xargs -r podman rmi -f
               ;;
 
             status)
-              docker version
+              podman version
               echo ""
-              docker images | head -20
+              podman images | head -20
               echo ""
-              docker ps -a | head -20
+              podman ps -a | head -20
               echo ""
-              docker system df
+              podman system df
               ;;
 
             help|*)
@@ -99,10 +87,10 @@ workflow:
               echo "Actions:"
               echo "  build              Build NoETL image"
               echo "  build-gui          Build GUI image"
-              echo "  noetl-image-build  Build without BuildKit"
-              echo "  cleanup-all        Remove builders/images/volumes"
+              echo "  noetl-image-build  Build without cache"
+              echo "  cleanup-all        Remove images/volumes"
               echo "  images-clear       Remove local/noetl images"
-              echo "  status             Show Docker status"
+              echo "  status             Show Podman status"
               echo ""
               echo "Optional:"
               echo "  --set noetl_repo_dir=../noetl"

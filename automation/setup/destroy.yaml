@@ -25,7 +25,7 @@ workflow:
 
       pkill -f "kubectl port-forward" 2>/dev/null || true
 
-      # Give Docker Desktop time to release ports
+      # Give Podman time to release ports
 
       sleep 2
 
@@ -44,23 +44,21 @@ workflow:
       kind delete cluster --name=noetl 2>/dev/null || echo "INFO Cluster not found
       or already deleted"
 
-      # Give Docker Desktop time to release ports after cluster deletion
+      # Give Podman time to release ports after cluster deletion
 
       sleep 3
 
       '
   next:
-  - step: cleanup_docker
-- step: cleanup_docker
-  desc: Clean up Docker resources
+  - step: cleanup_podman
+- step: cleanup_podman
+  desc: Clean up Podman resources
   tool:
     kind: shell
     cmds:
-    - 'docker builder prune --all --force
+    - 'podman system prune --all --force
 
-      docker image prune --all --force
-
-      docker volume prune --force || echo "Docker cleanup skipped or failed"
+      podman volume prune --force || echo "Podman cleanup skipped or failed"
 
       '
   next:
@@ -99,7 +97,7 @@ workflow:
 
       echo "  - Kind cluster: deleted"
 
-      echo "  - Docker resources: cleaned"
+      echo "  - Podman resources: cleaned"
 
       echo "  - Cache directories: cleared"
 
@@ -110,12 +108,6 @@ workflow:
       echo "You can now run bootstrap again:"
 
       echo "  noetl run boot"
-
-      echo ""
-
-      echo "NOTE: If ports are still in use (macOS), restart Docker Desktop:"
-
-      echo "  osascript -e ''quit app \"Docker\"'' && sleep 5 && open -a Docker"
 
       echo ""
 

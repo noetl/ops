@@ -45,30 +45,20 @@ workflow:
       kind: shell
       cmds:
         - |
-          ensure_colima_running() {
-            if ! command -v colima >/dev/null 2>&1; then
-              echo "ERROR: Colima is required for local kind workflow but is not installed."
-              echo "Install Colima and start it before creating the cluster."
+          ensure_podman_running() {
+            if ! command -v podman >/dev/null 2>&1; then
+              echo "ERROR: Podman is required but is not installed."
+              echo "Install with: brew install podman"
               exit 1
             fi
-
-            # colima v0.10+ uses log-style output: msg="colima is running ..."
-            if ! colima status 2>&1 | grep -qi "is running"; then
-              echo "ERROR: Colima is not running."
-              echo "Start it first: colima start --runtime docker"
-              exit 1
-            fi
-
-            DOCKER_CONTEXT="$(docker context show 2>/dev/null || true)"
-            if [ "$DOCKER_CONTEXT" != "colima" ]; then
-              echo "ERROR: Docker context must be 'colima' for kind cluster creation."
-              echo "Current context: ${DOCKER_CONTEXT:-<none>}"
-              echo "Run: docker context use colima"
+            if ! podman machine list 2>/dev/null | grep -q "noetl-dev.*running"; then
+              echo "ERROR: Podman machine 'noetl-dev' is not running."
+              echo "Start it: podman machine start noetl-dev"
               exit 1
             fi
           }
 
-          ensure_colima_running
+          ensure_podman_running
           echo ""
           echo "Creating Kind cluster 'noetl'..."
           kind create cluster --config=ci/kind/config.yaml
@@ -134,22 +124,15 @@ workflow:
       kind: shell
       cmds:
         - |
-          ensure_colima_running() {
-            # colima v0.10+ uses log-style output: msg="colima is running ..."
-            if ! colima status 2>&1 | grep -qi "is running"; then
-              echo "ERROR: Colima must be running to load images into kind."
-              echo "Start it first: colima start --runtime docker"
-              exit 1
-            fi
-            DOCKER_CONTEXT="$(docker context show 2>/dev/null || true)"
-            if [ "$DOCKER_CONTEXT" != "colima" ]; then
-              echo "ERROR: Docker context must be 'colima' to load images into kind."
-              echo "Run: docker context use colima"
+          ensure_podman_running() {
+            if ! podman machine list 2>/dev/null | grep -q "noetl-dev.*running"; then
+              echo "ERROR: Podman machine 'noetl-dev' must be running to load images into kind."
+              echo "Start it: podman machine start noetl-dev"
               exit 1
             fi
           }
 
-          ensure_colima_running
+          ensure_podman_running
           echo ""
           echo "Loading NoETL image to Kind cluster..."
           IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
@@ -166,26 +149,19 @@ workflow:
       kind: shell
       cmds:
         - |
-          ensure_colima_running() {
-            # colima v0.10+ uses log-style output: msg="colima is running ..."
-            if ! colima status 2>&1 | grep -qi "is running"; then
-              echo "ERROR: Colima must be running to inspect kind node images."
-              echo "Start it first: colima start --runtime docker"
-              exit 1
-            fi
-            DOCKER_CONTEXT="$(docker context show 2>/dev/null || true)"
-            if [ "$DOCKER_CONTEXT" != "colima" ]; then
-              echo "ERROR: Docker context must be 'colima' to inspect kind node images."
-              echo "Run: docker context use colima"
+          ensure_podman_running() {
+            if ! podman machine list 2>/dev/null | grep -q "noetl-dev.*running"; then
+              echo "ERROR: Podman machine 'noetl-dev' must be running to inspect kind node images."
+              echo "Start it: podman machine start noetl-dev"
               exit 1
             fi
           }
 
-          ensure_colima_running
+          ensure_podman_running
           echo ""
           echo "Images in Kind cluster:"
           echo "======================="
-          docker exec -it noetl-control-plane crictl images
+          podman exec -it noetl-control-plane crictl images
     next:
       spec:
         mode: exclusive
@@ -275,7 +251,7 @@ workflow:
           echo "  list        - List all Kind clusters"
           echo "  status      - Check cluster status and nodes"
           echo "  context-set - Set kubectl context to kind-noetl"
-          echo "  (requires Colima running and docker context set to colima)"
+          echo "  (requires Podman machine 'noetl-dev' running)"
           echo ""
           echo "Image Management:"
           echo "  image-load  - Load NoETL image to cluster"

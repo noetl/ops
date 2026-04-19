@@ -30,9 +30,9 @@ workflow:
     - "echo \"Validating prerequisites...\"\necho \"\"\n\nMISSING=\"\"\n\n# Check\
       \ noetl binary (required)\nif ! command -v noetl &> /dev/null; then\n  echo\
       \ \"FAIL noetl binary not found\"\n  MISSING=\"$MISSING noetl\"\nelse\n  echo\
-      \ \"OK noetl binary: $(which noetl)\"\nfi\n\n# Check Docker (required)\nif !\
-      \ command -v docker &> /dev/null; then\n  echo \"FAIL docker not found\"\n \
-      \ MISSING=\"$MISSING docker\"\nelse\n  echo \"OK docker: $(docker --version)\"\
+      \ \"OK noetl binary: $(which noetl)\"\nfi\n\n# Check Podman (required)\nif !\
+      \ command -v podman &> /dev/null; then\n  echo \"FAIL podman not found\"\n \
+      \ MISSING=\"$MISSING podman\"\nelse\n  echo \"OK podman: $(podman --version)\"\
       \nfi\n\n# Check kind (required)\nif ! command -v kind &> /dev/null; then\n \
       \ echo \"FAIL kind not found\"\n  MISSING=\"$MISSING kind\"\nelse\n  echo \"\
       OK kind: $(kind version)\"\nfi\n\n# Check kubectl (required)\nif ! command -v\
@@ -55,19 +55,19 @@ workflow:
       \ --set action=install-devtools\"\n  echo \"\"\n  echo \"  # Linux/WSL2:\"\n\
       \  echo \"  noetl run automation/development/tooling_linux.yaml --set action=install-devtools\"\
       \n  echo \"\"\n  echo \"  # Manual installation:\"\n  echo \"  macOS: brew install\
-      \ docker kind kubectl helm\"\n  echo \"  Linux: See https://noetl.dev/docs/installation\"\
+      \ podman kind kubectl helm\"\n  echo \"  Linux: See https://noetl.dev/docs/installation\"\
       \n  exit 1\nelse\n  echo \"OK All required prerequisites installed\"\nfi\n"
   next:
-  - step: check_docker_running
-- step: check_docker_running
-  desc: Verify Docker daemon is running
+  - step: check_podman_running
+- step: check_podman_running
+  desc: Verify Podman machine is running
   tool:
     kind: shell
     cmds:
-    - "echo \"\"\necho \"Checking Docker daemon...\"\nif ! docker info &> /dev/null;\
-      \ then\n  echo \"FAIL Docker daemon is not running\"\n  echo \"   Start Docker\
-      \ Desktop or run: sudo systemctl start docker\"\n  exit 1\nelse\n  echo \"OK\
-      \ Docker daemon is running\"\nfi\n"
+    - "echo \"\"\necho \"Checking Podman machine...\"\nif ! podman info &> /dev/null;\
+      \ then\n  echo \"FAIL Podman machine is not running\"\n  echo \"   Start it:\
+      \ podman machine start noetl-dev\"\n  exit 1\nelse\n  echo \"OK\
+      \ Podman machine is running\"\nfi\n"
   next:
   - step: check_existing_cluster
 - step: check_existing_cluster
@@ -105,20 +105,20 @@ workflow:
       \n    ls -la target/release/noetl\n  else\n    echo \"ERROR noetl CLI build\
       \ failed\"\n    exit 1\n  fi\nfi\n"
   next:
-  - step: build_docker_images
-- step: build_docker_images
-  desc: Build NoETL Docker images
+  - step: build_podman_images
+- step: build_podman_images
+  desc: Build NoETL container images
   tool:
     kind: shell
     cmds:
-    - "echo \"\"\necho \"Building Docker images...\"\n\n# Detect platform architecture\n\
+    - "echo \"\"\necho \"Building container images...\"\n\n# Detect platform architecture\n\
       ARCH=$(uname -m)\nif [ \"$ARCH\" = \"arm64\" ] || [ \"$ARCH\" = \"aarch64\"\
       \ ]; then\n  PLATFORM=\"linux/arm64\"\n  echo \"Detected ARM64 architecture,\
       \ building for: $PLATFORM\"\nelse\n  PLATFORM=\"linux/amd64\"\n  echo \"Detected\
       \ AMD64 architecture, building for: $PLATFORM\"\nfi\n\n# Generate timestamp\
       \ tag like task does\nIMAGE_TAG=$(date +%Y-%m-%d-%H-%M)\necho \"$IMAGE_TAG\"\
-      \ > .noetl_last_build_tag.txt\necho \"Building with tag: $IMAGE_TAG\"\n\ndocker\
-      \ buildx build --load --platform $PLATFORM \\\n  -t {{ workload.registry }}/{{\
+      \ > .noetl_last_build_tag.txt\necho \"Building with tag: $IMAGE_TAG\"\n\npodman\
+      \ build --platform $PLATFORM \\\n  -t {{ workload.registry }}/{{\
       \ workload.image_name }}:$IMAGE_TAG \\\n  -f docker/noetl/dev/Dockerfile .\n"
   next:
   - step: check_port_conflicts
@@ -128,7 +128,7 @@ workflow:
     kind: shell
     cmds:
     - "echo \"\"\necho \"Checking for kind cluster...\"\n\n# Ports are managed by\
-      \ kind cluster configuration (ci/kind/config.yaml)\n# Docker may hold ports\
+      \ kind cluster configuration (ci/kind/config.yaml)\n# Podman may hold ports\
       \ from previous sessions, but kind will handle remapping\nif kind get clusters\
       \ 2>/dev/null | grep -q \"^noetl$\"; then\n  echo \"OK Kind cluster 'noetl'\
       \ already exists\"\nelse\n  echo \"INFO Kind cluster will be created with port\
@@ -147,7 +147,7 @@ workflow:
   next:
   - step: load_image_to_kind
 - step: load_image_to_kind
-  desc: Load NoETL Docker image into kind cluster
+  desc: Load NoETL container image into kind cluster
   tool:
     kind: shell
     cmds:
@@ -300,15 +300,15 @@ workflow:
     when: '{{ workload.deploy_gateway == true }}'
   - step: reload_noetl_image
 - step: build_gateway_image
-  desc: Build Gateway Docker image
+  desc: Build Gateway container image
   tool:
     kind: shell
     cmds:
-    - "echo \"\"\necho \"Building Gateway Docker image...\"\n\n# Detect platform architecture\n\
+    - "echo \"\"\necho \"Building Gateway container image...\"\n\n# Detect platform architecture\n\
       ARCH=$(uname -m)\nif [ \"$ARCH\" = \"arm64\" ] || [ \"$ARCH\" = \"aarch64\"\
       \ ]; then\n  PLATFORM=\"linux/arm64\"\n  echo \"Detected ARM64 architecture,\
       \ building for: $PLATFORM\"\nelse\n  PLATFORM=\"linux/amd64\"\n  echo \"Detected\
-      \ AMD64 architecture, building for: $PLATFORM\"\nfi\n\ndocker buildx build --load\
+      \ AMD64 architecture, building for: $PLATFORM\"\nfi\n\npodman buildx build --load\
       \ --platform $PLATFORM \\\n  -t noetl-gateway:latest \\\n  -f crates/gateway/Dockerfile\
       \ crates/gateway\necho \"Gateway image built successfully\"\n"
   next:
@@ -324,7 +324,7 @@ workflow:
       \n  exit 1\nfi\nIMAGE_TAG=$(cat .noetl_last_build_tag.txt)\nNOETL_IMAGE=\"{{\
       \ workload.registry }}/{{ workload.image_name }}:$IMAGE_TAG\"\n\necho \"Loading\
       \ NoETL image: $NOETL_IMAGE\"\nkind load docker-image \"$NOETL_IMAGE\" --name\
-      \ noetl\n\n# Load gateway image if it exists\nif docker image inspect noetl-gateway:latest\
+      \ noetl\n\n# Load gateway image if it exists\nif podman image inspect noetl-gateway:latest\
       \ >/dev/null 2>&1; then\n  echo \"Loading Gateway image: noetl-gateway:latest\"\
       \n  kind load docker-image noetl-gateway:latest --name noetl\nelse\n  echo \"\
       INFO: Gateway image not found, skipping\"\nfi\n\necho \"Images loaded into kind\

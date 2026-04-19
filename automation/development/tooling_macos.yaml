@@ -9,7 +9,7 @@ executor:
   profile: local
   version: noetl-runtime/1
 workload:
-  action: help  # setup, validate-install, validate-devtools, validate-docker, install-base, install-devtools, install-jq, install-yq, install-kind, install-pyenv, install-uv, install-tfenv, install-psql, ensure-path, fix-docker-perms
+  action: help  # setup, validate-install, validate-devtools, validate-podman, install-base, install-devtools, install-jq, install-yq, install-kind, install-pyenv, install-uv, install-tfenv, install-psql, ensure-path, fix-docker-perms
 
 workflow:
   - step: start
@@ -28,8 +28,8 @@ workflow:
           when: "{{ workload.action == 'validate-install' }}"
         - step: validate_devtools
           when: "{{ workload.action == 'validate-devtools' }}"
-        - step: validate_docker
-          when: "{{ workload.action == 'validate-docker' }}"
+        - step: validate_podman
+          when: "{{ workload.action == 'validate-podman' }}"
         - step: install_base
           when: "{{ workload.action == 'install-base' }}"
         - step: install_devtools
@@ -101,14 +101,14 @@ workflow:
           else
             echo "[OK] cargo: $(cargo --version 2>/dev/null | head -n1 || echo installed)"
           fi
-          if command -v docker >/dev/null 2>&1; then
-            echo "[OK] docker available"; if ! docker info >/dev/null 2>&1; then
-              echo "[WARN] docker present but daemon not reachable"
-              echo "       -> Ensure Docker Desktop is running"
+          if command -v podman >/dev/null 2>&1; then
+            echo "[OK] podman available"; if ! podman info >/dev/null 2>&1; then
+              echo "[WARN] podman present but machine not reachable"
+              echo "       -> Run: podman machine start noetl-dev"
             fi
           else
-            echo "[MISSING] docker not found in PATH"
-            echo "       -> Install Docker Desktop from https://www.docker.com/products/docker-desktop/"
+            echo "[MISSING] podman not found in PATH"
+            echo "       -> Install with: brew install podman"
             fail=1
           fi
           if command -v noetl >/dev/null 2>&1; then
@@ -168,13 +168,13 @@ workflow:
           else
             echo "[OK] cargo: $(cargo --version 2>/dev/null | head -n1 || echo installed)"
           fi
-          if command -v docker >/dev/null 2>&1; then
-            echo "[OK] docker available"; if ! docker info >/dev/null 2>&1; then
-              echo "[WARN] docker present but daemon not reachable"
-              echo "       -> Ensure Docker Desktop is running"
+          if command -v podman >/dev/null 2>&1; then
+            echo "[OK] podman available"; if ! podman info >/dev/null 2>&1; then
+              echo "[WARN] podman present but machine not reachable"
+              echo "       -> Run: podman machine start noetl-dev"
             fi
           else
-            echo "[MISSING] docker not found in PATH"
+            echo "[MISSING] podman not found in PATH"
             fail=1
           fi
           if command -v noetl >/dev/null 2>&1; then
@@ -222,20 +222,20 @@ workflow:
       arcs:
         - step: end
 
-  - step: validate_docker
-    desc: Validate Docker Desktop on macOS
+  - step: validate_podman
+    desc: Validate Podman on macOS
     tool:
       kind: shell
       cmds:
         - |
           echo ""
-          echo "Validating Docker Desktop on macOS..."
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "[ERROR] Docker not found. Install Docker Desktop from https://www.docker.com/products/docker-desktop/"
+          echo "Validating Podman on macOS..."
+          if ! command -v podman >/dev/null 2>&1; then
+            echo "[ERROR] Podman not found. Install with: brew install podman"
             exit 1
           fi
-          docker info
-          docker run --rm hello-world
+          podman info
+          podman run --rm hello-world
     next:
       spec:
         mode: exclusive
@@ -455,7 +455,7 @@ workflow:
         - step: end
 
   - step: install_kind
-    desc: Install kind (Kubernetes in Docker) via Homebrew
+    desc: Install kind (Kubernetes in containers) via Homebrew
     tool:
       kind: shell
       cmds:
@@ -655,7 +655,7 @@ workflow:
           echo "  setup               - Validate required tooling on macOS"
           echo "  validate-install    - Validate required tools are installed"
           echo "  validate-devtools   - Validate optional dev tools available"
-          echo "  validate-docker     - Validate Docker Desktop"
+          echo "  validate-podman     - Validate Podman"
           echo ""
           echo "Installation (Base):"
           echo "  install-homebrew    - Install Homebrew package manager"
@@ -665,7 +665,7 @@ workflow:
           echo "Installation (Individual):"
           echo "  install-jq          - Install jq via Homebrew"
           echo "  install-yq          - Install yq via Homebrew"
-          echo "  install-kind        - Install kind (Kubernetes in Docker)"
+          echo "  install-kind        - Install kind (Kubernetes in containers)"
           echo "  install-pyenv       - Install pyenv via Homebrew"
           echo "  install-uv          - Install uv (fast Python package manager)"
           echo "  install-tfenv       - Install tfenv and latest Terraform"

@@ -45,12 +45,12 @@ workflow:
               echo "Auto-detected NoETL image: $NOETL_IMAGE"
             else
               # Find latest local/noetl image
-              NOETL_IMAGE=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^local/noetl:" | head -1)
+              NOETL_IMAGE=$(podman images --format "{{.Repository}}:{{.Tag}}" | grep "^local/noetl:" | head -1)
               if [ -n "$NOETL_IMAGE" ]; then
                 echo "Found NoETL image: $NOETL_IMAGE"
               else
                 echo "ERROR: No NoETL image found. Build one first:"
-                echo "  docker buildx build --load --platform linux/amd64 -t local/noetl:latest -f {{ workload.noetl_repo_dir }}/docker/noetl/dev/Dockerfile {{ workload.noetl_repo_dir }}"
+                echo "  podman build --platform linux/arm64 -t local/noetl:latest -f {{ workload.noetl_repo_dir }}/docker/noetl/dev/Dockerfile {{ workload.noetl_repo_dir }}"
                 exit 1
               fi
             fi
@@ -76,13 +76,13 @@ workflow:
           NOETL_IMAGE=$(cat /tmp/noetl_image_to_load.txt)
           echo "Loading NoETL image: $NOETL_IMAGE"
           
-          if docker image inspect "$NOETL_IMAGE" >/dev/null 2>&1; then
+          if podman image inspect "$NOETL_IMAGE" >/dev/null 2>&1; then
             kind load docker-image "$NOETL_IMAGE" --name noetl
             echo "✓ NoETL image loaded successfully"
           else
-            echo "ERROR: Image $NOETL_IMAGE not found in Docker"
+            echo "ERROR: Image $NOETL_IMAGE not found in Podman"
             echo "Available images:"
-            docker images | grep noetl
+            podman images | grep noetl
             exit 1
           fi
     next:
@@ -101,13 +101,13 @@ workflow:
           GATEWAY_IMAGE="{{ workload.gateway_image }}"
           echo "Loading Gateway image: $GATEWAY_IMAGE"
           
-          if docker image inspect "$GATEWAY_IMAGE" >/dev/null 2>&1; then
+          if podman image inspect "$GATEWAY_IMAGE" >/dev/null 2>&1; then
             kind load docker-image "$GATEWAY_IMAGE" --name noetl
             echo "✓ Gateway image loaded successfully"
           else
-            echo "WARNING: Gateway image $GATEWAY_IMAGE not found in Docker"
+            echo "WARNING: Gateway image $GATEWAY_IMAGE not found in Podman"
             echo "If you need Gateway, build it first:"
-            echo "  docker buildx build --load --platform linux/amd64 -t noetl-gateway:latest -f {{ workload.gateway_repo_dir }}/Dockerfile {{ workload.gateway_repo_dir }}"
+            echo "  podman build --platform linux/arm64 -t noetl-gateway:latest -f {{ workload.gateway_repo_dir }}/Dockerfile {{ workload.gateway_repo_dir }}"
           fi
     next:
       spec:

@@ -73,7 +73,7 @@ workflow:
           echo "Building: $IMAGE"
           echo "Platform: $PLATFORM"
           
-          docker buildx build --load --platform $PLATFORM \
+          podman build --platform $PLATFORM \
             -t "$IMAGE" \
             -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"
           
@@ -102,7 +102,7 @@ workflow:
           echo "Building: noetl-gateway:latest"
           echo "Platform: $PLATFORM"
           
-          docker buildx build --load --platform $PLATFORM \
+          podman build --platform $PLATFORM \
             -t noetl-gateway:latest \
             -f "$GATEWAY_REPO/Dockerfile" "$GATEWAY_REPO"
           

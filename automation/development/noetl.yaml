@@ -51,14 +51,12 @@ workflow:
             fi
           }
 
-          prepare_docker_storage() {
-            docker builder prune -a -f >/dev/null 2>&1 || true
-            docker image prune -f >/dev/null 2>&1 || true
-            docker container prune -f >/dev/null 2>&1 || true
+          prepare_podman_storage() {
+            podman system prune -f >/dev/null 2>&1 || true
           }
 
           resolve_latest_local_tag() {
-            docker image ls "$REGISTRY/$IMAGE_NAME" --format '{{.Tag}}' | grep -v '<none>' | head -n1
+            podman image ls "$REGISTRY/$IMAGE_NAME" --format '{{.Tag}}' | grep -v '<none>' | head -n1
           }
 
           ensure_repo() {
@@ -68,25 +66,15 @@ workflow:
             fi
           }
 
-          ensure_colima_running() {
-            if ! command -v colima >/dev/null 2>&1; then
-              echo "ERROR: Colima is required for local kind workflow but is not installed."
-              echo "Install Colima and start it before running this playbook."
+          ensure_podman_running() {
+            if ! command -v podman >/dev/null 2>&1; then
+              echo "ERROR: Podman is required but is not installed."
+              echo "Install with: brew install podman"
               exit 1
             fi
-
-            # colima v0.10+ uses log-style output: msg="colima is running ..."
-            if ! colima status 2>&1 | grep -qi "is running"; then
-              echo "ERROR: Colima is not running."
-              echo "Start it first: colima start --runtime docker"
-              exit 1
-            fi
-
-            DOCKER_CONTEXT="$(docker context show 2>/dev/null || true)"
-            if [ "$DOCKER_CONTEXT" != "colima" ]; then
-              echo "ERROR: Docker context must be 'colima' for this workflow."
-              echo "Current context: ${DOCKER_CONTEXT:-<none>}"
-              echo "Run: docker context use colima"
+            if ! podman machine list 2>/dev/null | grep -q "noetl-dev.*running"; then
+              echo "ERROR: Podman machine 'noetl-dev' is not running."
+              echo "Start it: podman machine start noetl-dev"
               exit 1
             fi
           }
@@ -108,7 +96,7 @@ workflow:
 
           ensure_local_dependencies() {
             ensure_repo
-            ensure_colima_running
+            ensure_podman_running
             ensure_kind_context
 
             SCHEMA_DDL="$NOETL_REPO/noetl/database/ddl/postgres/schema_ddl.sql"
@@ -144,8 +132,8 @@ workflow:
             kubectl apply -f "$NOETL_REPO/ci/manifests/nats/namespace.yaml"
             kubectl apply -f "$NOETL_REPO/ci/manifests/nats/nats.yaml"
 
-            if ! docker image inspect local/test-server:latest >/dev/null 2>&1; then
-              docker buildx build --load --platform linux/amd64 \
+            if ! podman image inspect local/test-server:latest >/dev/null 2>&1; then
+              podman build --platform linux/arm64 \
                 -t local/test-server:latest \
                 -f "$TEST_SERVER_DOCKERFILE" "$NOETL_REPO"
             fi
@@ -160,15 +148,15 @@ workflow:
 
           build() {
             ensure_repo
-            ensure_colima_running
-            prepare_docker_storage
+            ensure_podman_running
+            prepare_podman_storage
             PREV_TAG=""
             if [ -f .noetl_last_build_tag.txt ]; then
               PREV_TAG="$(cat .noetl_last_build_tag.txt)"
             fi
 
             IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
-            if docker buildx build --load --platform linux/amd64 \
+            if podman build --platform linux/arm64 \
               -t "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" \
               -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"; then
               echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
@@ -177,14 +165,14 @@ workflow:
             fi
 
             echo "WARNING: build failed; trying last known image tag"
-            if [ -n "$PREV_TAG" ] && docker image inspect "$REGISTRY/$IMAGE_NAME:$PREV_TAG" >/dev/null 2>&1; then
+            if [ -n "$PREV_TAG" ] && podman image inspect "$REGISTRY/$IMAGE_NAME:$PREV_TAG" >/dev/null 2>&1; then
               echo "$PREV_TAG" > .noetl_last_build_tag.txt
               echo "Using existing image $REGISTRY/$IMAGE_NAME:$PREV_TAG"
               return
             fi
 
             FALLBACK_TAG="$(resolve_latest_local_tag)"
-            if [ -n "$FALLBACK_TAG" ] && docker image inspect "$REGISTRY/$IMAGE_NAME:$FALLBACK_TAG" >/dev/null 2>&1; then
+            if [ -n "$FALLBACK_TAG" ] && podman image inspect "$REGISTRY/$IMAGE_NAME:$FALLBACK_TAG" >/dev/null 2>&1; then
               echo "$FALLBACK_TAG" > .noetl_last_build_tag.txt
               echo "Using latest available image $REGISTRY/$IMAGE_NAME:$FALLBACK_TAG"
               return
@@ -195,7 +183,7 @@ workflow:
           }
 
           load() {
-            ensure_colima_running
+            ensure_podman_running
             if [ ! -f .noetl_last_build_tag.txt ]; then
               FALLBACK_TAG="$(resolve_latest_local_tag)"
               if [ -z "$FALLBACK_TAG" ]; then
@@ -204,7 +192,7 @@ workflow:
               fi
               echo "$FALLBACK_TAG" > .noetl_last_build_tag.txt
             fi
-            prepare_docker_storage
+            prepare_podman_storage
             IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
             IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
             kind load docker-image "$IMAGE" --name noetl
@@ -268,7 +256,7 @@ workflow:
               echo ""
               echo "Actions: build, load, deploy, redeploy, status"
               echo "Optional: --set noetl_repo_dir=../noetl"
-              echo "Requirement: Colima must be running and Docker context set to 'colima'"
+              echo "Requirement: Podman machine 'noetl-dev' must be running"
               echo ""
               echo "LAN access:"
               echo "  This workflow expects kind config listenAddress=0.0.0.0"
