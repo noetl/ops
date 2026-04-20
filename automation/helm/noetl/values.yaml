@@ -175,7 +175,7 @@ config:
     NOETL_COMMAND_HEARTBEAT_INTERVAL_SECONDS: "10"
     NOETL_COMMAND_HEARTBEAT_TIMEOUT_SECONDS: "3"
     NOETL_COMMAND_HEARTBEAT_MAX_RETRIES: "1"
-    # Result Storage Configuration
+    # Result Storage Configuration (RisingWave-aligned, phase 1)
     NOETL_INLINE_MAX_BYTES: "65536"
     NOETL_PREVIEW_MAX_BYTES: "1024"
     NOETL_DEFAULT_STORAGE_TIER: "kv"
@@ -185,6 +185,21 @@ config:
     NOETL_POSTGRES_POOL_MAX_SIZE: "8"
     NOETL_POSTGRES_POOL_MAX_WAITING: "100"
     NOETL_POSTGRES_POOL_TIMEOUT_SECONDS: "30"
+    # Cloud durable tier for DISK async spill. 's3' covers MinIO via NOETL_S3_ENDPOINT.
+    NOETL_STORAGE_CLOUD_TIER: "s3"
+    NOETL_S3_ENDPOINT: "http://minio.minio.svc.cluster.local:9000"
+    NOETL_S3_BUCKET: "noetl-results"
+    NOETL_S3_REGION: "us-east-1"
+    # DISK tier (phase 1 DiskCacheBackend) uses the shared PVC at NOETL_DATA_DIR.
+    # 2 GB data pool (~90%) + 256 MB meta pool (~10%) fit inside 10Gi RWX PVC.
+    NOETL_STORAGE_LOCAL_CACHE_DIR: "/opt/noetl/data/disk_cache"
+    NOETL_STORAGE_LOCAL_DATA_CACHE_CAPACITY_MB: "2048"
+    NOETL_STORAGE_LOCAL_META_CACHE_CAPACITY_MB: "256"
+    # Rate limit bytes/sec. RisingWave recommends ~90% of sequential write
+    # for local SSD, 50-80% for cloud block storage. 200 MB/s is safe for NVMe.
+    NOETL_STORAGE_LOCAL_CACHE_INSERT_RATE_MB: "200"
+    # Quiet = re-index cache on worker restart for warm replay performance.
+    NOETL_STORAGE_LOCAL_CACHE_RECOVER_MODE: "Quiet"
   workerPool:
     RUST_LOG: "info,worker_pool=debug,noetl_tools=debug"
     WORKER_POOL_NAME: "worker-rust-pool"
