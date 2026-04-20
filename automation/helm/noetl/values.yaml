@@ -6,6 +6,7 @@ image:
   pullPolicy: Always
 
 server:
+  replicas: 2
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -20,7 +21,7 @@ server:
       memory: "256Mi"
 
 worker:
-  replicas: 3
+  replicas: 6
   strategy:
     type: RollingUpdate
     rollingUpdate:
