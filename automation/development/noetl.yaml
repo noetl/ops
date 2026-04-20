@@ -181,6 +181,7 @@ workflow:
             kind_load_image local/test-server:latest
             kubectl apply -f "$NOETL_REPO/ci/manifests/test-server/namespace.yaml"
             kubectl apply -f "$NOETL_REPO/ci/manifests/test-server/deployment.yaml"
+            kubectl set image deployment/paginated-api -n test-server api=localhost/local/test-server:latest --record=false
 
             kubectl rollout status deployment/postgres -n postgres --timeout=180s
             kubectl rollout status statefulset/nats -n nats --timeout=180s
