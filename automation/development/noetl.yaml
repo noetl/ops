@@ -64,30 +64,37 @@ workflow:
             echo "$tag"
           }
 
-          ensure_local_image_name() {
+          ensure_local_image_aliases() {
             # Podman often stores unqualified local images as localhost/<name>.
+            # Keep both aliases available so manifests and kind load use a stable reference.
             local image="$1"
             local alt="localhost/$image"
+            local has_image=0
+            local has_alt=0
 
             if podman image inspect "$image" >/dev/null 2>&1; then
-              return 0
+              has_image=1
             fi
 
             if podman image inspect "$alt" >/dev/null 2>&1; then
-              podman image tag "$alt" "$image"
-              return 0
+              has_alt=1
             fi
 
-            return 1
+            if [ "$has_image" -eq 0 ] && [ "$has_alt" -eq 0 ]; then
+              return 1
+            fi
+
+            if [ "$has_image" -eq 1 ] && [ "$has_alt" -eq 0 ]; then
+              podman image tag "$image" "$alt"
+            elif [ "$has_image" -eq 0 ] && [ "$has_alt" -eq 1 ]; then
+              podman image tag "$alt" "$image"
+            fi
+
+            return 0
           }
 
-          kind_load_image() {
+          kind_load_one_image() {
             local image="$1"
-
-            if ! ensure_local_image_name "$image"; then
-              echo "ERROR: image '$image' not present locally (or as localhost/$image)"
-              exit 1
-            fi
 
             if kind load docker-image "$image" --name noetl; then
               return 0
@@ -98,6 +105,37 @@ workflow:
             podman save -o "$archive" "$image"
             kind load image-archive "$archive" --name noetl
             rm -f "$archive"
+          }
+
+          kind_load_image() {
+            local image="$1"
+            local alt="localhost/$image"
+
+            if ! ensure_local_image_aliases "$image"; then
+              echo "ERROR: image '$image' not present locally (or as localhost/$image)"
+              exit 1
+            fi
+
+            # Load both aliases to avoid ErrImageNeverPull due to name mismatch.
+            kind_load_one_image "$image"
+            kind_load_one_image "$alt"
+          }
+
+          resolve_deploy_image() {
+            local image="$1"
+            local alt="localhost/$image"
+
+            if [ "${image#localhost/}" != "$image" ]; then
+              echo "$image"
+              return
+            fi
+
+            if podman image inspect "$alt" >/dev/null 2>&1; then
+              echo "$alt"
+              return
+            fi
+
+            echo "$image"
           }
 
           ensure_repo() {
@@ -201,6 +239,7 @@ workflow:
             if podman build --platform linux/arm64 \
               -t "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" \
               -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"; then
+              ensure_local_image_aliases "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
               echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
               echo "Built $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
               return
@@ -250,7 +289,7 @@ workflow:
             fi
             kubectl apply -f "$NOETL_REPO/ci/manifests/noetl/namespace/"
             IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
-            IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+            IMAGE="$(resolve_deploy_image "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG")"
             for manifest in "$NOETL_REPO"/ci/manifests/noetl/*.yaml; do
               if [ -f "$manifest" ]; then
                 sed "s|image_name:image_tag|$IMAGE|g" "$manifest" | kubectl apply -f -
