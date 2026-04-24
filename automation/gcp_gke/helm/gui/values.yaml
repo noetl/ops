@@ -10,6 +10,16 @@ service:
   loadBalancerIP: ""
   port: 80
   targetPort: 8080
+  nodePort: 30081
+
+env:
+  apiMode: "direct"
+  apiBaseUrl: "http://localhost:8082"
+  allowSkipAuth: "true"
+  gatewayUrl: ""
+  auth0Domain: ""
+  auth0ClientId: ""
+  auth0RedirectUri: ""
 
 ingress:
   enabled: false

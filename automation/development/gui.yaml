@@ -17,12 +17,17 @@ workload:
   kind_cluster_name: "noetl"
   gui_namespace: "gui"
   gui_release_name: "noetl-gui"
-  gui_service_type: "ClusterIP"
+  gui_service_type: "NodePort"
+  gui_node_port: 30081
   image_pull_policy: "IfNotPresent"
   build_platform: "linux/arm64"
   api_mode: "direct"
-  api_base_url: "http://localhost:8082"
+  api_base_url: "http://722-2.local:8082"
   allow_skip_auth: "true"
+  gateway_url: ""
+  auth0_domain: ""
+  auth0_client_id: ""
+  auth0_redirect_uri: ""
 
 workflow:
   - step: run
@@ -40,11 +45,16 @@ workflow:
           GUI_NAMESPACE="{{ workload.gui_namespace }}"
           GUI_RELEASE_NAME="{{ workload.gui_release_name }}"
           GUI_SERVICE_TYPE="{{ workload.gui_service_type }}"
+          GUI_NODE_PORT="{{ workload.gui_node_port }}"
           IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
           BUILD_PLATFORM="{{ workload.build_platform }}"
           API_MODE="{{ workload.api_mode }}"
           API_BASE_URL="{{ workload.api_base_url }}"
           ALLOW_SKIP_AUTH="{{ workload.allow_skip_auth }}"
+          GATEWAY_URL="{{ workload.gateway_url }}"
+          AUTH0_DOMAIN="{{ workload.auth0_domain }}"
+          AUTH0_CLIENT_ID="{{ workload.auth0_client_id }}"
+          AUTH0_REDIRECT_URI="{{ workload.auth0_redirect_uri }}"
 
           LAST_TAG_FILE=".gui_last_build_tag.txt"
           CONTAINER_CLI=""
@@ -112,16 +122,10 @@ workflow:
 
             if [ "$CONTAINER_CLI" = "docker" ]; then
               docker buildx build --load --platform "$BUILD_PLATFORM" \
-                --build-arg VITE_API_MODE="$API_MODE" \
-                --build-arg VITE_API_BASE_URL="$API_BASE_URL" \
-                --build-arg VITE_ALLOW_SKIP_AUTH="$ALLOW_SKIP_AUTH" \
                 -t "$IMAGE" \
                 -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
             else
               podman build --platform "$BUILD_PLATFORM" \
-                --build-arg VITE_API_MODE="$API_MODE" \
-                --build-arg VITE_API_BASE_URL="$API_BASE_URL" \
-                --build-arg VITE_ALLOW_SKIP_AUTH="$ALLOW_SKIP_AUTH" \
                 -t "$IMAGE" \
                 -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
             fi
@@ -155,7 +159,15 @@ workflow:
               --set image.repository="$IMAGE_REPOSITORY" \
               --set image.tag="$IMAGE_TAG" \
               --set image.pullPolicy="$IMAGE_PULL_POLICY" \
-              --set service.type="$GUI_SERVICE_TYPE"
+              --set service.type="$GUI_SERVICE_TYPE" \
+              --set service.nodePort="$GUI_NODE_PORT" \
+              --set env.apiMode="$API_MODE" \
+              --set env.apiBaseUrl="$API_BASE_URL" \
+              --set env.allowSkipAuth="$ALLOW_SKIP_AUTH" \
+              --set env.gatewayUrl="$GATEWAY_URL" \
+              --set env.auth0Domain="$AUTH0_DOMAIN" \
+              --set env.auth0ClientId="$AUTH0_CLIENT_ID" \
+              --set env.auth0RedirectUri="$AUTH0_REDIRECT_URI"
 
             kubectl -n "$GUI_NAMESPACE" rollout status deployment/gui --timeout=180s
           }
@@ -196,14 +208,21 @@ workflow:
               echo ""
               echo "Direct API settings:"
               echo "  --set api_mode=direct"
-              echo "  --set api_base_url=http://localhost:8082"
+              echo "  --set api_base_url=http://722-2.local:8082"
               echo "  --set allow_skip_auth=true"
+              echo ""
+              echo "Auth/gateway optional settings:"
+              echo "  --set gateway_url=http://gateway.example.com"
+              echo "  --set auth0_domain=<tenant>.us.auth0.com"
+              echo "  --set auth0_client_id=<client-id>"
+              echo "  --set auth0_redirect_uri=http://722-2.local:38081/login"
               echo ""
               echo "Other useful overrides:"
               echo "  --set gui_repo_dir=../gui"
               echo "  --set image_repository=localhost/local/noetl-gui"
               echo "  --set gui_namespace=gui"
-              echo "  --set gui_service_type=ClusterIP"
+              echo "  --set gui_service_type=NodePort"
+              echo "  --set gui_node_port=30081"
               ;;
           esac
     next:
