@@ -3,7 +3,7 @@ kind: Playbook
 metadata:
   name: gui_development_deploy
   path: automation/development/gui
-  description: Build/load/deploy helpers for standalone GUI in local kind
+  description: Build/load/deploy helpers for standalone GUI in local kind (direct NoETL API mode)
 
 executor:
   profile: local
@@ -11,10 +11,18 @@ executor:
 
 workload:
   action: help # build, load, deploy, redeploy, status
-  registry: local
-  image_name: gui
+  image_repository: localhost/local/noetl-gui
   gui_repo_dir: "../gui"
   expected_kube_context: "kind-noetl"
+  kind_cluster_name: "noetl"
+  gui_namespace: "gui"
+  gui_release_name: "noetl-gui"
+  gui_service_type: "ClusterIP"
+  image_pull_policy: "IfNotPresent"
+  build_platform: "linux/arm64"
+  api_mode: "direct"
+  api_base_url: "http://localhost:8082"
+  allow_skip_auth: "true"
 
 workflow:
   - step: run
@@ -26,13 +34,41 @@ workflow:
           set -euo pipefail
           ACTION="{{ workload.action }}"
           GUI_REPO="{{ workload.gui_repo_dir }}"
-          REGISTRY="{{ workload.registry }}"
-          IMAGE_NAME="{{ workload.image_name }}"
+          IMAGE_REPOSITORY="{{ workload.image_repository }}"
           EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
+          KIND_CLUSTER_NAME="{{ workload.kind_cluster_name }}"
+          GUI_NAMESPACE="{{ workload.gui_namespace }}"
+          GUI_RELEASE_NAME="{{ workload.gui_release_name }}"
+          GUI_SERVICE_TYPE="{{ workload.gui_service_type }}"
+          IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
+          BUILD_PLATFORM="{{ workload.build_platform }}"
+          API_MODE="{{ workload.api_mode }}"
+          API_BASE_URL="{{ workload.api_base_url }}"
+          ALLOW_SKIP_AUTH="{{ workload.allow_skip_auth }}"
+
+          LAST_TAG_FILE=".gui_last_build_tag.txt"
+          CONTAINER_CLI=""
+
+          detect_container_cli() {
+            if command -v docker >/dev/null 2>&1; then
+              CONTAINER_CLI="docker"
+              return
+            fi
+            if command -v podman >/dev/null 2>&1; then
+              CONTAINER_CLI="podman"
+              return
+            fi
+            echo "ERROR: neither docker nor podman is available in PATH"
+            exit 1
+          }
 
           ensure_repo() {
             if [ ! -d "$GUI_REPO" ]; then
               echo "ERROR: GUI repository not found: $GUI_REPO"
+              exit 1
+            fi
+            if [ ! -f "$GUI_REPO/Dockerfile" ]; then
+              echo "ERROR: GUI Dockerfile not found at $GUI_REPO/Dockerfile"
               exit 1
             fi
           }
@@ -52,50 +88,85 @@ workflow:
             fi
           }
 
+          kind_load_image() {
+            local image="$1"
+            if kind load docker-image "$image" --name "$KIND_CLUSTER_NAME"; then
+              return
+            fi
+
+            local archive="/tmp/$(echo "$image" | tr '/:' '__').tar"
+            if [ "$CONTAINER_CLI" = "docker" ]; then
+              docker save -o "$archive" "$image"
+            else
+              podman save -o "$archive" "$image"
+            fi
+            kind load image-archive "$archive" --name "$KIND_CLUSTER_NAME"
+            rm -f "$archive"
+          }
+
           build() {
             ensure_repo
+            detect_container_cli
             IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
-            echo "$IMAGE_TAG" > .gui_last_build_tag.txt
-            docker buildx build --load --platform linux/amd64 \
-              --build-arg VITE_API_MODE=direct \
-              --build-arg VITE_ALLOW_SKIP_AUTH=true \
-              -t "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" \
-              -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
-            echo "Built $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+            IMAGE="$IMAGE_REPOSITORY:$IMAGE_TAG"
+
+            if [ "$CONTAINER_CLI" = "docker" ]; then
+              docker buildx build --load --platform "$BUILD_PLATFORM" \
+                --build-arg VITE_API_MODE="$API_MODE" \
+                --build-arg VITE_API_BASE_URL="$API_BASE_URL" \
+                --build-arg VITE_ALLOW_SKIP_AUTH="$ALLOW_SKIP_AUTH" \
+                -t "$IMAGE" \
+                -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
+            else
+              podman build --platform "$BUILD_PLATFORM" \
+                --build-arg VITE_API_MODE="$API_MODE" \
+                --build-arg VITE_API_BASE_URL="$API_BASE_URL" \
+                --build-arg VITE_ALLOW_SKIP_AUTH="$ALLOW_SKIP_AUTH" \
+                -t "$IMAGE" \
+                -f "$GUI_REPO/Dockerfile" "$GUI_REPO"
+            fi
+
+            echo "$IMAGE_TAG" > "$LAST_TAG_FILE"
+            echo "Built $IMAGE"
           }
 
           load() {
-            if [ ! -f .gui_last_build_tag.txt ]; then
-              echo "ERROR: .gui_last_build_tag.txt not found. Run action=build first."
+            detect_container_cli
+            if [ ! -f "$LAST_TAG_FILE" ]; then
+              echo "ERROR: $LAST_TAG_FILE not found. Run action=build first."
               exit 1
             fi
-            IMAGE_TAG=$(cat .gui_last_build_tag.txt)
-            echo "Loading $REGISTRY/$IMAGE_NAME:$IMAGE_TAG into kind cluster..."
-            kind load docker-image "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" --name noetl
+            IMAGE_TAG=$(cat "$LAST_TAG_FILE")
+            IMAGE="$IMAGE_REPOSITORY:$IMAGE_TAG"
+            echo "Loading $IMAGE into kind cluster '$KIND_CLUSTER_NAME'..."
+            kind_load_image "$IMAGE"
           }
 
           deploy() {
             ensure_kind_context
-            if [ ! -f .gui_last_build_tag.txt ]; then
-              echo "ERROR: .gui_last_build_tag.txt not found. Run action=build first."
+            if [ ! -f "$LAST_TAG_FILE" ]; then
+              echo "ERROR: $LAST_TAG_FILE not found. Run action=build first."
               exit 1
             fi
-            IMAGE_TAG=$(cat .gui_last_build_tag.txt)
-            IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
-            for manifest in ci/manifests/gui/*.yaml; do
-              if [ -f "$manifest" ]; then
-                sed "s|image_name:image_tag|$IMAGE|g" "$manifest" | kubectl apply -f -
-              fi
-            done
-            kubectl rollout restart deployment/gui -n noetl 2>/dev/null || true
-            kubectl wait --for=condition=ready pod -l app=gui -n noetl --timeout=90s || true
+
+            IMAGE_TAG=$(cat "$LAST_TAG_FILE")
+            helm upgrade --install "$GUI_RELEASE_NAME" automation/gcp_gke/helm/gui \
+              --namespace "$GUI_NAMESPACE" --create-namespace \
+              --set image.repository="$IMAGE_REPOSITORY" \
+              --set image.tag="$IMAGE_TAG" \
+              --set image.pullPolicy="$IMAGE_PULL_POLICY" \
+              --set service.type="$GUI_SERVICE_TYPE"
+
+            kubectl -n "$GUI_NAMESPACE" rollout status deployment/gui --timeout=180s
           }
 
           status() {
             ensure_kind_context
-            kubectl get pods -l app=gui -n noetl
-            echo ""
-            kubectl get svc gui -n noetl
+            kubectl get ns "$GUI_NAMESPACE" >/dev/null 2>&1 || {
+              echo "Namespace '$GUI_NAMESPACE' not found"
+              exit 0
+            }
+            kubectl -n "$GUI_NAMESPACE" get deploy,svc,pods -o wide
           }
 
           case "$ACTION" in
@@ -122,7 +193,17 @@ workflow:
               echo "  noetl run automation/development/gui.yaml --runtime local --set action=<action>"
               echo ""
               echo "Actions: build, load, deploy, redeploy, status"
-              echo "Optional: --set gui_repo_dir=../gui"
+              echo ""
+              echo "Direct API settings:"
+              echo "  --set api_mode=direct"
+              echo "  --set api_base_url=http://localhost:8082"
+              echo "  --set allow_skip_auth=true"
+              echo ""
+              echo "Other useful overrides:"
+              echo "  --set gui_repo_dir=../gui"
+              echo "  --set image_repository=localhost/local/noetl-gui"
+              echo "  --set gui_namespace=gui"
+              echo "  --set gui_service_type=ClusterIP"
               ;;
           esac
     next:
