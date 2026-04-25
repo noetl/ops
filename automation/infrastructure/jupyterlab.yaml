@@ -9,6 +9,7 @@ executor:
   version: noetl-runtime/1
 workload:
   action: help  # deploy, undeploy, full, status, logs, port-forward, restart, shell, test, update-notebook
+  e2e_repo_dir: "../e2e"
 
 workflow:
   - step: start
@@ -56,8 +57,8 @@ workflow:
           kubectl create namespace noetl --dry-run=client -o yaml | kubectl apply -f -
           echo "Creating ConfigMap with notebooks..."
           kubectl create configmap jupyterlab-notebooks \
-            --from-file=regression_dashboard.ipynb=tests/fixtures/notebooks/regression_dashboard.ipynb \
-            --from-file=pagination_loop_test.ipynb=tests/fixtures/playbooks/pagination/loop_with_pagination/pagination_loop_test.ipynb \
+            --from-file=regression_dashboard.ipynb={{ workload.e2e_repo_dir }}/fixtures/notebooks/regression_dashboard.ipynb \
+            --from-file=pagination_loop_test.ipynb={{ workload.e2e_repo_dir }}/fixtures/playbooks/pagination/loop_with_pagination/pagination_loop_test.ipynb \
             -n noetl \
             --dry-run=client -o yaml | kubectl apply -f -
           kubectl apply -f ci/manifests/jupyterlab/pvc.yaml
@@ -106,8 +107,8 @@ workflow:
           kubectl create namespace noetl --dry-run=client -o yaml | kubectl apply -f -
           echo "Creating ConfigMap with notebooks..."
           kubectl create configmap jupyterlab-notebooks \
-            --from-file=regression_dashboard.ipynb=tests/fixtures/notebooks/regression_dashboard.ipynb \
-            --from-file=pagination_loop_test.ipynb=tests/fixtures/playbooks/pagination/loop_with_pagination/pagination_loop_test.ipynb \
+            --from-file=regression_dashboard.ipynb={{ workload.e2e_repo_dir }}/fixtures/notebooks/regression_dashboard.ipynb \
+            --from-file=pagination_loop_test.ipynb={{ workload.e2e_repo_dir }}/fixtures/playbooks/pagination/loop_with_pagination/pagination_loop_test.ipynb \
             -n noetl \
             --dry-run=client -o yaml | kubectl apply -f -
           kubectl apply -f ci/manifests/jupyterlab/pvc.yaml
@@ -270,7 +271,7 @@ workflow:
           echo ""
           echo "Updating notebook ConfigMap..."
           kubectl create configmap jupyterlab-notebooks \
-            --from-file=regression_dashboard.ipynb=tests/fixtures/notebooks/regression_dashboard.ipynb \
+            --from-file=regression_dashboard.ipynb={{ workload.e2e_repo_dir }}/fixtures/notebooks/regression_dashboard.ipynb \
             -n noetl \
             --dry-run=client -o yaml | kubectl apply -f -
           echo "Restarting JupyterLab to pick up changes..."

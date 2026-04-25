@@ -7,7 +7,7 @@ NoETL integration with Interactive Brokers Client Portal Gateway for automated t
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         NoETL Server/Worker Playbooks                       │
-│       tests/fixtures/playbooks/interactive_brokers/ibkr_api.yaml            │
+│       ../e2e/fixtures/playbooks/interactive_brokers/ibkr_api.yaml            │
 │       - TOTP generation via Python tool (pyotp)                             │
 │       - HTTP calls to IBKR Client Portal Gateway                            │
 │       - Credential management via NoETL keychain                            │
@@ -105,11 +105,11 @@ Combines build.yaml and deploy.yaml for complete setup.
 
 **Prerequisites**: Playbooks must be registered in the catalog before distributed execution.
 
-Located at `tests/fixtures/playbooks/interactive_brokers/ibkr_api.yaml`:
+Located at `../e2e/fixtures/playbooks/interactive_brokers/ibkr_api.yaml`:
 
 ```bash
 # Step 1: Register the playbook in catalog (one time)
-noetl register playbook --file tests/fixtures/playbooks/interactive_brokers/ibkr_api.yaml
+noetl register playbook --file ../e2e/fixtures/playbooks/interactive_brokers/ibkr_api.yaml
 # Returns: {"path":"automation/ibkr/api", ...}
 
 # Step 2: Execute on server/worker using the catalog path (automation/ibkr/api)
@@ -138,8 +138,8 @@ noetl execute playbook automation/ibkr/api --input /tmp/ibkr_params.json
 **Alternative - Local Execution** (no registration needed):
 ```bash
 # Execute locally using file path - supports direct --set parameters
-noetl run tests/fixtures/playbooks/interactive_brokers/ibkr_api.yaml --set action=status
-noetl run tests/fixtures/playbooks/interactive_brokers/ibkr_api.yaml --set action=accounts
+noetl run ../e2e/fixtures/playbooks/interactive_brokers/ibkr_api.yaml --set action=status
+noetl run ../e2e/fixtures/playbooks/interactive_brokers/ibkr_api.yaml --set action=accounts
 ```
 
 **Note**: 
@@ -150,7 +150,7 @@ noetl run tests/fixtures/playbooks/interactive_brokers/ibkr_api.yaml --set actio
 
 ### Verify Gateway (Server/Worker)
 
-Distributed verify playbook: `automation/ibkr/verify` (file: `tests/fixtures/playbooks/interactive_brokers/ibkr_gateway_verify.yaml`).
+Distributed verify playbook: `automation/ibkr/verify` (file: `../e2e/fixtures/playbooks/interactive_brokers/ibkr_gateway_verify.yaml`).
 
 ```bash
 noetl run automation/ibkr/verify -r distributed --set credential=ib_gateway
@@ -192,11 +192,11 @@ docker/ibkr-gateway/             # Created by build.yaml
 ├── dist/                        # Distribution files
 └── root/                        # Gateway config (conf.yaml)
 
-tests/fixtures/playbooks/interactive_brokers/
+../e2e/fixtures/playbooks/interactive_brokers/
 ├── ibkr_api.yaml                # Server/worker API playbook
 └── ...
 
-tests/fixtures/credentials/
+../e2e/fixtures/credentials/
 └── ib_gateway.json.example      # Credential template
 ```
 
@@ -205,8 +205,8 @@ tests/fixtures/credentials/
 Create credential file based on template:
 
 ```bash
-cp tests/fixtures/credentials/ib_gateway.json.example \
-   tests/fixtures/credentials/ib_gateway.json
+cp ../e2e/fixtures/credentials/ib_gateway.json.example \
+   ../e2e/fixtures/credentials/ib_gateway.json
 ```
 
 Edit with your IBKR credentials:
@@ -229,7 +229,7 @@ Edit with your IBKR credentials:
 Register:
 
 ```bash
-noetl catalog register tests/fixtures/credentials/ib_gateway.json
+noetl catalog register ../e2e/fixtures/credentials/ib_gateway.json
 ```
 
 ## Authentication Flow
@@ -273,7 +273,7 @@ IBKR_USERNAME=... IBKR_PASSWORD=... python scripts/ibkr/authenticate_gateway.py 
 
 ### Maintain session (tickle/reauth)
 
-Server/worker playbook: `automation/ibkr/maintain` (file: `tests/fixtures/playbooks/interactive_brokers/ibkr_gateway_maintain.yaml`).
+Server/worker playbook: `automation/ibkr/maintain` (file: `../e2e/fixtures/playbooks/interactive_brokers/ibkr_gateway_maintain.yaml`).
 
 - Calls `POST /v1/api/tickle` and returns one of: `noop`, `login_required`, `reauth`, `logout_then_reauth`.
 - Uses `POST /v1/api/logout` and `POST /v1/portal/iserver/reauthenticate?force=true` when needed.

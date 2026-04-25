@@ -25,7 +25,8 @@ workload:
   postgres_user: "demo"
   postgres_db: "demo_noetl"
   noetl_repo_dir: "../noetl"
-  sql_script: "../noetl/tests/fixtures/playbooks/api_integration/auth0/sql/provision_auth_schema.sql"
+  e2e_repo_dir: "../e2e"
+  sql_script: "../e2e/fixtures/playbooks/api_integration/auth0/sql/provision_auth_schema.sql"
   # For grant_admin action: email of user to grant admin role
   email: ""
   # Optional: Create initial admin user on first login

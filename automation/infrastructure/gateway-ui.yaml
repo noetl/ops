@@ -145,7 +145,7 @@ workflow:
           echo "  # View logs"
           echo "  noetl run automation/infrastructure/gateway-ui.yaml --set action=logs"
           echo ""
-          echo "Gateway UI Location: tests/fixtures/gateway_ui"
+          echo "Gateway UI Location: ../e2e/fixtures/gateway_ui"
           echo ""
     next:
       spec:
