@@ -38,7 +38,7 @@ You can still override playbook inputs with explicit paths (`--set cli_repo_dir=
 
 ## One-time compatibility links
 
-Some legacy playbooks still expect `docker/`, `tests/`, and `crates/` paths.
+Some legacy playbooks still expect `docker/`, `tests/`, `fixtures/`, and `crates/` paths.
 Create compatibility symlinks:
 
 ```bash
@@ -86,7 +86,8 @@ The playbook now supports split-repo source directories:
 - `noetl_repo_dir` (default `../noetl`)
 - `gateway_repo_dir` (default `../gateway`)
 - `gui_repo_dir` (default `../gui`)
-- `auth_playbooks_dir` (default `../noetl/tests/fixtures/playbooks/api_integration/auth0`)
+- `e2e_repo_dir` (default `../e2e`)
+- `auth_playbooks_dir` (default `../e2e/fixtures/playbooks/api_integration/auth0`)
 
 Example deploy:
 

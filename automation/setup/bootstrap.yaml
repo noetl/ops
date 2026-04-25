@@ -577,13 +577,13 @@ workflow:
 
       echo "  1. Register credentials:"
 
-      echo "     noetl register credential --directory tests/fixtures/credentials"
+      echo "     noetl register credential --directory ../e2e/fixtures/credentials"
 
       echo ""
 
       echo "  2. Register playbooks:"
 
-      echo "     noetl register playbook --directory tests/fixtures/playbooks"
+      echo "     noetl register playbook --directory ../e2e/fixtures/playbooks"
 
       echo ""
 

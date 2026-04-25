@@ -31,7 +31,8 @@ It does **not** modify existing kind-based automation and does not use `ci/` ass
 - `noetl_repo_dir` (default: `../noetl`)
 - `gateway_repo_dir` (default: `../gateway`)
 - `gui_repo_dir` (default: `../gui`)
-- `auth_playbooks_dir` (default: `../noetl/tests/fixtures/playbooks/api_integration/auth0`)
+- `e2e_repo_dir` (default: `../e2e`)
+- `auth_playbooks_dir` (default: `../e2e/fixtures/playbooks/api_integration/auth0`)
 
 If you use submodules, override these with `--set ..._repo_dir=<submodule-path>`.
 

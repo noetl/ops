@@ -105,5 +105,5 @@ nodes:
       - hostPath: ci/kind/cache/noetl-logs
         containerPath: /mnt/data/noetl-logs
 
-      - hostPath: tests/fixtures/gateway_ui
+      - hostPath: ../e2e/fixtures/gateway_ui
         containerPath: /mnt/gateway-ui

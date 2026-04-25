@@ -12,6 +12,7 @@ executor:
 workload:
   action: create # create, check, clean, help
   noetl_repo_dir: ../noetl
+  e2e_repo_dir: ../e2e
   gateway_repo_dir: ../gateway
   cli_repo_dir: ../cli
 
@@ -26,12 +27,13 @@ workflow:
 
           ACTION="{{ workload.action }}"
           NOETL_REPO="{{ workload.noetl_repo_dir }}"
+          E2E_REPO="{{ workload.e2e_repo_dir }}"
           GATEWAY_REPO="{{ workload.gateway_repo_dir }}"
           CLI_REPO="{{ workload.cli_repo_dir }}"
 
           case "$ACTION" in
             create)
-              for path in "$NOETL_REPO" "$GATEWAY_REPO" "$CLI_REPO"; do
+              for path in "$NOETL_REPO" "$E2E_REPO" "$GATEWAY_REPO" "$CLI_REPO"; do
                 if [ ! -d "$path" ]; then
                   echo "ERROR: required repo not found: $path"
                   exit 1
@@ -39,6 +41,7 @@ workflow:
               done
 
               NOETL_ABS="$(cd "$NOETL_REPO" && pwd)"
+              E2E_ABS="$(cd "$E2E_REPO" && pwd)"
               GATEWAY_ABS="$(cd "$GATEWAY_REPO" && pwd)"
               CLI_ABS="$(cd "$CLI_REPO" && pwd)"
 
@@ -47,13 +50,14 @@ workflow:
               ln -sfn "$CLI_ABS" crates/noetlctl
               ln -sfn "$NOETL_ABS/docker" docker
               ln -sfn "$NOETL_ABS/tests" tests
+              ln -sfn "$E2E_ABS/fixtures" fixtures
               ln -sfn "$NOETL_ABS/scripts" scripts
               echo "Created compatibility links:"
-              ls -ld crates/gateway crates/noetlctl docker tests scripts
+              ls -ld crates/gateway crates/noetlctl docker tests fixtures scripts
               ;;
 
             check)
-              for link in crates/gateway crates/noetlctl docker tests scripts; do
+              for link in crates/gateway crates/noetlctl docker tests fixtures scripts; do
                 if [ -L "$link" ]; then
                   printf "OK   %s -> %s\n" "$link" "$(readlink "$link")"
                 elif [ -e "$link" ]; then
@@ -65,7 +69,7 @@ workflow:
               ;;
 
             clean)
-              for link in crates/gateway crates/noetlctl docker tests scripts; do
+              for link in crates/gateway crates/noetlctl docker tests fixtures scripts; do
                 if [ -L "$link" ]; then
                   rm -f "$link"
                   echo "Removed $link"

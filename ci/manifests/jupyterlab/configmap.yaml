@@ -12,8 +12,8 @@ data:
   # 
   # Manual update:
   # kubectl create configmap jupyterlab-notebooks \
-  #   --from-file=regression_dashboard.ipynb=tests/fixtures/notebooks/regression_dashboard.ipynb \
-  #   --from-file=pagination_loop_test.ipynb=tests/fixtures/playbooks/pagination/loop_with_pagination/pagination_loop_test.ipynb \
+  #   --from-file=regression_dashboard.ipynb=../e2e/fixtures/notebooks/regression_dashboard.ipynb \
+  #   --from-file=pagination_loop_test.ipynb=../e2e/fixtures/playbooks/pagination/loop_with_pagination/pagination_loop_test.ipynb \
   #   -n noetl --dry-run=client -o yaml | kubectl apply -f -
   #
   # Notebooks included:

@@ -11,6 +11,7 @@ workload:
   cluster: noetl
   pg_host: localhost
   pg_port: 54321
+  e2e_repo_dir: "../e2e"
 
 workflow:
   - step: start
@@ -29,8 +30,8 @@ workflow:
       kind: shell
       cmds:
         - "echo 'Registering credentials...'"
-        - "./bin/noetl register credential tests/fixtures/credentials/pg_local.json"
-        - "./bin/noetl register credential tests/fixtures/credentials/pg_demo.json"
+        - "./bin/noetl register credential {{ workload.e2e_repo_dir }}/fixtures/credentials/pg_local.json"
+        - "./bin/noetl register credential {{ workload.e2e_repo_dir }}/fixtures/credentials/pg_demo.json"
         - "echo '✅ Credentials registered'"
     next:
       spec:
@@ -44,7 +45,7 @@ workflow:
       kind: shell
       cmds:
         - "echo 'Registering playbooks...'"
-        - "./bin/noetl register playbook tests/fixtures/playbooks/ --recursive"
+        - "./bin/noetl register playbook {{ workload.e2e_repo_dir }}/fixtures/playbooks/ --recursive"
         - "echo '✅ Playbooks registered'"
     next:
       spec:

@@ -11,6 +11,7 @@ executor:
 
 workload:
   action: help  # setup, setup-postgres, setup-clickhouse, register-credentials, verify
+  e2e_repo_dir: "../e2e"
 
   # PostgreSQL configuration
   postgres_admin_password: demo
@@ -188,15 +189,15 @@ workflow:
           echo "=== Registering Credentials ==="
 
           # Register pg_demo credential
-          if [ -f "tests/fixtures/credentials/pg_demo.json" ]; then
+          if [ -f "{{ workload.e2e_repo_dir }}/fixtures/credentials/pg_demo.json" ]; then
             echo "Registering pg_demo..."
-            noetl register credential --file tests/fixtures/credentials/pg_demo.json 2>/dev/null || echo "Already registered or error"
+            noetl register credential --file {{ workload.e2e_repo_dir }}/fixtures/credentials/pg_demo.json 2>/dev/null || echo "Already registered or error"
           fi
 
           # Register pg_noetl_k8s credential
-          if [ -f "tests/fixtures/credentials/pg_noetl_k8s.json" ]; then
+          if [ -f "{{ workload.e2e_repo_dir }}/fixtures/credentials/pg_noetl_k8s.json" ]; then
             echo "Registering pg_noetl_k8s..."
-            noetl register credential --file tests/fixtures/credentials/pg_noetl_k8s.json 2>/dev/null || echo "Already registered or error"
+            noetl register credential --file {{ workload.e2e_repo_dir }}/fixtures/credentials/pg_noetl_k8s.json 2>/dev/null || echo "Already registered or error"
           fi
 
           echo ""

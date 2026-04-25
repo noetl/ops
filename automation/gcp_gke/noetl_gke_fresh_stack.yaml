@@ -41,7 +41,8 @@ workload:
   noetl_repo_dir: "../noetl"
   gateway_repo_dir: "../gateway"
   gui_repo_dir: "../gui"
-  auth_playbooks_dir: "../noetl/tests/fixtures/playbooks/api_integration/auth0"
+  e2e_repo_dir: "../e2e"
+  auth_playbooks_dir: "../e2e/fixtures/playbooks/api_integration/auth0"
 
   # Image repositories.
   # NoETL defaults to published GHCR release images.
