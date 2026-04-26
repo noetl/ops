@@ -39,6 +39,8 @@ automation/
 │   └── kind.yaml              # Kind Kubernetes cluster management
 ├── development/               # Development workflows
 │   ├── noetl.yaml             # NoETL server/worker management
+│   ├── gui.yaml               # Standalone GUI image deploy/runtime env management
+│   ├── mcp_kubernetes.yaml    # Kubernetes MCP server for runtime observability
 │   ├── docker.yaml            # Docker image building
 │   ├── setup_tooling.yaml     # OS-aware tooling setup (auto-detects OS)
 │   ├── tooling_macos.yaml     # Development tool setup for macOS (Homebrew)

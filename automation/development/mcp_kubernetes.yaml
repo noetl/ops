@@ -1,0 +1,238 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kubernetes_mcp_development_deploy
+  path: automation/development/mcp_kubernetes
+  description: Deploy the Kubernetes MCP server for local NoETL runtime observability
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help # deploy, status, destroy
+  expected_kube_context: "kind-noetl"
+  namespace: "mcp"
+  release_name: "kubernetes-mcp-server"
+  chart_ref: "oci://ghcr.io/containers/charts/kubernetes-mcp-server"
+  chart_version: "0.1.0"
+  image_registry: "quay.io"
+  image_repository: "containers/kubernetes_mcp_server"
+  image_tag: "v0.0.61"
+  image_pull_policy: "IfNotPresent"
+  service_type: "ClusterIP"
+  service_port: 8080
+  toolsets: "core,config"
+  read_only: "true"
+  stateless: "true"
+  list_output: "table"
+
+workflow:
+  - step: run
+    desc: Run selected action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+
+          ACTION="{{ workload.action }}"
+          EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
+          NAMESPACE="{{ workload.namespace }}"
+          RELEASE_NAME="{{ workload.release_name }}"
+          CHART_REF="{{ workload.chart_ref }}"
+          CHART_VERSION="{{ workload.chart_version }}"
+          IMAGE_REGISTRY="{{ workload.image_registry }}"
+          IMAGE_REPOSITORY="{{ workload.image_repository }}"
+          IMAGE_TAG="{{ workload.image_tag }}"
+          IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
+          SERVICE_TYPE="{{ workload.service_type }}"
+          SERVICE_PORT="{{ workload.service_port }}"
+          TOOLSETS="{{ workload.toolsets }}"
+          READ_ONLY="{{ workload.read_only }}"
+          STATELESS="{{ workload.stateless }}"
+          LIST_OUTPUT="{{ workload.list_output }}"
+
+          ensure_kind_context() {
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" = "none" ]; then
+              echo "ERROR: No kubernetes context selected."
+              echo "Set context to $EXPECTED_CONTEXT before deploy/status actions."
+              exit 1
+            fi
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: Refusing to run local kind deploy against context '$CURRENT_CONTEXT'."
+              echo "Expected context: '$EXPECTED_CONTEXT'"
+              echo "Run: kubectl config use-context $EXPECTED_CONTEXT"
+              exit 1
+            fi
+          }
+
+          render_values() {
+            local file="$1"
+            local toolsets_json
+            toolsets_json=$(printf '%s' "$TOOLSETS" | awk -F, '
+              BEGIN { printf "[" }
+              {
+                for (i = 1; i <= NF; i++) {
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+                  if ($i == "") continue
+                  if (seen++) printf ", "
+                  printf "\"%s\"", $i
+                }
+              }
+              END { printf "]" }
+            ')
+
+            cat > "$file" <<EOF
+          image:
+            registry: ${IMAGE_REGISTRY}
+            repository: ${IMAGE_REPOSITORY}
+            version: ${IMAGE_TAG}
+            pullPolicy: ${IMAGE_PULL_POLICY}
+
+          service:
+            type: ${SERVICE_TYPE}
+            port: ${SERVICE_PORT}
+            targetPort: http
+
+          ingress:
+            enabled: false
+
+          httpRoute:
+            enabled: false
+
+          config:
+            port: "${SERVICE_PORT}"
+            read_only: ${READ_ONLY}
+            stateless: ${STATELESS}
+            list_output: "${LIST_OUTPUT}"
+            cluster_provider_strategy: "in-cluster"
+            toolsets: ${toolsets_json}
+            server_instructions: "NoETL runtime observer. Use read-only Kubernetes tools for cluster, namespace, pod, event, and workload diagnostics. Do not request or expose Secrets."
+            denied_resources:
+              - group: ""
+                version: "v1"
+                kind: "Secret"
+              - group: ""
+                version: "v1"
+                kind: "ServiceAccountToken"
+
+          rbac:
+            create: true
+            extraClusterRoles:
+              - name: runtime-observer
+                rules:
+                  - apiGroups: [""]
+                    resources:
+                      - namespaces
+                      - nodes
+                      - pods
+                      - pods/log
+                      - pods/status
+                      - services
+                      - endpoints
+                      - persistentvolumeclaims
+                      - configmaps
+                      - events
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["apps"]
+                    resources:
+                      - deployments
+                      - replicasets
+                      - statefulsets
+                      - daemonsets
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["batch"]
+                    resources:
+                      - jobs
+                      - cronjobs
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["events.k8s.io"]
+                    resources: ["events"]
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["metrics.k8s.io"]
+                    resources: ["pods", "nodes"]
+                    verbs: ["get", "list"]
+            extraClusterRoleBindings:
+              - name: runtime-observer
+                roleRef:
+                  name: runtime-observer
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          EOF
+          }
+
+          deploy() {
+            ensure_kind_context
+            local values_file
+            values_file=$(mktemp)
+            trap 'rm -f "${values_file:-}"' EXIT
+            render_values "$values_file"
+
+            helm upgrade --install "$RELEASE_NAME" "$CHART_REF" \
+              --version "$CHART_VERSION" \
+              --namespace "$NAMESPACE" --create-namespace \
+              -f "$values_file"
+
+            kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE_NAME" --timeout=180s
+            status
+          }
+
+          status() {
+            ensure_kind_context
+            kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || {
+              echo "Namespace '$NAMESPACE' not found"
+              exit 0
+            }
+            kubectl -n "$NAMESPACE" get deploy,svc,pods -o wide
+            echo ""
+            echo "Health:"
+            kubectl -n "$NAMESPACE" delete pod mcp-health-check --ignore-not-found >/dev/null 2>&1 || true
+            kubectl -n "$NAMESPACE" run mcp-health-check --rm -i --restart=Never \
+              --image=curlimages/curl:8.10.1 --quiet -- \
+              sh -c "curl -fsS 'http://${RELEASE_NAME}.${NAMESPACE}.svc.cluster.local:${SERVICE_PORT}/healthz' >/dev/null && echo ok" || true
+          }
+
+          destroy() {
+            ensure_kind_context
+            helm uninstall "$RELEASE_NAME" --namespace "$NAMESPACE" || true
+            kubectl delete namespace "$NAMESPACE" --ignore-not-found
+          }
+
+          case "$ACTION" in
+            deploy)
+              deploy
+              ;;
+            status)
+              status
+              ;;
+            destroy)
+              destroy
+              ;;
+            help|*)
+              echo "Usage:"
+              echo "  noetl run automation/development/mcp_kubernetes.yaml --runtime local --set action=<action>"
+              echo ""
+              echo "Actions: deploy, status, destroy"
+              echo ""
+              echo "Defaults:"
+              echo "  chart=$CHART_REF version=$CHART_VERSION"
+              echo "  image=$IMAGE_REGISTRY/$IMAGE_REPOSITORY:$IMAGE_TAG"
+              echo "  namespace=$NAMESPACE release=$RELEASE_NAME"
+              echo "  read_only=$READ_ONLY stateless=$STATELESS toolsets=$TOOLSETS"
+              ;;
+          esac
+    next:
+      - step: end
+
+  - step: end
+    desc: End workflow
+    tool:
+      kind: noop
