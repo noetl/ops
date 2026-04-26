@@ -81,12 +81,14 @@ workflow:
           }
 
           deploy_api() {
+            ensure_kind_context
             kubectl apply -f ci/manifests/gateway/namespace.yaml
             kubectl apply -f ci/manifests/gateway/deployment.yaml
             kubectl apply -f ci/manifests/gateway/service.yaml
           }
 
           deploy_ui() {
+            ensure_kind_context
             kubectl apply -f ci/manifests/gateway/configmap-ui.yaml
             kubectl apply -f ci/manifests/gateway/configmap-ui-files.yaml
             kubectl apply -f ci/manifests/gateway/deployment-ui.yaml
@@ -95,15 +97,25 @@ workflow:
 
           deploy_registry_image() {
             ensure_kind_context
+            NODE_PORT_ARG=""
+            case "$GATEWAY_SERVICE_TYPE" in
+              NodePort|LoadBalancer)
+                if [ -n "$GATEWAY_NODE_PORT" ] && [ "$GATEWAY_NODE_PORT" != "null" ]; then
+                  NODE_PORT_ARG="--set service.nodePort=$GATEWAY_NODE_PORT"
+                fi
+                ;;
+            esac
+
             helm upgrade --install "$GATEWAY_RELEASE_NAME" automation/helm/gateway \
               --namespace "$GATEWAY_NAMESPACE" --create-namespace \
+              --set namespace="$GATEWAY_NAMESPACE" \
               --set image.repository="$IMAGE_REPOSITORY" \
               --set image.tag="$IMAGE_TAG" \
               --set image.pullPolicy="$IMAGE_PULL_POLICY" \
               --set service.type="$GATEWAY_SERVICE_TYPE" \
-              --set service.nodePort="$GATEWAY_NODE_PORT" \
               --set env.noetlBaseUrl="$NOETL_BASE_URL" \
-              --set env.authBypass="$AUTH_BYPASS"
+              --set env.authBypass="$AUTH_BYPASS" \
+              $NODE_PORT_ARG
 
             kubectl -n "$GATEWAY_NAMESPACE" rollout status deployment/gateway --timeout=180s
           }
@@ -134,28 +146,32 @@ workflow:
               ;;
 
             remove)
-              kubectl delete namespace gateway --ignore-not-found=true
+              ensure_kind_context
+              kubectl delete namespace "$GATEWAY_NAMESPACE" --ignore-not-found=true
               ;;
 
             redeploy)
+              ensure_kind_context
               build
               load
-              kubectl rollout restart deployment/gateway -n gateway
-              kubectl rollout status deployment/gateway -n gateway --timeout=60s
+              kubectl rollout restart deployment/gateway -n "$GATEWAY_NAMESPACE"
+              kubectl rollout status deployment/gateway -n "$GATEWAY_NAMESPACE" --timeout=60s
               ;;
 
             restart)
-              kubectl rollout restart deployment/gateway -n gateway
-              kubectl rollout restart deployment/gateway-ui -n gateway
+              ensure_kind_context
+              kubectl rollout restart deployment/gateway -n "$GATEWAY_NAMESPACE"
+              kubectl rollout restart deployment/gateway-ui -n "$GATEWAY_NAMESPACE"
               ;;
 
             status)
               ensure_kind_context
-              kubectl get all -n gateway
+              kubectl get all -n "$GATEWAY_NAMESPACE"
               ;;
 
             logs)
-              kubectl logs -n gateway -l app=gateway --tail=100 -f
+              ensure_kind_context
+              kubectl logs -n "$GATEWAY_NAMESPACE" -l app=gateway --tail=100 -f
               ;;
 
             test)

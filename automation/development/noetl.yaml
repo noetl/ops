@@ -302,9 +302,14 @@ workflow:
               if [ -f "$manifest" ]; then
                 sed \
                   -e "s|image_name:image_tag|$IMAGE|g" \
-                  -e "s|imagePullPolicy: Never|imagePullPolicy: $IMAGE_PULL_POLICY|g" \
                   "$manifest" | kubectl apply -f -
               fi
+            done
+            for deployment in $(kubectl get deployments -n noetl -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+              for container in $(kubectl get deployment "$deployment" -n noetl -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}'); do
+                kubectl patch deployment "$deployment" -n noetl --type=strategic \
+                  -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$container\",\"imagePullPolicy\":\"$IMAGE_PULL_POLICY\"}]}}}}"
+              done
             done
             kubectl rollout restart deployment/noetl-server -n noetl 2>/dev/null || true
             kubectl rollout restart deployment/noetl-worker -n noetl 2>/dev/null || true
