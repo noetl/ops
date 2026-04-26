@@ -12,6 +12,7 @@ executor:
 workload:
   action: help # build, load, deploy, redeploy, status
   image_repository: localhost/local/noetl-gui
+  image_tag: ""
   gui_repo_dir: "../gui"
   expected_kube_context: "kind-noetl"
   kind_cluster_name: "noetl"
@@ -40,6 +41,7 @@ workflow:
           ACTION="{{ workload.action }}"
           GUI_REPO="{{ workload.gui_repo_dir }}"
           IMAGE_REPOSITORY="{{ workload.image_repository }}"
+          IMAGE_TAG_OVERRIDE="{{ workload.image_tag }}"
           EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
           KIND_CLUSTER_NAME="{{ workload.kind_cluster_name }}"
           GUI_NAMESPACE="{{ workload.gui_namespace }}"
@@ -148,12 +150,16 @@ workflow:
 
           deploy() {
             ensure_kind_context
-            if [ ! -f "$LAST_TAG_FILE" ]; then
+            if [ -n "$IMAGE_TAG_OVERRIDE" ]; then
+              IMAGE_TAG="$IMAGE_TAG_OVERRIDE"
+            elif [ -f "$LAST_TAG_FILE" ]; then
+              IMAGE_TAG=$(cat "$LAST_TAG_FILE")
+            else
               echo "ERROR: $LAST_TAG_FILE not found. Run action=build first."
+              echo "       Or provide --set image_tag=<tag> for a registry image deploy."
               exit 1
             fi
 
-            IMAGE_TAG=$(cat "$LAST_TAG_FILE")
             helm upgrade --install "$GUI_RELEASE_NAME" automation/gcp_gke/helm/gui \
               --namespace "$GUI_NAMESPACE" --create-namespace \
               --set image.repository="$IMAGE_REPOSITORY" \
@@ -220,6 +226,7 @@ workflow:
               echo "Other useful overrides:"
               echo "  --set gui_repo_dir=../gui"
               echo "  --set image_repository=localhost/local/noetl-gui"
+              echo "  --set image_tag=v1.0.5"
               echo "  --set gui_namespace=gui"
               echo "  --set gui_service_type=NodePort"
               echo "  --set gui_node_port=30081"

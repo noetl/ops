@@ -10,8 +10,18 @@ executor:
   version: noetl-runtime/1
 
 workload:
-  action: help # build-image, load-image, deploy, deploy-all, remove, redeploy, restart, status, logs, test
+  action: help # build-image, load-image, deploy, deploy-image, deploy-all, remove, redeploy, restart, status, logs, test
   gateway_repo_dir: "../gateway"
+  expected_kube_context: "kind-noetl"
+  gateway_namespace: "gateway"
+  gateway_release_name: "noetl-gateway"
+  image_repository: "ghcr.io/noetl/noetl-gateway"
+  image_tag: "latest"
+  image_pull_policy: "Always"
+  gateway_service_type: "NodePort"
+  gateway_node_port: 30090
+  noetl_base_url: "http://noetl.noetl.svc.cluster.local:8082"
+  auth_bypass: "true"
 
 workflow:
   - step: run
@@ -23,10 +33,34 @@ workflow:
           set -euo pipefail
           ACTION="{{ workload.action }}"
           GATEWAY_REPO="{{ workload.gateway_repo_dir }}"
+          EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
+          GATEWAY_NAMESPACE="{{ workload.gateway_namespace }}"
+          GATEWAY_RELEASE_NAME="{{ workload.gateway_release_name }}"
+          IMAGE_REPOSITORY="{{ workload.image_repository }}"
+          IMAGE_TAG="{{ workload.image_tag }}"
+          IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
+          GATEWAY_SERVICE_TYPE="{{ workload.gateway_service_type }}"
+          GATEWAY_NODE_PORT="{{ workload.gateway_node_port }}"
+          NOETL_BASE_URL="{{ workload.noetl_base_url }}"
+          AUTH_BYPASS="{{ workload.auth_bypass }}"
 
           ensure_gateway_repo() {
             if [ ! -d "$GATEWAY_REPO" ]; then
               echo "ERROR: Gateway repository not found: $GATEWAY_REPO"
+              exit 1
+            fi
+          }
+
+          ensure_kind_context() {
+            CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+            if [ -z "$CURRENT_CONTEXT" ]; then
+              echo "ERROR: No active kubectl context found."
+              echo "Set context to $EXPECTED_CONTEXT before deploy/status actions."
+              exit 1
+            fi
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: Refusing to run local kind deploy against context '$CURRENT_CONTEXT'."
+              echo "Expected context: '$EXPECTED_CONTEXT'"
               exit 1
             fi
           }
@@ -47,16 +81,43 @@ workflow:
           }
 
           deploy_api() {
+            ensure_kind_context
             kubectl apply -f ci/manifests/gateway/namespace.yaml
             kubectl apply -f ci/manifests/gateway/deployment.yaml
             kubectl apply -f ci/manifests/gateway/service.yaml
           }
 
           deploy_ui() {
+            ensure_kind_context
             kubectl apply -f ci/manifests/gateway/configmap-ui.yaml
             kubectl apply -f ci/manifests/gateway/configmap-ui-files.yaml
             kubectl apply -f ci/manifests/gateway/deployment-ui.yaml
             kubectl apply -f ci/manifests/gateway/service-ui.yaml
+          }
+
+          deploy_registry_image() {
+            ensure_kind_context
+            NODE_PORT_ARG=""
+            case "$GATEWAY_SERVICE_TYPE" in
+              NodePort|LoadBalancer)
+                if [ -n "$GATEWAY_NODE_PORT" ] && [ "$GATEWAY_NODE_PORT" != "null" ]; then
+                  NODE_PORT_ARG="--set service.nodePort=$GATEWAY_NODE_PORT"
+                fi
+                ;;
+            esac
+
+            helm upgrade --install "$GATEWAY_RELEASE_NAME" automation/helm/gateway \
+              --namespace "$GATEWAY_NAMESPACE" --create-namespace \
+              --set namespace="$GATEWAY_NAMESPACE" \
+              --set image.repository="$IMAGE_REPOSITORY" \
+              --set image.tag="$IMAGE_TAG" \
+              --set image.pullPolicy="$IMAGE_PULL_POLICY" \
+              --set service.type="$GATEWAY_SERVICE_TYPE" \
+              --set env.noetlBaseUrl="$NOETL_BASE_URL" \
+              --set env.authBypass="$AUTH_BYPASS" \
+              $NODE_PORT_ARG
+
+            kubectl -n "$GATEWAY_NAMESPACE" rollout status deployment/gateway --timeout=180s
           }
 
           case "$ACTION" in
@@ -73,6 +134,10 @@ workflow:
               deploy_api
               ;;
 
+            deploy-image)
+              deploy_registry_image
+              ;;
+
             deploy-all)
               build
               load
@@ -81,27 +146,32 @@ workflow:
               ;;
 
             remove)
-              kubectl delete namespace gateway --ignore-not-found=true
+              ensure_kind_context
+              kubectl delete namespace "$GATEWAY_NAMESPACE" --ignore-not-found=true
               ;;
 
             redeploy)
+              ensure_kind_context
               build
               load
-              kubectl rollout restart deployment/gateway -n gateway
-              kubectl rollout status deployment/gateway -n gateway --timeout=60s
+              kubectl rollout restart deployment/gateway -n "$GATEWAY_NAMESPACE"
+              kubectl rollout status deployment/gateway -n "$GATEWAY_NAMESPACE" --timeout=60s
               ;;
 
             restart)
-              kubectl rollout restart deployment/gateway -n gateway
-              kubectl rollout restart deployment/gateway-ui -n gateway
+              ensure_kind_context
+              kubectl rollout restart deployment/gateway -n "$GATEWAY_NAMESPACE"
+              kubectl rollout restart deployment/gateway-ui -n "$GATEWAY_NAMESPACE"
               ;;
 
             status)
-              kubectl get all -n gateway
+              ensure_kind_context
+              kubectl get all -n "$GATEWAY_NAMESPACE"
               ;;
 
             logs)
-              kubectl logs -n gateway -l app=gateway --tail=100 -f
+              ensure_kind_context
+              kubectl logs -n "$GATEWAY_NAMESPACE" -l app=gateway --tail=100 -f
               ;;
 
             test)
@@ -113,7 +183,9 @@ workflow:
               echo "Usage:"
               echo "  noetl run automation/infrastructure/gateway.yaml --runtime local --set action=<action>"
               echo ""
-              echo "Actions: build-image, load-image, deploy, deploy-all, remove, redeploy, restart, status, logs, test"
+              echo "Actions: build-image, load-image, deploy, deploy-image, deploy-all, remove, redeploy, restart, status, logs, test"
+              echo "Registry deploy without building:"
+              echo "  --set action=deploy-image --set image_repository=ghcr.io/noetl/noetl-gateway --set image_tag=v2.8.4"
               echo "Optional: --set gateway_repo_dir=../gateway"
               ;;
           esac

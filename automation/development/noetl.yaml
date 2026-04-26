@@ -13,6 +13,8 @@ workload:
   action: help # build, load, deploy, redeploy, status
   registry: local
   image_name: noetl
+  image_tag: ""
+  image_pull_policy: "Never"
   noetl_repo_dir: "../noetl"
   expected_kube_context: "kind-noetl"
 
@@ -28,6 +30,8 @@ workflow:
           NOETL_REPO="{{ workload.noetl_repo_dir }}"
           REGISTRY="{{ workload.registry }}"
           IMAGE_NAME="{{ workload.image_name }}"
+          IMAGE_TAG_OVERRIDE="{{ workload.image_tag }}"
+          IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
           EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
 
           detect_lan_host() {
@@ -283,17 +287,29 @@ workflow:
           deploy() {
             ensure_kind_context
             ensure_local_dependencies
-            if [ ! -f .noetl_last_build_tag.txt ]; then
+            if [ -n "$IMAGE_TAG_OVERRIDE" ]; then
+              IMAGE_TAG="$IMAGE_TAG_OVERRIDE"
+            elif [ -f .noetl_last_build_tag.txt ]; then
+              IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
+            else
               echo "ERROR: .noetl_last_build_tag.txt not found. Run action=build first."
+              echo "       Or provide --set image_tag=<tag> for a registry image deploy."
               exit 1
             fi
             kubectl apply -f "$NOETL_REPO/ci/manifests/noetl/namespace/"
-            IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
             IMAGE="$(resolve_deploy_image "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG")"
             for manifest in "$NOETL_REPO"/ci/manifests/noetl/*.yaml; do
               if [ -f "$manifest" ]; then
-                sed "s|image_name:image_tag|$IMAGE|g" "$manifest" | kubectl apply -f -
+                sed \
+                  -e "s|image_name:image_tag|$IMAGE|g" \
+                  "$manifest" | kubectl apply -f -
               fi
+            done
+            for deployment in $(kubectl get deployments -n noetl -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+              for container in $(kubectl get deployment "$deployment" -n noetl -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}'); do
+                kubectl patch deployment "$deployment" -n noetl --type=strategic \
+                  -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$container\",\"imagePullPolicy\":\"$IMAGE_PULL_POLICY\"}]}}}}"
+              done
             done
             kubectl rollout restart deployment/noetl-server -n noetl 2>/dev/null || true
             kubectl rollout restart deployment/noetl-worker -n noetl 2>/dev/null || true
@@ -337,6 +353,8 @@ workflow:
               echo ""
               echo "Actions: build, load, deploy, redeploy, status"
               echo "Optional: --set noetl_repo_dir=../noetl"
+              echo "Registry deploy without building:"
+              echo "  --set registry=ghcr.io/noetl --set image_name=noetl --set image_tag=v2.23.2 --set image_pull_policy=Always"
               echo "Requirement: Podman machine 'noetl-dev' must be running"
               echo ""
               echo "LAN access:"
