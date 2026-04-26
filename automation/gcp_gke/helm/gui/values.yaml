@@ -21,6 +21,7 @@ env:
   auth0ClientId: ""
   auth0RedirectUri: ""
   mcpKubernetesUrl: ""
+  # nginx-only upstream used by the GUI container entrypoint; not exposed to Vite/browser code.
   mcpKubernetesUpstream: ""
 
 ingress:
