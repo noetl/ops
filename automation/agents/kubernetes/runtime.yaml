@@ -26,7 +26,7 @@ workflow:
       endpoint: "{{ workload.endpoint }}"
       method: "{{ workload.method }}"
       tool: "{{ workload.tool }}"
-      arguments: "{{ workload.arguments }}"
+      arguments: "{{ workload.arguments | tojson }}"
     next:
       spec:
         mode: exclusive
@@ -58,8 +58,8 @@ workflow:
           "text": text,
           "raw": response,
         }
-    input:
-      mcp_response: "{{ call_mcp }}"
+      args:
+        mcp_response: "{{ call_mcp }}"
     next:
       spec:
         mode: exclusive
