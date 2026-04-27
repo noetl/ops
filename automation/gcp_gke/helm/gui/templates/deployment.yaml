@@ -1,3 +1,4 @@
+{{- $mcpKubernetesEnabled := eq (lower (toString .Values.env.mcpKubernetesEnabled)) "true" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,12 +35,16 @@ spec:
               value: {{ .Values.env.auth0ClientId | quote }}
             - name: VITE_AUTH0_REDIRECT_URI
               value: {{ .Values.env.auth0RedirectUri | quote }}
+            - name: VITE_MCP_KUBERNETES_ENABLED
+              value: {{ ternary "true" "false" $mcpKubernetesEnabled | quote }}
+            - name: MCP_KUBERNETES_ENABLED
+              value: {{ ternary "true" "false" $mcpKubernetesEnabled | quote }}
             - name: VITE_MCP_KUBERNETES_URL
-              value: {{ .Values.env.mcpKubernetesUrl | quote }}
+              value: {{ ternary .Values.env.mcpKubernetesUrl "" $mcpKubernetesEnabled | quote }}
             # Consumed by the nginx entrypoint to generate same-origin proxy config.
             # It is intentionally not VITE_ exposed to browser JavaScript.
             - name: MCP_KUBERNETES_UPSTREAM
-              value: {{ .Values.env.mcpKubernetesUpstream | quote }}
+              value: {{ ternary .Values.env.mcpKubernetesUpstream "" $mcpKubernetesEnabled | quote }}
           ports:
             - containerPort: {{ .Values.service.targetPort }}
               name: http

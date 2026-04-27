@@ -29,6 +29,7 @@ workload:
   auth0_domain: ""
   auth0_client_id: ""
   auth0_redirect_uri: ""
+  mcp_kubernetes_enabled: "false"
   mcp_kubernetes_url: "/mcp/kubernetes"
   mcp_kubernetes_upstream: "http://kubernetes-mcp-server.mcp.svc.cluster.local:8080"
 
@@ -59,8 +60,19 @@ workflow:
           AUTH0_DOMAIN="{{ workload.auth0_domain }}"
           AUTH0_CLIENT_ID="{{ workload.auth0_client_id }}"
           AUTH0_REDIRECT_URI="{{ workload.auth0_redirect_uri }}"
+          MCP_KUBERNETES_ENABLED="{{ workload.mcp_kubernetes_enabled }}"
           MCP_KUBERNETES_URL="{{ workload.mcp_kubernetes_url }}"
           MCP_KUBERNETES_UPSTREAM="{{ workload.mcp_kubernetes_upstream }}"
+          case "$(printf '%s' "$MCP_KUBERNETES_ENABLED" | tr '[:upper:]' '[:lower:]')" in
+            1|true|yes|on|enabled)
+              MCP_KUBERNETES_ENABLED="true"
+              ;;
+            *)
+              MCP_KUBERNETES_ENABLED="false"
+              MCP_KUBERNETES_URL=""
+              MCP_KUBERNETES_UPSTREAM=""
+              ;;
+          esac
 
           LAST_TAG_FILE=".gui_last_build_tag.txt"
           CONTAINER_CLI=""
@@ -178,6 +190,7 @@ workflow:
               --set env.auth0Domain="$AUTH0_DOMAIN" \
               --set env.auth0ClientId="$AUTH0_CLIENT_ID" \
               --set env.auth0RedirectUri="$AUTH0_REDIRECT_URI" \
+              --set env.mcpKubernetesEnabled="$MCP_KUBERNETES_ENABLED" \
               --set env.mcpKubernetesUrl="$MCP_KUBERNETES_URL" \
               --set env.mcpKubernetesUpstream="$MCP_KUBERNETES_UPSTREAM"
 
@@ -228,6 +241,7 @@ workflow:
               echo "  --set auth0_domain=<tenant>.us.auth0.com"
               echo "  --set auth0_client_id=<client-id>"
               echo "  --set auth0_redirect_uri=http://722-2.local:38081/login"
+              echo "  --set mcp_kubernetes_enabled=true"
               echo "  --set mcp_kubernetes_url=/mcp/kubernetes"
               echo "  --set mcp_kubernetes_upstream=http://kubernetes-mcp-server.mcp.svc.cluster.local:8080"
               echo ""
