@@ -1,0 +1,72 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kubernetes_runtime_agent
+  path: automation/agents/kubernetes/runtime
+  description: Read-only Kubernetes runtime agent backed by the Kubernetes MCP server
+  agent: true
+  capabilities:
+    - kubernetes-observability
+    - runtime-diagnostics
+    - mcp:kubernetes
+
+workload:
+  server: kubernetes
+  endpoint: "http://kubernetes-mcp-server.mcp.svc.cluster.local:8080/mcp"
+  method: tools/call
+  tool: pods_list
+  arguments: {}
+
+workflow:
+  - step: call_mcp
+    desc: Call the Kubernetes MCP server from the NoETL worker
+    tool:
+      kind: mcp
+      server: "{{ workload.server }}"
+      endpoint: "{{ workload.endpoint }}"
+      method: "{{ workload.method }}"
+      tool: "{{ workload.tool }}"
+      arguments: "{{ workload.arguments }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: summarize
+
+  - step: summarize
+    desc: Normalize the MCP response for terminal rendering and execution reports
+    tool:
+      kind: python
+      code: |
+        import json
+
+        response = mcp_response
+        if isinstance(response, str):
+          try:
+            response = json.loads(response)
+          except Exception:
+            response = {"text": response}
+
+        text = response.get("text") or json.dumps(response.get("result", response), default=str, indent=2)
+        result = {
+          "status": "ok",
+          "agent": "kubernetes_runtime_agent",
+          "server": response.get("server", "{{ workload.server }}"),
+          "method": response.get("method", "{{ workload.method }}"),
+          "tool": response.get("tool", "{{ workload.tool }}"),
+          "arguments": response.get("arguments", {{ workload.arguments | tojson }}),
+          "text": text,
+          "raw": response,
+        }
+    input:
+      mcp_response: "{{ call_mcp }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: End Kubernetes runtime agent execution
+    tool:
+      kind: noop
