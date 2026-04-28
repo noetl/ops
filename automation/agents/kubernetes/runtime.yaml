@@ -5,6 +5,23 @@ metadata:
   path: automation/agents/kubernetes/runtime
   description: Read-only Kubernetes runtime agent backed by the Kubernetes MCP server
   agent: true
+  terminal:
+    visible: true
+    workspace: kubernetes
+    scopes:
+      - /mcp/kubernetes
+    commands:
+      - status
+      - tools
+      - namespaces
+      - pods
+      - noetl
+      - events
+      - deployments
+      - services
+      - logs
+      - top
+      - describe
   capabilities:
     - kubernetes-observability
     - runtime-diagnostics
