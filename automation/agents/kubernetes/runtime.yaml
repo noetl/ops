@@ -84,6 +84,19 @@ workflow:
         - step: end
 
   - step: end
-    desc: End Kubernetes runtime agent execution
+    desc: |
+      Return the summarized MCP tool result so consumers (terminal UI,
+      execution detail page, parent playbooks calling this as a sub-flow)
+      see the actual payload instead of {"step": "end", "status": "noop"}.
+      A bare `kind: noop` here would discard `summarize.result` because the
+      engine puts the *terminal* step's output on `playbook.completed.result`,
+      not the previous step's.
     tool:
-      kind: noop
+      kind: python
+      input:
+        summary: '{{ summarize }}'
+      code: |
+        # Pass the summary through unchanged. `summarize` produces a dict
+        # with status / agent / server / method / tool / arguments / text /
+        # raw — exactly what callers want to see.
+        result = summary
