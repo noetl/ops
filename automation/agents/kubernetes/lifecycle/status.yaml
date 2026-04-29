@@ -37,7 +37,12 @@ workflow:
       kind: shell
       cmds:
         - |
-          set -uo pipefail
+          # -e so a real kubectl/RBAC failure is surfaced instead of being
+          # silently downgraded to "ok" later. Commands that may legitimately
+          # fail (the deploy/svc/pods listing on a partially-deployed
+          # namespace) are explicitly suffixed with || true; the healthz
+          # probe is gated by an if-block so its non-zero exit is observed.
+          set -euo pipefail
           NAMESPACE='{{ workload.mcp_resource.spec.deployment.namespace | default("mcp") }}'
           RELEASE_NAME='{{ workload.mcp_resource.spec.deployment.release_name | default("kubernetes-mcp-server") }}'
           SERVICE_PORT='{{ workload.mcp_resource.spec.deployment.service_port | default(8080) }}'

@@ -119,6 +119,55 @@ workflow:
                 kind: "ServiceAccountToken"
           rbac:
             create: true
+            # The runtime agent (automation/agents/kubernetes/runtime)
+            # exposes commands like pods, namespaces, events, top — the
+            # default chart RBAC is namespace-scoped, which would cause
+            # those commands to come back empty or RBAC-denied. Mirror
+            # the runtime-observer ClusterRole the existing in-tree
+            # automation/development/mcp_kubernetes.yaml ships so the
+            # lifecycle.deploy agent doesn't regress permissions when
+            # an operator switches from the dev playbook to the
+            # catalog-driven Mcp lifecycle. Override per Mcp resource
+            # by templating these blocks via spec.deployment.* in a
+            # follow-up if a tighter scope is required.
+            extraClusterRoles:
+              - name: runtime-observer
+                rules:
+                  - apiGroups: [""]
+                    resources:
+                      - namespaces
+                      - nodes
+                      - pods
+                      - pods/log
+                      - pods/status
+                      - services
+                      - endpoints
+                      - persistentvolumeclaims
+                      - configmaps
+                      - events
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["apps"]
+                    resources:
+                      - deployments
+                      - replicasets
+                      - statefulsets
+                      - daemonsets
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["batch"]
+                    resources:
+                      - jobs
+                      - cronjobs
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["events.k8s.io"]
+                    resources: ["events"]
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["metrics.k8s.io"]
+                    resources: ["pods", "nodes"]
+                    verbs: ["get", "list"]
+            extraClusterRoleBindings:
+              - name: runtime-observer
+                roleRef:
+                  name: runtime-observer
           resources:
             requests:
               cpu: 50m

@@ -38,7 +38,6 @@ workflow:
     tool:
       kind: playbook
       path: automation/agents/kubernetes/lifecycle/undeploy
-      return_step: end
       input:
         mcp_resource: '{{ workload.mcp_resource }}'
         verb: undeploy
@@ -57,7 +56,6 @@ workflow:
     tool:
       kind: playbook
       path: automation/agents/kubernetes/lifecycle/deploy
-      return_step: end
       input:
         mcp_resource: '{{ workload.mcp_resource }}'
         verb: deploy

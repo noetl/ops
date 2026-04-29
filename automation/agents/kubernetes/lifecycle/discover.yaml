@@ -44,7 +44,12 @@ workflow:
       kind: shell
       cmds:
         - |
-          set -uo pipefail
+          # -e so a real kubectl/RBAC failure is surfaced instead of
+          # being silently downgraded to "no tools" later. The
+          # in-cluster curl is wrapped in `... || echo '{"error":...}'`
+          # so a tools/list HTTP failure produces a parseable JSON
+          # error rather than tripping -e.
+          set -euo pipefail
           NAMESPACE='{{ workload.mcp_resource.spec.deployment.namespace | default("mcp") }}'
           RELEASE_NAME='{{ workload.mcp_resource.spec.deployment.release_name | default("kubernetes-mcp-server") }}'
           SERVICE_PORT='{{ workload.mcp_resource.spec.deployment.service_port | default(8080) }}'
@@ -90,10 +95,22 @@ workflow:
         end = raw.rfind("}")
         body = raw[start:end + 1] if start != -1 and end != -1 else raw
 
+        parse_error = None
         try:
             payload = json.loads(body)
         except Exception as exc:
-            payload = {"error": f"invalid json from MCP tools/list: {exc}"}
+            parse_error = f"invalid json from MCP tools/list: {exc}"
+            payload = {"error": parse_error}
+
+        # Either the in-cluster curl couldn't reach the server (the shell
+        # step's || echo branch produces {"error": "fetch failed"}) or
+        # json.loads itself failed. Surface this as a non-success status
+        # so callers can distinguish "discover failed" from "discover ran
+        # and saw zero tools" — those are very different outcomes for the
+        # noetl server's catalog patch logic.
+        fetch_error = None
+        if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+            fetch_error = payload["error"]
 
         tools = payload.get("tools") if isinstance(payload, dict) else None
         if not isinstance(tools, list):
@@ -107,12 +124,12 @@ workflow:
             out = set()
             for t in items or []:
                 if isinstance(t, dict):
-                    raw = t.get("name")
+                    raw_name = t.get("name")
                 else:
-                    raw = t
-                if raw is None:
+                    raw_name = t
+                if raw_name is None:
                     continue
-                name = str(raw).strip()
+                name = str(raw_name).strip()
                 if name:
                     out.add(name)
             return out
@@ -124,18 +141,42 @@ workflow:
         added = sorted(names_set - existing_set)
         removed = sorted(existing_set - names_set)
 
-        result = {
-            "status": "completed",
-            "agent": "kubernetes_mcp_lifecycle_discover",
-            "verb": "discover",
-            "mcp_path": mcp_path,
-            "tool_count": len(names),
-            "tool_names": names,
-            "added": added,
-            "removed": removed,
-            "text": "\n".join([
-                f"discovered {len(names)} tools on {mcp_path}",
-                f"  added:   {', '.join(added) if added else '-'}",
-                f"  removed: {', '.join(removed) if removed else '-'}",
-            ]),
-        }
+        if fetch_error or parse_error:
+            err = fetch_error or parse_error
+            result = {
+                "status": "failed",
+                "agent": "kubernetes_mcp_lifecycle_discover",
+                "verb": "discover",
+                "mcp_path": mcp_path,
+                "error": err,
+                "tool_count": 0,
+                "tool_names": [],
+                "tools": [],
+                "raw_payload": payload,
+                "added": [],
+                "removed": [],
+                "text": f"discover failed on {mcp_path}: {err}",
+            }
+        else:
+            # Include the full `tools` list (raw entries with descriptions
+            # and JSON schemas) and the raw_payload so the noetl server's
+            # /api/mcp/{path}/discover endpoint can patch
+            # mcp_resource.spec.tools from this output without a second
+            # round-trip to the MCP server.
+            result = {
+                "status": "completed",
+                "agent": "kubernetes_mcp_lifecycle_discover",
+                "verb": "discover",
+                "mcp_path": mcp_path,
+                "tool_count": len(names),
+                "tool_names": names,
+                "tools": tools,
+                "raw_payload": payload,
+                "added": added,
+                "removed": removed,
+                "text": "\n".join([
+                    f"discovered {len(names)} tools on {mcp_path}",
+                    f"  added:   {', '.join(added) if added else '-'}",
+                    f"  removed: {', '.join(removed) if removed else '-'}",
+                ]),
+            }
