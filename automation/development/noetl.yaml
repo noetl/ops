@@ -18,6 +18,14 @@ workload:
   noetl_repo_dir: "../noetl"
   expected_kube_context: "kind-noetl"
 
+  # Podman machine name to require when running build/load/deploy on
+  # macOS. Set to the empty string ("") to skip the check entirely —
+  # useful for setups where kind runs on colima, Docker Desktop, native
+  # podman, or directly inside Linux without a separate Podman machine.
+  # The default preserves the in-tree expectation that has shipped
+  # since the deploy helper was authored.
+  podman_machine: "noetl-dev"
+
 workflow:
   - step: run
     desc: Run selected action
@@ -33,6 +41,7 @@ workflow:
           IMAGE_TAG_OVERRIDE="{{ workload.image_tag }}"
           IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
           EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
+          PODMAN_MACHINE="{{ workload.podman_machine }}"
 
           detect_lan_host() {
             local host=""
@@ -155,9 +164,19 @@ workflow:
               echo "Install with: brew install podman"
               exit 1
             fi
-            if ! podman machine list 2>/dev/null | grep -q "noetl-dev.*running"; then
-              echo "ERROR: Podman machine 'noetl-dev' is not running."
-              echo "Start it: podman machine start noetl-dev"
+            # Empty PODMAN_MACHINE means "skip the machine check" —
+            # we're running against native podman, colima, Docker
+            # Desktop, or a Linux host without a separate VM. Podman
+            # is still required (above), we just don't insist on a
+            # specific machine being running.
+            if [ -z "$PODMAN_MACHINE" ]; then
+              return 0
+            fi
+            if ! podman machine list 2>/dev/null | grep -q "${PODMAN_MACHINE}.*running"; then
+              echo "ERROR: Podman machine '${PODMAN_MACHINE}' is not running."
+              echo "Start it:    podman machine start ${PODMAN_MACHINE}"
+              echo "Or override: --set podman_machine=<your-machine-name>"
+              echo "Or disable:  --set podman_machine=\"\"  (skip the machine check entirely)"
               exit 1
             fi
           }
@@ -355,7 +374,11 @@ workflow:
               echo "Optional: --set noetl_repo_dir=../noetl"
               echo "Registry deploy without building:"
               echo "  --set registry=ghcr.io/noetl --set image_name=noetl --set image_tag=v2.23.2 --set image_pull_policy=Always"
-              echo "Requirement: Podman machine 'noetl-dev' must be running"
+              echo ""
+              echo "Podman machine (macOS only):"
+              echo "  --set podman_machine=<name>  default: noetl-dev"
+              echo "  --set podman_machine=\"\"     skip the machine check"
+              echo "                                (colima / Docker Desktop / native podman / Linux)"
               echo ""
               echo "LAN access:"
               echo "  This workflow expects kind config listenAddress=0.0.0.0"
