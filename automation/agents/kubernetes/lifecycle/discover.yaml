@@ -4,17 +4,20 @@ metadata:
   name: kubernetes_mcp_lifecycle_discover
   path: automation/agents/kubernetes/lifecycle/discover
   description: |
-    Lifecycle agent: refresh the tool list of an Mcp catalog resource
-    by calling the running server's MCP tools/list endpoint and
-    re-registering the resource with the merged spec.
+    Lifecycle agent: fetch the running server's MCP tools/list response
+    from inside the cluster and return the discovered tool data plus a
+    diff against the existing spec.tools list. The actual catalog
+    update — patching the Mcp resource with the merged spec — is
+    performed by the noetl server (POST /api/mcp/{path}/discover)
+    on top of this payload; this agent only produces it.
 
-    The noetl server's POST /api/mcp/{path}/discover endpoint also
-    supports a "direct" strategy that fetches spec.discovery.tools_list_url
-    and patches the catalog without dispatching an agent — that path is
-    cheaper but requires the gateway to allow the URL through its
-    SSRF guard. Use this agent when you want the refresh to run
-    inside the cluster, with full kubectl context, rather than from
-    the noetl server's process.
+    The noetl server's /discover endpoint also supports a "direct"
+    strategy that fetches spec.discovery.tools_list_url and patches
+    the catalog without dispatching an agent — that path is cheaper
+    but requires the gateway to allow the URL through its SSRF guard.
+    Use this agent when you want the fetch to run inside the cluster,
+    with full kubectl context, rather than from the noetl server's
+    process.
   agent: true
   capabilities:
     - kubernetes
@@ -33,7 +36,6 @@ workload:
       deployment: {}
     metadata: {}
   verb: discover
-  force: false
 
 workflow:
   - step: list_tools
@@ -56,11 +58,15 @@ workflow:
             exit 0
           fi
 
-          kubectl -n "$NAMESPACE" delete pod mcp-discover-curl --ignore-not-found >/dev/null 2>&1 || true
           # Run curl from inside the cluster so we hit the in-cluster
           # service DNS. The pod is ephemeral (--rm) and prints the raw
           # JSON body on stdout for the python step below to parse.
-          kubectl -n "$NAMESPACE" run mcp-discover-curl --rm -i --restart=Never \
+          # Use a unique pod name per execution so concurrent discover
+          # runs don't race each other (one run deleting the other's
+          # pod and corrupting the captured stdout).
+          POD_NAME="mcp-discover-curl-$$-$(date +%s%N | tail -c 8)"
+          trap 'kubectl -n "$NAMESPACE" delete pod "$POD_NAME" --ignore-not-found >/dev/null 2>&1 || true' EXIT
+          kubectl -n "$NAMESPACE" run "$POD_NAME" --rm -i --restart=Never \
             --image=curlimages/curl:8.10.1 --quiet -- \
             sh -c "curl -fsS '$TOOLS_URL' || echo '{\"error\":\"fetch failed\"}'"
     next:
@@ -93,13 +99,30 @@ workflow:
         if not isinstance(tools, list):
             tools = []
 
-        names = sorted({(t.get("name") if isinstance(t, dict) else str(t)) for t in tools})
-        existing_names = sorted({
-            (t.get("name") if isinstance(t, dict) else str(t))
-            for t in (existing_tools or [])
-        })
-        added = sorted(set(names) - set(existing_names))
-        removed = sorted(set(existing_names) - set(names))
+        def _names(items):
+            # Coerce each tool entry to a non-empty name string. Drop
+            # anything that doesn't yield one — a missing/empty name
+            # would otherwise either crash sorted() (None vs str) or
+            # quietly poison the diff with empty strings.
+            out = set()
+            for t in items or []:
+                if isinstance(t, dict):
+                    raw = t.get("name")
+                else:
+                    raw = t
+                if raw is None:
+                    continue
+                name = str(raw).strip()
+                if name:
+                    out.add(name)
+            return out
+
+        names_set = _names(tools)
+        existing_set = _names(existing_tools)
+
+        names = sorted(names_set)
+        added = sorted(names_set - existing_set)
+        removed = sorted(existing_set - names_set)
 
         result = {
             "status": "completed",

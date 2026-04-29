@@ -58,8 +58,13 @@ workflow:
 
           echo
           echo "--- healthz ---"
-          kubectl -n "$NAMESPACE" delete pod mcp-health-check --ignore-not-found >/dev/null 2>&1 || true
-          if kubectl -n "$NAMESPACE" run mcp-health-check --rm -i --restart=Never \
+          # Use a unique pod name per execution so concurrent status
+          # runs (or a status run overlapping with anything else using
+          # the same pod name) don't race each other and corrupt the
+          # captured healthz output.
+          HEALTHCHECK_POD="mcp-health-check-$$-$(date +%s%N | tail -c 8)"
+          trap 'kubectl -n "$NAMESPACE" delete pod "$HEALTHCHECK_POD" --ignore-not-found >/dev/null 2>&1 || true' EXIT
+          if kubectl -n "$NAMESPACE" run "$HEALTHCHECK_POD" --rm -i --restart=Never \
               --image=curlimages/curl:8.10.1 --quiet -- \
               sh -c "curl -fsS 'http://${RELEASE_NAME}.${NAMESPACE}.svc.cluster.local:${SERVICE_PORT}/healthz' 2>/dev/null && echo ok"; then
             echo "healthz: ok"

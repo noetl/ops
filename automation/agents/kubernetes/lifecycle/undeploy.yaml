@@ -31,7 +31,12 @@ workload:
   verb: undeploy
 
   expected_kube_context: "kind-noetl"
-  delete_namespace: true
+  # Default to false — deleting the namespace is a high-blast-radius
+  # operation if the Mcp resource shares its namespace with anything
+  # else. Callers that genuinely want a fresh namespace (e.g. the
+  # redeploy lifecycle agent) must pass delete_namespace: true
+  # explicitly when dispatching this playbook.
+  delete_namespace: false
 
 workflow:
   - step: undeploy

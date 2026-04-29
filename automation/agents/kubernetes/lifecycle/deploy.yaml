@@ -68,7 +68,7 @@ workflow:
           CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
           if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
             echo "ERROR: refusing to deploy '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
-            echo "  expected: '$EXPECTED_CONTEXT' (set NOETL Mcp.spec.expected_kube_context to override)"
+            echo "  expected: '$EXPECTED_CONTEXT' (override by passing workload.expected_kube_context to the dispatch call)"
             exit 1
           fi
 
