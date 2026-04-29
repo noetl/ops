@@ -43,10 +43,19 @@ workflow:
           RELEASE_NAME='{{ workload.mcp_resource.spec.deployment.release_name | default("kubernetes-mcp-server") }}'
           EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
 
-          CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
-          if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
-            echo "ERROR: refusing to restart '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
-            exit 1
+          # Detect in-cluster execution (same pattern as the deploy
+          # agent). The worker pod's service account already pins this
+          # to the right cluster; the kubectl-context guard is only
+          # meaningful when an operator runs the agent from their
+          # local terminal.
+          if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+            echo "INFO: running in-cluster (KUBERNETES_SERVICE_HOST set); skipping context check"
+          else
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: refusing to restart '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
+              exit 1
+            fi
           fi
 
           kubectl -n "$NAMESPACE" rollout restart "deployment/$RELEASE_NAME"
