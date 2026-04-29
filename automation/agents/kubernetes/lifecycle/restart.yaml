@@ -1,0 +1,72 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kubernetes_mcp_lifecycle_restart
+  path: automation/agents/kubernetes/lifecycle/restart
+  description: |
+    Lifecycle agent: kubectl rollout restart on the kubernetes-mcp-server
+    deployment described by an Mcp catalog resource. Useful for picking
+    up a configmap/secret change or for clearing in-memory state without
+    the round-trip of a full helm uninstall + reinstall.
+
+    Granting execute permission on this playbook path equals granting
+    "may run lifecycle.restart" on the matching Mcp resource.
+  agent: true
+  capabilities:
+    - kubernetes
+    - mcp:lifecycle:restart
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  mcp_resource:
+    path: ""
+    version: 0
+    spec:
+      deployment: {}
+    metadata: {}
+  verb: restart
+
+  expected_kube_context: "kind-noetl"
+
+workflow:
+  - step: restart
+    desc: kubectl rollout restart + wait
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.mcp_resource.spec.deployment.namespace | default("mcp") }}'
+          RELEASE_NAME='{{ workload.mcp_resource.spec.deployment.release_name | default("kubernetes-mcp-server") }}'
+          EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
+
+          CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+          if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+            echo "ERROR: refusing to restart '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
+            exit 1
+          fi
+
+          kubectl -n "$NAMESPACE" rollout restart "deployment/$RELEASE_NAME"
+          kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE_NAME" --timeout=120s
+          echo "RESTARTED ${RELEASE_NAME} in namespace ${NAMESPACE}"
+    next:
+      - step: end
+
+  - step: end
+    tool:
+      kind: python
+      input:
+        restart_output: '{{ restart }}'
+        mcp_path: '{{ workload.mcp_resource.path }}'
+        verb: '{{ workload.verb }}'
+      code: |
+        result = {
+            "status": "completed",
+            "agent": "kubernetes_mcp_lifecycle_restart",
+            "verb": verb,
+            "mcp_path": mcp_path,
+            "text": (restart_output if isinstance(restart_output, str) else str(restart_output)),
+        }

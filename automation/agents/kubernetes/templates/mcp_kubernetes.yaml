@@ -1,0 +1,71 @@
+apiVersion: noetl.io/v2
+kind: Mcp
+metadata:
+  name: kubernetes
+  path: mcp/kubernetes
+  description: |
+    In-cluster Kubernetes MCP server (read-only) for runtime
+    observability. Backed by quay.io/containers/kubernetes_mcp_server.
+
+    This is the curated template the GUI's "Add MCP server" wizard
+    pulls from when an operator wants to register a fresh
+    kubernetes-mcp-server. To use:
+
+    1. POST this YAML to /api/catalog/register with resource_type=mcp.
+    2. POST /api/mcp/mcp/kubernetes/lifecycle/deploy to provision the
+       Helm release.
+    3. POST /api/mcp/mcp/kubernetes/discover to refresh the tool list
+       once the server is healthy.
+    4. The GUI's terminal-prompt and the friendly Run dialog can now
+       invoke any of the runtime agent's commands (status, pods,
+       namespaces, etc.) and lifecycle verbs.
+
+  tags:
+    - kubernetes
+    - observability
+    - runtime
+    - read-only
+
+spec:
+  url: http://kubernetes-mcp-server.mcp.svc.cluster.local:8080/mcp
+  protocol: mcp/1.0
+  # tools[] is populated by lifecycle.discover; kept empty here so a
+  # freshly registered template doesn't lie about what's available
+  # before the server is reachable.
+  tools: []
+
+  lifecycle:
+    deploy:    automation/agents/kubernetes/lifecycle/deploy
+    redeploy:  automation/agents/kubernetes/lifecycle/redeploy
+    undeploy:  automation/agents/kubernetes/lifecycle/undeploy
+    status:    automation/agents/kubernetes/lifecycle/status
+    restart:   automation/agents/kubernetes/lifecycle/restart
+    discover:  automation/agents/kubernetes/lifecycle/discover
+
+  discovery:
+    initialize_url: http://kubernetes-mcp-server.mcp.svc.cluster.local:8080/healthz
+    tools_list_url: http://kubernetes-mcp-server.mcp.svc.cluster.local:8080/mcp/tools
+    refresh_via:    automation/agents/kubernetes/lifecycle/discover
+
+  runtime:
+    agent: automation/agents/kubernetes/runtime
+
+  # Deployment knobs read by the lifecycle/deploy + lifecycle/undeploy
+  # agents. Override these at registration time when registering more
+  # than one Mcp resource that uses the kubernetes-mcp-server chart
+  # against different namespaces / image tags / toolset profiles.
+  deployment:
+    namespace: mcp
+    release_name: kubernetes-mcp-server
+    chart_ref: oci://ghcr.io/containers/charts/kubernetes-mcp-server
+    chart_version: "0.1.0"
+    image_registry: quay.io
+    image_repository: containers/kubernetes_mcp_server
+    image_tag: v0.0.61
+    image_pull_policy: IfNotPresent
+    service_type: ClusterIP
+    service_port: 8080
+    toolsets: "core,config"
+    read_only: "true"
+    stateless: "true"
+    list_output: "table"

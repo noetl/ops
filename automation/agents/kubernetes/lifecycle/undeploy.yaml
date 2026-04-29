@@ -1,0 +1,86 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kubernetes_mcp_lifecycle_undeploy
+  path: automation/agents/kubernetes/lifecycle/undeploy
+  description: |
+    Lifecycle agent: tear down the kubernetes-mcp-server deployment
+    described by an Mcp catalog resource. Helm uninstall + namespace
+    delete; idempotent (a missing release / namespace is treated as
+    success).
+
+    Granting execute permission on this playbook path equals granting
+    "may run lifecycle.undeploy" on the matching Mcp resource —
+    auth-as-playbook flow handles the rest.
+  agent: true
+  capabilities:
+    - kubernetes
+    - mcp:lifecycle:undeploy
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  mcp_resource:
+    path: ""
+    version: 0
+    spec:
+      deployment: {}
+    metadata: {}
+  verb: undeploy
+
+  expected_kube_context: "kind-noetl"
+  delete_namespace: true
+
+workflow:
+  - step: undeploy
+    desc: helm uninstall + optional namespace delete
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          MCP_PATH='{{ workload.mcp_resource.path }}'
+          NAMESPACE='{{ workload.mcp_resource.spec.deployment.namespace | default("mcp") }}'
+          RELEASE_NAME='{{ workload.mcp_resource.spec.deployment.release_name | default("kubernetes-mcp-server") }}'
+          DELETE_NS='{{ workload.delete_namespace }}'
+          EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
+
+          CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+          if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+            echo "ERROR: refusing to undeploy '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
+            echo "  expected: '$EXPECTED_CONTEXT'"
+            exit 1
+          fi
+
+          if helm status "$RELEASE_NAME" --namespace "$NAMESPACE" >/dev/null 2>&1; then
+            helm uninstall "$RELEASE_NAME" --namespace "$NAMESPACE"
+          else
+            echo "  release '$RELEASE_NAME' not present in namespace '$NAMESPACE'; nothing to uninstall"
+          fi
+
+          if [ "$DELETE_NS" = "true" ] || [ "$DELETE_NS" = "True" ]; then
+            kubectl delete namespace "$NAMESPACE" --ignore-not-found
+          fi
+
+          echo "UNDEPLOYED ${RELEASE_NAME} from namespace ${NAMESPACE} (Mcp resource ${MCP_PATH})"
+    next:
+      - step: end
+
+  - step: end
+    desc: Return the undeploy summary
+    tool:
+      kind: python
+      input:
+        undeploy_output: '{{ undeploy }}'
+        mcp_path: '{{ workload.mcp_resource.path }}'
+        verb: '{{ workload.verb }}'
+      code: |
+        result = {
+            "status": "completed",
+            "agent": "kubernetes_mcp_lifecycle_undeploy",
+            "verb": verb,
+            "mcp_path": mcp_path,
+            "text": (undeploy_output if isinstance(undeploy_output, str) else str(undeploy_output)),
+        }

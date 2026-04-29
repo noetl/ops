@@ -1,0 +1,118 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kubernetes_mcp_lifecycle_discover
+  path: automation/agents/kubernetes/lifecycle/discover
+  description: |
+    Lifecycle agent: refresh the tool list of an Mcp catalog resource
+    by calling the running server's MCP tools/list endpoint and
+    re-registering the resource with the merged spec.
+
+    The noetl server's POST /api/mcp/{path}/discover endpoint also
+    supports a "direct" strategy that fetches spec.discovery.tools_list_url
+    and patches the catalog without dispatching an agent — that path is
+    cheaper but requires the gateway to allow the URL through its
+    SSRF guard. Use this agent when you want the refresh to run
+    inside the cluster, with full kubectl context, rather than from
+    the noetl server's process.
+  agent: true
+  capabilities:
+    - kubernetes
+    - mcp:lifecycle:discover
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  mcp_resource:
+    path: ""
+    version: 0
+    spec:
+      discovery: {}
+      deployment: {}
+    metadata: {}
+  verb: discover
+  force: false
+
+workflow:
+  - step: list_tools
+    desc: Call the MCP server's tools/list endpoint via in-cluster curl
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -uo pipefail
+          NAMESPACE='{{ workload.mcp_resource.spec.deployment.namespace | default("mcp") }}'
+          RELEASE_NAME='{{ workload.mcp_resource.spec.deployment.release_name | default("kubernetes-mcp-server") }}'
+          SERVICE_PORT='{{ workload.mcp_resource.spec.deployment.service_port | default(8080) }}'
+          TOOLS_URL='{{ workload.mcp_resource.spec.discovery.tools_list_url | default("") }}'
+          if [ -z "$TOOLS_URL" ]; then
+            TOOLS_URL="http://${RELEASE_NAME}.${NAMESPACE}.svc.cluster.local:${SERVICE_PORT}/mcp/tools"
+          fi
+
+          if ! kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
+            echo '{"error":"namespace not found","namespace":"'"$NAMESPACE"'"}'
+            exit 0
+          fi
+
+          kubectl -n "$NAMESPACE" delete pod mcp-discover-curl --ignore-not-found >/dev/null 2>&1 || true
+          # Run curl from inside the cluster so we hit the in-cluster
+          # service DNS. The pod is ephemeral (--rm) and prints the raw
+          # JSON body on stdout for the python step below to parse.
+          kubectl -n "$NAMESPACE" run mcp-discover-curl --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 --quiet -- \
+            sh -c "curl -fsS '$TOOLS_URL' || echo '{\"error\":\"fetch failed\"}'"
+    next:
+      - step: end
+
+  - step: end
+    desc: Parse the tools/list response and surface a refresh summary
+    tool:
+      kind: python
+      input:
+        list_output: '{{ list_tools }}'
+        mcp_path: '{{ workload.mcp_resource.path }}'
+        existing_tools: '{{ workload.mcp_resource.spec.tools | default([]) }}'
+      code: |
+        import json
+
+        raw = list_output if isinstance(list_output, str) else str(list_output)
+        # The kubectl run output has trailing "pod ... deleted" noise; strip
+        # everything after the first '{' .. last '}' to get a clean JSON.
+        start = raw.find("{")
+        end = raw.rfind("}")
+        body = raw[start:end + 1] if start != -1 and end != -1 else raw
+
+        try:
+            payload = json.loads(body)
+        except Exception as exc:
+            payload = {"error": f"invalid json from MCP tools/list: {exc}"}
+
+        tools = payload.get("tools") if isinstance(payload, dict) else None
+        if not isinstance(tools, list):
+            tools = []
+
+        names = sorted({(t.get("name") if isinstance(t, dict) else str(t)) for t in tools})
+        existing_names = sorted({
+            (t.get("name") if isinstance(t, dict) else str(t))
+            for t in (existing_tools or [])
+        })
+        added = sorted(set(names) - set(existing_names))
+        removed = sorted(set(existing_names) - set(names))
+
+        result = {
+            "status": "completed",
+            "agent": "kubernetes_mcp_lifecycle_discover",
+            "verb": "discover",
+            "mcp_path": mcp_path,
+            "tool_count": len(names),
+            "tool_names": names,
+            "added": added,
+            "removed": removed,
+            "text": "\n".join([
+                f"discovered {len(names)} tools on {mcp_path}",
+                f"  added:   {', '.join(added) if added else '-'}",
+                f"  removed: {', '.join(removed) if removed else '-'}",
+            ]),
+        }

@@ -1,0 +1,93 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kubernetes_mcp_lifecycle_redeploy
+  path: automation/agents/kubernetes/lifecycle/redeploy
+  description: |
+    Lifecycle agent: full clean redeploy. Calls the undeploy agent
+    first, then the deploy agent, both as sub-playbooks so each step's
+    output flows through the same call.done event chain the GUI's run
+    dialog renders inline.
+
+    Use lifecycle.deploy for an in-place helm upgrade that preserves
+    the namespace and PVCs; use lifecycle.redeploy when you need a
+    from-scratch rebuild (image pull policy reset, RBAC reseat, etc.).
+  agent: true
+  capabilities:
+    - kubernetes
+    - mcp:lifecycle:redeploy
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  mcp_resource:
+    path: ""
+    version: 0
+    spec:
+      deployment: {}
+    metadata: {}
+  verb: redeploy
+
+  expected_kube_context: "kind-noetl"
+
+workflow:
+  - step: undeploy
+    desc: Run the undeploy lifecycle agent as a sub-playbook
+    tool:
+      kind: playbook
+      path: automation/agents/kubernetes/lifecycle/undeploy
+      return_step: end
+      input:
+        mcp_resource: '{{ workload.mcp_resource }}'
+        verb: undeploy
+        expected_kube_context: '{{ workload.expected_kube_context }}'
+        # During redeploy we always tear the namespace down so the new
+        # helm install starts from a clean slate.
+        delete_namespace: true
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: deploy
+
+  - step: deploy
+    desc: Run the deploy lifecycle agent as a sub-playbook
+    tool:
+      kind: playbook
+      path: automation/agents/kubernetes/lifecycle/deploy
+      return_step: end
+      input:
+        mcp_resource: '{{ workload.mcp_resource }}'
+        verb: deploy
+        expected_kube_context: '{{ workload.expected_kube_context }}'
+    next:
+      - step: end
+
+  - step: end
+    desc: Combine sub-results into a single redeploy summary
+    tool:
+      kind: python
+      input:
+        undeploy_result: '{{ undeploy }}'
+        deploy_result: '{{ deploy }}'
+        mcp_path: '{{ workload.mcp_resource.path }}'
+      code: |
+        def _txt(r):
+            if isinstance(r, dict):
+                return r.get("text") or str(r)
+            return str(r)
+        result = {
+            "status": "completed",
+            "agent": "kubernetes_mcp_lifecycle_redeploy",
+            "verb": "redeploy",
+            "mcp_path": mcp_path,
+            "text": "\n".join([
+                "--- undeploy ---",
+                _txt(undeploy_result),
+                "",
+                "--- deploy ---",
+                _txt(deploy_result),
+            ]),
+        }
