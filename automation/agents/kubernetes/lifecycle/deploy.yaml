@@ -185,7 +185,10 @@ workflow:
           kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE_NAME" --timeout=180s
           echo "DEPLOYED ${RELEASE_NAME} v${IMAGE_TAG} in namespace ${NAMESPACE} for Mcp resource ${MCP_PATH}"
     next:
-      - step: end
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
 
   - step: end
     desc: Return the deploy summary for callers

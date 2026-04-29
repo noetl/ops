@@ -53,7 +53,10 @@ workflow:
           kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE_NAME" --timeout=120s
           echo "RESTARTED ${RELEASE_NAME} in namespace ${NAMESPACE}"
     next:
-      - step: end
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
 
   - step: end
     tool:

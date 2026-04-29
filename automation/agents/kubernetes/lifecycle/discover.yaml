@@ -75,7 +75,10 @@ workflow:
             --image=curlimages/curl:8.10.1 --quiet -- \
             sh -c "curl -fsS '$TOOLS_URL' || echo '{\"error\":\"fetch failed\"}'"
     next:
-      - step: end
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
 
   - step: end
     desc: Parse the tools/list response and surface a refresh summary
