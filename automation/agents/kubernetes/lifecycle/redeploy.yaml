@@ -61,7 +61,10 @@ workflow:
         verb: deploy
         expected_kube_context: '{{ workload.expected_kube_context }}'
     next:
-      - step: end
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
 
   - step: end
     desc: Combine sub-results into a single redeploy summary

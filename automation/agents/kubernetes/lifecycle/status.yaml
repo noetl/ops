@@ -77,7 +77,10 @@ workflow:
             echo "healthz: failed"
           fi
     next:
-      - step: end
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
 
   - step: end
     desc: Return status output
