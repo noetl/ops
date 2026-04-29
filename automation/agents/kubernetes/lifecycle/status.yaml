@@ -48,9 +48,18 @@ workflow:
           SERVICE_PORT='{{ workload.mcp_resource.spec.deployment.service_port | default(8080) }}'
           EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
 
-          CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
-          if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
-            echo "WARN: current context '$CURRENT_CONTEXT' differs from expected '$EXPECTED_CONTEXT' — reporting against current."
+          # In-cluster execution skips the context comparison entirely
+          # (the worker pod's service account already pins it to the
+          # right cluster). For local-terminal execution we keep the
+          # advisory warning rather than the deploy/undeploy/restart
+          # hard guard, since status is read-only and safe to run.
+          if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+            echo "INFO: running in-cluster (KUBERNETES_SERVICE_HOST set)"
+          else
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "WARN: current context '$CURRENT_CONTEXT' differs from expected '$EXPECTED_CONTEXT' — reporting against current."
+            fi
           fi
 
           if ! kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then

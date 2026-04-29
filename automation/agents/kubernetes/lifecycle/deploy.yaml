@@ -65,11 +65,24 @@ workflow:
           LIST_OUTPUT='{{ workload.mcp_resource.spec.deployment.list_output | default("table") }}'
           EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
 
-          CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
-          if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
-            echo "ERROR: refusing to deploy '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
-            echo "  expected: '$EXPECTED_CONTEXT' (override by passing workload.expected_kube_context to the dispatch call)"
-            exit 1
+          # Detect in-cluster execution — KUBERNETES_SERVICE_HOST is
+          # always set inside a Kubernetes pod by the kubelet. When the
+          # noetl dispatcher hands this agent off to a worker pod, the
+          # worker authenticates via its service account and there's
+          # no kubectl context to compare against. Skip the guard in
+          # that case; the worker's in-cluster credentials already
+          # pin it to "this cluster". Preserve the guard for the
+          # local-terminal invocation path so an operator can't fat-
+          # finger a deploy against the wrong context.
+          if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+            echo "INFO: running in-cluster (KUBERNETES_SERVICE_HOST set); skipping context check"
+          else
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: refusing to deploy '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
+              echo "  expected: '$EXPECTED_CONTEXT' (override by passing workload.expected_kube_context to the dispatch call)"
+              exit 1
+            fi
           fi
 
           values_file=$(mktemp)

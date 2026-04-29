@@ -52,11 +52,20 @@ workflow:
           DELETE_NS='{{ workload.delete_namespace }}'
           EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
 
-          CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
-          if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
-            echo "ERROR: refusing to undeploy '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
-            echo "  expected: '$EXPECTED_CONTEXT'"
-            exit 1
+          # Detect in-cluster execution (same pattern as the deploy
+          # agent). The worker pod's service account already pins this
+          # to the right cluster; the kubectl-context guard is only
+          # meaningful when an operator runs the agent from their
+          # local terminal.
+          if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+            echo "INFO: running in-cluster (KUBERNETES_SERVICE_HOST set); skipping context check"
+          else
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: refusing to undeploy '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
+              echo "  expected: '$EXPECTED_CONTEXT'"
+              exit 1
+            fi
           fi
 
           if helm status "$RELEASE_NAME" --namespace "$NAMESPACE" >/dev/null 2>&1; then
