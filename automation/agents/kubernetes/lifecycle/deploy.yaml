@@ -1,0 +1,209 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kubernetes_mcp_lifecycle_deploy
+  path: automation/agents/kubernetes/lifecycle/deploy
+  description: |
+    Lifecycle agent: deploy (or upgrade in place) a kubernetes-mcp-server
+    instance described by an Mcp catalog resource.
+
+    Reads the deployment block from workload.mcp_resource.spec.deployment
+    so a single agent can serve any Mcp resource that opts into the
+    kubernetes-mcp-server chart, not just the default in-tree one. This
+    is the playbook the noetl server dispatches to when a client calls
+    POST /api/mcp/{path}/lifecycle/deploy.
+
+    Authorization is governed by the existing
+    api_integration/auth0/check_playbook_access flow against
+    auth.playbook_permissions: granting execute permission on this
+    path is exactly granting "may run lifecycle.deploy on the
+    Kubernetes MCP".
+  agent: true
+  capabilities:
+    - kubernetes
+    - mcp:lifecycle:deploy
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # Populated by the noetl /api/mcp/{path}/lifecycle/{verb} dispatcher.
+  mcp_resource:
+    path: ""
+    version: 0
+    spec:
+      deployment: {}
+    metadata: {}
+  verb: deploy
+
+  # Local-only knobs the dispatcher doesn't fill in.
+  expected_kube_context: "kind-noetl"
+
+workflow:
+  - step: deploy
+    desc: Render Helm values from the Mcp resource spec and helm upgrade
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          MCP_PATH='{{ workload.mcp_resource.path }}'
+          NAMESPACE='{{ workload.mcp_resource.spec.deployment.namespace | default("mcp") }}'
+          RELEASE_NAME='{{ workload.mcp_resource.spec.deployment.release_name | default("kubernetes-mcp-server") }}'
+          CHART_REF='{{ workload.mcp_resource.spec.deployment.chart_ref | default("oci://ghcr.io/containers/charts/kubernetes-mcp-server") }}'
+          CHART_VERSION='{{ workload.mcp_resource.spec.deployment.chart_version | default("0.1.0") }}'
+          IMAGE_REGISTRY='{{ workload.mcp_resource.spec.deployment.image_registry | default("quay.io") }}'
+          IMAGE_REPOSITORY='{{ workload.mcp_resource.spec.deployment.image_repository | default("containers/kubernetes_mcp_server") }}'
+          IMAGE_TAG='{{ workload.mcp_resource.spec.deployment.image_tag | default("v0.0.61") }}'
+          IMAGE_PULL_POLICY='{{ workload.mcp_resource.spec.deployment.image_pull_policy | default("IfNotPresent") }}'
+          SERVICE_TYPE='{{ workload.mcp_resource.spec.deployment.service_type | default("ClusterIP") }}'
+          SERVICE_PORT='{{ workload.mcp_resource.spec.deployment.service_port | default(8080) }}'
+          TOOLSETS='{{ workload.mcp_resource.spec.deployment.toolsets | default("core,config") }}'
+          READ_ONLY='{{ workload.mcp_resource.spec.deployment.read_only | default("true") }}'
+          STATELESS='{{ workload.mcp_resource.spec.deployment.stateless | default("true") }}'
+          LIST_OUTPUT='{{ workload.mcp_resource.spec.deployment.list_output | default("table") }}'
+          EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
+
+          CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+          if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+            echo "ERROR: refusing to deploy '$RELEASE_NAME' against context '$CURRENT_CONTEXT'."
+            echo "  expected: '$EXPECTED_CONTEXT' (override by passing workload.expected_kube_context to the dispatch call)"
+            exit 1
+          fi
+
+          values_file=$(mktemp)
+          trap 'rm -f "${values_file:-}"' EXIT
+
+          toolsets_json=$(printf '%s' "$TOOLSETS" | awk -F, '
+            BEGIN { printf "[" }
+            {
+              for (i = 1; i <= NF; i++) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+                if ($i == "") continue
+                if (seen++) printf ", "
+                printf "\"%s\"", $i
+              }
+            }
+            END { printf "]" }
+          ')
+
+          cat > "$values_file" <<EOF
+          image:
+            registry: ${IMAGE_REGISTRY}
+            repository: ${IMAGE_REPOSITORY}
+            version: ${IMAGE_TAG}
+            pullPolicy: ${IMAGE_PULL_POLICY}
+          service:
+            type: ${SERVICE_TYPE}
+            port: ${SERVICE_PORT}
+            targetPort: http
+          ingress:
+            enabled: false
+          httpRoute:
+            enabled: false
+          config:
+            port: "${SERVICE_PORT}"
+            read_only: ${READ_ONLY}
+            stateless: ${STATELESS}
+            list_output: "${LIST_OUTPUT}"
+            cluster_provider_strategy: "in-cluster"
+            toolsets: ${toolsets_json}
+            server_instructions: "NoETL runtime observer (Mcp resource ${MCP_PATH}). Read-only Kubernetes diagnostics."
+            denied_resources:
+              - group: ""
+                version: "v1"
+                kind: "Secret"
+              - group: ""
+                version: "v1"
+                kind: "ServiceAccountToken"
+          rbac:
+            create: true
+            # The runtime agent (automation/agents/kubernetes/runtime)
+            # exposes commands like pods, namespaces, events, top — the
+            # default chart RBAC is namespace-scoped, which would cause
+            # those commands to come back empty or RBAC-denied. Mirror
+            # the runtime-observer ClusterRole the existing in-tree
+            # automation/development/mcp_kubernetes.yaml ships so the
+            # lifecycle.deploy agent doesn't regress permissions when
+            # an operator switches from the dev playbook to the
+            # catalog-driven Mcp lifecycle. Override per Mcp resource
+            # by templating these blocks via spec.deployment.* in a
+            # follow-up if a tighter scope is required.
+            extraClusterRoles:
+              - name: runtime-observer
+                rules:
+                  - apiGroups: [""]
+                    resources:
+                      - namespaces
+                      - nodes
+                      - pods
+                      - pods/log
+                      - pods/status
+                      - services
+                      - endpoints
+                      - persistentvolumeclaims
+                      - configmaps
+                      - events
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["apps"]
+                    resources:
+                      - deployments
+                      - replicasets
+                      - statefulsets
+                      - daemonsets
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["batch"]
+                    resources:
+                      - jobs
+                      - cronjobs
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["events.k8s.io"]
+                    resources: ["events"]
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["metrics.k8s.io"]
+                    resources: ["pods", "nodes"]
+                    verbs: ["get", "list"]
+            extraClusterRoleBindings:
+              - name: runtime-observer
+                roleRef:
+                  name: runtime-observer
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          EOF
+
+          helm upgrade --install "$RELEASE_NAME" "$CHART_REF" \
+            --version "$CHART_VERSION" \
+            --namespace "$NAMESPACE" --create-namespace \
+            -f "$values_file"
+
+          kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE_NAME" --timeout=180s
+          echo "DEPLOYED ${RELEASE_NAME} v${IMAGE_TAG} in namespace ${NAMESPACE} for Mcp resource ${MCP_PATH}"
+    next:
+      - step: end
+
+  - step: end
+    desc: Return the deploy summary for callers
+    tool:
+      kind: python
+      input:
+        deploy_output: '{{ deploy }}'
+        mcp_path: '{{ workload.mcp_resource.path }}'
+        verb: '{{ workload.verb }}'
+      code: |
+        # Pass through the shell step's stdout so the GUI's run dialog
+        # shows the helm upgrade summary inline (without this the agent's
+        # playbook.completed.result would be the bare noop ack — see
+        # noetl/ops#13 for the parallel issue on the runtime agent).
+        result = {
+            "status": "completed",
+            "agent": "kubernetes_mcp_lifecycle_deploy",
+            "verb": verb,
+            "mcp_path": mcp_path,
+            "text": (deploy_output if isinstance(deploy_output, str) else str(deploy_output)),
+        }

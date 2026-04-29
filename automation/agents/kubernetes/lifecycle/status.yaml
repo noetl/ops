@@ -1,0 +1,97 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kubernetes_mcp_lifecycle_status
+  path: automation/agents/kubernetes/lifecycle/status
+  description: |
+    Lifecycle agent: report deployment + service + pod state for the
+    kubernetes-mcp-server described by an Mcp catalog resource, and
+    probe the in-cluster healthz endpoint with a short-lived curl pod.
+
+    Read-only. Safe to grant broadly to non-admin roles. The dispatcher
+    sends the resolved Mcp resource as workload.mcp_resource.
+  agent: true
+  capabilities:
+    - kubernetes
+    - mcp:lifecycle:status
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  mcp_resource:
+    path: ""
+    version: 0
+    spec:
+      deployment: {}
+    metadata: {}
+  verb: status
+
+  expected_kube_context: "kind-noetl"
+
+workflow:
+  - step: status
+    desc: kubectl get deploy/svc/pod + curl healthz
+    tool:
+      kind: shell
+      cmds:
+        - |
+          # -e so a real kubectl/RBAC failure is surfaced instead of being
+          # silently downgraded to "ok" later. Commands that may legitimately
+          # fail (the deploy/svc/pods listing on a partially-deployed
+          # namespace) are explicitly suffixed with || true; the healthz
+          # probe is gated by an if-block so its non-zero exit is observed.
+          set -euo pipefail
+          NAMESPACE='{{ workload.mcp_resource.spec.deployment.namespace | default("mcp") }}'
+          RELEASE_NAME='{{ workload.mcp_resource.spec.deployment.release_name | default("kubernetes-mcp-server") }}'
+          SERVICE_PORT='{{ workload.mcp_resource.spec.deployment.service_port | default(8080) }}'
+          EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
+
+          CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+          if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+            echo "WARN: current context '$CURRENT_CONTEXT' differs from expected '$EXPECTED_CONTEXT' — reporting against current."
+          fi
+
+          if ! kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
+            echo "namespace '$NAMESPACE' not found — release not deployed"
+            exit 0
+          fi
+
+          echo "--- workload ---"
+          kubectl -n "$NAMESPACE" get deploy,svc,pods -o wide || true
+
+          echo
+          echo "--- healthz ---"
+          # Use a unique pod name per execution so concurrent status
+          # runs (or a status run overlapping with anything else using
+          # the same pod name) don't race each other and corrupt the
+          # captured healthz output.
+          HEALTHCHECK_POD="mcp-health-check-$$-$(date +%s%N | tail -c 8)"
+          trap 'kubectl -n "$NAMESPACE" delete pod "$HEALTHCHECK_POD" --ignore-not-found >/dev/null 2>&1 || true' EXIT
+          if kubectl -n "$NAMESPACE" run "$HEALTHCHECK_POD" --rm -i --restart=Never \
+              --image=curlimages/curl:8.10.1 --quiet -- \
+              sh -c "curl -fsS 'http://${RELEASE_NAME}.${NAMESPACE}.svc.cluster.local:${SERVICE_PORT}/healthz' 2>/dev/null && echo ok"; then
+            echo "healthz: ok"
+          else
+            echo "healthz: failed"
+          fi
+    next:
+      - step: end
+
+  - step: end
+    desc: Return status output
+    tool:
+      kind: python
+      input:
+        status_output: '{{ status }}'
+        mcp_path: '{{ workload.mcp_resource.path }}'
+        verb: '{{ workload.verb }}'
+      code: |
+        result = {
+            "status": "completed",
+            "agent": "kubernetes_mcp_lifecycle_status",
+            "verb": verb,
+            "mcp_path": mcp_path,
+            "text": (status_output if isinstance(status_output, str) else str(status_output)),
+        }
