@@ -21,7 +21,9 @@ workload:
   # Private Gateway service inside GKE
   gateway_namespace: gateway
   gateway_service_name: gateway
-  gateway_service_port: "8090"
+  # Kubernetes Service port. The gateway container listens on 8090, but the
+  # Helm Service exposes port 80 and forwards to targetPort 8090.
+  gateway_service_port: "80"
   gateway_deployment_name: gateway
   gateway_service_type: ClusterIP
 
@@ -433,6 +435,11 @@ workflow:
 
             (
               cd "$GUI_REPO_DIR"
+              if [ -n "$CF_ACCOUNT_ID_INPUT" ]; then
+                export CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID_INPUT"
+                export CF_ACCOUNT_ID="$CF_ACCOUNT_ID_INPUT"
+              fi
+
               npm ci
               VITE_API_MODE=gateway \
               VITE_API_BASE_URL="$GATEWAY_PUBLIC_URL" \
