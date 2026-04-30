@@ -166,6 +166,8 @@ workload:
   noetl_worker_postgres_pool_timeout_seconds: 60
   noetl_worker_max_inflight_commands: 4
   noetl_worker_max_inflight_db_commands: 3
+  noetl_worker_nats_max_deliver: 1000
+  noetl_worker_nats_max_ack_pending: 64
   noetl_tempstore_max_ref_cache_entries: 50000
   noetl_tempstore_max_memory_cache_entries: 20000
   demo_can_read_noetl_schema: true
@@ -188,6 +190,7 @@ workload:
   gateway_cors_include_localhost: true
 
   # GUI settings
+  deploy_gui: true
   gui_service_type: LoadBalancer
   gui_load_balancer_ip: "35.226.162.30"
 
@@ -211,21 +214,31 @@ workflow:
             exit 1
           fi
 
-          # Guardrail: if ingress is disabled, GUI/Gateway must stay publicly reachable via LB.
+          # Guardrail: if ingress is disabled, deployed public services must stay reachable via LB.
           if [ "{{ workload.action }}" = "deploy" ] || [ "{{ workload.action }}" = "provision-deploy" ]; then
             if [ "{{ workload.deploy_ingress }}" != "true" ]; then
-              if [ "{{ workload.gateway_service_type }}" != "LoadBalancer" ] || [ "{{ workload.gui_service_type }}" != "LoadBalancer" ]; then
-                echo "ERROR: deploy_ingress=false requires gateway_service_type=LoadBalancer and gui_service_type=LoadBalancer"
-                echo "       Otherwise public domains will fail with Cloudflare 522."
+              if [ "{{ workload.gateway_service_type }}" != "LoadBalancer" ]; then
+                echo "ERROR: deploy_ingress=false requires gateway_service_type=LoadBalancer"
+                echo "       Otherwise the public gateway domain will fail with Cloudflare 522."
+                exit 1
+              fi
+              if [ "{{ workload.deploy_gui }}" = "true" ] && [ "{{ workload.gui_service_type }}" != "LoadBalancer" ]; then
+                echo "ERROR: deploy_ingress=false with deploy_gui=true requires gui_service_type=LoadBalancer"
+                echo "       Set deploy_gui=false when the GUI is hosted outside GKE, such as Cloudflare Pages."
                 exit 1
               fi
             fi
 
             # Guardrail: ingress with placeholder example.com hosts causes cert provisioning failures.
             if [ "{{ workload.deploy_ingress }}" = "true" ]; then
-              if [ "{{ workload.noetl_public_host }}" = "api.example.com" ] || [ "{{ workload.gateway_public_host }}" = "gateway.example.com" ] || [ "{{ workload.gui_public_host }}" = "gui.example.com" ]; then
+              if [ "{{ workload.noetl_public_host }}" = "api.example.com" ] || [ "{{ workload.gateway_public_host }}" = "gateway.example.com" ]; then
                 echo "ERROR: ingress hosts are still placeholder example.com values."
-                echo "       Set noetl_public_host/gateway_public_host/gui_public_host to real DNS names before deploy."
+                echo "       Set noetl_public_host/gateway_public_host to real DNS names before deploy."
+                exit 1
+              fi
+              if [ "{{ workload.deploy_gui }}" = "true" ] && [ "{{ workload.gui_public_host }}" = "gui.example.com" ]; then
+                echo "ERROR: GUI ingress host is still the placeholder gui.example.com value."
+                echo "       Set gui_public_host to a real DNS name or set deploy_gui=false."
                 exit 1
               fi
             fi
@@ -267,7 +280,7 @@ workflow:
           echo "    --set gateway_load_balancer_ip=34.71.6.63 \\"
           echo "    --set build_images=false"
           echo ""
-          echo "  # Expose GUI and gateway without exposing NoETL API"
+          echo "  # Expose gateway only and host GUI outside GKE"
           echo "  noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \\"
           echo "    --set action=deploy \\"
           echo "    --set project_id=my-gcp-project \\"
@@ -275,8 +288,7 @@ workflow:
           echo "    --set deploy_ingress=false \\"
           echo "    --set gateway_service_type=LoadBalancer \\"
           echo "    --set gateway_load_balancer_ip=34.71.6.63 \\"
-          echo "    --set gui_service_type=LoadBalancer \\"
-          echo "    --set gui_load_balancer_ip=34.71.6.64 \\"
+          echo "    --set deploy_gui=false \\"
           echo "    --set cloud_sql_enable_private_ip=true \\"
           echo "    --set cloud_sql_enable_public_ip=false \\"
           echo "    --set gui_gateway_public_url=https://gateway.example.com \\"
@@ -1458,6 +1470,42 @@ workflow:
           kubectl rollout status deployment/noetl-server -n noetl --timeout=300s
           kubectl rollout status deployment/noetl-worker -n noetl --timeout=300s
     next:
+      - step: ensure_noetl_nats_consumer
+
+  - step: ensure_noetl_nats_consumer
+    desc: Ensure NoETL worker durable NATS consumer exists before dispatching bootstrap playbooks
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -e
+          NATS_SERVER="nats://{{ workload.nats_user }}:{{ workload.nats_password }}@nats:4222"
+          STREAM="NOETL_COMMANDS"
+          SUBJECT="noetl.commands"
+          CONSUMER="noetl_worker_pool"
+
+          echo "Ensuring NATS stream and durable consumer: $STREAM/$CONSUMER"
+          kubectl -n nats exec deploy/nats-box -- nats --server "$NATS_SERVER" stream info "$STREAM" >/dev/null 2>&1 || \
+            kubectl -n nats exec deploy/nats-box -- nats --server "$NATS_SERVER" stream add "$STREAM" \
+              --subjects "$SUBJECT" \
+              --storage memory \
+              --retention limits \
+              --max-age 1h \
+              --defaults
+
+          kubectl -n nats exec deploy/nats-box -- nats --server "$NATS_SERVER" consumer info "$STREAM" "$CONSUMER" >/dev/null 2>&1 || \
+            kubectl -n nats exec deploy/nats-box -- nats --server "$NATS_SERVER" consumer add "$STREAM" "$CONSUMER" \
+              --pull \
+              --filter "$SUBJECT" \
+              --ack explicit \
+              --deliver all \
+              --replay instant \
+              --max-deliver {{ workload.noetl_worker_nats_max_deliver }} \
+              --max-pending {{ workload.noetl_worker_nats_max_ack_pending }} \
+              --wait 960s \
+              --defaults
+          kubectl -n nats exec deploy/nats-box -- nats --server "$NATS_SERVER" consumer info "$STREAM" "$CONSUMER" | sed -n '1,80p'
+    next:
       - step: bootstrap_gateway_auth
 
   - step: bootstrap_gateway_auth
@@ -1832,6 +1880,11 @@ workflow:
       cmds:
         - |
           set -e
+          if [ "{{ workload.deploy_gui }}" != "true" ]; then
+            echo "deploy_gui=false, skipping GUI static IP reservation"
+            exit 0
+          fi
+
           if [ "{{ workload.gui_service_type }}" != "LoadBalancer" ]; then
             echo "GUI service type is not LoadBalancer, skipping static IP reservation"
             exit 0
@@ -1877,6 +1930,11 @@ workflow:
       cmds:
         - |
           set -e
+          if [ "{{ workload.deploy_gui }}" != "true" ]; then
+            echo "deploy_gui=false, skipping GUI Helm deploy"
+            exit 0
+          fi
+
           REGISTRY="{{ workload.region }}-docker.pkg.dev/{{ workload.project_id }}/{{ workload.repository_id }}"
           GUI_IMAGE="{{ workload.gui_image_repository }}"
           [ -z "$GUI_IMAGE" ] && GUI_IMAGE="$REGISTRY/noetl-gui"
@@ -1937,6 +1995,12 @@ workflow:
               echo "Skipping PostgreSQL removal: NoETL currently points to '$CURRENT_DB_HOST' (expected '{{ workload.postgres_host }}')"
             fi
           fi
+
+          if [ "{{ workload.deploy_gui }}" != "true" ]; then
+            echo "deploy_gui=false -> removing in-cluster GUI release"
+            helm uninstall noetl-gui -n gui --ignore-not-found
+            kubectl delete namespace gui --ignore-not-found=true
+          fi
     next:
       - step: check_status
 
@@ -1957,17 +2021,29 @@ workflow:
           echo "========== Workloads =========="
           kubectl get deploy -n noetl
           kubectl get deploy -n gateway
-          kubectl get deploy -n gui
+          if kubectl get namespace gui >/dev/null 2>&1; then
+            kubectl get deploy -n gui
+          else
+            echo "gui namespace not present (deploy_gui=false or external GUI hosting)"
+          fi
           echo ""
           echo "========== Services =========="
           kubectl get svc -n noetl
           kubectl get svc -n gateway
-          kubectl get svc -n gui
+          if kubectl get namespace gui >/dev/null 2>&1; then
+            kubectl get svc -n gui
+          else
+            echo "gui namespace not present (deploy_gui=false or external GUI hosting)"
+          fi
           echo ""
           echo "========== Ingress =========="
           kubectl get ingress -n noetl
           kubectl get ingress -n gateway
-          kubectl get ingress -n gui
+          if kubectl get namespace gui >/dev/null 2>&1; then
+            kubectl get ingress -n gui
+          else
+            echo "gui namespace not present (deploy_gui=false or external GUI hosting)"
+          fi
     next:
       - when: "{{ workload.action == 'destroy' }}"
         then:

@@ -71,13 +71,14 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set gui_public_host=gui.example.com
 ```
 
-## Cloud SQL Private IP + Static Public LBs (mestumre.dev)
+## Cloud SQL Private IP + Gateway LB + Cloudflare GUI (mestumre.dev)
 
 Use this deploy profile for:
 - existing cluster `noetl-cluster`
 - Cloud SQL + PgBouncer (no in-cluster PostgreSQL)
 - private-only Cloud SQL IP
-- static public IPs for gateway and GUI (Cloudflare DNS targets)
+- static public IP for the gateway only
+- GUI hosted outside GKE, for example Cloudflare Pages at `mestumre.dev`
 
 ```bash
 noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
@@ -87,7 +88,9 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set cluster_name=noetl-cluster \
   --set build_images=false \
   --set noetl_image_repository=ghcr.io/noetl/noetl \
-  --set noetl_image_tag=v2.8.9 \
+  --set noetl_image_tag=v2.29.0 \
+  --set gateway_image_repository=ghcr.io/noetl/gateway \
+  --set gateway_image_tag=v2.10.0 \
   --set use_cloud_sql=true \
   --set cloud_sql_enable_private_ip=true \
   --set cloud_sql_enable_public_ip=false \
@@ -97,14 +100,18 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set deploy_ingress=false \
   --set gateway_service_type=LoadBalancer \
   --set gateway_load_balancer_ip=34.46.180.136 \
-  --set gui_service_type=LoadBalancer \
-  --set gui_load_balancer_ip=35.226.162.30 \
+  --set deploy_gui=false \
   --set gateway_public_host=gateway.mestumre.dev \
   --set gui_public_host=mestumre.dev \
   --set gateway_public_url=https://gateway.mestumre.dev \
   --set gui_gateway_public_url=https://gateway.mestumre.dev \
   --set gateway_cors_allowed_domains='mestumre.dev,gateway.mestumre.dev'
 ```
+
+With `deploy_gui=false`, the playbook skips GUI static IP reservation,
+skips the in-cluster GUI Helm deployment, and removes any existing
+`noetl-gui` release/`gui` namespace. Deploy the GUI separately as a static
+site that talks to `https://gateway.mestumre.dev`.
 
 ## Gateway Auth Bootstrap
 
