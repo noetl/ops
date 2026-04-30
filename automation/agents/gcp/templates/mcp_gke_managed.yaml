@@ -1,0 +1,49 @@
+apiVersion: noetl.io/v2
+kind: Mcp
+metadata:
+  name: gcp-gke
+  path: mcp/gcp
+  description: |
+    Google Cloud managed GKE MCP endpoint (read-only) for cluster and
+    Kubernetes-resource observability. This resource does not deploy an
+    in-cluster MCP server; NoETL worker executions call Google's
+    container.googleapis.com MCP endpoint with workload identity or an
+    explicitly supplied access token.
+  tags:
+    - gcp
+    - gke
+    - google-cloud
+    - observability
+    - runtime
+    - read-only
+  terminal:
+    workspace: gcp
+    scopes:
+      - /mcp/gcp
+
+spec:
+  url: https://container.googleapis.com/mcp/read-only
+  protocol: mcp/1.0
+  provider: google-cloud
+  managed: true
+  tools: []
+
+  discovery:
+    refresh_via: mcp/gcp/gke
+
+  runtime:
+    agent: mcp/gcp/gke
+
+  auth:
+    type: google_adc
+    metadata_server: true
+    token_env: GOOGLE_OAUTH_ACCESS_TOKEN
+    scope: https://www.googleapis.com/auth/cloud-platform
+
+  deployment:
+    mode: remote-managed
+    endpoint: https://container.googleapis.com/mcp/read-only
+    required_google_services:
+      - container.googleapis.com
+    recommended_roles:
+      - roles/container.viewer
