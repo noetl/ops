@@ -1,0 +1,538 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: cloudflare_gke_gateway_edge
+  path: automation/cloudflare/gke_gateway_edge
+  description: Deploy the NoETL GUI to Cloudflare Pages and expose the private GKE Gateway through Cloudflare Tunnel.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help # deploy, tunnel, pages, status, remove-tunnel, help
+
+  # GKE target
+  project_id: noetl-demo-19700101
+  region: us-central1
+  cluster_name: noetl-cluster
+  kube_context: "" # optional guard; when set, refuse to run against a different context after get-credentials
+
+  # Private Gateway service inside GKE
+  gateway_namespace: gateway
+  gateway_service_name: gateway
+  gateway_service_port: "8090"
+  gateway_deployment_name: gateway
+  gateway_service_type: ClusterIP
+
+  # Cloudflare
+  cloudflare_api_token_env: CLOUDFLARE_API_TOKEN
+  cloudflare_account_id: "" # auto-discover when the token can list exactly one account
+  cloudflare_zone_name: mestumre.dev
+  tunnel_name: noetl-gke-gateway
+  gateway_hostname: gateway.mestumre.dev
+  extra_gateway_hostnames: "" # comma-separated; each hostname routes to the same GKE Gateway service
+  tunnel_namespace: cloudflare
+  tunnel_secret_name: noetl-gke-gateway-tunnel
+  tunnel_deployment_name: noetl-gke-gateway-tunnel
+  tunnel_replicas: "2"
+  cloudflared_image: cloudflare/cloudflared:latest
+
+  # Cloudflare Pages GUI
+  deploy_pages: "true"
+  gui_repo_dir: "../gui"
+  pages_project_name: noetl-gui
+  pages_branch: main
+  gui_domain: mestumre.dev
+  gateway_public_url: https://gateway.mestumre.dev
+  allow_skip_auth: "false"
+  auth0_domain: ""
+  auth0_client_id: ""
+  auth0_redirect_uri: "https://mestumre.dev/login"
+
+workflow:
+  - step: run
+    desc: Run selected Cloudflare edge action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+
+          ACTION="{{ workload.action }}"
+          PROJECT_ID="{{ workload.project_id }}"
+          REGION="{{ workload.region }}"
+          CLUSTER_NAME="{{ workload.cluster_name }}"
+          KUBE_CONTEXT="{{ workload.kube_context }}"
+          GATEWAY_NAMESPACE="{{ workload.gateway_namespace }}"
+          GATEWAY_SERVICE_NAME="{{ workload.gateway_service_name }}"
+          GATEWAY_SERVICE_PORT="{{ workload.gateway_service_port }}"
+          GATEWAY_DEPLOYMENT_NAME="{{ workload.gateway_deployment_name }}"
+          GATEWAY_SERVICE_TYPE="{{ workload.gateway_service_type }}"
+          CF_TOKEN_ENV="{{ workload.cloudflare_api_token_env }}"
+          CF_ACCOUNT_ID_INPUT="{{ workload.cloudflare_account_id }}"
+          CF_ZONE_NAME="{{ workload.cloudflare_zone_name }}"
+          TUNNEL_NAME="{{ workload.tunnel_name }}"
+          GATEWAY_HOSTNAME="{{ workload.gateway_hostname }}"
+          EXTRA_GATEWAY_HOSTNAMES="{{ workload.extra_gateway_hostnames }}"
+          TUNNEL_NAMESPACE="{{ workload.tunnel_namespace }}"
+          TUNNEL_SECRET_NAME="{{ workload.tunnel_secret_name }}"
+          TUNNEL_DEPLOYMENT_NAME="{{ workload.tunnel_deployment_name }}"
+          TUNNEL_REPLICAS="{{ workload.tunnel_replicas }}"
+          CLOUDFLARED_IMAGE="{{ workload.cloudflared_image }}"
+          DEPLOY_PAGES="{{ workload.deploy_pages }}"
+          GUI_REPO_DIR="{{ workload.gui_repo_dir }}"
+          PAGES_PROJECT_NAME="{{ workload.pages_project_name }}"
+          PAGES_BRANCH="{{ workload.pages_branch }}"
+          GUI_DOMAIN="{{ workload.gui_domain }}"
+          GATEWAY_PUBLIC_URL="{{ workload.gateway_public_url }}"
+          ALLOW_SKIP_AUTH="{{ workload.allow_skip_auth }}"
+          AUTH0_DOMAIN="{{ workload.auth0_domain }}"
+          AUTH0_CLIENT_ID="{{ workload.auth0_client_id }}"
+          AUTH0_REDIRECT_URI="{{ workload.auth0_redirect_uri }}"
+
+          TMP_DIR="$(mktemp -d)"
+          cleanup() {
+            rm -rf "$TMP_DIR"
+          }
+          trap cleanup EXIT
+
+          require_cmd() {
+            command -v "$1" >/dev/null 2>&1 || {
+              echo "ERROR: required command not found: $1"
+              exit 1
+            }
+          }
+
+          require_env() {
+            local name="$1"
+            if [ -z "${!name:-}" ]; then
+              echo "ERROR: environment variable $name is required."
+              echo "Export it in your local shell; do not put it in a playbook or commit it."
+              exit 1
+            fi
+          }
+
+          configure_kube() {
+            require_cmd gcloud
+            require_cmd kubectl
+            gcloud container clusters get-credentials "$CLUSTER_NAME" \
+              --region "$REGION" \
+              --project "$PROJECT_ID"
+
+            local current_context
+            current_context="$(kubectl config current-context 2>/dev/null || true)"
+            echo "kubectl context: $current_context"
+            if [ -n "$KUBE_CONTEXT" ] && [ "$current_context" != "$KUBE_CONTEXT" ]; then
+              echo "ERROR: refusing to run against kubectl context '$current_context'."
+              echo "Expected: $KUBE_CONTEXT"
+              exit 1
+            fi
+          }
+
+          ensure_gateway_private() {
+            configure_kube
+            echo "Ensuring gateway service is private..."
+            kubectl -n "$GATEWAY_NAMESPACE" get svc "$GATEWAY_SERVICE_NAME" >/dev/null
+            kubectl -n "$GATEWAY_NAMESPACE" patch svc "$GATEWAY_SERVICE_NAME" \
+              --type='merge' \
+              -p "{\"spec\":{\"type\":\"$GATEWAY_SERVICE_TYPE\"}}" >/dev/null
+            kubectl -n "$GATEWAY_NAMESPACE" rollout status "deployment/$GATEWAY_DEPLOYMENT_NAME" --timeout=180s
+            kubectl -n "$GATEWAY_NAMESPACE" get svc "$GATEWAY_SERVICE_NAME"
+          }
+
+          build_hostnames_csv() {
+            if [ -n "$EXTRA_GATEWAY_HOSTNAMES" ]; then
+              printf '%s,%s' "$GATEWAY_HOSTNAME" "$EXTRA_GATEWAY_HOSTNAMES"
+            else
+              printf '%s' "$GATEWAY_HOSTNAME"
+            fi
+          }
+
+          configure_cloudflare_tunnel() {
+            require_cmd curl
+            require_cmd python3
+            require_env "$CF_TOKEN_ENV"
+
+            local state_file="$TMP_DIR/cloudflare-state.json"
+            export CF_STATE_FILE="$state_file"
+            export CF_TOKEN_VALUE="${!CF_TOKEN_ENV}"
+            export CF_ACCOUNT_ID_INPUT
+            export CF_ZONE_NAME
+            export TUNNEL_NAME
+            export GATEWAY_HOSTNAMES_CSV
+            export GATEWAY_TUNNEL_SERVICE_URL="http://${GATEWAY_SERVICE_NAME}.${GATEWAY_NAMESPACE}.svc.cluster.local:${GATEWAY_SERVICE_PORT}"
+            export GUI_DOMAIN
+            export PAGES_PROJECT_NAME
+            export CONFIGURE_PAGES_DOMAIN="$DEPLOY_PAGES"
+
+            python3 <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          API = "https://api.cloudflare.com/client/v4"
+          token = os.environ["CF_TOKEN_VALUE"]
+          state_file = os.environ["CF_STATE_FILE"]
+
+          def cf(method, path, body=None):
+              data = None
+              headers = {"Authorization": f"Bearer {token}"}
+              if body is not None:
+                  data = json.dumps(body).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(f"{API}{path}", data=data, method=method, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      raw = resp.read().decode("utf-8")
+              except urllib.error.HTTPError as exc:
+                  raw = exc.read().decode("utf-8", errors="replace")
+                  raise SystemExit(f"Cloudflare API {method} {path} failed with HTTP {exc.code}: {raw}") from exc
+              payload = json.loads(raw or "{}")
+              if not payload.get("success", False):
+                  raise SystemExit(f"Cloudflare API {method} {path} failed: {json.dumps(payload.get('errors') or payload)}")
+              return payload.get("result")
+
+          def paged_get(path):
+              result = cf("GET", path)
+              if isinstance(result, list):
+                  return result
+              if isinstance(result, dict):
+                  for key in ("result", "items", "data"):
+                      value = result.get(key)
+                      if isinstance(value, list):
+                          return value
+              return []
+
+          def account_id():
+              explicit = os.environ.get("CF_ACCOUNT_ID_INPUT", "").strip()
+              if explicit:
+                  return explicit
+              accounts = paged_get("/accounts")
+              if len(accounts) != 1:
+                  names = ", ".join(a.get("name", a.get("id", "unknown")) for a in accounts)
+                  raise SystemExit(
+                      "Cloudflare account could not be auto-discovered. "
+                      f"Accessible accounts={len(accounts)} [{names}]. "
+                      "Set workload.cloudflare_account_id."
+                  )
+              return accounts[0]["id"]
+
+          def all_zones():
+              zones = []
+              page = 1
+              while True:
+                  result = cf("GET", f"/zones?page={page}&per_page=50")
+                  if isinstance(result, list):
+                      chunk = result
+                      info = {}
+                  else:
+                      chunk = result.get("result", result.get("items", []))
+                      info = result.get("result_info", {})
+                  zones.extend(chunk)
+                  if info and page < int(info.get("total_pages", page)):
+                      page += 1
+                      continue
+                  break
+              return zones
+
+          def zone_for_hostname(hostname, zones):
+              hostname = hostname.rstrip(".").lower()
+              matches = [
+                  z for z in zones
+                  if hostname == z.get("name", "").lower()
+                  or hostname.endswith("." + z.get("name", "").lower())
+              ]
+              if not matches:
+                  raise SystemExit(f"No accessible Cloudflare zone found for hostname {hostname}")
+              matches.sort(key=lambda z: len(z.get("name", "")), reverse=True)
+              return matches[0]
+
+          def list_tunnels(acct, name):
+              path = f"/accounts/{acct}/cfd_tunnel?is_deleted=false&name={urllib.parse.quote(name)}"
+              result = cf("GET", path)
+              if isinstance(result, list):
+                  return result
+              if isinstance(result, dict):
+                  return result.get("result") or result.get("items") or []
+              return []
+
+          def tunnel_token(acct, tunnel_id, maybe_token=None):
+              if maybe_token:
+                  return maybe_token
+              result = cf("GET", f"/accounts/{acct}/cfd_tunnel/{tunnel_id}/token")
+              if isinstance(result, str):
+                  return result
+              if isinstance(result, dict):
+                  return result.get("token") or result.get("value") or result.get("result")
+              raise SystemExit("Cloudflare tunnel token endpoint returned an unexpected response shape")
+
+          acct = account_id()
+          zones = all_zones()
+          zone_name = os.environ.get("CF_ZONE_NAME", "").strip()
+          if zone_name and not any(z.get("name") == zone_name for z in zones):
+              raise SystemExit(f"Configured Cloudflare zone is not accessible: {zone_name}")
+
+          tunnel_name = os.environ["TUNNEL_NAME"].strip()
+          tunnels = [t for t in list_tunnels(acct, tunnel_name) if t.get("name") == tunnel_name and not t.get("deleted_at")]
+          if tunnels:
+              tunnel = tunnels[0]
+              created = False
+          else:
+              tunnel = cf("POST", f"/accounts/{acct}/cfd_tunnel", {"name": tunnel_name, "config_src": "cloudflare"})
+              created = True
+
+          tunnel_id = tunnel["id"]
+          token_value = tunnel_token(acct, tunnel_id, tunnel.get("token"))
+          service = os.environ["GATEWAY_TUNNEL_SERVICE_URL"]
+          hostnames = [
+              h.strip().rstrip(".").lower()
+              for h in os.environ["GATEWAY_HOSTNAMES_CSV"].replace("\n", ",").split(",")
+              if h.strip()
+          ]
+          if not hostnames:
+              raise SystemExit("No gateway hostnames configured")
+
+          ingress = [{"hostname": h, "service": service, "originRequest": {}} for h in hostnames]
+          ingress.append({"service": "http_status:404"})
+          cf("PUT", f"/accounts/{acct}/cfd_tunnel/{tunnel_id}/configurations", {"config": {"ingress": ingress}})
+
+          cname_target = f"{tunnel_id}.cfargotunnel.com"
+          dns_actions = []
+          for hostname in hostnames:
+              zone = zone_for_hostname(hostname, zones)
+              zone_id = zone["id"]
+              existing = cf("GET", f"/zones/{zone_id}/dns_records?name={urllib.parse.quote(hostname)}")
+              records = existing if isinstance(existing, list) else existing.get("result", existing.get("items", []))
+              for record in records:
+                  if record.get("type") != "CNAME":
+                      cf("DELETE", f"/zones/{zone_id}/dns_records/{record['id']}")
+                      dns_actions.append(f"deleted {record.get('type')} {hostname}")
+              cname = next((r for r in records if r.get("type") == "CNAME"), None)
+              body = {"type": "CNAME", "name": hostname, "content": cname_target, "proxied": True, "ttl": 1}
+              if cname:
+                  cf("PUT", f"/zones/{zone_id}/dns_records/{cname['id']}", body)
+                  dns_actions.append(f"updated CNAME {hostname}")
+              else:
+                  cf("POST", f"/zones/{zone_id}/dns_records", body)
+                  dns_actions.append(f"created CNAME {hostname}")
+
+          pages_domain = os.environ.get("GUI_DOMAIN", "").strip().rstrip(".").lower()
+          pages_project = os.environ.get("PAGES_PROJECT_NAME", "").strip()
+          pages_domain_result = "skipped"
+          if os.environ.get("CONFIGURE_PAGES_DOMAIN", "false").lower() == "true" and pages_domain and pages_project:
+              try:
+                  cf("GET", f"/accounts/{acct}/pages/projects/{urllib.parse.quote(pages_project)}/domains/{urllib.parse.quote(pages_domain)}")
+                  pages_domain_result = "already associated"
+              except SystemExit:
+                  cf("POST", f"/accounts/{acct}/pages/projects/{urllib.parse.quote(pages_project)}/domains", {"name": pages_domain})
+                  pages_domain_result = "associated"
+
+          with open(state_file, "w", encoding="utf-8") as fh:
+              json.dump(
+                  {
+                      "account_id": acct,
+                      "tunnel_id": tunnel_id,
+                      "tunnel_name": tunnel_name,
+                      "tunnel_created": created,
+                      "tunnel_token": token_value,
+                      "hostnames": hostnames,
+                      "service": service,
+                      "dns_actions": dns_actions,
+                      "pages_domain": pages_domain_result,
+                  },
+                  fh,
+              )
+
+          print(f"Cloudflare tunnel ready: {tunnel_name} ({tunnel_id})")
+          print(f"Tunnel hostnames: {', '.join(hostnames)}")
+          print(f"Tunnel service: {service}")
+          print(f"DNS actions: {', '.join(dns_actions)}")
+          print(f"Pages custom domain: {pages_domain_result}")
+          PY
+
+            python3 - "$state_file" "$TMP_DIR/token" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              data = json.load(fh)
+          with open(sys.argv[2], "w", encoding="utf-8") as fh:
+              fh.write(data["tunnel_token"])
+          PY
+          }
+
+          deploy_cloudflared() {
+            local state_file="$CF_STATE_FILE"
+            local token_file="$TMP_DIR/token"
+            kubectl create namespace "$TUNNEL_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+            kubectl -n "$TUNNEL_NAMESPACE" create secret generic "$TUNNEL_SECRET_NAME" \
+              --from-file=token="$token_file" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            cat <<YAML | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${TUNNEL_DEPLOYMENT_NAME}
+            namespace: ${TUNNEL_NAMESPACE}
+            labels:
+              app: ${TUNNEL_DEPLOYMENT_NAME}
+          spec:
+            replicas: ${TUNNEL_REPLICAS}
+            selector:
+              matchLabels:
+                app: ${TUNNEL_DEPLOYMENT_NAME}
+            template:
+              metadata:
+                labels:
+                  app: ${TUNNEL_DEPLOYMENT_NAME}
+              spec:
+                containers:
+                  - name: cloudflared
+                    image: ${CLOUDFLARED_IMAGE}
+                    imagePullPolicy: Always
+                    args:
+                      - tunnel
+                      - --no-autoupdate
+                      - run
+                      - --token
+                      - \$(TUNNEL_TOKEN)
+                    env:
+                      - name: TUNNEL_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${TUNNEL_SECRET_NAME}
+                            key: token
+                    resources:
+                      requests:
+                        cpu: 50m
+                        memory: 64Mi
+                      limits:
+                        cpu: 500m
+                        memory: 256Mi
+          YAML
+
+            kubectl -n "$TUNNEL_NAMESPACE" rollout status "deployment/$TUNNEL_DEPLOYMENT_NAME" --timeout=180s
+            kubectl -n "$TUNNEL_NAMESPACE" get pods -l "app=$TUNNEL_DEPLOYMENT_NAME"
+          }
+
+          deploy_pages() {
+            if [ "$DEPLOY_PAGES" != "true" ]; then
+              echo "deploy_pages=false, skipping Cloudflare Pages upload"
+              return
+            fi
+            require_cmd npm
+            require_env "$CF_TOKEN_ENV"
+            if [ ! -d "$GUI_REPO_DIR" ]; then
+              echo "ERROR: GUI repository not found: $GUI_REPO_DIR"
+              exit 1
+            fi
+
+            (
+              cd "$GUI_REPO_DIR"
+              npm ci
+              VITE_API_MODE=gateway \
+              VITE_API_BASE_URL="$GATEWAY_PUBLIC_URL" \
+              VITE_GATEWAY_URL="$GATEWAY_PUBLIC_URL" \
+              VITE_ALLOW_SKIP_AUTH="$ALLOW_SKIP_AUTH" \
+              VITE_AUTH0_DOMAIN="$AUTH0_DOMAIN" \
+              VITE_AUTH0_CLIENT_ID="$AUTH0_CLIENT_ID" \
+              VITE_AUTH0_REDIRECT_URI="$AUTH0_REDIRECT_URI" \
+              npm run build
+
+              npx --yes wrangler pages project create "$PAGES_PROJECT_NAME" \
+                --production-branch "$PAGES_BRANCH" >/dev/null 2>&1 || true
+
+              npx --yes wrangler pages deploy dist \
+                --project-name "$PAGES_PROJECT_NAME" \
+                --branch "$PAGES_BRANCH"
+            )
+          }
+
+          status() {
+            configure_kube
+            echo "Gateway service:"
+            kubectl -n "$GATEWAY_NAMESPACE" get svc "$GATEWAY_SERVICE_NAME" -o wide || true
+            echo ""
+            echo "Cloudflared:"
+            kubectl -n "$TUNNEL_NAMESPACE" get deploy,pods -l "app=$TUNNEL_DEPLOYMENT_NAME" || true
+            echo ""
+            echo "Public services:"
+            kubectl get svc -A | awk 'NR==1 || $5 != "<none>" {print}'
+          }
+
+          remove_tunnel() {
+            configure_kube
+            kubectl -n "$TUNNEL_NAMESPACE" delete deployment "$TUNNEL_DEPLOYMENT_NAME" --ignore-not-found=true
+            kubectl -n "$TUNNEL_NAMESPACE" delete secret "$TUNNEL_SECRET_NAME" --ignore-not-found=true
+          }
+
+          case "$ACTION" in
+            deploy)
+              require_env "$CF_TOKEN_ENV"
+              GATEWAY_HOSTNAMES_CSV="$(build_hostnames_csv)"
+              export GATEWAY_HOSTNAMES_CSV
+              ensure_gateway_private
+              deploy_pages
+              configure_cloudflare_tunnel
+              deploy_cloudflared
+              status
+              echo ""
+              echo "Smoke checks:"
+              curl -fsS "https://${GATEWAY_HOSTNAME}/health" || true
+              echo ""
+              curl -I "https://${GUI_DOMAIN}" || true
+              ;;
+
+            tunnel)
+              require_env "$CF_TOKEN_ENV"
+              GATEWAY_HOSTNAMES_CSV="$(build_hostnames_csv)"
+              export GATEWAY_HOSTNAMES_CSV
+              ensure_gateway_private
+              configure_cloudflare_tunnel
+              deploy_cloudflared
+              status
+              ;;
+
+            pages)
+              require_env "$CF_TOKEN_ENV"
+              deploy_pages
+              GATEWAY_HOSTNAMES_CSV="$(build_hostnames_csv)"
+              export GATEWAY_HOSTNAMES_CSV
+              configure_cloudflare_tunnel
+              ;;
+
+            status)
+              status
+              ;;
+
+            remove-tunnel)
+              remove_tunnel
+              ;;
+
+            help|*)
+              echo "Usage:"
+              echo "  noetl run automation/cloudflare/gke_gateway_edge.yaml --runtime local --set action=deploy"
+              echo ""
+              echo "Required local environment:"
+              echo "  export ${CF_TOKEN_ENV}=<Cloudflare API token>"
+              echo ""
+              echo "The token needs Cloudflare Pages Edit, DNS Edit for the zone, and Tunnel/Connector write permissions."
+              echo ""
+              echo "Useful settings:"
+              echo "  --set gateway_hostname=gateway.mestumre.dev"
+              echo "  --set extra_gateway_hostnames=gateway.example.com,api.example.net"
+              echo "  --set deploy_pages=false"
+              echo "  --set cloudflare_account_id=<account-id>  # required if token can access multiple accounts"
+              ;;
+          esac
+    next:
+      - step: end
+
+  - step: end
+    desc: End workflow
+    tool:
+      kind: noop
