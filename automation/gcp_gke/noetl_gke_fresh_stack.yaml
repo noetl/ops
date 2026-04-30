@@ -77,6 +77,9 @@ workload:
   deploy_postgres: false
   postgres_host: pgbouncer.postgres.svc.cluster.local
   postgres_port: "5432"
+  # Re-apply idempotent NoETL DDL even when tables already exist. Keep this on
+  # for Cloud SQL/PgBouncer deployments so merged schema/index changes land.
+  reapply_noetl_schema: true
 
   # Cloud SQL (single instance hosts both noetl + demo_noetl databases)
   cloud_sql_instance_name: noetl-shared-pg
@@ -1138,7 +1141,7 @@ workflow:
       cmds:
         - |
           set -e
-          SCHEMA_FILE="noetl/database/ddl/postgres/schema_ddl.sql"
+          SCHEMA_FILE="{{ workload.noetl_repo_dir }}/noetl/database/ddl/postgres/schema_ddl.sql"
           if [ ! -f "$SCHEMA_FILE" ]; then
             echo "WARNING: Schema file not found: $SCHEMA_FILE"
             echo "Skipping schema initialization"
@@ -1191,15 +1194,15 @@ workflow:
           fi
 
           TABLE_EXISTS=$(kubectl exec -n "$DB_CLIENT_NS" "$DB_CLIENT_POD" -- /bin/sh -c "PGPASSWORD={{ workload.postgres_password }} psql -h $PGHOST -p $PGPORT -U postgres -d noetl -tAc \"SELECT 1 FROM information_schema.tables WHERE table_schema='noetl' AND table_name='event'\"" 2>/dev/null || echo "")
-          if [ "$TABLE_EXISTS" = "1" ]; then
-            echo "NoETL schema already initialized"
+          if [ "$TABLE_EXISTS" = "1" ] && [ "{{ workload.reapply_noetl_schema }}" != "true" ]; then
+            echo "NoETL schema already initialized (reapply_noetl_schema=false)"
             exit 0
           fi
 
           kubectl exec -n "$DB_CLIENT_NS" "$DB_CLIENT_POD" -- /bin/sh -c "PGPASSWORD={{ workload.postgres_password }} psql -h $PGHOST -p $PGPORT -U postgres -d noetl -c \"CREATE SCHEMA IF NOT EXISTS noetl\""
           cat "$SCHEMA_FILE" | kubectl exec -i -n "$DB_CLIENT_NS" "$DB_CLIENT_POD" -- /bin/sh -c "PGPASSWORD={{ workload.postgres_password }} psql -h $PGHOST -p $PGPORT -U postgres -d noetl"
           kubectl exec -n "$DB_CLIENT_NS" "$DB_CLIENT_POD" -- /bin/sh -c "PGPASSWORD={{ workload.postgres_password }} psql -h $PGHOST -p $PGPORT -U postgres -d noetl -c \"GRANT ALL ON SCHEMA noetl TO noetl; GRANT ALL ON ALL TABLES IN SCHEMA noetl TO noetl; GRANT ALL ON ALL SEQUENCES IN SCHEMA noetl TO noetl;\""
-          echo "NoETL schema initialized"
+          echo "NoETL schema initialized/applied"
     next:
       - step: init_demo_database
 
@@ -1627,6 +1630,37 @@ workflow:
 
           if [ "$STATUS" != "COMPLETED" ]; then
             echo "ERROR: Timed out waiting for provision_auth_schema execution to complete"
+            exit 1
+          fi
+
+          EXEC_JSON=$(NOETL_USE_GATEWAY=0 noetl --server-url "$NOETL_URL" exec catalog://api_integration/auth0/setup_admin_permissions -r distributed --json)
+          EXEC_ID=$(printf '%s' "$EXEC_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("execution_id", ""))')
+
+          if [ -z "$EXEC_ID" ]; then
+            echo "ERROR: Failed to parse execution_id from setup_admin_permissions output"
+            echo "$EXEC_JSON"
+            exit 1
+          fi
+
+          echo "Waiting for setup_admin_permissions execution: $EXEC_ID"
+          STATUS=""
+          for _ in $(seq 1 90); do
+            STATUS=$(curl -fsS "$NOETL_URL/api/executions/$EXEC_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status", ""))')
+            case "$STATUS" in
+              COMPLETED)
+                break
+                ;;
+              FAILED|CANCELLED)
+                echo "ERROR: setup_admin_permissions execution ended with status=$STATUS"
+                curl -fsS "$NOETL_URL/api/executions/$EXEC_ID" | python3 -c "import json,sys; data=json.load(sys.stdin); [print(f\"{e.get('timestamp')} {e.get('event_type')} {e.get('node_name')} {e.get('error')}\") for e in data.get('events', []) if e.get('event_type') in ('command.failed','call.error','workflow.failed','playbook.failed')]"
+                exit 1
+                ;;
+            esac
+            sleep 2
+          done
+
+          if [ "$STATUS" != "COMPLETED" ]; then
+            echo "ERROR: Timed out waiting for setup_admin_permissions execution to complete"
             exit 1
           fi
 

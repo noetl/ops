@@ -1,0 +1,189 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: gcp_gke_mcp_runtime_agent
+  path: mcp/gcp/gke
+  description: Read-only Google Cloud GKE MCP agent backed by the managed container.googleapis.com endpoint
+  agent: true
+  terminal:
+    visible: true
+    workspace: gcp
+    scopes:
+      - /mcp/gcp
+      - /mcp/gcp/gke
+    commands:
+      - status
+      - tools
+      - call
+  capabilities:
+    - gcp-observability
+    - gke-observability
+    - runtime-diagnostics
+    - mcp:gcp
+
+workload:
+  server: gcp-gke
+  endpoint: "https://container.googleapis.com/mcp/read-only"
+  method: tools/list
+  tool: ""
+  arguments: {}
+  timeout_seconds: 60
+  access_token: ""
+
+workflow:
+  - step: call_gcp_mcp
+    desc: Call the managed Google Cloud GKE MCP endpoint from the NoETL worker
+    tool:
+      kind: python
+      input:
+        request:
+          server: "{{ workload.server }}"
+          endpoint: "{{ workload.endpoint }}"
+          method: "{{ workload.method }}"
+          tool: "{{ workload.tool }}"
+          arguments: "{{ workload.arguments | tojson }}"
+          timeout_seconds: "{{ workload.timeout_seconds }}"
+          access_token: "{{ workload.access_token }}"
+      code: |
+        import json
+        import os
+        import urllib.error
+        import urllib.request
+
+        def _parse_json_or_sse(body):
+          import json
+
+          text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body or "")
+          data_lines = []
+          for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("data:"):
+              payload = stripped[5:].strip()
+              if payload and payload != "[DONE]":
+                data_lines.append(payload)
+          candidate = "\n".join(data_lines) if data_lines else text
+          try:
+            return json.loads(candidate)
+          except Exception:
+            return {"text": text}
+
+        def _metadata_access_token(timeout):
+          import json
+          import urllib.request
+
+          metadata_url = (
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/token"
+          )
+          req = urllib.request.Request(
+            metadata_url,
+            headers={"Metadata-Flavor": "Google"},
+            method="GET",
+          )
+          with urllib.request.urlopen(req, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+          return payload.get("access_token") or ""
+
+        cfg = request if isinstance(request, dict) else {}
+        endpoint = str(cfg.get("endpoint") or "https://container.googleapis.com/mcp/read-only")
+        method = str(cfg.get("method") or "tools/list")
+        tool_name = str(cfg.get("tool") or "")
+        timeout = int(float(cfg.get("timeout_seconds") or 60))
+        raw_args = cfg.get("arguments") or {}
+        if isinstance(raw_args, str):
+          raw_args = raw_args.strip()
+          arguments = json.loads(raw_args) if raw_args else {}
+        elif isinstance(raw_args, dict):
+          arguments = raw_args
+        else:
+          arguments = {}
+
+        try:
+          access_token = str(cfg.get("access_token") or os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN") or "")
+          if not access_token:
+            access_token = _metadata_access_token(min(timeout, 10))
+
+          payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+          }
+          if method == "tools/call":
+            if not tool_name:
+              raise ValueError("workload.tool is required when workload.method is tools/call")
+            payload["params"] = {
+              "name": tool_name,
+              "arguments": arguments,
+            }
+
+          body = json.dumps(payload).encode("utf-8")
+          headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+          }
+          http_request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+          with urllib.request.urlopen(http_request, timeout=timeout) as response:
+            raw_body = response.read()
+            parsed = _parse_json_or_sse(raw_body)
+        except urllib.error.HTTPError as exc:
+          error_body = exc.read().decode("utf-8", errors="replace")
+          result = {
+            "status": "error",
+            "agent": "gcp_gke_mcp_runtime_agent",
+            "server": cfg.get("server") or "gcp-gke",
+            "method": method,
+            "tool": tool_name,
+            "arguments": arguments,
+            "error": f"HTTP {exc.code}: {error_body[:800]}",
+            "text": f"Google Cloud MCP call failed with HTTP {exc.code}",
+          }
+        except Exception as exc:
+          result = {
+            "status": "error",
+            "agent": "gcp_gke_mcp_runtime_agent",
+            "server": cfg.get("server") or "gcp-gke",
+            "method": method,
+            "tool": tool_name,
+            "arguments": arguments,
+            "error": str(exc),
+            "text": f"Google Cloud MCP call failed: {exc}",
+          }
+        else:
+          response_result = parsed.get("result") if isinstance(parsed, dict) else None
+          content = response_result.get("content") if isinstance(response_result, dict) else None
+          text_parts = []
+          if isinstance(content, list):
+            for item in content:
+              if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(str(item.get("text") or ""))
+          text = "\n".join(part for part in text_parts if part).strip()
+          if not text:
+            text = json.dumps(response_result or parsed, default=str, indent=2)
+          tools = response_result.get("tools") if isinstance(response_result, dict) else None
+          result = {
+            "status": "ok",
+            "agent": "gcp_gke_mcp_runtime_agent",
+            "server": cfg.get("server") or "gcp-gke",
+            "endpoint": endpoint,
+            "method": method,
+            "tool": tool_name,
+            "arguments": arguments,
+            "tools": tools if isinstance(tools, list) else [],
+            "text": text,
+            "raw": parsed,
+          }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Return the summarized managed-GCP MCP result for terminal rendering and execution reports
+    tool:
+      kind: python
+      input:
+        summary: "{{ call_gcp_mcp }}"
+      code: |
+        result = summary

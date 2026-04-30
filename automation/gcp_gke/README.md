@@ -127,6 +127,36 @@ This is controlled by:
 
 Set it to `false` only if you manage auth catalog/credentials separately.
 
+## Managed Google Cloud GKE MCP
+
+The ops catalog includes a remote-managed GKE MCP resource and runtime agent:
+
+- `automation/agents/gcp/runtime.yaml` registers the terminal-visible
+  agent playbook at `mcp/gcp/gke`
+- `automation/agents/gcp/templates/mcp_gke_managed.yaml` registers the
+  `kind: Mcp` resource at `mcp/gcp`
+
+Register them after NoETL is reachable:
+
+```bash
+cd repos/ops
+noetl catalog register automation/agents/gcp/runtime.yaml
+noetl catalog register automation/agents/gcp/templates/mcp_gke_managed.yaml
+```
+
+The runtime agent calls Google's managed read-only endpoint,
+`https://container.googleapis.com/mcp/read-only`, from the NoETL worker.
+On GKE, bind the `noetl/noetl-worker` Kubernetes service account to a
+Google service account with `roles/container.viewer` so the worker can
+obtain a token from the metadata server. The GUI terminal then exposes:
+
+```text
+cd /mcp/gcp
+status
+tools
+call list_clusters --set parent=projects/<project-id>/locations/-
+```
+
 ## Multi-domain CORS
 
 Gateway CORS is now assembled from multiple inputs so it is easier to manage multiple GUI domains:
