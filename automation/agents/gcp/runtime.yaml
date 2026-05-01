@@ -85,6 +85,10 @@ workflow:
           return payload.get("access_token") or ""
 
         def _summarize_tools(tools):
+          def clip(value, limit=160):
+            text = str(value or "").replace("\n", " ").strip()
+            return text if len(text) <= limit else f"{text[: limit - 3]}..."
+
           if not isinstance(tools, list):
             return []
           summaries = []
@@ -96,9 +100,9 @@ workflow:
               continue
             summary = {"name": name}
             if tool.get("title"):
-              summary["title"] = str(tool.get("title"))
+              summary["title"] = clip(tool.get("title"), 80)
             if tool.get("description"):
-              summary["description"] = str(tool.get("description"))
+              summary["description"] = clip(tool.get("description"), 160)
             summaries.append(summary)
           return summaries
 
