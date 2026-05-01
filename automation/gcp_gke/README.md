@@ -154,8 +154,13 @@ noetl catalog register automation/agents/gcp/templates/mcp_gke_managed.yaml
 The runtime agent calls Google's managed read-only endpoint,
 `https://container.googleapis.com/mcp/read-only`, from the NoETL worker.
 On GKE, bind the `noetl/noetl-worker` Kubernetes service account to a
-Google service account with `roles/container.viewer` so the worker can
-obtain a token from the metadata server. The GUI terminal then exposes:
+Google service account with:
+
+- `roles/container.viewer` for read-only GKE inventory
+- `roles/mcp.toolUser` for `mcp.tools.call` access to the managed MCP endpoint
+
+Restart the worker deployment after adding or changing the IAM roles so
+fresh metadata tokens pick up the new permissions. The GUI terminal then exposes:
 
 ```text
 cd /mcp/gcp
@@ -163,6 +168,9 @@ status
 tools
 call list_clusters --set parent=projects/<project-id>/locations/-
 ```
+
+Generic MCP tool invocation currently uses the `call` command prefix.
+For example, type `call list_clusters ...`, not `list_clusters`.
 
 ## Multi-domain CORS
 
