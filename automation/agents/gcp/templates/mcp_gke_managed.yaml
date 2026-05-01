@@ -47,3 +47,4 @@ spec:
       - container.googleapis.com
     recommended_roles:
       - roles/container.viewer
+      - roles/mcp.toolUser
