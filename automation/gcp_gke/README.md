@@ -105,7 +105,7 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set gui_public_host=mestumre.dev \
   --set gateway_public_url=https://gateway.mestumre.dev \
   --set gui_gateway_public_url=https://gateway.mestumre.dev \
-  --set gateway_cors_allowed_domains='mestumre.dev,team4.mestumre.dev,gateway.mestumre.dev'
+  --set gateway_cors_allowed_domains='mestumre.dev,gateway.mestumre.dev'
 ```
 
 With `deploy_gui=false`, the playbook skips GUI static IP reservation,
@@ -181,7 +181,7 @@ Gateway CORS is now assembled from multiple inputs so it is easier to manage mul
 - `gateway_cors_allowed_origins` accepts comma/space/newline-separated origins or bare domains
 - `gateway_cors_allowed_domains` accepts additional bare domains
 
-Every browser app that calls `https://gateway.mestumre.dev` directly must be included here. For example, the Team4 Pages app at `https://team4.mestumre.dev` needs `team4.mestumre.dev` in `gateway_cors_allowed_domains`; otherwise Auth0 can redirect back to Team4, but the browser blocks Team4 from exchanging the Auth0 token with `/api/auth/login`.
+Every browser app that calls the gateway directly must be included here. Otherwise an identity provider can redirect back to the app, but the browser will block the app from exchanging the identity token with `/api/auth/login`.
 
 Example:
 
@@ -191,8 +191,8 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set action=deploy \
   --set project_id=<gcp-project-id> \
   --set build_images=false \
-  --set gateway_cors_allowed_domains='mestumre.dev,staging.mestumre.dev' \
-  --set gateway_cors_allowed_origins='https://preview.mestumre.dev'
+  --set gateway_cors_allowed_domains='app.example.com,staging.example.com' \
+  --set gateway_cors_allowed_origins='https://preview.example.com'
 ```
 
 ## PostgreSQL Stability (Autopilot)
