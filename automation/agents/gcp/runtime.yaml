@@ -84,6 +84,24 @@ workflow:
             payload = json.loads(response.read().decode("utf-8"))
           return payload.get("access_token") or ""
 
+        def _summarize_tools(tools):
+          if not isinstance(tools, list):
+            return []
+          summaries = []
+          for tool in tools:
+            if not isinstance(tool, dict):
+              continue
+            name = str(tool.get("name") or "")
+            if not name:
+              continue
+            summary = {"name": name}
+            if tool.get("title"):
+              summary["title"] = str(tool.get("title"))
+            if tool.get("description"):
+              summary["description"] = str(tool.get("description"))
+            summaries.append(summary)
+          return summaries
+
         cfg = request if isinstance(request, dict) else {}
         endpoint = str(cfg.get("endpoint") or "https://container.googleapis.com/mcp/read-only")
         method = str(cfg.get("method") or "tools/list")
@@ -152,6 +170,8 @@ workflow:
         else:
           response_result = parsed.get("result") if isinstance(parsed, dict) else None
           content = response_result.get("content") if isinstance(response_result, dict) else None
+          raw_tools = response_result.get("tools") if isinstance(response_result, dict) else None
+          tools = _summarize_tools(raw_tools)
           text_parts = []
           if isinstance(content, list):
             for item in content:
@@ -159,8 +179,10 @@ workflow:
                 text_parts.append(str(item.get("text") or ""))
           text = "\n".join(part for part in text_parts if part).strip()
           if not text:
-            text = json.dumps(response_result or parsed, default=str, indent=2)
-          tools = response_result.get("tools") if isinstance(response_result, dict) else None
+            if method == "tools/list":
+              text = "\n".join(tool["name"] for tool in tools)
+            else:
+              text = json.dumps(response_result or parsed, default=str, indent=2)
           result = {
             "status": "ok",
             "agent": "gcp_gke_mcp_runtime_agent",
@@ -169,9 +191,12 @@ workflow:
             "method": method,
             "tool": tool_name,
             "arguments": arguments,
-            "tools": tools if isinstance(tools, list) else [],
+            "tools": tools,
+            "tools_count": len(tools),
             "text": text,
-            "raw": parsed,
+            "raw_jsonrpc": parsed.get("jsonrpc") if isinstance(parsed, dict) else None,
+            "raw_id": parsed.get("id") if isinstance(parsed, dict) else None,
+            "raw_result_tools_count": len(raw_tools) if isinstance(raw_tools, list) else 0,
           }
     next:
       spec:
