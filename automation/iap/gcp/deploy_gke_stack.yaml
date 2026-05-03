@@ -38,7 +38,7 @@ workload:
   # Python images:
   build_noetl: true          # Python NoETL (docker/noetl/pip) - same image for server AND worker
   # Rust images (all disabled by default - slow to compile):
-  build_noetlctl: false      # Rust noetlctl CLI binary (crates/noetlctl) - builds 'noetl' command
+  build_cli: false      # Rust CLI binary (crates/cli) - builds 'noetl' command
   build_gateway: false       # Rust Gateway (crates/gateway) - API gateway
   build_worker_pool: false   # Rust Worker Pool (crates/worker-pool) - not used yet
   build_control_plane: false # Rust Control Plane (crates/control-plane) - not used yet
@@ -102,7 +102,7 @@ workflow:
     vars:
       artifact_registry: "{{ workload.region }}-docker.pkg.dev/{{ workload.project_id }}/{{ workload.repository_id }}"
       noetl_image: "{{ workload.region }}-docker.pkg.dev/{{ workload.project_id }}/{{ workload.repository_id }}/noetl"
-      noetlctl_image: "{{ workload.region }}-docker.pkg.dev/{{ workload.project_id }}/{{ workload.repository_id }}/noetlctl"
+      cli_image: "{{ workload.region }}-docker.pkg.dev/{{ workload.project_id }}/{{ workload.repository_id }}/noetl-rust-cli"
       gateway_image: "{{ workload.region }}-docker.pkg.dev/{{ workload.project_id }}/{{ workload.repository_id }}/noetl-gateway"
       worker_image: "{{ workload.region }}-docker.pkg.dev/{{ workload.project_id }}/{{ workload.repository_id }}/noetl-worker"
     next:
@@ -153,7 +153,7 @@ workflow:
           echo "  Python images:"
           echo "    build_noetl           - Build Python NoETL (server+worker, same image) (default: true)"
           echo "  Rust images (all default to false - slow to compile):"
-          echo "    build_noetlctl        - Build Rust noetlctl CLI binary (default: false)"
+          echo "    build_cli        - Build Rust CLI binary (default: false)"
           echo "    build_gateway         - Build Rust Gateway (default: false)"
           echo "    build_worker_pool     - Build Rust Worker Pool (default: false, not used yet)"
           echo "    build_control_plane   - Build Rust Control Plane (default: false, not used yet)"
@@ -167,15 +167,15 @@ workflow:
           echo "    --set project_id=noetl-demo-19700101 \\"
           echo "    --set deploy_gateway=false"
           echo ""
-          echo "Example - Build Python NoETL + Rust noetlctl CLI:"
+          echo "Example - Build Python NoETL + Rust CLI:"
           echo "  noetl run automation/iap/gcp/deploy_gke_stack.yaml \\"
           echo "    --set project_id=noetl-demo-19700101 \\"
-          echo "    --set build_noetlctl=true"
+          echo "    --set build_cli=true"
           echo ""
-          echo "Example - Build all Rust components (gateway, noetlctl):"
+          echo "Example - Build all Rust components (gateway, Rust CLI):"
           echo "  noetl run automation/iap/gcp/deploy_gke_stack.yaml \\"
           echo "    --set project_id=noetl-demo-19700101 \\"
-          echo "    --set build_noetlctl=true \\"
+          echo "    --set build_cli=true \\"
           echo "    --set build_gateway=true"
           echo ""
           echo "Example - Deploy to existing cluster without rebuilding:"
@@ -321,13 +321,13 @@ workflow:
               echo "=== Skipping NoETL Server build (build_noetl=false) ==="
             fi
 
-            # Build noetlctl (Rust CLI) - only if build_noetlctl is true
-            if [ "{{ workload.build_noetlctl }}" = "true" ]; then
+            # Build Rust CLI - only if build_cli is true
+            if [ "{{ workload.build_cli }}" = "true" ]; then
               echo ""
-              echo "=== Building noetlctl (Rust CLI) via Cloud Build ==="
-              if [ -f "crates/noetlctl/Dockerfile" ]; then
-              # Create temporary cloudbuild.yaml for noetlctl
-              cat > /tmp/cloudbuild-noetlctl.yaml << 'CLOUDBUILD'
+              echo "=== Building Rust CLI via Cloud Build ==="
+              if [ -f "crates/cli/Dockerfile" ]; then
+              # Create temporary cloudbuild.yaml for Rust CLI
+              cat > /tmp/cloudbuild-cli.yaml << 'CLOUDBUILD'
           steps:
             - name: 'gcr.io/cloud-builders/docker'
               args:
@@ -337,7 +337,7 @@ workflow:
                 - '-t'
                 - '$_IMAGE:latest'
                 - '-f'
-                - 'crates/noetlctl/Dockerfile'
+                - 'crates/cli/Dockerfile'
                 - '.'
           images:
             - '$_IMAGE:$_TAG'
@@ -348,16 +348,16 @@ workflow:
           CLOUDBUILD
               gcloud builds submit \
                 --project {{ workload.project_id }} \
-                --config=/tmp/cloudbuild-noetlctl.yaml \
-                --substitutions=_IMAGE={{ vars.noetlctl_image }},_TAG=$TAG \
+                --config=/tmp/cloudbuild-cli.yaml \
+                --substitutions=_IMAGE={{ vars.cli_image }},_TAG=$TAG \
                 .
-                echo "noetlctl image built: {{ vars.noetlctl_image }}:$TAG"
+                echo "Rust CLI image built: {{ vars.cli_image }}:$TAG"
               else
-                echo "WARNING: crates/noetlctl/Dockerfile not found, skipping"
+                echo "WARNING: crates/cli/Dockerfile not found, skipping"
               fi
             else
               echo ""
-              echo "=== Skipping noetlctl build (build_noetlctl=false) ==="
+              echo "=== Skipping Rust CLI build (build_cli=false) ==="
             fi
 
             # Build Gateway (Rust) - only if build_gateway is true
@@ -449,25 +449,25 @@ workflow:
               echo "=== Skipping NoETL Server build (build_noetl=false) ==="
             fi
 
-            # Build and push noetlctl image (Rust CLI) - only if build_noetlctl is true
-            if [ "{{ workload.build_noetlctl }}" = "true" ]; then
+            # Build and push Rust CLI image - only if build_cli is true
+            if [ "{{ workload.build_cli }}" = "true" ]; then
               echo ""
-              echo "=== Building noetlctl (Rust CLI) ==="
-              if [ -f "crates/noetlctl/Dockerfile" ]; then
+              echo "=== Building Rust CLI ==="
+              if [ -f "crates/cli/Dockerfile" ]; then
               docker build --platform {{ workload.docker_platform }} \
-                -t {{ vars.noetlctl_image }}:$TAG \
-                -t {{ vars.noetlctl_image }}:latest \
-                -f crates/noetlctl/Dockerfile \
+                -t {{ vars.cli_image }}:$TAG \
+                -t {{ vars.cli_image }}:latest \
+                -f crates/cli/Dockerfile \
                 .
-              docker push {{ vars.noetlctl_image }}:$TAG
-                docker push {{ vars.noetlctl_image }}:latest
-                echo "noetlctl image pushed: {{ vars.noetlctl_image }}:$TAG"
+              docker push {{ vars.cli_image }}:$TAG
+                docker push {{ vars.cli_image }}:latest
+                echo "Rust CLI image pushed: {{ vars.cli_image }}:$TAG"
               else
-                echo "WARNING: crates/noetlctl/Dockerfile not found, skipping"
+                echo "WARNING: crates/cli/Dockerfile not found, skipping"
               fi
             else
               echo ""
-              echo "=== Skipping noetlctl build (build_noetlctl=false) ==="
+              echo "=== Skipping Rust CLI build (build_cli=false) ==="
             fi
 
             # Build and push Gateway image - only if build_gateway is true

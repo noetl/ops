@@ -47,17 +47,17 @@ workflow:
 
               mkdir -p crates
               ln -sfn "$GATEWAY_ABS" crates/gateway
-              ln -sfn "$CLI_ABS" crates/noetlctl
+              ln -sfn "$CLI_ABS" crates/cli
               ln -sfn "$NOETL_ABS/docker" docker
               ln -sfn "$NOETL_ABS/tests" tests
               ln -sfn "$E2E_ABS/fixtures" fixtures
               ln -sfn "$NOETL_ABS/scripts" scripts
               echo "Created compatibility links:"
-              ls -ld crates/gateway crates/noetlctl docker tests fixtures scripts
+              ls -ld crates/gateway crates/cli docker tests fixtures scripts
               ;;
 
             check)
-              for link in crates/gateway crates/noetlctl docker tests fixtures scripts; do
+              for link in crates/gateway crates/cli docker tests fixtures scripts; do
                 if [ -L "$link" ]; then
                   printf "OK   %s -> %s\n" "$link" "$(readlink "$link")"
                 elif [ -e "$link" ]; then
@@ -69,7 +69,7 @@ workflow:
               ;;
 
             clean)
-              for link in crates/gateway crates/noetlctl docker tests fixtures scripts; do
+              for link in crates/gateway crates/cli docker tests fixtures scripts; do
                 if [ -L "$link" ]; then
                   rm -f "$link"
                   echo "Removed $link"

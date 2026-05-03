@@ -114,12 +114,12 @@ workflow:
           if command -v noetl >/dev/null 2>&1; then
             echo "[OK] noetl CLI: $(noetl --version 2>/dev/null | head -n1 || echo present)"
           else
-            echo "[INFO] noetl CLI not installed - install with: pip install noetl[cli]"
+            echo "[INFO] noetl CLI not installed - install with: brew tap noetl/tap && brew install noetl"
           fi
           exit $fail
           '
-          echo "Building noetlctl locally..."
-          cargo build --release --manifest-path crates/noetlctl/Cargo.toml
+          echo "Building NoETL Rust CLI locally..."
+          cargo build --release --manifest-path ../cli/Cargo.toml
     next:
       spec:
         mode: exclusive
@@ -180,7 +180,7 @@ workflow:
           if command -v noetl >/dev/null 2>&1; then
             echo "[OK] noetl CLI: $(noetl --version 2>/dev/null | head -n1 || echo present)"
           else
-            echo "[INFO] noetl CLI not installed - install with: pip install noetl[cli]"
+            echo "[INFO] noetl CLI not installed - install with: brew tap noetl/tap && brew install noetl"
           fi
           exit $fail
           '
