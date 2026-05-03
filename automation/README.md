@@ -110,7 +110,7 @@ noetl run automation/setup/bootstrap.yaml
 Steps performed:
 1. Verify dependencies (Docker, kubectl, kind)
 2. Check ports availability (54321, 3000, 39428, 8082)
-3. Build noetlctl Rust CLI
+3. Build Rust CLI Rust CLI
 4. Build NoETL Docker image
 5. Create kind Kubernetes cluster
 6. Load image into kind
@@ -455,7 +455,7 @@ next:
 ## See Also
 
 - [Command Reference](../documentation/docs/operations/command-reference.md) - Complete command reference with all actions
-- [NoETL CLI Documentation](../documentation/docs/noetlctl/index.md)
-- [Local Execution Guide](../documentation/docs/noetlctl/local_execution.md)
+- [NoETL CLI Documentation](../documentation/docs/Rust CLI/index.md)
+- [Local Execution Guide](../documentation/docs/Rust CLI/local_execution.md)
 - [Infrastructure as Playbook](../documentation/docs/features/infrastructure_as_playbook.md)
 - [NoETL DSL Reference](https://noetl.dev/docs/reference/dsl/)
