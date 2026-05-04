@@ -1,0 +1,19 @@
+{{- if .Values.ollamaBridge.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-bridge
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: ollama-bridge
+    noetl.io/component: ai-bridge
+spec:
+  type: {{ .Values.ollamaBridge.service.type | default "ClusterIP" }}
+  ports:
+    - name: jsonrpc
+      port: {{ .Values.ollamaBridge.service.port | default 8765 }}
+      targetPort: jsonrpc
+      protocol: TCP
+  selector:
+    app: ollama-bridge
+{{- end }}

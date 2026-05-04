@@ -1,0 +1,84 @@
+{{- if .Values.ollamaBridge.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-bridge
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: ollama-bridge
+    noetl.io/component: ai-bridge
+spec:
+  replicas: {{ .Values.ollamaBridge.replicas | default 1 }}
+  strategy:
+{{- toYaml (.Values.ollamaBridge.strategy | default dict) | nindent 4 }}
+  selector:
+    matchLabels:
+      app: ollama-bridge
+  template:
+    metadata:
+      labels:
+        app: ollama-bridge
+        noetl.io/component: ai-bridge
+    spec:
+      containers:
+        - name: ollama-bridge
+          # Reuse the same noetl image — the bridge ships in the
+          # noetl.tools.ollama_bridge package. Falls back to the
+          # chart-level image when the bridge-specific image isn't
+          # set so most operators only have to bump one tag.
+          image: "{{ .Values.ollamaBridge.image.repository | default .Values.image.repository }}:{{ .Values.ollamaBridge.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.ollamaBridge.image.pullPolicy | default .Values.image.pullPolicy }}
+          command: ["python"]
+          args: ["-m", "noetl.tools.ollama_bridge"]
+          ports:
+            - name: jsonrpc
+              containerPort: {{ .Values.ollamaBridge.service.port | default 8765 }}
+              protocol: TCP
+          env:
+            - name: OLLAMA_URL
+              value: {{ .Values.ollamaBridge.ollama.url | quote }}
+            - name: OLLAMA_TIMEOUT_SECONDS
+              value: {{ .Values.ollamaBridge.ollama.timeoutSeconds | default 120 | quote }}
+            - name: OLLAMA_BRIDGE_HOST
+              value: {{ .Values.ollamaBridge.bridge.host | default "0.0.0.0" | quote }}
+            - name: OLLAMA_BRIDGE_PORT
+              value: {{ .Values.ollamaBridge.service.port | default 8765 | quote }}
+{{- with .Values.ollamaBridge.extraEnv }}
+{{- toYaml . | nindent 12 }}
+{{- end }}
+          resources:
+{{- toYaml .Values.ollamaBridge.resources | nindent 12 }}
+          # /healthz is wired by build_app() in server.py. Liveness
+          # gives a generous initial delay because aiohttp / fastapi
+          # imports are lazy + cold on first request, and we don't
+          # want the kubelet restart-looping during a slow node
+          # warm-up.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.ollamaBridge.service.port | default 8765 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.ollamaBridge.service.port | default 8765 }}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+{{- with .Values.ollamaBridge.nodeSelector }}
+      nodeSelector:
+{{- toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.ollamaBridge.tolerations }}
+      tolerations:
+{{- toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.ollamaBridge.affinity }}
+      affinity:
+{{- toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}
