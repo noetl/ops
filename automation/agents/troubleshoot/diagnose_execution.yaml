@@ -72,19 +72,31 @@ workload:
   # 0.0 = always escalate, 1.0 = never escalate.
   confidence_threshold: 0.7
 
-  # escalate_to: "openai" | "claude" | "none". Only "openai" is wired
-  # in this version; "claude" follow-up tracked separately.
+  # escalate_to: "openai" | "claude" | "none". Both upstream models
+  # are wired; pick based on which API key is provisioned and the
+  # cost / depth profile you want.
   escalate_to: "openai"
 
-  # Credentials for the escalation path. Pulled from the keychain
-  # at execution time so the API key never lives in the workload dict.
+  # Credentials for the OpenAI escalation path. Pulled from the
+  # keychain at execution time so the API key never lives in the
+  # workload dict.
   openai_credential: openai_token
   openai_model: "gpt-4o-mini"
+
+  # Credentials for the Anthropic / Claude escalation path. Same
+  # contract as the OpenAI block; choose claude when you'd rather
+  # spend the marginal cost on a larger context window or stronger
+  # multi-step reasoning.
+  anthropic_credential: anthropic_token
+  anthropic_model: "claude-haiku-4-5"
 
 keychain:
   - name: openai_token
     type: openai
     api_key: "{{ workload.openai_secret_path | default('') }}"
+  - name: anthropic_token
+    type: anthropic
+    api_key: "{{ workload.anthropic_secret_path | default('') }}"
 
 workflow:
   # ---------------------------------------------------------------------
@@ -331,6 +343,9 @@ workflow:
         # Low confidence → escalate to OpenAI
         - when: "{{ workload.escalate_to == 'openai' }}"
           step: escalate_openai
+        # Low confidence → escalate to Anthropic Claude
+        - when: "{{ workload.escalate_to == 'claude' }}"
+          step: escalate_claude
         # Unknown escalate_to → fall back to local result
         - step: persist_diagnosis
 
@@ -411,6 +426,7 @@ workflow:
 
         result = {
           "status": "ok",
+          "source": "openai",
           "confidence": float(parsed.get("confidence", 0.0)),
           "category": str(parsed.get("category") or "unknown"),
           "root_cause": str(parsed.get("root_cause") or ""),
@@ -427,6 +443,134 @@ workflow:
         - step: persist_diagnosis
 
   # ---------------------------------------------------------------------
+  # 5b. Escalation: stronger analysis via Anthropic Claude (parallel
+  # to the OpenAI path; routed via workload.escalate_to=='claude')
+  # ---------------------------------------------------------------------
+  - step: escalate_claude
+    desc: Stronger analysis via Anthropic Claude when local model is uncertain
+    tool:
+      kind: http
+      method: POST
+      url: https://api.anthropic.com/v1/messages
+      headers:
+        # Anthropic requires the `x-api-key` header rather than the
+        # OpenAI-style `Authorization: Bearer ...`. The
+        # `anthropic-version` header pins the API surface so an
+        # upstream change doesn't silently re-shape the response
+        # mid-deployment.
+        x-api-key: "{{ keychain.anthropic_token.api_key }}"
+        anthropic-version: "2023-06-01"
+        Content-Type: application/json
+      body:
+        model: "{{ workload.anthropic_model }}"
+        max_tokens: 1024
+        temperature: 0.1
+        # Claude doesn't have OpenAI's `response_format: json_object`
+        # equivalent — instead the system prompt asks for strict JSON
+        # and the parser strips any preamble / fences. In practice
+        # claude-haiku-4-5 returns clean JSON for this schema; the
+        # belt-and-suspenders parsing matches what we already do for
+        # the local Ollama response.
+        system: |
+          You are a NoETL execution-failure analyst. Given a
+          compact failure summary AND a low-confidence first-pass
+          classification from a local 2B model, return a refined
+          diagnosis as a single JSON object and nothing else:
+
+            {
+              "category": "transient_5xx|auth|rate_limit|bad_request|tool_error|infra|unknown",
+              "confidence": 0.0..1.0,
+              "root_cause": "<one or two sentences>",
+              "suggested_action": "<one or two sentences, concrete>",
+              "user_message": "<friendly, no jargon>",
+              "first_pass_was_correct": true|false,
+              "first_pass_disagreement": "<empty when correct>"
+            }
+
+          Output ONLY the JSON object — no markdown fences, no
+          preamble, no postamble.
+        messages:
+          - role: user
+            content: |
+              Failure summary:
+              {{ extract_failure_signal.summary | tojson }}
+
+              First-pass classification (low confidence):
+              {{ parse_ollama_response | tojson }}
+      retry:
+        max_attempts: 3
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      arcs:
+        - step: parse_claude_response
+
+  - step: parse_claude_response
+    desc: Extract the refined diagnosis from the Anthropic envelope
+    tool:
+      kind: python
+      code: |
+        import json
+        import re
+
+        body = claude_body
+        if isinstance(body, str):
+          try:
+            body = json.loads(body)
+          except Exception:
+            body = {}
+
+        # Anthropic /v1/messages shape:
+        #   { content: [{ type: "text", text: "..." }, ...], ... }
+        # OpenAI's choices[0].message.content has no equivalent here.
+        text = ""
+        content = (body or {}).get("content")
+        if isinstance(content, list):
+          for block in content:
+            if not isinstance(block, dict):
+              continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+              text = block["text"]
+              break
+
+        # Defensive: strip markdown fences and locate the first JSON
+        # object — same belt-and-suspenders we apply to Ollama, since
+        # the system prompt says "no fences" but a stray newline can
+        # still confuse downstream tooling.
+        text = (text or "").strip()
+        m = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
+        if m:
+          text = m.group(1).strip()
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start >= 0 and brace_end > brace_start:
+          text = text[brace_start:brace_end + 1]
+
+        parsed = {}
+        try:
+          parsed = json.loads(text or "{}")
+        except Exception:
+          parsed = {}
+
+        result = {
+          "status": "ok",
+          "source": "claude",
+          "confidence": float(parsed.get("confidence", 0.0)),
+          "category": str(parsed.get("category") or "unknown"),
+          "root_cause": str(parsed.get("root_cause") or ""),
+          "suggested_action": str(parsed.get("suggested_action") or ""),
+          "user_message": str(parsed.get("user_message") or ""),
+          "first_pass_correct": bool(parsed.get("first_pass_was_correct", False)),
+          "disagreement": str(parsed.get("first_pass_disagreement") or ""),
+          "model": "{{ workload.anthropic_model }}",
+        }
+      args:
+        claude_body: "{{ escalate_claude.data }}"
+    next:
+      arcs:
+        - step: persist_diagnosis
+
+  # ---------------------------------------------------------------------
   # 6. Persist + return
   # ---------------------------------------------------------------------
   - step: persist_diagnosis
@@ -434,16 +578,29 @@ workflow:
     tool:
       kind: python
       code: |
-        # Pick the higher-confidence result. If escalation ran, prefer
-        # it; otherwise use the local model's output as-is.
+        # Pick the higher-confidence result. If escalation ran (either
+        # OpenAI or Claude), prefer the remote analysis; otherwise use
+        # the local model's output as-is.
+        #
+        # `remote_openai` and `remote_claude` are mutually exclusive —
+        # the routing arcs in parse_ollama_response dispatch to at most
+        # one escalation path per execution — so reading whichever
+        # arrived first is unambiguous. When neither escalation ran,
+        # both will be None and we fall back to the local result.
         local = local_diag if isinstance(local_diag, dict) else {}
-        remote = remote_diag if isinstance(remote_diag, dict) else None
+        remote_oai = remote_openai if isinstance(remote_openai, dict) else None
+        remote_anth = remote_claude if isinstance(remote_claude, dict) else None
+        remote = None
+        for candidate in (remote_oai, remote_anth):
+          if isinstance(candidate, dict) and candidate.get("status") == "ok":
+            remote = candidate
+            break
 
         chosen = local
         source = "ollama"
-        if isinstance(remote, dict) and remote.get("status") == "ok":
+        if isinstance(remote, dict):
           chosen = remote
-          source = "openai"
+          source = str(remote.get("source") or "remote")
 
         # Build the final envelope. `text` / `summary` / `user_message`
         # mirror the GUI's extractAgentText heuristic so the run
@@ -456,7 +613,10 @@ workflow:
           "root_cause": chosen.get("root_cause") or "",
           "suggested_action": chosen.get("suggested_action") or "",
           "source": source,
-          "escalated": source == "openai",
+          # `escalated` is true when ANY remote model ran, regardless
+          # of which one. Operators reading the envelope just want to
+          # know "did we spend cloud-API tokens?" not "which vendor".
+          "escalated": source in ("openai", "claude"),
         }
         user_message = chosen.get("user_message") or (
           "Diagnosis (" + source + "): " + (chosen.get("root_cause") or "no root cause identified")
@@ -472,7 +632,8 @@ workflow:
         }
       args:
         local_diag: "{{ parse_ollama_response }}"
-        remote_diag: "{{ parse_openai_response | default(none) }}"
+        remote_openai: "{{ parse_openai_response | default(none) }}"
+        remote_claude: "{{ parse_claude_response | default(none) }}"
     next:
       arcs:
         - step: end
