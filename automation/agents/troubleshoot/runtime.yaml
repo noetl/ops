@@ -1,0 +1,69 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: troubleshoot_runtime_agent
+  path: automation/agents/troubleshoot/runtime
+  description: |
+    Terminal-facing wrapper around the diagnose_execution playbook.
+    Lets the GUI's `troubleshoot <execution_id>` command call into the
+    diagnostic flow without callers needing to remember the full
+    catalog path.
+
+    Equivalent to `tool: agent framework=noetl` against
+    `automation/agents/troubleshoot/diagnose_execution` but exposed
+    through the runtime-agent contract that the GUI's terminal
+    prompt + run dialog already understand.
+
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: true
+
+  terminal:
+    visible: true
+    workspace: troubleshoot
+    scopes:
+      - /troubleshoot
+    commands:
+      - diagnose
+      - last_failure
+
+  capabilities:
+    - troubleshooting
+    - failure-analysis
+    - cheap-first-inference
+    - ai-os
+
+  tags:
+    - troubleshoot
+    - cheap-first
+    - ai-os
+
+workload:
+  # The execution to diagnose. The terminal wrapper accepts either a
+  # bare execution_id or the literal string "last_failure" — the
+  # latter pulls the most recent failed execution from the event
+  # log.
+  execution_id: ""
+
+  # Pass-through to the inner diagnose playbook
+  ollama_model: "gemma2:2b"
+  confidence_threshold: 0.7
+  escalate_to: "openai"
+
+workflow:
+  - step: dispatch_diagnose
+    desc: Hand off to the diagnose_execution playbook
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/troubleshoot/diagnose_execution
+      payload:
+        execution_id: "{{ workload.execution_id }}"
+        ollama_model: "{{ workload.ollama_model }}"
+        confidence_threshold: "{{ workload.confidence_threshold }}"
+        escalate_to: "{{ workload.escalate_to }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end
