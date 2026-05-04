@@ -1,0 +1,508 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: troubleshoot_diagnose_execution
+  path: automation/agents/troubleshoot/diagnose_execution
+  description: |
+    Self-troubleshoot agent: take a failed execution_id, fetch the
+    event log, classify the failure with a local Ollama model
+    (cheap-first), escalate to a stronger model only when the local
+    classification's confidence is low. Returns a structured
+    diagnosis with category, root_cause, suggested_action, and a
+    user-facing summary.
+
+    Composes the NoETL-as-AI-OS spike gaps:
+    - Gap 1 (`tool: agent framework=noetl`) — peer playbooks can call
+      this as an agent
+    - Gap 2 (playbook-as-MCP-server) — Cursor / Claude Desktop / IDE
+      plugins can call this directly via MCP without bespoke glue
+    - Gap 3 (typed metadata) — `exposes_as_mcp: true` is now a real
+      Pydantic field
+    - Gap 5 (mcp/ollama) — the cheap-first inference layer
+
+    Cost / latency profile:
+
+      most failures (HTTP 5xx, transient timeouts, known patterns):
+        Ollama only — ~200ms, $0.00
+      novel / interesting failures:
+        Ollama + OpenAI escalation — ~3s, ~$0.01
+
+    The escalation threshold is a workload knob (`confidence_threshold`)
+    so operators can tune cost vs. depth per deployment. Set
+    `escalate_to: none` to disable escalation entirely (Ollama-only
+    mode for air-gapped deployments).
+
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: true
+  tags:
+    - troubleshoot
+    - cheap-first
+    - ollama
+    - ai-os
+    - failure-analysis
+
+  capabilities:
+    - troubleshooting
+    - failure-analysis
+    - cheap-first-inference
+    - ai-os
+
+workload:
+  # Required: the failed execution to diagnose. Caller is expected to
+  # already know this — typically it comes from the parent's child
+  # execution graph (when a `tool: agent framework=noetl` step fails)
+  # or from the GUI's run dialog when a user clicks "diagnose".
+  execution_id: ""
+
+  # NoETL server URL (for fetching events). Defaults to the in-cluster
+  # service DNS; override for cross-cluster or local-dev.
+  noetl_url: "http://noetl-server.noetl.svc.cluster.local:8080"
+
+  # Cheap-first: local Ollama model for the triage pass. gemma2:2b is
+  # the sweet spot for failure classification — small enough to be fast
+  # (~200ms), large enough to handle structured-output prompts. Override
+  # to qwen2.5:7b for noisier failures or when running on a beefier
+  # node.
+  ollama_model: "gemma2:2b"
+  ollama_mcp_server: "mcp/ollama"
+
+  # Escalation knobs.
+  # confidence_threshold: skip escalation when Ollama returns >= this.
+  # 0.0 = always escalate, 1.0 = never escalate.
+  confidence_threshold: 0.7
+
+  # escalate_to: "openai" | "claude" | "none". Only "openai" is wired
+  # in this version; "claude" follow-up tracked separately.
+  escalate_to: "openai"
+
+  # Credentials for the escalation path. Pulled from the keychain
+  # at execution time so the API key never lives in the workload dict.
+  openai_credential: openai_token
+  openai_model: "gpt-4o-mini"
+
+keychain:
+  - name: openai_token
+    type: openai
+    api_key: "{{ workload.openai_secret_path | default('') }}"
+
+workflow:
+  # ---------------------------------------------------------------------
+  # 1. Fetch the failed execution's event log
+  # ---------------------------------------------------------------------
+  - step: fetch_events
+    desc: Pull the paginated event log for the failed execution
+    tool:
+      kind: http
+      method: GET
+      url: "{{ workload.noetl_url }}/api/executions/{{ workload.execution_id }}?include_events=true&page_size=200"
+      retry:
+        max_attempts: 3
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 1
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        # 2xx → continue; non-2xx → bail with a structured failure so
+        # the caller knows the diagnosis itself failed (not the
+        # execution under investigation).
+        - when: "{{ fetch_events.data.status_code | default(200) | int < 400 }}"
+          step: extract_failure_signal
+        - step: handle_fetch_failure
+
+  # ---------------------------------------------------------------------
+  # 2. Compress events into a triage-ready failure summary
+  # ---------------------------------------------------------------------
+  - step: extract_failure_signal
+    desc: Walk the event log, identify the failed step, build a compact summary
+    tool:
+      kind: python
+      code: |
+        # Extract a triage-ready signal from the event log.
+        # We're looking for:
+        #   - which step failed
+        #   - what tool kind it used
+        #   - the error message / code / status_code
+        #   - any context the worker preserved
+        #
+        # Output is a compact dict that fits comfortably in a 2B-model's
+        # context window — Ollama gemma2:2b has 8K context but we want
+        # to leave headroom for the system prompt + chain-of-thought.
+
+        events = []
+        if isinstance(data, dict):
+          events = data.get("events", []) or []
+        elif isinstance(data, list):
+          events = data
+
+        # Find the first non-success terminal event (call.failed,
+        # step.failed, playbook.failed, etc.). The runtime emits these
+        # in order, so the first one is the proximate cause.
+        failure = None
+        for evt in events:
+          if not isinstance(evt, dict):
+            continue
+          status = (evt.get("status") or "").upper()
+          etype = evt.get("event_type") or ""
+          if status == "FAILED" or etype.endswith(".failed"):
+            failure = evt
+            break
+
+        # Pull error text from common locations: status detail, context,
+        # body field that the noetl HTTP tool stashes there.
+        def _err_text(e):
+          if not isinstance(e, dict):
+            return ""
+          ctx = e.get("context") or {}
+          for key in ("error", "error_message", "detail", "message"):
+            v = ctx.get(key) if isinstance(ctx, dict) else None
+            if isinstance(v, str) and v.strip():
+              return v
+          # The HTTP tool often stashes upstream body here
+          body = ctx.get("body") if isinstance(ctx, dict) else None
+          if isinstance(body, str):
+            return body[:1500]
+          if isinstance(body, dict):
+            import json as _json
+            return _json.dumps(body, default=str)[:1500]
+          return ""
+
+        # Deduplicate steps by node_name to avoid spamming the prompt.
+        # We only need: terminal failed step + last 3 events for context.
+        compact_events = []
+        seen_nodes = set()
+        for evt in events[-30:]:
+          if not isinstance(evt, dict):
+            continue
+          node = evt.get("node_name") or ""
+          key = (node, evt.get("event_type"))
+          if key in seen_nodes:
+            continue
+          seen_nodes.add(key)
+          compact_events.append({
+            "node": node,
+            "type": evt.get("event_type"),
+            "status": evt.get("status"),
+            "tool_kind": (evt.get("context") or {}).get("tool_kind") if isinstance(evt.get("context"), dict) else None,
+          })
+
+        result = {
+          "status": "ok",
+          "summary": {
+            "execution_id": "{{ workload.execution_id }}",
+            "failed_step": (failure or {}).get("node_name") if failure else None,
+            "tool_kind": ((failure or {}).get("context") or {}).get("tool_kind") if isinstance((failure or {}).get("context"), dict) else None,
+            "status_code": ((failure or {}).get("context") or {}).get("status_code") if isinstance((failure or {}).get("context"), dict) else None,
+            "error_text": _err_text(failure)[:1500],
+            "event_count": len(events),
+            "trail": compact_events[-15:],
+          },
+        }
+      args:
+        data: "{{ fetch_events.data }}"
+    next:
+      arcs:
+        - step: ollama_triage
+
+  # ---------------------------------------------------------------------
+  # 3. Cheap-first triage via local Ollama (gemma2:2b)
+  # ---------------------------------------------------------------------
+  - step: ollama_triage
+    desc: Classify the failure with a local Ollama model — fast, free, structured
+    tool:
+      kind: mcp
+      server: "{{ workload.ollama_mcp_server }}"
+      tool: chat
+      arguments:
+        model: "{{ workload.ollama_model }}"
+        temperature: 0.1
+        # We ask for strict JSON output. Small models sometimes wrap it
+        # in markdown fences or prose — the parser below strips both.
+        system: |
+          You are a NoETL execution-failure triage assistant. Given a
+          compact failure summary, respond with a single JSON object
+          and nothing else:
+
+            {
+              "category": "transient_5xx|auth|rate_limit|bad_request|tool_error|infra|unknown",
+              "confidence": 0.0..1.0,
+              "root_cause": "<one sentence>",
+              "suggested_action": "<one sentence, actionable>",
+              "user_message": "<one sentence, friendly, no jargon>"
+            }
+
+          Confidence reflects how sure you are about the category and
+          root_cause. Be conservative: if you can't tell from the
+          summary, set confidence below 0.5 and category=unknown.
+          Do NOT invent error codes or explanations the summary
+          doesn't support.
+        messages:
+          - role: user
+            content: "{{ extract_failure_signal.summary | tojson }}"
+    next:
+      arcs:
+        - step: parse_ollama_response
+
+  # ---------------------------------------------------------------------
+  # 4. Parse + decide whether to escalate
+  # ---------------------------------------------------------------------
+  - step: parse_ollama_response
+    desc: Strip markdown fences, parse JSON, surface confidence
+    tool:
+      kind: python
+      code: |
+        import json
+        import re
+
+        # The MCP envelope: ollama_triage.content[0].text holds the
+        # assistant message. Defensive about shape because gemma2:2b
+        # occasionally returns slightly different envelopes.
+        text = ""
+        if isinstance(triage, dict):
+          content = triage.get("content")
+          if isinstance(content, list) and content:
+            first = content[0]
+            if isinstance(first, dict):
+              text = str(first.get("text") or "")
+          if not text:
+            text = str(triage.get("text") or triage.get("message") or "")
+        elif isinstance(triage, str):
+          text = triage
+
+        # Strip markdown fences ```json ... ``` if present.
+        text = text.strip()
+        m = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
+        if m:
+          text = m.group(1).strip()
+
+        # Find the first { ... } block — small models sometimes prepend
+        # "Sure, here's the JSON:" before the actual object.
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start >= 0 and brace_end > brace_start:
+          text = text[brace_start:brace_end + 1]
+
+        parsed = None
+        parse_error = None
+        try:
+          parsed = json.loads(text)
+        except Exception as exc:
+          parse_error = f"{type(exc).__name__}: {exc}"
+
+        # If parsing failed, force escalation (confidence=0).
+        confidence = 0.0
+        category = "unknown"
+        root_cause = ""
+        suggested_action = ""
+        user_message = ""
+        if isinstance(parsed, dict):
+          try:
+            confidence = float(parsed.get("confidence", 0.0))
+          except (TypeError, ValueError):
+            confidence = 0.0
+          category = str(parsed.get("category") or "unknown")
+          root_cause = str(parsed.get("root_cause") or "")
+          suggested_action = str(parsed.get("suggested_action") or "")
+          user_message = str(parsed.get("user_message") or "")
+
+        result = {
+          "status": "ok",
+          "confidence": max(0.0, min(1.0, confidence)),
+          "category": category,
+          "root_cause": root_cause,
+          "suggested_action": suggested_action,
+          "user_message": user_message,
+          "parse_error": parse_error,
+          "raw_text": text[:2000],
+        }
+      args:
+        triage: "{{ ollama_triage.result | default(ollama_triage) }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        # High confidence → trust the local model
+        - when: "{{ parse_ollama_response.confidence >= workload.confidence_threshold }}"
+          step: persist_diagnosis
+        # Operator opted out of escalation
+        - when: "{{ workload.escalate_to == 'none' }}"
+          step: persist_diagnosis
+        # Low confidence → escalate to OpenAI
+        - when: "{{ workload.escalate_to == 'openai' }}"
+          step: escalate_openai
+        # Unknown escalate_to → fall back to local result
+        - step: persist_diagnosis
+
+  # ---------------------------------------------------------------------
+  # 5. Escalation: stronger analysis via OpenAI
+  # ---------------------------------------------------------------------
+  - step: escalate_openai
+    desc: Stronger analysis via OpenAI when local model is uncertain
+    tool:
+      kind: http
+      method: POST
+      url: https://api.openai.com/v1/chat/completions
+      headers:
+        Authorization: "Bearer {{ keychain.openai_token.api_key }}"
+        Content-Type: application/json
+      body:
+        model: "{{ workload.openai_model }}"
+        temperature: 0.1
+        response_format:
+          type: json_object
+        messages:
+          - role: system
+            content: |
+              You are a NoETL execution-failure analyst. Given a
+              compact failure summary AND a low-confidence first-pass
+              classification from a local 2B model, return a refined
+              diagnosis as a single JSON object:
+
+                {
+                  "category": "transient_5xx|auth|rate_limit|bad_request|tool_error|infra|unknown",
+                  "confidence": 0.0..1.0,
+                  "root_cause": "<one or two sentences>",
+                  "suggested_action": "<one or two sentences, concrete>",
+                  "user_message": "<friendly, no jargon>",
+                  "first_pass_was_correct": true|false,
+                  "first_pass_disagreement": "<empty when correct>"
+                }
+          - role: user
+            content: |
+              Failure summary:
+              {{ extract_failure_signal.summary | tojson }}
+
+              First-pass classification (low confidence):
+              {{ parse_ollama_response | tojson }}
+      retry:
+        max_attempts: 3
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      arcs:
+        - step: parse_openai_response
+
+  - step: parse_openai_response
+    desc: Extract the refined diagnosis from the OpenAI envelope
+    tool:
+      kind: python
+      code: |
+        import json
+
+        body = openai_body
+        if isinstance(body, str):
+          try:
+            body = json.loads(body)
+          except Exception:
+            body = {}
+
+        choices = (body or {}).get("choices") or []
+        text = ""
+        if choices and isinstance(choices[0], dict):
+          msg = choices[0].get("message") or {}
+          text = str(msg.get("content") or "")
+
+        parsed = {}
+        try:
+          parsed = json.loads(text or "{}")
+        except Exception:
+          parsed = {}
+
+        result = {
+          "status": "ok",
+          "confidence": float(parsed.get("confidence", 0.0)),
+          "category": str(parsed.get("category") or "unknown"),
+          "root_cause": str(parsed.get("root_cause") or ""),
+          "suggested_action": str(parsed.get("suggested_action") or ""),
+          "user_message": str(parsed.get("user_message") or ""),
+          "first_pass_correct": bool(parsed.get("first_pass_was_correct", False)),
+          "disagreement": str(parsed.get("first_pass_disagreement") or ""),
+          "model": "{{ workload.openai_model }}",
+        }
+      args:
+        openai_body: "{{ escalate_openai.data }}"
+    next:
+      arcs:
+        - step: persist_diagnosis
+
+  # ---------------------------------------------------------------------
+  # 6. Persist + return
+  # ---------------------------------------------------------------------
+  - step: persist_diagnosis
+    desc: Pick the best diagnosis available + emit structured result
+    tool:
+      kind: python
+      code: |
+        # Pick the higher-confidence result. If escalation ran, prefer
+        # it; otherwise use the local model's output as-is.
+        local = local_diag if isinstance(local_diag, dict) else {}
+        remote = remote_diag if isinstance(remote_diag, dict) else None
+
+        chosen = local
+        source = "ollama"
+        if isinstance(remote, dict) and remote.get("status") == "ok":
+          chosen = remote
+          source = "openai"
+
+        # Build the final envelope. `text` / `summary` / `user_message`
+        # mirror the GUI's extractAgentText heuristic so the run
+        # dialog renders the friendly message inline; `data` carries
+        # the structured diagnosis for programmatic callers.
+        diagnosis = {
+          "execution_id": "{{ workload.execution_id }}",
+          "category": chosen.get("category") or "unknown",
+          "confidence": chosen.get("confidence", 0.0),
+          "root_cause": chosen.get("root_cause") or "",
+          "suggested_action": chosen.get("suggested_action") or "",
+          "source": source,
+          "escalated": source == "openai",
+        }
+        user_message = chosen.get("user_message") or (
+          "Diagnosis (" + source + "): " + (chosen.get("root_cause") or "no root cause identified")
+        )
+
+        result = {
+          "status": "ok",
+          "diagnosis": diagnosis,
+          "data": diagnosis,
+          "summary": user_message,
+          "text": user_message,
+          "user_message": user_message,
+        }
+      args:
+        local_diag: "{{ parse_ollama_response }}"
+        remote_diag: "{{ parse_openai_response | default(none) }}"
+    next:
+      arcs:
+        - step: end
+
+  # ---------------------------------------------------------------------
+  # Failure paths
+  # ---------------------------------------------------------------------
+  - step: handle_fetch_failure
+    desc: Couldn't pull the event log itself — surface a structured failure
+    tool:
+      kind: python
+      code: |
+        status = (data or {}).get("status_code") if isinstance(data, dict) else None
+        result = {
+          "status": "error",
+          "error": "fetch_events_failed",
+          "summary": (
+            "Couldn't fetch event log for execution "
+            "{{ workload.execution_id }}: noetl returned status "
+            + str(status or "unknown")
+          ),
+          "user_message": (
+            "Diagnostic failed: couldn't reach the noetl API. "
+            "Check the execution_id is correct and the server is reachable."
+          ),
+        }
+      args:
+        data: "{{ fetch_events.data | default({}) }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end
