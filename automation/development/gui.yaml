@@ -221,7 +221,7 @@ workflow:
               echo "  --set gateway_url=http://gateway.example.com"
               echo "  --set auth0_domain=<tenant>.us.auth0.com"
               echo "  --set auth0_client_id=<client-id>"
-              echo "  --set auth0_redirect_uri=http://722-2.local:38081/login"
+              echo "  --set auth0_redirect_uri=http://722-2.local:30081/login"
               echo ""
               echo "Other useful overrides:"
               echo "  --set gui_repo_dir=../gui"

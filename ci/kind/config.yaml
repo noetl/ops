@@ -114,7 +114,7 @@ nodes:
 
         # Standalone GUI
       - containerPort: 30081
-        hostPort: 38081
+        hostPort: 30081
         listenAddress: "0.0.0.0"
         protocol: TCP
 
