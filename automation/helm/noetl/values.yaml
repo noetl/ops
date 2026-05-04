@@ -211,6 +211,71 @@ config:
     WORKER_HEARTBEAT_INTERVAL: "15"
     WORKER_MAX_CONCURRENT: "4"
 
+# Optional AI-bridge sidecar.
+#
+# Disabled by default — the chart's optional-dependency contract
+# means a NoETL deployment without AI features must keep working.
+# Operators opt in by setting `ollamaBridge.enabled: true` and
+# pointing `ollama.url` at their Ollama instance (in-cluster
+# StatefulSet, external endpoint, etc.).
+#
+# What this deploys when enabled:
+#   - Deployment running `python -m noetl.tools.ollama_bridge`
+#     out of the same noetl image (the bridge ships in
+#     noetl.tools.ollama_bridge, so no separate image is needed)
+#   - ClusterIP Service on port 8765 reachable in-cluster as
+#     `ollama-bridge.<namespace>.svc.cluster.local:8765`
+#
+# Once deployed, register the catalog template at
+# noetl/tools/ollama_bridge/catalog_template.yaml so playbooks
+# can call `tool: kind: mcp server: mcp/ollama tool: chat ...`.
+# See docs/operations/ollama_bridge.md for the full runbook.
+ollamaBridge:
+  enabled: false
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  image:
+    # Override only when running a non-default bridge image. Empty
+    # values fall back to the chart-level `image.repository` /
+    # `image.tag` so most deployments only have to bump one tag.
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  service:
+    type: ClusterIP
+    port: 8765
+  bridge:
+    host: "0.0.0.0"
+  ollama:
+    # URL of the Ollama instance the bridge fronts. Default points
+    # at an in-cluster Ollama service in the noetl namespace; for
+    # remote / external Ollama, set this to the reachable URL.
+    url: "http://ollama.noetl.svc.cluster.local:11434"
+    # Wall-clock timeout for upstream calls. 120s covers cold-start
+    # model loads on commodity CPU; tune down for warm fleets.
+    timeoutSeconds: 120
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  # Schedule the bridge close to the Ollama backend it talks to.
+  # Empty defaults — operators set these when they want GPU-pinning
+  # or AZ-affinity.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Extra env vars merged into the container spec — useful for
+  # propagating site-specific values (proxy settings, custom
+  # logging targets, etc.) without forking the chart.
+  extraEnv: []
+
 secrets:
   postgresPassword: "demo"
   noetlPassword: "noetl"
