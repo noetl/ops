@@ -152,7 +152,8 @@ workflow:
             print(c)
           ")
 
-          declare -A RESULTS
+          RESULTS_FILE="/tmp/noetl-bump-image-results-$$.txt"
+          : > "$RESULTS_FILE"
 
           for component in $COMPONENTS; do
             echo
@@ -162,7 +163,7 @@ workflow:
             # honors the optional-dependency contract.
             if ! kubectl -n "$NAMESPACE" get deploy "$component" >/dev/null 2>&1; then
               echo "SKIP: deployment/$component not present in namespace $NAMESPACE"
-              RESULTS[$component]="skipped"
+              echo "$component skipped" >> "$RESULTS_FILE"
               continue
             fi
 
@@ -173,7 +174,7 @@ workflow:
               -o jsonpath='{.spec.template.spec.containers[0].name}')
             if [ -z "$container" ]; then
               echo "ERROR: couldn't resolve container name for deploy/$component"
-              RESULTS[$component]="error"
+              echo "$component error" >> "$RESULTS_FILE"
               continue
             fi
 
@@ -184,7 +185,7 @@ workflow:
 
             if [ "$current_image" = "$NEW_IMAGE" ]; then
               echo "  already at target image — no-op"
-              RESULTS[$component]="unchanged"
+              echo "$component unchanged" >> "$RESULTS_FILE"
               continue
             fi
 
@@ -195,11 +196,11 @@ workflow:
             echo "  waiting for rollout (timeout: ${TIMEOUT}s)..."
             if kubectl -n "$NAMESPACE" rollout status \
                 "deploy/$component" --timeout="${TIMEOUT}s"; then
-              RESULTS[$component]="bumped"
+              echo "$component bumped" >> "$RESULTS_FILE"
             else
               echo "  ERROR: rollout failed; the deployment may still converge"
               echo "  diagnostic: kubectl -n $NAMESPACE rollout status deploy/$component"
-              RESULTS[$component]="rollout_failed"
+              echo "$component rollout_failed" >> "$RESULTS_FILE"
             fi
           done
 
@@ -207,22 +208,24 @@ workflow:
           echo "=== summary ==="
           # Emit a structured per-component result that downstream
           # steps + the GUI can render.
-          for component in "${!RESULTS[@]}"; do
-            echo "  $component: ${RESULTS[$component]}"
-          done
+          while read -r component status; do
+            [ -n "$component" ] || continue
+            echo "  $component: $status"
+          done < "$RESULTS_FILE"
 
           # Fail the step if any component reported an error or a
           # rollout failure — but skipped/unchanged/bumped are all
           # success states.
-          for component in "${!RESULTS[@]}"; do
-            case "${RESULTS[$component]}" in
+          while read -r component status; do
+            [ -n "$component" ] || continue
+            case "$status" in
               error|rollout_failed)
                 echo
-                echo "ERROR: at least one component (${component}: ${RESULTS[$component]}) didn't converge"
+                echo "ERROR: at least one component (${component}: ${status}) didn't converge"
                 exit 1
                 ;;
             esac
-          done
+          done < "$RESULTS_FILE"
     next:
       arcs:
         - step: verify_images
