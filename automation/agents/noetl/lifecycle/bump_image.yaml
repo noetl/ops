@@ -5,8 +5,10 @@ metadata:
   path: automation/agents/noetl/lifecycle/bump_image
   description: |
     Lifecycle agent: bump the noetl-server / noetl-worker /
-    ollama-bridge container images to a target tag, then wait for
-    rollouts to converge.
+    ollama-bridge container images to a target tag. For public
+    external registries such as GHCR and Quay, it first verifies
+    the target image tag is visible to the registry API, then waits
+    for Kubernetes rollouts to converge.
 
     This is the noetl-native replacement for hand-running
     ``kubectl -n noetl set image`` from an operator terminal — the
@@ -28,6 +30,11 @@ metadata:
     actually exist; missing Deployments are reported as "skipped"
     rather than treated as errors. So bumping a cluster that hasn't
     deployed the bridge yet doesn't fail the whole playbook.
+
+    **Registry-availability guard.** GHCR release tags can appear in
+    GitHub releases before the package manifest is pullable. The
+    pre-rollout probe fails fast with a structured error instead of
+    letting Kubernetes sit in ImagePullBackOff until rollout timeout.
 
   agent: true
   exposes_as_mcp: true
@@ -72,6 +79,11 @@ workload:
   # on commodity nodes when the new image isn't pre-pulled. 300s
   # gives generous headroom; bump higher for slow networks.
   rollout_timeout_seconds: 300
+
+  # External registry probe settings. GHCR can lag GitHub releases by
+  # 30-90s; defaults give roughly two minutes of headroom.
+  ghcr_probe_attempts: 12
+  ghcr_probe_sleep_seconds: 10
 
   # Local-terminal context guard. Skipped when running in-cluster
   # (KUBERNETES_SERVICE_HOST set on every pod by the kubelet).
@@ -123,10 +135,96 @@ workflow:
           echo "OK: target_tag='$TARGET_TAG' namespace='$NAMESPACE'"
     next:
       arcs:
+        - step: verify_image_available
+
+  # ---------------------------------------------------------------------
+  # 2. Verify external registry image availability before mutating pods
+  # ---------------------------------------------------------------------
+  - step: verify_image_available
+    desc: Probe GHCR/Quay manifest availability before rollout
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          REPO='{{ workload.image_repository }}'
+          TAG='{{ workload.target_tag }}'
+          ATTEMPTS='{{ workload.ghcr_probe_attempts }}'
+          SLEEP_SECONDS='{{ workload.ghcr_probe_sleep_seconds }}'
+          NEW_IMAGE="$REPO:$TAG"
+
+          case "$ATTEMPTS" in
+            ''|*[!0-9]*)
+              echo "ERROR: workload.ghcr_probe_attempts must be a positive integer"
+              exit 1
+              ;;
+          esac
+          case "$SLEEP_SECONDS" in
+            ''|*[!0-9]*)
+              echo "ERROR: workload.ghcr_probe_sleep_seconds must be a non-negative integer"
+              exit 1
+              ;;
+          esac
+          if [ "$ATTEMPTS" -lt 1 ]; then
+            echo "ERROR: workload.ghcr_probe_attempts must be >= 1"
+            exit 1
+          fi
+
+          case "$NEW_IMAGE" in
+            ghcr.io/*|quay.io/*)
+              ;;
+            *)
+              echo "INFO: skipping registry probe for local/private image '$NEW_IMAGE'"
+              exit 0
+              ;;
+          esac
+
+          IMAGE_WITHOUT_TAG="${NEW_IMAGE%:*}"
+          IMAGE_TAG="${NEW_IMAGE##*:}"
+          if [ -z "$IMAGE_TAG" ] || [ "$IMAGE_TAG" = "$NEW_IMAGE" ]; then
+            echo "ERROR: couldn't extract tag from image '$NEW_IMAGE'"
+            exit 1
+          fi
+
+          REGISTRY="${IMAGE_WITHOUT_TAG%%/*}"
+          REPOSITORY="${IMAGE_WITHOUT_TAG#*/}"
+          MANIFEST_URL="https://${REGISTRY}/v2/${REPOSITORY}/manifests/${IMAGE_TAG}"
+
+          echo "INFO: probing registry manifest for $NEW_IMAGE"
+          attempt=1
+          while [ "$attempt" -le "$ATTEMPTS" ]; do
+            if [ "$REGISTRY" = "ghcr.io" ]; then
+              TOKEN=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull" \
+                | python3 -c "import json, sys; print(json.load(sys.stdin).get('token', ''))")
+              if [ -n "$TOKEN" ] && curl -sfI \
+                  -H "Authorization: Bearer $TOKEN" \
+                  -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+                  "$MANIFEST_URL" >/dev/null; then
+                echo "OK: registry manifest is available for $NEW_IMAGE (attempt $attempt/$ATTEMPTS)"
+                exit 0
+              fi
+            else
+              if curl -sfI "$MANIFEST_URL" >/dev/null; then
+                echo "OK: registry manifest is available for $NEW_IMAGE (attempt $attempt/$ATTEMPTS)"
+                exit 0
+              fi
+            fi
+
+            if [ "$attempt" -ge "$ATTEMPTS" ]; then
+              echo "ERROR: registry has not yet exposed $NEW_IMAGE after $ATTEMPTS attempts"
+              exit 1
+            fi
+
+            echo "INFO: $NEW_IMAGE not available yet (attempt $attempt/$ATTEMPTS); retrying in ${SLEEP_SECONDS}s"
+            attempt=$((attempt + 1))
+            sleep "$SLEEP_SECONDS"
+          done
+    next:
+      arcs:
         - step: bump_components
 
   # ---------------------------------------------------------------------
-  # 2. For each component: kubectl set image + rollout wait
+  # 3. For each component: kubectl set image + rollout wait
   # ---------------------------------------------------------------------
   - step: bump_components
     desc: Apply the new image tag to each component + wait for rollout
@@ -139,7 +237,80 @@ workflow:
           REPO='{{ workload.image_repository }}'
           TAG='{{ workload.target_tag }}'
           TIMEOUT='{{ workload.rollout_timeout_seconds }}'
+          ATTEMPTS='{{ workload.ghcr_probe_attempts }}'
+          SLEEP_SECONDS='{{ workload.ghcr_probe_sleep_seconds }}'
           NEW_IMAGE="$REPO:$TAG"
+
+          probe_registry_manifest() {
+            case "$ATTEMPTS" in
+              ''|*[!0-9]*)
+                echo "ERROR: workload.ghcr_probe_attempts must be a positive integer"
+                return 1
+                ;;
+            esac
+            case "$SLEEP_SECONDS" in
+              ''|*[!0-9]*)
+                echo "ERROR: workload.ghcr_probe_sleep_seconds must be a non-negative integer"
+                return 1
+                ;;
+            esac
+            if [ "$ATTEMPTS" -lt 1 ]; then
+              echo "ERROR: workload.ghcr_probe_attempts must be >= 1"
+              return 1
+            fi
+
+            case "$NEW_IMAGE" in
+              ghcr.io/*|quay.io/*)
+                ;;
+              *)
+                echo "INFO: skipping registry probe for local/private image '$NEW_IMAGE'"
+                return 0
+                ;;
+            esac
+
+            IMAGE_WITHOUT_TAG="${NEW_IMAGE%:*}"
+            IMAGE_TAG="${NEW_IMAGE##*:}"
+            if [ -z "$IMAGE_TAG" ] || [ "$IMAGE_TAG" = "$NEW_IMAGE" ]; then
+              echo "ERROR: couldn't extract tag from image '$NEW_IMAGE'"
+              return 1
+            fi
+
+            REGISTRY="${IMAGE_WITHOUT_TAG%%/*}"
+            REPOSITORY="${IMAGE_WITHOUT_TAG#*/}"
+            MANIFEST_URL="https://${REGISTRY}/v2/${REPOSITORY}/manifests/${IMAGE_TAG}"
+
+            echo "INFO: confirming registry manifest for $NEW_IMAGE before kubectl set image"
+            attempt=1
+            while [ "$attempt" -le "$ATTEMPTS" ]; do
+              if [ "$REGISTRY" = "ghcr.io" ]; then
+                TOKEN=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull" \
+                  | python3 -c "import json, sys; print(json.load(sys.stdin).get('token', ''))")
+                if [ -n "$TOKEN" ] && curl -sfI \
+                    -H "Authorization: Bearer $TOKEN" \
+                    -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+                    "$MANIFEST_URL" >/dev/null; then
+                  echo "OK: registry manifest is available for $NEW_IMAGE (attempt $attempt/$ATTEMPTS)"
+                  return 0
+                fi
+              else
+                if curl -sfI "$MANIFEST_URL" >/dev/null; then
+                  echo "OK: registry manifest is available for $NEW_IMAGE (attempt $attempt/$ATTEMPTS)"
+                  return 0
+                fi
+              fi
+
+              if [ "$attempt" -ge "$ATTEMPTS" ]; then
+                echo "ERROR: registry has not yet exposed $NEW_IMAGE after $ATTEMPTS attempts"
+                return 1
+              fi
+
+              echo "INFO: $NEW_IMAGE not available yet (attempt $attempt/$ATTEMPTS); retrying in ${SLEEP_SECONDS}s"
+              attempt=$((attempt + 1))
+              sleep "$SLEEP_SECONDS"
+            done
+          }
+
+          probe_registry_manifest
 
           # Read the components list as JSON, then iterate.
           # Jinja's `tojson` filter is the one safe way to embed
