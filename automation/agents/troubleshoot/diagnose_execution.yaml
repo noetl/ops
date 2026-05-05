@@ -66,6 +66,7 @@ workload:
   # node.
   ollama_model: "gemma3:4b"
   ollama_mcp_server: "mcp/ollama"
+  ollama_mcp_endpoint: "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
 
   # Escalation knobs.
   # confidence_threshold: skip escalation when Ollama returns >= this.
@@ -225,6 +226,7 @@ workflow:
     tool:
       kind: mcp
       server: "{{ workload.ollama_mcp_server }}"
+      endpoint: "{{ workload.ollama_mcp_endpoint }}"
       tool: chat
       arguments:
         model: "{{ workload.ollama_model }}"
