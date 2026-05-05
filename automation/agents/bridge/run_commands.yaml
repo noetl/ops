@@ -1,0 +1,166 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: bridge_run_commands
+  path: automation/agents/bridge/run_commands
+  description: |
+    Generic shell-command runner used as the execution backend for
+    the Claude ↔ Codex agent bridge. Takes a list of commands as
+    workload, runs each one sequentially via Python's ``subprocess``,
+    captures stdout / stderr / exit_code per step, returns the
+    standard agent envelope with structured per-step results.
+
+    Designed to run via ``noetl exec --runtime local`` so the bridge
+    works without depending on a noetl-server / NATS / postgres
+    cluster. Just the Rust CLI binary + Python interpreter; no
+    network egress required beyond what the commands themselves
+    invoke.
+
+    **Why a noetl playbook instead of raw bash?** The bridge's
+    procedural mode used to shell out via ``bash -c "$cmd"`` directly
+    from a watcher script. Routing through a noetl playbook gives us:
+
+    - Structured workload + return envelope (typed input/output, not
+      free-form stdout)
+    - Replayability (the same task file can be re-run via
+      ``noetl exec --runtime local <file>``)
+    - Auth-as-playbook gating (if registered in catalog, the existing
+      check_playbook_access flow can grant / deny per-user)
+    - Composability (other playbooks can invoke this as a sub-flow
+      via ``tool: kind: playbook``)
+    - GUI visibility (when run via distributed runtime instead of
+      local — same playbook, two delivery modes)
+
+  agent: true
+  exposes_as_mcp: true
+
+  capabilities:
+    - bridge
+    - shell-runner
+    - automation
+
+  tags:
+    - bridge
+    - run-commands
+    - local-runtime
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # List of {id, shell} entries. Each one is a separate bash -c call.
+  # Step IDs default to "step-N" when not provided. Empty shell
+  # strings are skipped (lets you splice the playbook with
+  # placeholders that get filled in by jinja at exec time).
+  commands: []
+
+  # When a command exits non-zero, stop processing the rest. Set to
+  # false for "best effort run all of them and report which failed"
+  # semantics (rare, but useful for status sweeps).
+  stop_on_error: true
+
+  # Optional: per-command default timeout in seconds. Each step's
+  # subprocess.run gets this as the timeout= arg. 0 means no
+  # timeout. Override by setting workload.timeout_seconds_per_step.
+  timeout_seconds_per_step: 0
+
+workflow:
+  # ---------------------------------------------------------------------
+  # 1. Run all the commands sequentially via subprocess
+  # ---------------------------------------------------------------------
+  - step: run_all
+    desc: Execute each command + capture stdout / stderr / exit_code
+    tool:
+      kind: python
+      code: |
+        import subprocess
+        import time
+
+        # subprocess kwargs we'll reuse. text=True gives us str
+        # stdout/stderr instead of bytes (cleaner JSON
+        # serialisation; the agent envelope is JSON-bound).
+        kwargs = {
+          "capture_output": True,
+          "text": True,
+          "shell": False,   # we explicitly invoke bash -c so the
+                            # caller controls quoting; subprocess
+                            # shell=True would double-interpret.
+        }
+
+        results = []
+        ok = True
+        stop_reason = None
+
+        for entry in commands:
+          if not isinstance(entry, dict):
+            continue
+          step_id = str(entry.get("id") or "step-" + str(len(results)))
+          shell_cmd = str(entry.get("shell") or "")
+          if not shell_cmd.strip():
+            continue
+
+          start = time.time()
+          step_kwargs = dict(kwargs)
+          if isinstance(timeout_seconds_per_step, (int, float)) and timeout_seconds_per_step > 0:
+            step_kwargs["timeout"] = float(timeout_seconds_per_step)
+
+          try:
+            proc = subprocess.run(["bash", "-c", shell_cmd], **step_kwargs)
+            rc = proc.returncode
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+          except subprocess.TimeoutExpired as exc:
+            rc = -1
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = "TIMEOUT after " + str(timeout_seconds_per_step) + "s"
+          except Exception as exc:
+            rc = -1
+            stdout = ""
+            stderr = "EXCEPTION: " + type(exc).__name__ + ": " + str(exc)
+
+          dur = round(time.time() - start, 3)
+
+          results.append({
+            "step_id": step_id,
+            "exit_code": rc,
+            "duration_seconds": dur,
+            "stdout": stdout,
+            "stderr": stderr,
+          })
+
+          if rc != 0 and stop_on_error:
+            ok = False
+            stop_reason = "step '" + step_id + "' exited with code " + str(rc)
+            break
+
+        # Build the standard agent envelope. The `summary` /  `text` /
+        # `user_message` fields all carry the same one-liner so the
+        # GUI's extractAgentText heuristic + bridge consumers see a
+        # single human-readable result.
+        n = len(results)
+        if ok:
+          summary = "Ran " + str(n) + " command(s) successfully"
+        else:
+          summary = "Ran " + str(n) + " command(s); stopped: " + str(stop_reason or "unknown error")
+
+        result = {
+          "status": "ok" if ok else "error",
+          "data": {
+            "results": results,
+            "command_count": n,
+            "stopped_on_error": (not ok),
+          },
+          "summary": summary,
+          "text": summary,
+          "user_message": summary,
+        }
+      args:
+        commands: "{{ workload.commands }}"
+        stop_on_error: "{{ workload.stop_on_error | default(true) }}"
+        timeout_seconds_per_step: "{{ workload.timeout_seconds_per_step | default(0) }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end
