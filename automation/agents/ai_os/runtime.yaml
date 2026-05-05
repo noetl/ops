@@ -1,0 +1,70 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ai_os_runtime_agent
+  path: automation/agents/ai_os/runtime
+  description: |
+    Terminal-facing wrapper for the AI-OS lifecycle agents. Lets the
+    GUI's prompt resolve `ai-os deploy`, `ai-os undeploy`, `ai-os status`
+    without callers needing the full lifecycle path.
+
+    Each verb dispatches the corresponding lifecycle playbook via
+    `tool: agent framework=noetl` (Gap 1) and surfaces the result.
+
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: true
+
+  terminal:
+    visible: true
+    workspace: ai-os
+    scopes:
+      - /ai-os
+    commands:
+      - deploy
+      - undeploy
+      - status
+
+  capabilities:
+    - ai-os
+    - lifecycle
+    - kubernetes
+
+  tags:
+    - ai-os
+    - lifecycle
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # One of: deploy | undeploy | status
+  verb: status
+  # Pass-through to the lifecycle playbook
+  namespace: noetl
+  expected_kube_context: "kind-noetl"
+  ollama:
+    model: "gemma2:2b"
+  bridge:
+    helm_release: "noetl"
+
+workflow:
+  - step: dispatch_lifecycle
+    desc: Hand off to the appropriate lifecycle playbook
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: "automation/agents/ai_os/lifecycle/{{ workload.verb }}"
+      payload:
+        namespace: "{{ workload.namespace }}"
+        expected_kube_context: "{{ workload.expected_kube_context }}"
+        ollama:
+          model: "{{ workload.ollama.model }}"
+        bridge:
+          helm_release: "{{ workload.bridge.helm_release }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end

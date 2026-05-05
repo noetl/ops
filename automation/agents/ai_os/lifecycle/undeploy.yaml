@@ -1,0 +1,114 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ai_os_undeploy
+  path: automation/agents/ai_os/lifecycle/undeploy
+  description: |
+    Tear down the AI infrastructure deployed by
+    automation/agents/ai_os/lifecycle/deploy:
+
+    1. Helm-upgrade the noetl chart with ``ollamaBridge.enabled=false``
+       — removes the bridge Deployment + Service.
+    2. Delete the Ollama Deployment + Service.
+    3. Optionally delete the Ollama PVC (preserve_data flag).
+
+    The optional-dependency contract means deleting the AI subsystem
+    leaves noetl core running unaffected. Use this when you want to
+    free the cluster resources OR when downgrading a cluster from
+    "AI features enabled" back to baseline.
+
+  agent: true
+  exposes_as_mcp: true
+
+  capabilities:
+    - ai-os
+    - infrastructure
+    - lifecycle:undeploy
+
+  tags:
+    - ai-os
+    - ollama
+    - lifecycle
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  namespace: noetl
+  bridge:
+    helm_release: "noetl"
+    helm_chart: "repos/ops/automation/helm/noetl"
+  ollama:
+    # Set to false to also delete the PVC (model store). True
+    # preserves the PVC so a re-deploy doesn't have to re-pull
+    # multi-GB model files.
+    preserve_data: true
+  expected_kube_context: "kind-noetl"
+
+workflow:
+  - step: disable_bridge
+    desc: Helm-upgrade with ollamaBridge.enabled=false (removes bridge Deployment + Service)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+          RELEASE='{{ workload.bridge.helm_release }}'
+          CHART='{{ workload.bridge.helm_chart }}'
+          EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
+
+          if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+            echo "INFO: running in-cluster; skipping kube-context check"
+          else
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: refusing to undeploy against context '$CURRENT_CONTEXT'."
+              echo "  expected: '$EXPECTED_CONTEXT'"
+              exit 1
+            fi
+          fi
+
+          if ! helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1; then
+            echo "INFO: release '$RELEASE' not found; nothing to disable"
+            exit 0
+          fi
+
+          helm upgrade "$RELEASE" "$CHART" \
+            --namespace "$NAMESPACE" \
+            --reuse-values \
+            --set ollamaBridge.enabled=false
+
+          echo "OK: ollamaBridge.enabled=false applied"
+    next:
+      arcs:
+        - step: delete_ollama
+
+  - step: delete_ollama
+    desc: Delete the Ollama Deployment + Service (and PVC unless preserved)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+          PRESERVE_DATA='{{ workload.ollama.preserve_data }}'
+
+          # Idempotent deletes — `--ignore-not-found` so re-running
+          # against an already-clean cluster doesn't error.
+          kubectl -n "$NAMESPACE" delete deployment ollama --ignore-not-found
+          kubectl -n "$NAMESPACE" delete service ollama --ignore-not-found
+
+          if [ "$PRESERVE_DATA" = "false" ] || [ "$PRESERVE_DATA" = "False" ]; then
+            kubectl -n "$NAMESPACE" delete pvc ollama-data --ignore-not-found
+            echo "OK: Ollama Deployment, Service, and PVC removed"
+          else
+            echo "OK: Ollama Deployment and Service removed (PVC preserved)"
+            echo "    Set workload.ollama.preserve_data=false to also delete the PVC"
+          fi
+    next:
+      arcs:
+        - step: end
+
+  - step: end
