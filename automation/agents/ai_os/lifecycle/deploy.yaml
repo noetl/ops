@@ -53,9 +53,9 @@ workload:
     # Ollama image. Pin a specific tag in production; "latest" is
     # fine for local kind / dev clusters.
     image: "ollama/ollama:latest"
-    # PVC size for the model store. gemma2:2b is ~1.6GB on disk;
-    # qwen2.5:7b is ~5GB; llama3.2 is ~2GB. 20Gi covers a few
-    # models without resizing.
+    # PVC size for the model store. gemma3:4b is ~3.3GB on disk;
+    # qwen3:32b is ~20GB. 20Gi covers Gemma 4 comfortably; use
+    # 40Gi+ when also pulling larger Qwen models.
     storage_size: "20Gi"
     # Empty default → cluster's default StorageClass. Set explicitly
     # for clusters with multiple classes (e.g. "standard-rwx" on
@@ -67,13 +67,14 @@ workload:
     service_port: 11434
     # Model to pre-pull after the pod is ready. Set to empty string
     # to skip the pull step (operator pulls models out-of-band).
-    model: "gemma2:2b"
-    # Resource requests / limits. CPU inference on a 2B-parameter
-    # model fits comfortably in 2 cores / 4Gi.
+    model: "gemma3:4b"
+    # Resource requests / limits. gemma3:4b needs just over 4Gi while
+    # loading on CPU in Ollama, so leave enough headroom above the
+    # model's reported requirement.
     cpu_request: "500m"
     cpu_limit: "2"
-    memory_request: "2Gi"
-    memory_limit: "4Gi"
+    memory_request: "3Gi"
+    memory_limit: "5Gi"
     # Wait timeout for pod readiness (seconds). Cold-start with
     # an empty PVC + first model pull can take 60–90s on commodity
     # nodes.
