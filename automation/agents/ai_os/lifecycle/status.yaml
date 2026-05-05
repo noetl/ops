@@ -1,0 +1,194 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ai_os_status
+  path: automation/agents/ai_os/lifecycle/status
+  description: |
+    Report the current state of the NoETL-as-AI-OS infrastructure:
+
+    - Ollama Deployment / Service / PVC presence + Ready status
+    - List of locally pulled Ollama models
+    - ollama-bridge sidecar Deployment / Service / Ready status
+    - Bridge → Ollama JSON-RPC reachability (tools/list smoke)
+    - Catalog presence of mcp/ollama, troubleshoot agents, spike fixtures
+
+    Read-only: this playbook never mutates cluster or catalog state.
+
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: true
+
+  capabilities:
+    - ai-os
+    - lifecycle:status
+    - kubernetes-observability
+
+  tags:
+    - ai-os
+    - status
+    - read-only
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  namespace: noetl
+  noetl_url: "http://noetl-server.noetl.svc.cluster.local:8080"
+
+workflow:
+  - step: ollama_status
+    desc: Check Ollama Deployment / Service / PVC + list pulled models
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+
+          echo "=== Ollama backend ==="
+          kubectl -n "$NAMESPACE" get deployment ollama 2>/dev/null \
+            && echo "  Deployment: present" \
+            || echo "  Deployment: MISSING"
+
+          kubectl -n "$NAMESPACE" get service ollama 2>/dev/null \
+            && echo "  Service: present" \
+            || echo "  Service: MISSING"
+
+          kubectl -n "$NAMESPACE" get pvc ollama-data 2>/dev/null \
+            && echo "  PVC: present" \
+            || echo "  PVC: MISSING"
+
+          echo
+          echo "=== Pulled models ==="
+          POD=$(kubectl -n "$NAMESPACE" get pod -l app=ollama \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -z "$POD" ]; then
+            echo "  (Ollama pod not running — no models to list)"
+          else
+            kubectl -n "$NAMESPACE" exec "$POD" -- \
+              wget -qO- "http://localhost:11434/api/tags" 2>/dev/null \
+              | grep -o '"name":"[^"]*"' \
+              || echo "  (couldn't reach Ollama /api/tags)"
+          fi
+    next:
+      arcs:
+        - step: bridge_status
+
+  - step: bridge_status
+    desc: Check ollama-bridge sidecar + bridge → Ollama reachability
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+
+          echo "=== Bridge sidecar ==="
+          kubectl -n "$NAMESPACE" get deployment ollama-bridge 2>/dev/null \
+            && echo "  Deployment: present" \
+            || echo "  Deployment: MISSING (helm: ollamaBridge.enabled=false?)"
+
+          kubectl -n "$NAMESPACE" get service ollama-bridge 2>/dev/null \
+            && echo "  Service: present" \
+            || echo "  Service: MISSING"
+
+          echo
+          echo "=== Bridge → Ollama reachability ==="
+          BRIDGE_POD=$(kubectl -n "$NAMESPACE" get pod -l app=ollama-bridge \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -z "$BRIDGE_POD" ]; then
+            echo "  (bridge pod not running — can't smoke /jsonrpc)"
+          else
+            # tools/list is the cheapest call that exercises the bridge.
+            # We don't validate the body shape here; status is a
+            # connectivity check, not a full assertion.
+            if kubectl -n "$NAMESPACE" exec "$BRIDGE_POD" -- \
+                wget -qO- --post-data='{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+                --header='Content-Type: application/json' \
+                "http://localhost:8765/jsonrpc" >/dev/null 2>&1; then
+              echo "  /jsonrpc tools/list: OK"
+            else
+              echo "  /jsonrpc tools/list: FAILED (bridge pod up but JSON-RPC unreachable)"
+            fi
+          fi
+    next:
+      arcs:
+        - step: catalog_status
+
+  - step: catalog_status
+    desc: Check whether the AI-OS catalog entries are registered
+    tool:
+      kind: http
+      method: GET
+      url: "{{ workload.noetl_url }}/api/catalog/entries?resource_type=playbook"
+      retry:
+        max_attempts: 2
+        retry_on_status: [502, 503, 504]
+        backoff_seconds: 1
+    next:
+      arcs:
+        - step: render_catalog_status
+
+  - step: render_catalog_status
+    desc: Walk the catalog list, report presence of each AI-OS entry
+    tool:
+      kind: python
+      code: |
+        # Defensive about response shapes — catalog list endpoint
+        # might return either an envelope or a bare list.
+        body = catalog_body
+        entries = []
+        if isinstance(body, dict):
+          entries = body.get("entries") or body.get("items") or body.get("data") or []
+        elif isinstance(body, list):
+          entries = body
+
+        # Build a set of registered paths
+        registered_paths = set()
+        for e in entries:
+          if isinstance(e, dict) and isinstance(e.get("path"), str):
+            registered_paths.add(e["path"])
+
+        # AI-OS entries we care about
+        wanted = [
+          ("automation/agents/troubleshoot/diagnose_execution", "troubleshoot agent"),
+          ("automation/agents/troubleshoot/runtime", "troubleshoot runtime wrapper"),
+          ("automation/agents/ai_os/lifecycle/deploy", "AI-OS deploy lifecycle"),
+          ("automation/agents/ai_os/lifecycle/undeploy", "AI-OS undeploy lifecycle"),
+          ("automation/agents/ai_os/lifecycle/status", "AI-OS status (this)"),
+          ("tests/spike/spike_e2e_test", "spike e2e smoke test"),
+          ("tests/spike/spike_failing_subflow", "spike failing subflow"),
+        ]
+
+        lines = ["=== Catalog entries ==="]
+        all_present = True
+        for path, label in wanted:
+          status = "present" if path in registered_paths else "MISSING"
+          if path not in registered_paths:
+            all_present = False
+          lines.append(f"  {status:8s} {path:65s} ({label})")
+
+        # mcp/ollama is kind=mcp, not playbook — list endpoint above
+        # filtered to playbooks, so we just note that operators check
+        # it separately.
+        lines.append("")
+        lines.append("(mcp/ollama is kind=Mcp — verify separately with `noetl catalog list Mcp`)")
+        lines.append("")
+
+        summary = "\n".join(lines)
+        result = {
+          "status": "ok",
+          "summary": summary,
+          "text": summary,
+          "all_present": all_present,
+          "registered": [p for p, _ in wanted if p in registered_paths],
+          "missing": [p for p, _ in wanted if p not in registered_paths],
+        }
+      args:
+        catalog_body: "{{ catalog_status.data }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end

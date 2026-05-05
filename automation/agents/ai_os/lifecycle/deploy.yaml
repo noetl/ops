@@ -1,0 +1,421 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ai_os_deploy
+  path: automation/agents/ai_os/lifecycle/deploy
+  description: |
+    Deploy the AI infrastructure for the NoETL-as-AI-OS spike:
+
+    1. **Ollama backend** — Deployment + Service + PVC in the noetl
+       namespace. Single replica, no GPU pinning by default
+       (gemma2:2b runs fine on commodity CPU at ~200ms inference).
+    2. **Pull gemma2:2b** (or whichever model is configured) into the
+       Ollama pod's model store.
+    3. **Enable ollamaBridge sidecar** via helm upgrade, flipping
+       `ollamaBridge.enabled` to true on the noetl chart.
+    4. **Verify reachability** — bridge → Ollama health check.
+
+    After this completes, ``noetl exec tests/spike/spike_e2e_test``
+    should run GREEN with a real diagnosis attached via Gap 4.1 +
+    the troubleshoot agent + the cheap-first Ollama path.
+
+    **Idempotent**: re-running is safe. ``kubectl apply`` reconciles
+    the manifests, helm upgrade reuses the existing release, and
+    the model-pull step skips if the model is already present.
+
+    **Optional-dependency contract still holds**: this playbook
+    *adds* the AI subsystem to a cluster that didn't have it; it
+    doesn't change anything about how noetl core runs without it.
+
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: true
+
+  capabilities:
+    - ai-os
+    - infrastructure
+    - lifecycle:deploy
+    - kubernetes
+
+  tags:
+    - ai-os
+    - ollama
+    - mcp-bridge
+    - lifecycle
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  namespace: noetl
+  ollama:
+    # Ollama image. Pin a specific tag in production; "latest" is
+    # fine for local kind / dev clusters.
+    image: "ollama/ollama:latest"
+    # PVC size for the model store. gemma2:2b is ~1.6GB on disk;
+    # qwen2.5:7b is ~5GB; llama3.2 is ~2GB. 20Gi covers a few
+    # models without resizing.
+    storage_size: "20Gi"
+    # Empty default → cluster's default StorageClass. Set explicitly
+    # for clusters with multiple classes (e.g. "standard-rwx" on
+    # GKE Filestore).
+    storage_class: ""
+    # Service name for in-cluster DNS. The default matches what the
+    # bridge's ``OLLAMA_URL`` env var points at.
+    service_name: "ollama"
+    service_port: 11434
+    # Model to pre-pull after the pod is ready. Set to empty string
+    # to skip the pull step (operator pulls models out-of-band).
+    model: "gemma2:2b"
+    # Resource requests / limits. CPU inference on a 2B-parameter
+    # model fits comfortably in 2 cores / 4Gi.
+    cpu_request: "500m"
+    cpu_limit: "2"
+    memory_request: "2Gi"
+    memory_limit: "4Gi"
+    # Wait timeout for pod readiness (seconds). Cold-start with
+    # an empty PVC + first model pull can take 60–90s on commodity
+    # nodes.
+    ready_timeout_seconds: 300
+
+  bridge:
+    # Helm release name for the noetl chart. Match what's currently
+    # deployed (default: "noetl" in the noetl namespace).
+    helm_release: "noetl"
+    # Path to the noetl chart on disk. Operators may override when
+    # working off a release artifact instead of the in-tree chart.
+    helm_chart: "repos/ops/automation/helm/noetl"
+    # Where to fetch existing helm values before merging the bridge
+    # block. Empty → call ``helm get values`` and use whatever's
+    # currently deployed.
+    existing_values_file: ""
+
+  # Local-terminal context guard. Skipped when running in-cluster
+  # (KUBERNETES_SERVICE_HOST set). Override for non-default kube
+  # contexts.
+  expected_kube_context: "kind-noetl"
+
+workflow:
+  # ---------------------------------------------------------------------
+  # 1. Context guard + apply Ollama manifests
+  # ---------------------------------------------------------------------
+  - step: apply_ollama_manifests
+    desc: Apply Ollama Deployment + Service + PVC to the cluster
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+
+          NAMESPACE='{{ workload.namespace }}'
+          IMAGE='{{ workload.ollama.image }}'
+          STORAGE_SIZE='{{ workload.ollama.storage_size }}'
+          STORAGE_CLASS='{{ workload.ollama.storage_class }}'
+          SERVICE_NAME='{{ workload.ollama.service_name }}'
+          SERVICE_PORT='{{ workload.ollama.service_port }}'
+          CPU_REQUEST='{{ workload.ollama.cpu_request }}'
+          CPU_LIMIT='{{ workload.ollama.cpu_limit }}'
+          MEM_REQUEST='{{ workload.ollama.memory_request }}'
+          MEM_LIMIT='{{ workload.ollama.memory_limit }}'
+          EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
+
+          # Same in-cluster guard pattern as the kubernetes lifecycle
+          # agents — KUBERNETES_SERVICE_HOST is set by the kubelet
+          # inside every pod, so when noetl dispatches this to a
+          # worker pod the in-cluster credentials already pin it to
+          # the right cluster. Local-terminal invocations preserve
+          # the kubectl-context guard so you can't fat-finger a
+          # deploy against the wrong cluster.
+          if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+            echo "INFO: running in-cluster; skipping kube-context check"
+          else
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: refusing to deploy against context '$CURRENT_CONTEXT'."
+              echo "  expected: '$EXPECTED_CONTEXT' (override via workload.expected_kube_context)"
+              exit 1
+            fi
+          fi
+
+          # Ensure namespace exists
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml \
+            | kubectl apply -f -
+
+          # Build PVC manifest. storage_class is optional — empty
+          # value falls back to the cluster's default StorageClass.
+          if [ -n "$STORAGE_CLASS" ]; then
+            STORAGE_CLASS_LINE="storageClassName: $STORAGE_CLASS"
+          else
+            STORAGE_CLASS_LINE=""
+          fi
+
+          # Apply the three manifests via a single kubectl apply.
+          # Inline manifest avoids polluting repos/ops with a sibling
+          # YAML; operators who want to fork the manifest can copy
+          # this block out.
+          cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: ollama-data
+            labels:
+              app: ollama
+              noetl.io/component: ai-backend
+          spec:
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests:
+                storage: $STORAGE_SIZE
+            $STORAGE_CLASS_LINE
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ollama
+            labels:
+              app: ollama
+              noetl.io/component: ai-backend
+          spec:
+            replicas: 1
+            strategy:
+              type: Recreate
+            selector:
+              matchLabels: { app: ollama }
+            template:
+              metadata:
+                labels:
+                  app: ollama
+                  noetl.io/component: ai-backend
+              spec:
+                containers:
+                - name: ollama
+                  image: $IMAGE
+                  ports:
+                  - name: http
+                    containerPort: $SERVICE_PORT
+                  env:
+                  - name: OLLAMA_HOST
+                    value: "0.0.0.0:$SERVICE_PORT"
+                  - name: OLLAMA_KEEP_ALIVE
+                    value: "5m"
+                  resources:
+                    requests:
+                      cpu: $CPU_REQUEST
+                      memory: $MEM_REQUEST
+                    limits:
+                      cpu: $CPU_LIMIT
+                      memory: $MEM_LIMIT
+                  volumeMounts:
+                  - name: data
+                    mountPath: /root/.ollama
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: http
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                  livenessProbe:
+                    httpGet:
+                      path: /
+                      port: http
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                    timeoutSeconds: 5
+                volumes:
+                - name: data
+                  persistentVolumeClaim:
+                    claimName: ollama-data
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: $SERVICE_NAME
+            labels:
+              app: ollama
+              noetl.io/component: ai-backend
+          spec:
+            type: ClusterIP
+            selector: { app: ollama }
+            ports:
+            - name: http
+              port: $SERVICE_PORT
+              targetPort: http
+          EOF
+
+          echo "OK: Ollama manifests applied to namespace $NAMESPACE"
+    next:
+      arcs:
+        - step: wait_ollama_ready
+
+  # ---------------------------------------------------------------------
+  # 2. Wait for Ollama pod readiness
+  # ---------------------------------------------------------------------
+  - step: wait_ollama_ready
+    desc: Wait for the Ollama pod to become Ready
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+          TIMEOUT='{{ workload.ollama.ready_timeout_seconds }}'
+
+          echo "Waiting up to ${TIMEOUT}s for Ollama pod to become ready..."
+          kubectl -n "$NAMESPACE" wait \
+            --for=condition=ready pod \
+            -l app=ollama \
+            --timeout="${TIMEOUT}s"
+
+          echo "OK: Ollama pod is ready"
+          kubectl -n "$NAMESPACE" get pod -l app=ollama
+    next:
+      arcs:
+        - step: pull_model
+
+  # ---------------------------------------------------------------------
+  # 3. Pull the configured model into the Ollama pod
+  # ---------------------------------------------------------------------
+  - step: pull_model
+    desc: Pull the configured model so it's locally cached
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+          MODEL='{{ workload.ollama.model }}'
+
+          if [ -z "$MODEL" ]; then
+            echo "INFO: workload.ollama.model is empty; skipping model pull"
+            exit 0
+          fi
+
+          POD=$(kubectl -n "$NAMESPACE" get pod -l app=ollama \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Checking whether $MODEL is already pulled..."
+          # /api/tags returns {models: [{name, ...}]}; jq is overkill
+          # here, just grep for the model tag string.
+          if kubectl -n "$NAMESPACE" exec "$POD" -- \
+              wget -qO- "http://localhost:{{ workload.ollama.service_port }}/api/tags" \
+              2>/dev/null | grep -q "\"$MODEL\""; then
+            echo "OK: $MODEL is already pulled"
+            exit 0
+          fi
+
+          echo "Pulling $MODEL..."
+          kubectl -n "$NAMESPACE" exec "$POD" -- \
+            ollama pull "$MODEL"
+          echo "OK: $MODEL is now available"
+    next:
+      arcs:
+        - step: enable_bridge
+
+  # ---------------------------------------------------------------------
+  # 4. Flip ollamaBridge.enabled=true via helm upgrade
+  # ---------------------------------------------------------------------
+  - step: enable_bridge
+    desc: Helm-upgrade the noetl chart with ollamaBridge.enabled=true
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+          RELEASE='{{ workload.bridge.helm_release }}'
+          CHART='{{ workload.bridge.helm_chart }}'
+          OLLAMA_SVC='{{ workload.ollama.service_name }}'
+          OLLAMA_PORT='{{ workload.ollama.service_port }}'
+
+          # Pull current values (operator's existing overrides) so we
+          # don't accidentally reset them. helm get values returns
+          # only user-supplied values; defaults from values.yaml are
+          # added back automatically on upgrade.
+          existing=$(mktemp)
+          trap 'rm -f "${existing:-}"' EXIT
+
+          if helm get values "$RELEASE" -n "$NAMESPACE" -o yaml \
+              > "$existing" 2>/dev/null; then
+            echo "INFO: merging into existing helm values for $RELEASE"
+          else
+            echo "INFO: no existing release '$RELEASE' found; creating fresh"
+            echo "{}" > "$existing"
+          fi
+
+          # Append the bridge block. We use `--set` flags rather than
+          # editing the values file in place — safer round-trip and
+          # easier to audit.
+          helm upgrade --install "$RELEASE" "$CHART" \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            -f "$existing" \
+            --set ollamaBridge.enabled=true \
+            --set "ollamaBridge.ollama.url=http://${OLLAMA_SVC}.${NAMESPACE}.svc.cluster.local:${OLLAMA_PORT}" \
+            --reuse-values
+
+          echo "OK: helm upgrade applied with ollamaBridge.enabled=true"
+    next:
+      arcs:
+        - step: wait_bridge_ready
+
+  # ---------------------------------------------------------------------
+  # 5. Wait for the bridge sidecar to be Ready
+  # ---------------------------------------------------------------------
+  - step: wait_bridge_ready
+    desc: Wait for the ollama-bridge pod to become Ready
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+
+          echo "Waiting up to 120s for ollama-bridge pod to become ready..."
+          kubectl -n "$NAMESPACE" wait \
+            --for=condition=ready pod \
+            -l app=ollama-bridge \
+            --timeout=120s
+
+          echo "OK: ollama-bridge pod is ready"
+          kubectl -n "$NAMESPACE" get pod -l app=ollama-bridge
+    next:
+      arcs:
+        - step: verify_reachability
+
+  # ---------------------------------------------------------------------
+  # 6. End-to-end reachability: bridge → Ollama via the JSON-RPC surface
+  # ---------------------------------------------------------------------
+  - step: verify_reachability
+    desc: Call the bridge's tools/list to confirm Ollama is reachable
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+
+          # The bridge exposes /jsonrpc on port 8765. tools/list is
+          # the cheapest call that exercises the bridge → Ollama path.
+          echo "Calling bridge /jsonrpc tools/list..."
+          BRIDGE_POD=$(kubectl -n "$NAMESPACE" get pod -l app=ollama-bridge \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          kubectl -n "$NAMESPACE" exec "$BRIDGE_POD" -- \
+            wget -qO- --post-data='{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+            --header='Content-Type: application/json' \
+            "http://localhost:8765/jsonrpc"
+
+          echo
+          echo "OK: bridge JSON-RPC reachable + tools/list returned"
+          echo
+          echo "AI-OS deployment complete. The spike e2e smoke should"
+          echo "now run GREEN with a real diagnosis attached. Try:"
+          echo "  noetl exec tests/spike/spike_e2e_test --runtime distributed --json"
+    next:
+      arcs:
+        - step: end
+
+  - step: end
