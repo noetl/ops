@@ -296,19 +296,20 @@ workflow:
           POD=$(kubectl -n "$NAMESPACE" get pod -l app=ollama \
             -o jsonpath='{.items[0].metadata.name}')
 
+          # `ollama list` is the native way to check pulled models —
+          # avoids depending on wget/curl being present in the
+          # ollama/ollama image (it ships neither). The grep is loose
+          # because `ollama list` formats vary slightly by version
+          # (sometimes prefixes the digest, sometimes the size).
           echo "Checking whether $MODEL is already pulled..."
-          # /api/tags returns {models: [{name, ...}]}; jq is overkill
-          # here, just grep for the model tag string.
-          if kubectl -n "$NAMESPACE" exec "$POD" -- \
-              wget -qO- "http://localhost:{{ workload.ollama.service_port }}/api/tags" \
-              2>/dev/null | grep -q "\"$MODEL\""; then
+          if kubectl -n "$NAMESPACE" exec "$POD" -- ollama list 2>/dev/null \
+              | grep -q "$MODEL"; then
             echo "OK: $MODEL is already pulled"
             exit 0
           fi
 
           echo "Pulling $MODEL..."
-          kubectl -n "$NAMESPACE" exec "$POD" -- \
-            ollama pull "$MODEL"
+          kubectl -n "$NAMESPACE" exec "$POD" -- ollama pull "$MODEL"
           echo "OK: $MODEL is now available"
     next:
       arcs:
@@ -397,18 +398,38 @@ workflow:
           set -euo pipefail
           NAMESPACE='{{ workload.namespace }}'
 
-          # The bridge exposes /jsonrpc on port 8765. tools/list is
-          # the cheapest call that exercises the bridge → Ollama path.
-          echo "Calling bridge /jsonrpc tools/list..."
+          # Smoke the bridge → Ollama path via Python (always available
+          # in the noetl image — much more portable than wget/curl).
+          # `python -c` runs an inline script that POSTs the JSON-RPC
+          # tools/list call to the bridge's /healthz peer endpoint
+          # and exits non-zero on any error.
           BRIDGE_POD=$(kubectl -n "$NAMESPACE" get pod -l app=ollama-bridge \
             -o jsonpath='{.items[0].metadata.name}')
 
+          echo "Calling bridge /jsonrpc tools/list..."
+          # Use the bridge's own python runtime — the noetl image is
+          # built with python3 + stdlib so this works without any
+          # additional shipped binaries.
           kubectl -n "$NAMESPACE" exec "$BRIDGE_POD" -- \
-            wget -qO- --post-data='{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-            --header='Content-Type: application/json' \
-            "http://localhost:8765/jsonrpc"
+            python3 -c "
+          import json
+          import urllib.request
 
-          echo
+          req = urllib.request.Request(
+            'http://localhost:8765/jsonrpc',
+            data=json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}).encode(),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+          )
+          with urllib.request.urlopen(req, timeout=10) as r:
+            body = json.loads(r.read())
+          tools = (body.get('result') or {}).get('tools') or []
+          print('Bridge tools/list returned', len(tools), 'tools:', [t.get('name') for t in tools])
+          if not tools:
+            print('WARN: tools list is empty')
+            raise SystemExit(1)
+          "
+
           echo "OK: bridge JSON-RPC reachable + tools/list returned"
           echo
           echo "AI-OS deployment complete. The spike e2e smoke should"

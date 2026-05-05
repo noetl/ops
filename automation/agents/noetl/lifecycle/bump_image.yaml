@@ -1,0 +1,322 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: noetl_lifecycle_bump_image
+  path: automation/agents/noetl/lifecycle/bump_image
+  description: |
+    Lifecycle agent: bump the noetl-server / noetl-worker /
+    ollama-bridge container images to a target tag, then wait for
+    rollouts to converge.
+
+    This is the noetl-native replacement for hand-running
+    ``kubectl -n noetl set image`` from an operator terminal — the
+    deployment becomes a structured noetl execution that's logged
+    to the event store, can be replayed, and surfaces per-component
+    status via the standard agent envelope.
+
+    By default touches all three AI-OS components (server, worker,
+    bridge). Override ``workload.components`` to bump a subset
+    (e.g. just the bridge during a hotfix iteration without
+    recycling worker capacity).
+
+    **Idempotent.** Re-running with the same tag is a no-op
+    (kubectl set image is naturally idempotent; the rollout wait
+    short-circuits when the deployment is already at the requested
+    image).
+
+    **Optional-dependency contract.** Only acts on Deployments that
+    actually exist; missing Deployments are reported as "skipped"
+    rather than treated as errors. So bumping a cluster that hasn't
+    deployed the bridge yet doesn't fail the whole playbook.
+
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: true
+
+  capabilities:
+    - noetl-lifecycle
+    - lifecycle:bump-image
+    - kubernetes
+
+  tags:
+    - noetl
+    - lifecycle
+    - image-bump
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # Required. The new image tag (just the tag, not the full ref).
+  # Example: "v2.35.2"
+  target_tag: ""
+
+  # Image registry + repository. The Deployments in the chart use
+  # the same image for server / worker / bridge so we can bump them
+  # all to the same tag in one playbook.
+  image_repository: "ghcr.io/noetl/noetl"
+
+  # Namespace where the Deployments live.
+  namespace: "noetl"
+
+  # Components to bump. Each entry is a Deployment name. The default
+  # set covers the AI-OS bring-up; operators trim this to a subset
+  # for surgical iterations (just bridge while debugging Gap 5, etc.).
+  components:
+    - "noetl-server"
+    - "noetl-worker"
+    - "ollama-bridge"
+
+  # Wait timeout per component (seconds). Cold-start can take 60+s
+  # on commodity nodes when the new image isn't pre-pulled. 300s
+  # gives generous headroom; bump higher for slow networks.
+  rollout_timeout_seconds: 300
+
+  # Local-terminal context guard. Skipped when running in-cluster
+  # (KUBERNETES_SERVICE_HOST set on every pod by the kubelet).
+  expected_kube_context: "kind-noetl"
+
+workflow:
+  # ---------------------------------------------------------------------
+  # 1. Validate the workload + context
+  # ---------------------------------------------------------------------
+  - step: validate
+    desc: Validate target_tag is set + check kube context (when local)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          TARGET_TAG='{{ workload.target_tag }}'
+          NAMESPACE='{{ workload.namespace }}'
+          EXPECTED_CONTEXT='{{ workload.expected_kube_context }}'
+
+          if [ -z "$TARGET_TAG" ]; then
+            echo "ERROR: workload.target_tag is required (e.g. 'v2.35.2')"
+            exit 1
+          fi
+
+          # Basic shape check — semver-ish or commit-sha-ish.
+          # Reject obviously malformed inputs early to fail-fast.
+          if ! echo "$TARGET_TAG" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+            echo "ERROR: target_tag '$TARGET_TAG' contains invalid characters"
+            exit 1
+          fi
+
+          # Same in-cluster guard pattern as the other lifecycle
+          # agents — KUBERNETES_SERVICE_HOST is set by the kubelet
+          # inside every pod, so when noetl dispatches this to a
+          # worker pod the in-cluster credentials already pin it
+          # to the right cluster.
+          if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+            echo "INFO: running in-cluster; skipping kube-context check"
+          else
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: refusing to bump-image against context '$CURRENT_CONTEXT'."
+              echo "  expected: '$EXPECTED_CONTEXT' (override via workload.expected_kube_context)"
+              exit 1
+            fi
+          fi
+
+          echo "OK: target_tag='$TARGET_TAG' namespace='$NAMESPACE'"
+    next:
+      arcs:
+        - step: bump_components
+
+  # ---------------------------------------------------------------------
+  # 2. For each component: kubectl set image + rollout wait
+  # ---------------------------------------------------------------------
+  - step: bump_components
+    desc: Apply the new image tag to each component + wait for rollout
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+          REPO='{{ workload.image_repository }}'
+          TAG='{{ workload.target_tag }}'
+          TIMEOUT='{{ workload.rollout_timeout_seconds }}'
+          NEW_IMAGE="$REPO:$TAG"
+
+          # Read the components list as JSON, then iterate.
+          # Jinja's `tojson` filter is the one safe way to embed
+          # array workload values into a shell command — anything
+          # else risks shell-quoting bugs.
+          COMPONENTS_JSON='{{ workload.components | tojson }}'
+          COMPONENTS=$(echo "$COMPONENTS_JSON" | python3 -c "
+          import json, sys
+          for c in json.load(sys.stdin):
+            print(c)
+          ")
+
+          declare -A RESULTS
+
+          for component in $COMPONENTS; do
+            echo
+            echo "=== $component ==="
+
+            # Skip components whose Deployment doesn't exist —
+            # honors the optional-dependency contract.
+            if ! kubectl -n "$NAMESPACE" get deploy "$component" >/dev/null 2>&1; then
+              echo "SKIP: deployment/$component not present in namespace $NAMESPACE"
+              RESULTS[$component]="skipped"
+              continue
+            fi
+
+            # The container name conventionally matches the deployment
+            # name in the noetl chart. Verify before set-image to fail
+            # loudly if the convention drifts.
+            container=$(kubectl -n "$NAMESPACE" get deploy "$component" \
+              -o jsonpath='{.spec.template.spec.containers[0].name}')
+            if [ -z "$container" ]; then
+              echo "ERROR: couldn't resolve container name for deploy/$component"
+              RESULTS[$component]="error"
+              continue
+            fi
+
+            current_image=$(kubectl -n "$NAMESPACE" get deploy "$component" \
+              -o jsonpath="{.spec.template.spec.containers[?(@.name=='$container')].image}")
+            echo "  current image: $current_image"
+            echo "  target image:  $NEW_IMAGE"
+
+            if [ "$current_image" = "$NEW_IMAGE" ]; then
+              echo "  already at target image — no-op"
+              RESULTS[$component]="unchanged"
+              continue
+            fi
+
+            echo "  bumping..."
+            kubectl -n "$NAMESPACE" set image \
+              "deploy/$component" "$container=$NEW_IMAGE"
+
+            echo "  waiting for rollout (timeout: ${TIMEOUT}s)..."
+            if kubectl -n "$NAMESPACE" rollout status \
+                "deploy/$component" --timeout="${TIMEOUT}s"; then
+              RESULTS[$component]="bumped"
+            else
+              echo "  ERROR: rollout failed; the deployment may still converge"
+              echo "  diagnostic: kubectl -n $NAMESPACE rollout status deploy/$component"
+              RESULTS[$component]="rollout_failed"
+            fi
+          done
+
+          echo
+          echo "=== summary ==="
+          # Emit a structured per-component result that downstream
+          # steps + the GUI can render.
+          for component in "${!RESULTS[@]}"; do
+            echo "  $component: ${RESULTS[$component]}"
+          done
+
+          # Fail the step if any component reported an error or a
+          # rollout failure — but skipped/unchanged/bumped are all
+          # success states.
+          for component in "${!RESULTS[@]}"; do
+            case "${RESULTS[$component]}" in
+              error|rollout_failed)
+                echo
+                echo "ERROR: at least one component (${component}: ${RESULTS[$component]}) didn't converge"
+                exit 1
+                ;;
+            esac
+          done
+    next:
+      arcs:
+        - step: verify_images
+
+  # ---------------------------------------------------------------------
+  # 3. Verify the pods actually report the new image
+  # ---------------------------------------------------------------------
+  - step: verify_images
+    desc: Poll each component's pods + confirm they're at the new image
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NAMESPACE='{{ workload.namespace }}'
+          REPO='{{ workload.image_repository }}'
+          TAG='{{ workload.target_tag }}'
+          NEW_IMAGE="$REPO:$TAG"
+
+          COMPONENTS_JSON='{{ workload.components | tojson }}'
+          COMPONENTS=$(echo "$COMPONENTS_JSON" | python3 -c "
+          import json, sys
+          for c in json.load(sys.stdin):
+            print(c)
+          ")
+
+          all_ok=true
+          for component in $COMPONENTS; do
+            if ! kubectl -n "$NAMESPACE" get deploy "$component" >/dev/null 2>&1; then
+              continue   # skipped during bump_components; nothing to verify
+            fi
+
+            running_image=$(kubectl -n "$NAMESPACE" get pod \
+              -l "app=$component" \
+              -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null \
+              || echo "")
+
+            if [ "$running_image" = "$NEW_IMAGE" ]; then
+              echo "OK: $component is running $running_image"
+            else
+              echo "MISMATCH: $component is running '$running_image' (expected '$NEW_IMAGE')"
+              all_ok=false
+            fi
+          done
+
+          if [ "$all_ok" = "false" ]; then
+            echo
+            echo "WARN: at least one component's pods are not yet at the target image."
+            echo "      The rollout may still be converging — re-run noetl status,"
+            echo "      OR run `kubectl -n $NAMESPACE get pods` to inspect."
+            exit 1
+          fi
+
+          echo
+          echo "All components verified at $NEW_IMAGE"
+    next:
+      arcs:
+        - step: summarize
+
+  # ---------------------------------------------------------------------
+  # 4. Build the structured result envelope
+  # ---------------------------------------------------------------------
+  - step: summarize
+    desc: Emit a final result envelope with per-component status
+    tool:
+      kind: python
+      code: |
+        # The shell steps above don't expose structured per-component
+        # state to this step (their stdout is captured but not parsed),
+        # so we surface a high-level "all converged" marker. Operators
+        # who want detailed per-pod info pull it from the event log.
+        target = "{{ workload.image_repository }}:{{ workload.target_tag }}"
+        components = {{ workload.components | tojson }}
+
+        text = (
+          "Noetl image bump complete. "
+          + ", ".join(components)
+          + f" → {target}"
+        )
+
+        result = {
+          "status": "ok",
+          "summary": text,
+          "text": text,
+          "user_message": text,
+          "data": {
+            "target_image": target,
+            "components": components,
+            "namespace": "{{ workload.namespace }}",
+          },
+        }
+      args: {}
+    next:
+      arcs:
+        - step: end
+
+  - step: end

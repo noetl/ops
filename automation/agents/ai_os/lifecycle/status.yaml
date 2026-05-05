@@ -66,10 +66,9 @@ workflow:
           if [ -z "$POD" ]; then
             echo "  (Ollama pod not running — no models to list)"
           else
-            kubectl -n "$NAMESPACE" exec "$POD" -- \
-              wget -qO- "http://localhost:11434/api/tags" 2>/dev/null \
-              | grep -o '"name":"[^"]*"' \
-              || echo "  (couldn't reach Ollama /api/tags)"
+            # `ollama list` is native to the image; wget/curl aren't.
+            kubectl -n "$NAMESPACE" exec "$POD" -- ollama list 2>/dev/null \
+              || echo "  (couldn't run ollama list)"
           fi
     next:
       arcs:
@@ -100,13 +99,18 @@ workflow:
           if [ -z "$BRIDGE_POD" ]; then
             echo "  (bridge pod not running — can't smoke /jsonrpc)"
           else
-            # tools/list is the cheapest call that exercises the bridge.
-            # We don't validate the body shape here; status is a
-            # connectivity check, not a full assertion.
-            if kubectl -n "$NAMESPACE" exec "$BRIDGE_POD" -- \
-                wget -qO- --post-data='{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-                --header='Content-Type: application/json' \
-                "http://localhost:8765/jsonrpc" >/dev/null 2>&1; then
+            # The noetl image ships python3+stdlib; wget/curl aren't
+            # guaranteed. Use python's urllib for the connectivity smoke.
+            if kubectl -n "$NAMESPACE" exec "$BRIDGE_POD" -- python3 -c "
+          import json, urllib.request
+          req = urllib.request.Request(
+            'http://localhost:8765/jsonrpc',
+            data=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/list'}).encode(),
+            headers={'Content-Type':'application/json'},
+            method='POST',
+          )
+          urllib.request.urlopen(req, timeout=5).read()
+          " >/dev/null 2>&1; then
               echo "  /jsonrpc tools/list: OK"
             else
               echo "  /jsonrpc tools/list: FAILED (bridge pod up but JSON-RPC unreachable)"
