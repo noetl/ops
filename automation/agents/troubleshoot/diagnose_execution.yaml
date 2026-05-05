@@ -57,14 +57,14 @@ workload:
 
   # NoETL server URL (for fetching events). Defaults to the in-cluster
   # service DNS; override for cross-cluster or local-dev.
-  noetl_url: "http://noetl-server.noetl.svc.cluster.local:8080"
+  noetl_url: "http://noetl.noetl.svc.cluster.local:8082"
 
   # Cheap-first: local Ollama model for the triage pass. gemma2:2b is
   # the sweet spot for failure classification — small enough to be fast
   # (~200ms), large enough to handle structured-output prompts. Override
   # to qwen2.5:7b for noisier failures or when running on a beefier
   # node.
-  ollama_model: "gemma2:2b"
+  ollama_model: "gemma3:4b"
   ollama_mcp_server: "mcp/ollama"
 
   # Escalation knobs.
