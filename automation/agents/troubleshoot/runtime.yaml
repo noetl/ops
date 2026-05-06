@@ -45,8 +45,11 @@ workload:
   # log.
   execution_id: ""
 
-  # Pass-through to the inner diagnose playbook
-  ollama_model: "gemma2:2b"
+  # Pass-through to the inner diagnose playbook. Canonical triage_*
+  # fields only; the old Ollama-specific workload aliases were removed
+  # after noetl#418 made generic triage_* forwarding available.
+  triage_model: "gemma3:4b"
+  triage_mcp_server: "mcp/ollama"
   confidence_threshold: 0.7
   escalate_to: "openai"
 
@@ -59,7 +62,8 @@ workflow:
       entrypoint: automation/agents/troubleshoot/diagnose_execution
       payload:
         execution_id: "{{ workload.execution_id }}"
-        ollama_model: "{{ workload.ollama_model }}"
+        triage_model: "{{ workload.triage_model }}"
+        triage_mcp_server: "{{ workload.triage_mcp_server }}"
         confidence_threshold: "{{ workload.confidence_threshold }}"
         escalate_to: "{{ workload.escalate_to }}"
     next:

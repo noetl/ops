@@ -20,12 +20,12 @@ metadata:
       Pydantic field
     - Gap 5 (mcp/ollama) — the validated default cheap-first inference layer
 
-    The canonical backend workload fields are now
-    `triage_mcp_server` and `triage_model`, so GKE deployments can
-    pointer-swap from in-cluster Ollama to a compatible cloud MCP
-    backend such as Vertex AI / Gemini without branching this agent.
-    The deprecated `ollama_mcp_server` and `ollama_model` aliases are
-    retained for one release cycle. See the design doc:
+    The canonical backend workload fields are `triage_mcp_server`
+    and `triage_model`, so GKE deployments can pointer-swap from
+    in-cluster Ollama to a compatible cloud MCP backend such as
+    Vertex AI / Gemini without branching this agent. Migration
+    history: workload knobs simplified in v2.36.0 — see noetl#418
+    and ops#42 for the rationale. See the design doc:
     docs/architecture/vertex_ai_triage_backend.md.
 
     Cost / latency profile:
@@ -67,21 +67,15 @@ workload:
   # service DNS; override for cross-cluster or local-dev.
   noetl_url: "http://noetl.noetl.svc.cluster.local:8082"
 
-  # Cheap-first triage backend. The canonical fields are triage_*; the
-  # ollama_* names stay as deprecated aliases for one release cycle.
+  # Cheap-first triage backend. Canonical triage_* fields only.
   # Resolution order in the playbook body is:
-  #   triage_* override > ollama_* alias override > default.
+  #   triage_* override > default.
+  # Migration history: workload knobs simplified in v2.36.0 — see
+  # noetl#418 and ops#42 for the rationale.
   triage_model: "gemma3:4b"
   triage_mcp_server: "mcp/ollama"
   triage_mcp_endpoint: ""
   triage_mcp_tool: ""
-
-  # Deprecated aliases. Keep these working through the alias window so
-  # v2.35.x callers that pass Ollama-specific names do not break.
-  ollama_model: "gemma3:4b"
-  ollama_mcp_server: "mcp/ollama"
-  ollama_mcp_endpoint: "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
-  ollama_mcp_tool: "chat"
 
   # Escalation knobs.
   # confidence_threshold: skip escalation when Ollama returns >= this.
@@ -237,7 +231,7 @@ workflow:
   # 3. Resolve the triage backend pointer.
   # ---------------------------------------------------------------------
   - step: resolve_triage_backend
-    desc: Resolve canonical triage_* fields with deprecated ollama_* aliases
+    desc: Resolve canonical triage_* fields
     tool:
       kind: python
       code: |
@@ -251,29 +245,13 @@ workflow:
           return str(value).strip() if value is not None else ""
 
         triage_server = _s(triage_mcp_server)
-        alias_server = _s(ollama_mcp_server)
         triage_model = _s(triage_model)
-        alias_model = _s(ollama_model)
 
-        # Because YAML workload defaults are present even when callers
-        # use the deprecated aliases, treat the canonical default as
-        # unset when the alias carries a non-default override.
-        if triage_server and (triage_server != DEFAULT_SERVER or not alias_server or alias_server == DEFAULT_SERVER):
-          server = triage_server
-        elif alias_server:
-          server = alias_server
-        else:
-          server = DEFAULT_SERVER
+        server = triage_server or DEFAULT_SERVER
+        model = triage_model or DEFAULT_MODEL
 
-        if triage_model and (triage_model != DEFAULT_MODEL or not alias_model or alias_model == DEFAULT_MODEL):
-          model = triage_model
-        elif alias_model:
-          model = alias_model
-        else:
-          model = DEFAULT_MODEL
-
-        endpoint = _s(triage_mcp_endpoint) or _s(ollama_mcp_endpoint)
-        tool = _s(triage_mcp_tool) or _s(ollama_mcp_tool)
+        endpoint = _s(triage_mcp_endpoint)
+        tool = _s(triage_mcp_tool)
         if server == VERTEX_STUB_SERVER:
           endpoint = _s(triage_mcp_endpoint) or (
             _s(noetl_url).rstrip("/")
@@ -303,20 +281,12 @@ workflow:
             if server == VERTEX_AI_SERVER
             else "ollama"
           ),
-          "alias_used": {
-            "server": server == alias_server and alias_server != triage_server,
-            "model": model == alias_model and alias_model != triage_model,
-          },
         }
       args:
         triage_mcp_server: "{{ workload.triage_mcp_server }}"
-        ollama_mcp_server: "{{ workload.ollama_mcp_server }}"
         triage_model: "{{ workload.triage_model }}"
-        ollama_model: "{{ workload.ollama_model }}"
         triage_mcp_endpoint: "{{ workload.triage_mcp_endpoint }}"
-        ollama_mcp_endpoint: "{{ workload.ollama_mcp_endpoint }}"
         triage_mcp_tool: "{{ workload.triage_mcp_tool }}"
-        ollama_mcp_tool: "{{ workload.ollama_mcp_tool }}"
         noetl_url: "{{ workload.noetl_url }}"
     next:
       arcs:

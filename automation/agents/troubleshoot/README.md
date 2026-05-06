@@ -43,12 +43,17 @@ fetch_events ──→ extract_failure_signal ──→ ollama_triage
 |------------------------|----------------------------------------------------|----------------------------------------|
 | `execution_id`         | `""` (required)                                    | which failed execution to diagnose     |
 | `noetl_url`            | `http://noetl-server.noetl.svc.cluster.local:8080` | NoETL API base (for fetching events)   |
-| `ollama_model`         | `gemma2:2b`                                        | local Ollama model for first-pass      |
-| `ollama_mcp_server`    | `mcp/ollama`                                       | catalog path of the Ollama MCP bridge  |
+| `triage_model`         | `gemma3:4b`                                        | triage model for first-pass diagnosis  |
+| `triage_mcp_server`    | `mcp/ollama`                                       | catalog path of the triage MCP backend |
 | `confidence_threshold` | `0.7`                                              | escalate when local confidence < this  |
 | `escalate_to`          | `openai`                                           | `openai` / `claude` / `none`           |
 | `openai_credential`    | `openai_token`                                     | keychain entry for OpenAI API key      |
 | `openai_model`         | `gpt-4o-mini`                                      | OpenAI model for escalation            |
+
+Migration history: workload backend knobs were simplified in v2.36.0
+after noetl#418 made canonical `triage_*` forwarding generic. Use
+`triage_model` and `triage_mcp_server` for both local Ollama and cloud
+MCP backends.
 
 ## Output shape
 
@@ -116,8 +121,8 @@ POST /api/mcp/playbook/automation/agents/troubleshoot/diagnose_execution/jsonrpc
 
 ## Prerequisites
 
-- Ollama bridge sidecar deployed and `mcp/ollama` registered in the
-  catalog (NoETL-as-AI-OS Gap 5 — see
+- Triage MCP backend registered in the catalog. Local development uses
+  the Ollama bridge sidecar at `mcp/ollama` (NoETL-as-AI-OS Gap 5 — see
   `noetl/tools/ollama_bridge/catalog_template.yaml`)
-- A model pulled locally (`ollama pull gemma2:2b`)
+- A model pulled locally when using the Ollama backend (`ollama pull gemma3:4b`)
 - For escalation: `openai_token` in the keychain
