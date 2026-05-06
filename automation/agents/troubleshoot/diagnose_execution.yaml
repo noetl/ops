@@ -245,6 +245,7 @@ workflow:
         DEFAULT_MODEL = "gemma3:4b"
         DEFAULT_OLLAMA_ENDPOINT = "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
         VERTEX_STUB_SERVER = "mcp/vertex-ai-stub"
+        VERTEX_AI_SERVER = "mcp/vertex-ai"
 
         def _s(value):
           return str(value).strip() if value is not None else ""
@@ -279,6 +280,12 @@ workflow:
             + "/api/mcp/playbook/automation/agents/mcp/vertex-ai-stub/jsonrpc"
           )
           tool = _s(triage_mcp_tool) or "chat_completion"
+        elif server == VERTEX_AI_SERVER:
+          endpoint = _s(triage_mcp_endpoint) or (
+            _s(noetl_url).rstrip("/")
+            + "/api/mcp/playbook/automation/agents/mcp/vertex-ai/jsonrpc"
+          )
+          tool = _s(triage_mcp_tool) or "chat_completion"
         else:
           endpoint = endpoint or DEFAULT_OLLAMA_ENDPOINT
           tool = tool or "chat"
@@ -289,7 +296,13 @@ workflow:
           "endpoint": endpoint,
           "tool": tool,
           "model": model,
-          "source_hint": "vertex-stub" if server == VERTEX_STUB_SERVER else "ollama",
+          "source_hint": (
+            "vertex-stub"
+            if server == VERTEX_STUB_SERVER
+            else "vertex-ai"
+            if server == VERTEX_AI_SERVER
+            else "ollama"
+          ),
           "alias_used": {
             "server": server == alias_server and alias_server != triage_server,
             "model": model == alias_model and alias_model != triage_model,
@@ -380,7 +393,7 @@ workflow:
 
         # Playbook-as-MCP endpoints return the child execution summary
         # as content[0].text, with the child execution_id in _meta. For
-        # stub pointer-swap validation, fetch the child execution and
+        # playbook-backed MCP calls, fetch the child execution and
         # use the actual terminal step text so the rest of this agent
         # sees the same diagnosis JSON shape as the Ollama bridge.
         child_execution_id = meta.get("noetl_execution_id") if isinstance(meta, dict) else None
@@ -393,7 +406,7 @@ workflow:
             for evt in events:
               if not isinstance(evt, dict):
                 continue
-              if evt.get("node_name") != "canned_chat_completion":
+              if evt.get("node_name") not in ("canned_chat_completion", "vertex_generate_content"):
                 continue
               if evt.get("event_type") not in ("command.completed", "step.exit", "call.done"):
                 continue
@@ -404,6 +417,20 @@ workflow:
                 text = candidate_text
                 child_meta = ctx.get("_meta") if isinstance(ctx.get("_meta"), dict) else {}
                 meta = {**meta, **child_meta}
+                usage = ctx.get("usage") if isinstance(ctx.get("usage"), dict) else {}
+                if not usage and any(k in ctx for k in ("usage_prompt_tokens", "usage_completion_tokens", "usage_total_tokens")):
+                  usage = {
+                    "prompt_tokens": int(ctx.get("usage_prompt_tokens") or 0),
+                    "completion_tokens": int(ctx.get("usage_completion_tokens") or 0),
+                    "total_tokens": int(ctx.get("usage_total_tokens") or 0),
+                  }
+                if usage:
+                  meta["usage"] = usage
+                  meta.setdefault("ollama_response", {
+                    "model": meta.get("model") or "{{ resolve_triage_backend.model }}",
+                    "backend": meta.get("backend") or "{{ resolve_triage_backend.source_hint }}",
+                    "usage": usage,
+                  })
                 break
           except Exception:
             # Keep the original MCP summary text; parse fallback below
@@ -455,6 +482,14 @@ workflow:
             "completion_tokens": 256,
             "total_tokens": 1490,
           }
+
+        if source == "vertex-ai" and isinstance(meta, dict):
+          usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}
+          meta.setdefault("ollama_response", {
+            "model": "{{ resolve_triage_backend.model }}",
+            "backend": "vertex-ai",
+            "usage": usage,
+          })
 
         result = {
           "status": "ok",
