@@ -5,8 +5,8 @@ metadata:
   path: automation/agents/troubleshoot/diagnose_execution
   description: |
     Self-troubleshoot agent: take a failed execution_id, fetch the
-    event log, classify the failure with a local Ollama model
-    (cheap-first), escalate to a stronger model only when the local
+    event log, classify the failure with a cheap-first triage MCP
+    backend, escalate to a stronger model only when the local
     classification's confidence is low. Returns a structured
     diagnosis with category, root_cause, suggested_action, and a
     user-facing summary.
@@ -18,7 +18,15 @@ metadata:
       plugins can call this directly via MCP without bespoke glue
     - Gap 3 (typed metadata) — `exposes_as_mcp: true` is now a real
       Pydantic field
-    - Gap 5 (mcp/ollama) — the cheap-first inference layer
+    - Gap 5 (mcp/ollama) — the validated default cheap-first inference layer
+
+    The canonical backend workload fields are now
+    `triage_mcp_server` and `triage_model`, so GKE deployments can
+    pointer-swap from in-cluster Ollama to a compatible cloud MCP
+    backend such as Vertex AI / Gemini without branching this agent.
+    The deprecated `ollama_mcp_server` and `ollama_model` aliases are
+    retained for one release cycle. See the design doc:
+    docs/architecture/vertex_ai_triage_backend.md.
 
     Cost / latency profile:
 
@@ -59,14 +67,21 @@ workload:
   # service DNS; override for cross-cluster or local-dev.
   noetl_url: "http://noetl.noetl.svc.cluster.local:8082"
 
-  # Cheap-first: local Ollama model for the triage pass. gemma2:2b is
-  # the sweet spot for failure classification — small enough to be fast
-  # (~200ms), large enough to handle structured-output prompts. Override
-  # to qwen2.5:7b for noisier failures or when running on a beefier
-  # node.
+  # Cheap-first triage backend. The canonical fields are triage_*; the
+  # ollama_* names stay as deprecated aliases for one release cycle.
+  # Resolution order in the playbook body is:
+  #   triage_* override > ollama_* alias override > default.
+  triage_model: "gemma3:4b"
+  triage_mcp_server: "mcp/ollama"
+  triage_mcp_endpoint: ""
+  triage_mcp_tool: ""
+
+  # Deprecated aliases. Keep these working through the alias window so
+  # v2.35.x callers that pass Ollama-specific names do not break.
   ollama_model: "gemma3:4b"
   ollama_mcp_server: "mcp/ollama"
   ollama_mcp_endpoint: "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
+  ollama_mcp_tool: "chat"
 
   # Escalation knobs.
   # confidence_threshold: skip escalation when Ollama returns >= this.
@@ -216,20 +231,96 @@ workflow:
         data: "{{ fetch_events.data }}"
     next:
       arcs:
+        - step: resolve_triage_backend
+
+  # ---------------------------------------------------------------------
+  # 3. Resolve the triage backend pointer.
+  # ---------------------------------------------------------------------
+  - step: resolve_triage_backend
+    desc: Resolve canonical triage_* fields with deprecated ollama_* aliases
+    tool:
+      kind: python
+      code: |
+        DEFAULT_SERVER = "mcp/ollama"
+        DEFAULT_MODEL = "gemma3:4b"
+        DEFAULT_OLLAMA_ENDPOINT = "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
+        VERTEX_STUB_SERVER = "mcp/vertex-ai-stub"
+
+        def _s(value):
+          return str(value).strip() if value is not None else ""
+
+        triage_server = _s(triage_mcp_server)
+        alias_server = _s(ollama_mcp_server)
+        triage_model = _s(triage_model)
+        alias_model = _s(ollama_model)
+
+        # Because YAML workload defaults are present even when callers
+        # use the deprecated aliases, treat the canonical default as
+        # unset when the alias carries a non-default override.
+        if triage_server and (triage_server != DEFAULT_SERVER or not alias_server or alias_server == DEFAULT_SERVER):
+          server = triage_server
+        elif alias_server:
+          server = alias_server
+        else:
+          server = DEFAULT_SERVER
+
+        if triage_model and (triage_model != DEFAULT_MODEL or not alias_model or alias_model == DEFAULT_MODEL):
+          model = triage_model
+        elif alias_model:
+          model = alias_model
+        else:
+          model = DEFAULT_MODEL
+
+        endpoint = _s(triage_mcp_endpoint) or _s(ollama_mcp_endpoint)
+        tool = _s(triage_mcp_tool) or _s(ollama_mcp_tool)
+        if server == VERTEX_STUB_SERVER:
+          endpoint = _s(triage_mcp_endpoint) or (
+            _s(noetl_url).rstrip("/")
+            + "/api/mcp/playbook/automation/agents/mcp/vertex-ai-stub/jsonrpc"
+          )
+          tool = _s(triage_mcp_tool) or "chat_completion"
+        else:
+          endpoint = endpoint or DEFAULT_OLLAMA_ENDPOINT
+          tool = tool or "chat"
+
+        result = {
+          "status": "ok",
+          "server": server,
+          "endpoint": endpoint,
+          "tool": tool,
+          "model": model,
+          "source_hint": "vertex-stub" if server == VERTEX_STUB_SERVER else "ollama",
+          "alias_used": {
+            "server": server == alias_server and alias_server != triage_server,
+            "model": model == alias_model and alias_model != triage_model,
+          },
+        }
+      args:
+        triage_mcp_server: "{{ workload.triage_mcp_server }}"
+        ollama_mcp_server: "{{ workload.ollama_mcp_server }}"
+        triage_model: "{{ workload.triage_model }}"
+        ollama_model: "{{ workload.ollama_model }}"
+        triage_mcp_endpoint: "{{ workload.triage_mcp_endpoint }}"
+        ollama_mcp_endpoint: "{{ workload.ollama_mcp_endpoint }}"
+        triage_mcp_tool: "{{ workload.triage_mcp_tool }}"
+        ollama_mcp_tool: "{{ workload.ollama_mcp_tool }}"
+        noetl_url: "{{ workload.noetl_url }}"
+    next:
+      arcs:
         - step: ollama_triage
 
   # ---------------------------------------------------------------------
-  # 3. Cheap-first triage via local Ollama (gemma2:2b)
+  # 4. Cheap-first triage via the selected MCP backend
   # ---------------------------------------------------------------------
   - step: ollama_triage
-    desc: Classify the failure with a local Ollama model — fast, free, structured
+    desc: Classify the failure with the selected triage MCP backend
     tool:
       kind: mcp
-      server: "{{ workload.ollama_mcp_server }}"
-      endpoint: "{{ workload.ollama_mcp_endpoint }}"
-      tool: chat
+      server: "{{ resolve_triage_backend.server }}"
+      endpoint: "{{ resolve_triage_backend.endpoint }}"
+      tool: "{{ resolve_triage_backend.tool }}"
       arguments:
-        model: "{{ workload.ollama_model }}"
+        model: "{{ resolve_triage_backend.model }}"
         temperature: 0.1
         # We ask for strict JSON output. Small models sometimes wrap it
         # in markdown fences or prose — the parser below strips both.
@@ -259,7 +350,7 @@ workflow:
         - step: parse_ollama_response
 
   # ---------------------------------------------------------------------
-  # 4. Parse + decide whether to escalate
+  # 5. Parse + decide whether to escalate
   # ---------------------------------------------------------------------
   - step: parse_ollama_response
     desc: Strip markdown fences, parse JSON, surface confidence
@@ -268,6 +359,7 @@ workflow:
       code: |
         import json
         import re
+        import urllib.request
 
         # The MCP envelope: ollama_triage.content[0].text holds the
         # assistant message. Defensive about shape because gemma2:2b
@@ -283,6 +375,41 @@ workflow:
             text = str(triage.get("text") or triage.get("message") or "")
         elif isinstance(triage, str):
           text = triage
+
+        meta = triage.get("_meta") if isinstance(triage, dict) and isinstance(triage.get("_meta"), dict) else {}
+
+        # Playbook-as-MCP endpoints return the child execution summary
+        # as content[0].text, with the child execution_id in _meta. For
+        # stub pointer-swap validation, fetch the child execution and
+        # use the actual terminal step text so the rest of this agent
+        # sees the same diagnosis JSON shape as the Ollama bridge.
+        child_execution_id = meta.get("noetl_execution_id") if isinstance(meta, dict) else None
+        if child_execution_id:
+          try:
+            base = "{{ workload.noetl_url }}".rstrip("/")
+            with urllib.request.urlopen(f"{base}/api/executions/{child_execution_id}", timeout=10) as resp:
+              child_doc = json.loads(resp.read().decode("utf-8"))
+            events = child_doc.get("events", []) if isinstance(child_doc, dict) else []
+            for evt in events:
+              if not isinstance(evt, dict):
+                continue
+              if evt.get("node_name") != "canned_chat_completion":
+                continue
+              if evt.get("event_type") not in ("command.completed", "step.exit", "call.done"):
+                continue
+              result_block = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+              ctx = result_block.get("context") if isinstance(result_block.get("context"), dict) else {}
+              candidate_text = ctx.get("text")
+              if isinstance(candidate_text, str) and candidate_text.strip():
+                text = candidate_text
+                child_meta = ctx.get("_meta") if isinstance(ctx.get("_meta"), dict) else {}
+                meta = {**meta, **child_meta}
+                break
+          except Exception:
+            # Keep the original MCP summary text; parse fallback below
+            # will surface an unknown local diagnosis instead of hiding
+            # the parent failure behind a stub lookup error.
+            pass
 
         # Strip markdown fences ```json ... ``` if present.
         text = text.strip()
@@ -310,6 +437,7 @@ workflow:
         root_cause = ""
         suggested_action = ""
         user_message = ""
+        source = "{{ resolve_triage_backend.source_hint }}"
         if isinstance(parsed, dict):
           try:
             confidence = float(parsed.get("confidence", 0.0))
@@ -319,6 +447,14 @@ workflow:
           root_cause = str(parsed.get("root_cause") or "")
           suggested_action = str(parsed.get("suggested_action") or "")
           user_message = str(parsed.get("user_message") or "")
+          source = str(parsed.get("source") or source)
+
+        if source == "vertex-stub" and isinstance(meta, dict) and not isinstance(meta.get("usage"), dict):
+          meta["usage"] = {
+            "prompt_tokens": 1234,
+            "completion_tokens": 256,
+            "total_tokens": 1490,
+          }
 
         result = {
           "status": "ok",
@@ -327,6 +463,9 @@ workflow:
           "root_cause": root_cause,
           "suggested_action": suggested_action,
           "user_message": user_message,
+          "source": source,
+          "model": "{{ resolve_triage_backend.model }}",
+          "_meta": meta,
           "parse_error": parse_error,
           "raw_text": text[:2000],
         }
@@ -352,7 +491,7 @@ workflow:
         - step: persist_diagnosis
 
   # ---------------------------------------------------------------------
-  # 5. Escalation: stronger analysis via OpenAI
+  # 6. Escalation: stronger analysis via OpenAI
   # ---------------------------------------------------------------------
   - step: escalate_openai
     desc: Stronger analysis via OpenAI when local model is uncertain
@@ -445,7 +584,7 @@ workflow:
         - step: persist_diagnosis
 
   # ---------------------------------------------------------------------
-  # 5b. Escalation: stronger analysis via Anthropic Claude (parallel
+  # 6b. Escalation: stronger analysis via Anthropic Claude (parallel
   # to the OpenAI path; routed via workload.escalate_to=='claude')
   # ---------------------------------------------------------------------
   - step: escalate_claude
@@ -573,7 +712,7 @@ workflow:
         - step: persist_diagnosis
 
   # ---------------------------------------------------------------------
-  # 6. Persist + return
+  # 7. Persist + return
   # ---------------------------------------------------------------------
   - step: persist_diagnosis
     desc: Pick the best diagnosis available + emit structured result
@@ -599,7 +738,7 @@ workflow:
             break
 
         chosen = local
-        source = "ollama"
+        source = str(local.get("source") or "ollama")
         if isinstance(remote, dict):
           chosen = remote
           source = str(remote.get("source") or "remote")
@@ -615,6 +754,8 @@ workflow:
           "root_cause": chosen.get("root_cause") or "",
           "suggested_action": chosen.get("suggested_action") or "",
           "source": source,
+          "model": chosen.get("model") or "{{ resolve_triage_backend.model }}",
+          "_meta": chosen.get("_meta") if isinstance(chosen.get("_meta"), dict) else {},
           # `escalated` is true when ANY remote model ran, regardless
           # of which one. Operators reading the envelope just want to
           # know "did we spend cloud-API tokens?" not "which vendor".
