@@ -1,0 +1,95 @@
+# STUB IMPLEMENTATION.
+# Returns canned responses for pointer-swap validation. The real Vertex AI
+# integration is in a follow-up task; see
+# sync/issues/2026-05-06-future-vertex-ai-gemini-mcp-pointer-swap.md.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: chat_completion
+  path: automation/agents/mcp/vertex-ai-stub
+  description: |
+    Stub MCP backend for Vertex AI / Gemini triage pointer-swap
+    validation. It is exposed through NoETL's playbook-as-MCP JSON-RPC
+    endpoint and returns canned chat_completion responses without
+    calling any Google Cloud API.
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  tags:
+    - mcp
+    - vertex-ai
+    - gemini
+    - stub
+    - triage
+
+workload:
+  model: "gemini-2.0-flash"
+  messages: []
+  system: ""
+  temperature: 0.1
+
+workflow:
+  - step: canned_chat_completion
+    desc: Return a canned MCP chat_completion result for pointer-swap validation
+    tool:
+      kind: python
+      code: |
+        import json
+
+        model_name = str(model or "gemini-2.0-flash")
+        diagnosis = {
+          "category": "unknown",
+          "confidence": 0.63,
+          "root_cause": (
+            "Vertex AI stub backend received the triage request; "
+            "no real cloud model was called in this validation run."
+          ),
+          "suggested_action": (
+            "Use this stub only to validate MCP pointer swapping; replace "
+            "it with the real Vertex AI backend in the follow-up task."
+          ),
+          "user_message": "Vertex AI stub returned a valid canned diagnosis.",
+          "source": "vertex-stub",
+        }
+        usage = {
+          "prompt_tokens": 1234,
+          "completion_tokens": 256,
+          "total_tokens": 1490,
+        }
+        result = {
+          "status": "ok",
+          "content": [
+            {
+              "type": "text",
+              "text": json.dumps(diagnosis, separators=(",", ":")),
+            }
+          ],
+          "isError": False,
+          "_meta": {
+            "backend": "vertex-ai-stub",
+            "model": model_name,
+            "usage": usage,
+          },
+          "data": {
+            "diagnosis": diagnosis,
+            "_meta": {
+              "backend": "vertex-ai-stub",
+              "model": model_name,
+              "usage": usage,
+            },
+          },
+          "summary": "Vertex AI stub returned a valid canned diagnosis.",
+          "text": json.dumps(diagnosis, separators=(",", ":")),
+        }
+      args:
+        model: "{{ workload.model }}"
+        messages: "{{ workload.messages }}"
+        system: "{{ workload.system }}"
+        temperature: "{{ workload.temperature }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end
+    tool:
+      kind: noop
