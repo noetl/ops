@@ -218,9 +218,29 @@ workflow:
               texts.append(part["text"])
           return "\n".join(texts).strip()
 
+        # NoETL executes Python snippets with separate globals/locals maps.
+        # Functions resolve sibling helpers through globals, so publish them
+        # explicitly before calling helpers from other helpers.
+        globals().update({
+          "base64": base64,
+          "json": json,
+          "os": os,
+          "time": time,
+          "urllib": urllib,
+          "VertexMcpError": VertexMcpError,
+          "_json_dumps": _json_dumps,
+          "_b64url": _b64url,
+          "_service_account_jwt_token": _service_account_jwt_token,
+          "_metadata_token": _metadata_token,
+          "_access_token": _access_token,
+          "_message_content": _message_content,
+          "_to_vertex_contents": _to_vertex_contents,
+          "_extract_text": _extract_text,
+        })
+
         project = str(vertex_project or "").strip()
         region = str(vertex_region or "us-central1").strip()
-        model_name = str(vertex_model or model or "gemini-2.0-flash").strip()
+        model_name = str(model or vertex_model or "gemini-2.0-flash").strip()
         service_account = str(vertex_credential or "").strip()
 
         if not project:
@@ -255,7 +275,7 @@ workflow:
               body["systemInstruction"] = {"parts": [{"text": system_text}]}
 
             endpoint = (
-              f"https://{region}-aiplatform.googleapis.com/v1/projects/{project}"
+              f"https://{'aiplatform.googleapis.com' if region == 'global' else region + '-aiplatform.googleapis.com'}/v1/projects/{project}"
               f"/locations/{region}/publishers/google/models/{model_name}:generateContent"
             )
             req = urllib.request.Request(
