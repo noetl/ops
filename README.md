@@ -104,13 +104,12 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set deploy_ingress=false \
   --set gateway_service_type=LoadBalancer \
   --set gateway_load_balancer_ip=34.46.180.136 \
-  --set gui_service_type=LoadBalancer \
-  --set gui_load_balancer_ip=35.226.162.30 \
-  --set pgbouncer_default_pool_size=4 \
+  --set deploy_gui=false \
+  --set pgbouncer_default_pool_size=6 \
   --set pgbouncer_min_pool_size=1 \
   --set pgbouncer_reserve_pool_size=1 \
-  --set pgbouncer_max_db_connections=8 \
-  --set pgbouncer_server_idle_timeout=120
+  --set pgbouncer_max_db_connections=6 \
+  --set pgbouncer_server_idle_timeout=300
 ```
 
 ## Post-deploy checks

@@ -105,6 +105,11 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set gui_public_host=mestumre.dev \
   --set gateway_public_url=https://gateway.mestumre.dev \
   --set gui_gateway_public_url=https://gateway.mestumre.dev \
+  --set pgbouncer_default_pool_size=6 \
+  --set pgbouncer_min_pool_size=1 \
+  --set pgbouncer_reserve_pool_size=1 \
+  --set pgbouncer_max_db_connections=6 \
+  --set pgbouncer_server_idle_timeout=300 \
   --set gateway_cors_allowed_domains='mestumre.dev,gateway.mestumre.dev'
 ```
 
