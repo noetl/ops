@@ -6,7 +6,7 @@ metadata:
   labels:
     app: paginated-api
 spec:
-  replicas: 1
+  replicas: 8
   selector:
     matchLabels:
       app: paginated-api
@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: api
-        image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/test-server:latest
+        image: ghcr.io/noetl/test-server:e2e-710c585
         imagePullPolicy: Always
         ports:
         - containerPort: 5555
