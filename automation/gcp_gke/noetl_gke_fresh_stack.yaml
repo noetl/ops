@@ -133,7 +133,7 @@ workload:
   clickhouse_storage_size: 10Gi
 
   # NoETL settings
-  noetl_worker_replicas: 4
+  noetl_worker_replicas: 16
   noetl_server_rollout_max_surge: 0
   noetl_server_rollout_max_unavailable: 1
   noetl_worker_rollout_max_surge: 0
@@ -149,10 +149,10 @@ workload:
   # Server connects to `noetl` db; workers connect to `demo_noetl` db (separate pools).
   #
   # Connection budget per database:
-  #   noetl db    : server pool max=4  (1 server pod x 4)       <= pgbouncer 2x6=12 cap
-  #   demo_noetl  : worker pool max=16 (4 worker pods x 4 each) <= pgbouncer 2x6=12 cap
-  # PgBouncer queues worker bursts before Cloud SQL rather than letting every
-  # cursor worker open a backend connection.
+  #   noetl db    : server pool max=4  (1 server pod x 4) <= pgbouncer 2x6=12 cap
+  #   demo_noetl  : workers can burst above Cloud SQL's backend cap; PgBouncer
+  #                 queues those bursts rather than letting every worker open a
+  #                 backend connection.
   #
   # Inflight commands per worker: max_inflight_commands=8, max_inflight_db_commands=4.
   # PFT cursor workloads must also keep cursor max_in_flight bounded; the e2e
@@ -191,7 +191,9 @@ workload:
   gateway_cors_include_localhost: true
 
   # GUI settings
-  deploy_gui: true
+  # GUI is hosted from Cloudflare Pages in the production GKE shape; keep
+  # in-cluster GUI opt-in only.
+  deploy_gui: false
   gui_service_type: LoadBalancer
   gui_load_balancer_ip: "35.226.162.30"
 
