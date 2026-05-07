@@ -133,7 +133,12 @@ workload:
   clickhouse_storage_size: 10Gi
 
   # NoETL settings
-  noetl_worker_replicas: 16
+  noetl_worker_replicas: 2
+  noetl_worker_autoscaling_enabled: true
+  noetl_worker_autoscaling_min_replicas: 2
+  noetl_worker_autoscaling_max_replicas: 16
+  noetl_worker_autoscaling_target_cpu: 70
+  noetl_worker_autoscaling_target_memory: ""
   noetl_server_rollout_max_surge: 0
   noetl_server_rollout_max_unavailable: 1
   noetl_worker_rollout_max_surge: 0
@@ -1431,6 +1436,11 @@ workflow:
             --set image.repository="$NOETL_IMAGE" \
             --set image.tag={{ workload.noetl_image_tag }} \
             --set worker.replicas={{ workload.noetl_worker_replicas }} \
+            --set worker.autoscaling.enabled={{ workload.noetl_worker_autoscaling_enabled }} \
+            --set worker.autoscaling.minReplicas={{ workload.noetl_worker_autoscaling_min_replicas }} \
+            --set worker.autoscaling.maxReplicas={{ workload.noetl_worker_autoscaling_max_replicas }} \
+            --set worker.autoscaling.targetCPUUtilizationPercentage={{ workload.noetl_worker_autoscaling_target_cpu }} \
+            --set-string worker.autoscaling.targetMemoryUtilizationPercentage="{{ workload.noetl_worker_autoscaling_target_memory }}" \
             --set server.strategy.type=RollingUpdate \
             --set server.strategy.rollingUpdate.maxSurge={{ workload.noetl_server_rollout_max_surge }} \
             --set server.strategy.rollingUpdate.maxUnavailable={{ workload.noetl_server_rollout_max_unavailable }} \

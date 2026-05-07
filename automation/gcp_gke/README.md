@@ -121,6 +121,18 @@ the gateway tunnel itself, and `travel.mestumre.dev` for the travel app).
 See the [Multi-domain CORS pitfall](#pitfall-set-on-the-allowed-domains-list-replaces-it-does-not-merge)
 section below.
 
+Worker autoscaling is enabled by default for this GKE shape:
+
+- `noetl_worker_autoscaling_min_replicas=2`
+- `noetl_worker_autoscaling_max_replicas=16`
+- `noetl_worker_autoscaling_target_cpu=70`
+
+The HPA scales down after the workload settles, so burst tests do not leave
+16 workers running indefinitely. For the PFT 10k fixture specifically, the
+hot path is a single bulk Python command with its own internal thread pool;
+extra worker pods are mainly useful for surrounding distributed work and for
+keeping the cluster ready for mixed workloads.
+
 With `deploy_gui=false`, the playbook skips GUI static IP reservation,
 skips the in-cluster GUI Helm deployment, and removes any existing
 `noetl-gui` release/`gui` namespace. Deploy the GUI separately as a static

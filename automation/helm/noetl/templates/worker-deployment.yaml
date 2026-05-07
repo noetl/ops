@@ -9,7 +9,9 @@ metadata:
     runtime: cpu
     worker-pool: worker-cpu-01
 spec:
+{{- if not .Values.worker.autoscaling.enabled }}
   replicas: {{ .Values.worker.replicas }}
+{{- end }}
   strategy:
 {{- toYaml .Values.worker.strategy | nindent 4 }}
   selector:
