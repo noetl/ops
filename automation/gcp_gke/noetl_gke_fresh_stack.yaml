@@ -190,7 +190,9 @@ workload:
   gateway_cors_include_localhost: true
 
   # GUI settings
-  deploy_gui: true
+  # Default to external GUI hosting (Cloudflare Pages). Set true only when
+  # intentionally deploying the GUI Helm chart inside GKE.
+  deploy_gui: false
   gui_service_type: LoadBalancer
   gui_load_balancer_ip: "35.226.162.30"
 

@@ -113,6 +113,11 @@ skips the in-cluster GUI Helm deployment, and removes any existing
 `noetl-gui` release/`gui` namespace. Deploy the GUI separately as a static
 site that talks to `https://gateway.mestumre.dev`.
 
+`deploy_gui=false` is the default for the fresh-stack playbook because the
+supported production pattern is Cloudflare-hosted GUI plus GKE-hosted Gateway
+and NoETL services. Set `deploy_gui=true` only for a temporary in-cluster GUI
+deployment.
+
 ## Gateway Auth Bootstrap
 
 By default the deploy playbook now auto-bootstraps gateway auth dependencies:
