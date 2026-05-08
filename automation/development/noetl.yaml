@@ -16,12 +16,13 @@ workload:
   image_tag: ""
   image_pull_policy: "Never"
   noetl_repo_dir: "../noetl"
+  e2e_repo_dir: "../e2e"
   expected_kube_context: "kind-noetl"
 
   # Podman machine name to require when running build/load/deploy on
   # macOS. Set to the empty string ("") to skip the check entirely —
-  # useful for setups where kind runs on colima, Docker Desktop, native
-  # podman, or directly inside Linux without a separate Podman machine.
+  # useful for setups where kind runs on Podman Desktop, native podman,
+  # or directly inside Linux without a separate Podman machine.
   # The default preserves the in-tree expectation that has shipped
   # since the deploy helper was authored.
   podman_machine: "noetl-dev"
@@ -36,6 +37,7 @@ workflow:
           set -euo pipefail
           ACTION="{{ workload.action }}"
           NOETL_REPO="{{ workload.noetl_repo_dir }}"
+          E2E_REPO="{{ workload.e2e_repo_dir }}"
           REGISTRY="{{ workload.registry }}"
           IMAGE_NAME="{{ workload.image_name }}"
           IMAGE_TAG_OVERRIDE="{{ workload.image_tag }}"
@@ -109,15 +111,18 @@ workflow:
           kind_load_one_image() {
             local image="$1"
 
-            if kind load docker-image "$image" --name noetl; then
+            if kind load docker-image "$image" --name noetl >/tmp/noetl-kind-load-image.log 2>&1; then
+              rm -f /tmp/noetl-kind-load-image.log
               return 0
             fi
 
             # Fallback: load image archive when direct load fails under podman provider.
+            echo "Direct kind image load did not find $image; falling back to podman image archive."
             local archive="/tmp/$(echo "$image" | tr '/:' '__').tar"
             podman save -o "$archive" "$image"
             kind load image-archive "$archive" --name noetl
             rm -f "$archive"
+            rm -f /tmp/noetl-kind-load-image.log
           }
 
           kind_load_image() {
@@ -165,8 +170,8 @@ workflow:
               exit 1
             fi
             # Empty PODMAN_MACHINE means "skip the machine check" —
-            # we're running against native podman, colima, Docker
-            # Desktop, or a Linux host without a separate VM. Podman
+            # we're running against native podman, Podman Desktop, or a
+            # Linux host without a separate VM. Podman
             # is still required (above), we just don't insist on a
             # specific machine being running.
             if [ -z "$PODMAN_MACHINE" ]; then
@@ -202,13 +207,20 @@ workflow:
             ensure_kind_context
 
             SCHEMA_DDL="$NOETL_REPO/noetl/database/ddl/postgres/schema_ddl.sql"
+            TEST_SERVER_REPO="$NOETL_REPO"
             TEST_SERVER_DOCKERFILE="$NOETL_REPO/docker/test-server/Dockerfile"
+            if [ -f "$E2E_REPO/docker/test-server/Dockerfile" ]; then
+              TEST_SERVER_REPO="$E2E_REPO"
+              TEST_SERVER_DOCKERFILE="$E2E_REPO/docker/test-server/Dockerfile"
+            fi
             if [ ! -f "$SCHEMA_DDL" ]; then
               echo "ERROR: PostgreSQL schema DDL not found at $SCHEMA_DDL"
               exit 1
             fi
             if [ ! -f "$TEST_SERVER_DOCKERFILE" ]; then
-              echo "ERROR: Test server Dockerfile not found at $TEST_SERVER_DOCKERFILE"
+              echo "ERROR: Test server Dockerfile not found."
+              echo "Checked preferred e2e repo: $E2E_REPO/docker/test-server/Dockerfile"
+              echo "Checked fallback noetl repo: $NOETL_REPO/docker/test-server/Dockerfile"
               exit 1
             fi
 
@@ -235,14 +247,15 @@ workflow:
             kubectl apply -f "$NOETL_REPO/ci/manifests/nats/nats.yaml"
 
             if ! podman image inspect local/test-server:latest >/dev/null 2>&1; then
+              echo "Building local test-server from $TEST_SERVER_REPO"
               podman build --platform linux/arm64 \
                 -t local/test-server:latest \
-                -f "$TEST_SERVER_DOCKERFILE" "$NOETL_REPO"
+                -f "$TEST_SERVER_DOCKERFILE" "$TEST_SERVER_REPO"
             fi
             kind_load_image local/test-server:latest
             kubectl apply -f "$NOETL_REPO/ci/manifests/test-server/namespace.yaml"
             kubectl apply -f "$NOETL_REPO/ci/manifests/test-server/deployment.yaml"
-            kubectl set image deployment/paginated-api -n test-server api=localhost/local/test-server:latest --record=false
+            kubectl set image deployment/paginated-api -n test-server api=localhost/local/test-server:latest
 
             kubectl rollout status deployment/postgres -n postgres --timeout=180s
             kubectl rollout status statefulset/nats -n nats --timeout=180s
@@ -372,13 +385,14 @@ workflow:
               echo ""
               echo "Actions: build, load, deploy, redeploy, status"
               echo "Optional: --set noetl_repo_dir=../noetl"
+              echo "Optional: --set e2e_repo_dir=../e2e"
               echo "Registry deploy without building:"
               echo "  --set registry=ghcr.io/noetl --set image_name=noetl --set image_tag=v2.23.2 --set image_pull_policy=Always"
               echo ""
               echo "Podman machine (macOS only):"
               echo "  --set podman_machine=<name>  default: noetl-dev"
               echo "  --set podman_machine=\"\"     skip the machine check"
-              echo "                                (colima / Docker Desktop / native podman / Linux)"
+              echo "                                (Podman Desktop / native podman / Linux)"
               echo ""
               echo "LAN access:"
               echo "  This workflow expects kind config listenAddress=0.0.0.0"
