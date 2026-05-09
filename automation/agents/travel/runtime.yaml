@@ -8,16 +8,16 @@ metadata:
     for AI agents and MCP tooling using only playbooks.
 
     Takes a natural-language query, classifies intent (flights / hotels
-    / locations / activities / help) via the configured AI provider,
+    / locations / activities / help) via OpenAI or Anthropic,
     routes to the right Amadeus endpoint, and emits the result as a
     widget tree in `result.render`. The widget renderer in NoetlPrompt
     materialises the tree in the terminal; the travel canvas in
     GatewayAssistant renders the same shape.
 
-    The AI provider is parameterised via `workload.ai_provider` —
-    swap OpenAI for Vertex AI / Anthropic / Ollama by changing one
-    workload field. NoETL templates the URL, headers, and request
-    body; everything else is the same playbook.
+    The AI provider is parameterised via `workload.ai_provider`.
+    OpenAI is the default; Anthropic is supported by the same merged
+    Python classification step. Vertex AI and Ollama stay deferred
+    because they need different auth and in-cluster routing designs.
   version: "1.0"
   agent: true
   tags: [agent, travel, widgets, ai-os, flagship]
@@ -25,20 +25,22 @@ metadata:
     visible: true
     workspace: travel
     scopes: [/mcp/amadeus]
-  capabilities: [mcp:amadeus, ai:openai, ai:vertex-ai, ai:anthropic, ai:ollama]
+  capabilities: [mcp:amadeus, ai:openai, ai:anthropic]
 
 workload:
   pg_auth: pg_k8s
   gcp_auth: google_oauth
-  ai_provider: openai            # openai | vertex-ai | anthropic | ollama
+  ai_provider: openai            # openai | anthropic
   query: "Help"
   request_id: ""
   callback_url: ""
   amadeus_env: test              # test | production
   gcp_project: "noetl-cluster"
   ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8080"
-  # Secret-manager paths. Per-provider; only the one matching
-  # workload.ai_provider is actually bound by the keychain block below.
+  # Secret-manager paths. Provider keychain entries are bound
+  # unconditionally with bare references; the Python classifier selects
+  # the effective provider and falls back cleanly when Anthropic is
+  # requested but its token is empty.
   openai_secret_path: projects/1014428265962/secrets/openai-api-key/versions/1
   anthropic_secret_path: projects/1014428265962/secrets/anthropic-api-key/versions/1
   amadeus_key_path: projects/1014428265962/secrets/api-key-test-api-amadeus-com/versions/1
@@ -57,9 +59,8 @@ keychain:
   #   2. The OAuth2 endpoint URL must be a plain string — Jinja
   #      conditionals on the endpoint don't render in keychain context.
   #   3. `when:` predicates on keychain entries appear to be unsupported
-  #      today; entries are simply present-or-absent. Multi-provider
-  #      switching (anthropic, vertex-ai) belongs in a follow-up round
-  #      after this baseline is GREEN.
+  #      today; entries are simply present-or-absent. Provider switching
+  #      belongs in normal workflow code, not in keychain predicates.
   - name: openai_token
     kind: secret_manager
     provider: gcp
@@ -67,6 +68,14 @@ keychain:
     auth: "{{ gcp_auth }}"
     map:
       api_key: "{{ openai_secret_path }}"
+
+  - name: anthropic_token
+    kind: secret_manager
+    provider: gcp
+    scope: global
+    auth: "{{ gcp_auth }}"
+    map:
+      api_key: "{{ anthropic_secret_path }}"
 
   - name: amadeus_credentials
     kind: secret_manager
@@ -115,81 +124,136 @@ workflow:
         - step: classify_intent
 
   # ---------------------------------------------------------------------
-  # 2. Intent classification — OpenAI-only baseline.
+  # 2. Intent classification — OpenAI + Anthropic.
   #
-  # Multi-provider abstraction (Vertex AI / Anthropic / Ollama via
-  # workload.ai_provider) is a follow-up round once this baseline is
-  # GREEN. The keychain shape and the AMBER-round failure modes
-  # captured in
-  # bridge/outbox/20260509-051749-travel-agent-amber-to-green.result.json
-  # showed that conditionally-bound keychain entries leave the URL/
-  # header templates with empty values. Land OpenAI cleanly first;
-  # then layer the abstraction back.
+  # Provider switching happens inside this Python step, not through
+  # keychain `when:` predicates or Jinja conditionals on URL/headers/body.
+  # This follows docs/reference/playbook_authoring_guide.md: bind
+  # provider tokens unconditionally with bare keychain refs, then choose
+  # request shape and response unwrap in normal code.
   # ---------------------------------------------------------------------
   - step: classify_intent
-    desc: Classify intent via OpenAI; extract structured params
-    tool:
-      kind: http
-      method: POST
-      url: "https://api.openai.com/v1/chat/completions"
-      headers:
-        Authorization: "Bearer {{ keychain.openai_token.api_key }}"
-        Content-Type: application/json
-      payload:
-        model: "gpt-4o-mini"
-        response_format:
-          type: json_object
-        messages:
-          - role: system
-            content: |
-              You are a travel agent classifier. Given a user query, return ONLY
-              a JSON object with these keys:
-              - intent: one of "flights", "hotels", "locations", "activities", "help"
-              - origin: IATA code (or null)
-              - destination: IATA code (or null)
-              - departureDate: YYYY-MM-DD (convert relative dates; or null)
-              - adults: integer, default 1
-              - city: for hotels (or null)
-              - keyword: for locations or activities (or null)
-              Use null for fields that don't apply.
-          - role: user
-            content: "{{ workload.query }}"
-      retry:
-        max_attempts: 2
-        retry_on_status: [429, 500, 502, 503, 504]
-        backoff_seconds: 2
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: parse_classification
-
-  # ---------------------------------------------------------------------
-  # 3. Parse the AI response into a uniform shape regardless of provider.
-  # ---------------------------------------------------------------------
-  - step: parse_classification
-    desc: Marshal the OpenAI response into a uniform schema
+    desc: Classify intent via OpenAI or Anthropic; extract structured params
     tool:
       kind: python
       input:
-        ai_response: "{{ classify_intent }}"
         query: "{{ workload.query }}"
+        requested_provider: "{{ workload.ai_provider }}"
+        openai_api_key: "{{ keychain.openai_token.api_key | default('') }}"
+        anthropic_api_key: "{{ keychain.anthropic_token.api_key | default('') }}"
       code: |
-        import json, re
+        import json
+        import re
+        import urllib.error
+        import urllib.request
 
         def _coerce(value):
             if value in (None, "", "null"):
                 return None
             return value
 
-        # OpenAI-only baseline; multi-provider response shapes
-        # (Vertex / Anthropic) come back in a follow-up round once
-        # this OpenAI path is GREEN end-to-end.
-        text = ""
-        if isinstance(ai_response, dict):
-            data = ai_response.get("data", ai_response)
+        system_prompt = """You are a travel agent classifier. Given a user query, return ONLY
+        a JSON object with these keys:
+        - intent: one of "flights", "hotels", "locations", "activities", "help"
+        - origin: IATA code (or null)
+        - destination: IATA code (or null)
+        - departureDate: YYYY-MM-DD (convert relative dates; or null)
+        - adults: integer, default 1
+        - city: for hotels (or null)
+        - keyword: for locations or activities (or null)
+        Use null for fields that don't apply."""
+
+        def _post_json(url, headers, payload):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        def _openai_text():
+            body = {
+                "model": "gpt-4o-mini",
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+            }
+            data = _post_json(
+                "https://api.openai.com/v1/chat/completions",
+                {
+                    "Authorization": f"Bearer {openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                body,
+            )
             choices = (data or {}).get("choices") or []
             if choices:
-                text = ((choices[0] or {}).get("message") or {}).get("content") or ""
+                return ((choices[0] or {}).get("message") or {}).get("content") or ""
+            return ""
+
+        def _anthropic_text():
+            body = {
+                "model": "claude-3-5-haiku-latest",
+                "max_tokens": 512,
+                "temperature": 0,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": query}],
+            }
+            data = _post_json(
+                "https://api.anthropic.com/v1/messages",
+                {
+                    "x-api-key": anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                body,
+            )
+            parts = (data or {}).get("content") or []
+            return "".join(str((part or {}).get("text") or "") for part in parts if (part or {}).get("type") == "text")
+
+        requested = (requested_provider or "openai").strip().lower()
+        effective_provider = requested if requested in ("openai", "anthropic") else "openai"
+        provider_fallback_reason = None
+        if requested == "anthropic" and not (anthropic_api_key or "").strip():
+            effective_provider = "openai"
+            provider_fallback_reason = "anthropic token missing"
+        elif requested not in ("openai", "anthropic"):
+            effective_provider = "openai"
+            provider_fallback_reason = f"{requested or 'empty'} provider unsupported"
+
+        try:
+            text = _anthropic_text() if effective_provider == "anthropic" else _openai_text()
+            provider_error = None
+        except urllib.error.HTTPError as exc:
+            provider_error = f"{effective_provider} HTTP {exc.code}"
+            if effective_provider == "anthropic":
+                effective_provider = "openai"
+                provider_fallback_reason = provider_error
+                try:
+                    text = _openai_text()
+                    provider_error = None
+                except Exception as fallback_exc:
+                    text = ""
+                    provider_error = f"openai fallback failed: {type(fallback_exc).__name__}: {fallback_exc}"
+            else:
+                text = ""
+        except Exception as exc:
+            provider_error = f"{effective_provider} {type(exc).__name__}: {exc}"
+            if effective_provider == "anthropic":
+                effective_provider = "openai"
+                provider_fallback_reason = provider_error
+                try:
+                    text = _openai_text()
+                    provider_error = None
+                except Exception as fallback_exc:
+                    text = ""
+                    provider_error = f"openai fallback failed: {type(fallback_exc).__name__}: {fallback_exc}"
+            else:
+                text = ""
 
         # Strip markdown fences if the AI ignored response_format.
         text = (text or "").strip()
@@ -215,11 +279,15 @@ workflow:
             "adults": int(parsed.get("adults") or 1),
             "city": _coerce(parsed.get("city")),
             "keyword": _coerce(parsed.get("keyword")),
+            "requested_provider": requested,
+            "effective_provider": effective_provider,
+            "provider_fallback_reason": provider_fallback_reason,
+            "provider_error": provider_error,
             "raw_text": text[:600],
         }
         # Pre-serialise to a JSON string for the audit SQL. This sidesteps
         # the failure mode in the original cut where the audit step tried
-        # `{{ parse_classification | tojson | replace("'", "''") }}` inside
+        # `{{ classify_intent | tojson | replace("'", "''") }}` inside
         # a YAML `|` block — the apostrophes inside the replace filter
         # collided with the SQL string delimiters and Postgres saw a
         # malformed literal (see bridge/outbox/20260509-044651-...result.json
@@ -243,21 +311,21 @@ workflow:
         VALUES (
           '{{ execution_id }}',
           'classify_intent',
-          '{{ workload.ai_provider }}',
-          '{{ parse_classification.intent }}',
-          '{{ parse_classification.json_str | default("{}") | replace("'", "''") }}'::jsonb
+          '{{ classify_intent.effective_provider | default(workload.ai_provider) }}',
+          '{{ classify_intent.intent }}',
+          '{{ classify_intent.json_str | default("{}") | replace("'", "''") }}'::jsonb
         );
     next:
       spec: { mode: exclusive }
       arcs:
         - step: amadeus_call_flights
-          when: "{{ parse_classification.intent == 'flights' }}"
+          when: "{{ classify_intent.intent == 'flights' }}"
         - step: amadeus_call_locations
-          when: "{{ parse_classification.intent == 'locations' }}"
+          when: "{{ classify_intent.intent == 'locations' }}"
         # Hotels and activities are stubbed — they fall through to the
         # help renderer in phase 1. Phase 2 wires the real Amadeus calls.
         - step: render_help
-          when: "{{ parse_classification.intent in ('hotels', 'activities', 'help') }}"
+          when: "{{ classify_intent.intent in ('hotels', 'activities', 'help') }}"
 
   # ---------------------------------------------------------------------
   # 4a. Flights branch.
@@ -278,9 +346,9 @@ workflow:
       kind: python
       input:
         access_token: "{{ keychain.amadeus_token.access_token }}"
-        origin: "{{ parse_classification.origin | default('SFO') }}"
-        destination: "{{ parse_classification.destination | default('JFK') }}"
-        departure_date: "{{ parse_classification.departureDate | default('2026-07-15') }}"
+        origin: "{{ classify_intent.origin | default('SFO') }}"
+        destination: "{{ classify_intent.destination | default('JFK') }}"
+        departure_date: "{{ classify_intent.departureDate | default('2026-07-15') }}"
       code: |
         import json
         import urllib.request
@@ -345,10 +413,10 @@ workflow:
       kind: python
       input:
         envelope: "{{ amadeus_call_flights }}"
-        classification: "{{ parse_classification }}"
+        classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
-        provider: "{{ workload.ai_provider }}"
+        provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
       code: |
         import json
 
@@ -412,6 +480,7 @@ workflow:
                     "children": [
                         {"type": "app:title", "args": {"text": "Travel agent · flights", "size": 18, "boldness": 700}},
                         {"type": "app:text", "args": {"title": "Query", "message": query}},
+                        {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
                         {"type": "app:alert", "args": {"variant": "warning", "message": f"No flights matched {classification.get('origin') or '?'} → {classification.get('destination') or '?'} on {classification.get('departureDate') or '?'}."}},
                     ],
                 },
@@ -429,7 +498,7 @@ workflow:
                             "type": "app:row",
                             "args": {"gap": 8, "children": [
                                 {"type": "app:statusbar", "args": {"text": f"intent=flights", "styleKey": "success"}},
-                                {"type": "app:statusbar", "args": {"text": f"provider={provider}", "styleKey": "info"}},
+                                {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
                                 {"type": "app:statusbar", "args": {"text": f"{classification.get('origin') or '?'} → {classification.get('destination') or '?'}", "styleKey": "info"}},
                                 {"type": "app:statusbar", "args": {"text": classification.get("departureDate") or "?", "styleKey": "info"}},
                             ]},
@@ -452,6 +521,9 @@ workflow:
         result = {
             "intent": "flights",
             "offers_total": len(offers),
+            "requested_provider": classification.get("requested_provider"),
+            "effective_provider": provider,
+            "provider_fallback_reason": classification.get("provider_fallback_reason"),
             "summary": f"{len(offers)} flight offer(s) returned",
             "text": f"{len(offers)} flight offer(s) returned for {classification.get('origin') or '?'} → {classification.get('destination') or '?'}",
             "render": render,
@@ -469,7 +541,7 @@ workflow:
       kind: python
       input:
         access_token: "{{ keychain.amadeus_token.access_token }}"
-        keyword: "{{ parse_classification.keyword | default(parse_classification.city) | default(parse_classification.origin) | default(workload.query) }}"
+        keyword: "{{ classify_intent.keyword | default(classify_intent.city) | default(classify_intent.origin) | default(workload.query) }}"
       code: |
         import json
         import urllib.parse
@@ -520,10 +592,10 @@ workflow:
       kind: python
       input:
         envelope: "{{ amadeus_call_locations }}"
-        classification: "{{ parse_classification }}"
+        classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
-        provider: "{{ workload.ai_provider }}"
+        provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
       code: |
         import json
         body = envelope.get("body") if isinstance(envelope, dict) else {}
@@ -551,6 +623,11 @@ workflow:
                 "children": [
                     {"type": "app:title", "args": {"text": f"Travel agent · {len(items)} location{'s' if len(items) != 1 else ''}", "size": 18, "boldness": 700}},
                     {"type": "app:text", "args": {"title": "Query", "message": query}},
+                    {"type": "app:row", "args": {"gap": 8, "children": [
+                        {"type": "app:statusbar", "args": {"text": "intent=locations", "styleKey": "success"}},
+                        {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
+                        {"type": "app:statusbar", "args": {"text": f"keyword={classification.get('keyword') or query}", "styleKey": "info"}},
+                    ]}},
                     {"type": "app:recordtable", "args": {
                         "columns": [
                             {"title": "Code", "dataIndex": "iataCode", "sorter": True},
@@ -569,6 +646,9 @@ workflow:
         result = {
             "intent": "locations",
             "items_total": len(items),
+            "requested_provider": classification.get("requested_provider"),
+            "effective_provider": provider,
+            "provider_fallback_reason": classification.get("provider_fallback_reason"),
             "summary": f"{len(items)} location(s) found",
             "text": f"{len(items)} location(s) returned",
             "render": render,
@@ -583,10 +663,10 @@ workflow:
     tool:
       kind: python
       input:
-        classification: "{{ parse_classification }}"
+        classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
-        provider: "{{ workload.ai_provider }}"
+        provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
       code: |
         intent = classification.get("intent") or "help"
         if intent in ("hotels", "activities"):
@@ -609,13 +689,17 @@ workflow:
                     {"type": "app:alert", "args": {"variant": "info", "message": note}},
                     {"type": "app:row", "args": {"gap": 8, "children": examples}},
                     {"type": "app:horizontalline", "args": {}},
-                    {"type": "app:text", "args": {"title": "Provider", "message": f"This run used {provider}. Re-run with --provider vertex-ai / anthropic / ollama to switch."}},
+                    {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
+                    {"type": "app:text", "args": {"title": "Provider", "message": "Use --provider anthropic to switch classifiers. Vertex AI and Ollama stay deferred for separate auth/routing rounds."}},
                 ],
             },
         }
 
         result = {
             "intent": intent,
+            "requested_provider": classification.get("requested_provider"),
+            "effective_provider": provider,
+            "provider_fallback_reason": classification.get("provider_fallback_reason"),
             "summary": note,
             "text": note,
             "render": render,
@@ -632,9 +716,10 @@ workflow:
       input:
         flights_envelope: "{{ amadeus_call_flights | default({}) }}"
         locations_envelope: "{{ amadeus_call_locations | default({}) }}"
-        classification: "{{ parse_classification }}"
+        classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
+        provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
       code: |
         # Both branches now use the urllib Python wrapper, so the envelope
         # shape is { ok, status_code, body }.
@@ -678,11 +763,13 @@ workflow:
                     {"type": "app:infotable", "args": {
                         "data": {
                             "intent": classification.get("intent"),
+                            "effective_provider": provider,
                             "status_code": status_code,
                             "upstream_message": body_msg,
                         },
                         "fields": [
                             {"label": "Intent", "key": "intent"},
+                            {"label": "Provider", "key": "effective_provider"},
                             {"label": "Upstream status", "key": "status_code"},
                             {"label": "Upstream message", "key": "upstream_message"},
                         ],
@@ -707,6 +794,9 @@ workflow:
             "outcome": "amadeus_failure",
             "stage": "amadeus_search",
             "intent": classification.get("intent"),
+            "requested_provider": classification.get("requested_provider"),
+            "effective_provider": provider,
+            "provider_fallback_reason": classification.get("provider_fallback_reason"),
             "user_message": user_message,
             "upstream_status_code": status_code,
             "upstream_message": body_msg,
