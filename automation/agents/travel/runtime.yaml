@@ -781,16 +781,33 @@ workflow:
     tool:
       kind: python
       input:
-        flights: "{{ render_flights | default({}) }}"
-        locations: "{{ render_locations | default({}) }}"
-        help_payload: "{{ render_help | default({}) }}"
-        failure: "{{ render_amadeus_failure | default({}) }}"
+        flights_json: '{{ render_flights | default({}) | tojson }}'
+        locations_json: '{{ render_locations | default({}) | tojson }}'
+        help_payload_json: '{{ render_help | default({}) | tojson }}'
+        failure_json: '{{ render_amadeus_failure | default({}) | tojson }}'
       code: |
+        import json
+
+        def decode_payload(raw):
+            if isinstance(raw, dict):
+                return raw
+            if not raw:
+                return {}
+            try:
+                decoded = json.loads(raw)
+            except Exception:
+                return {}
+            return decoded if isinstance(decoded, dict) else {}
+
         # Pick whichever render_* step actually ran in this branch.
         # Order doesn't really matter — only one fires per execution
         # because the routing arcs from log_classification are exclusive
         # — but we check failure first so an Amadeus 5xx surfaces over
         # any leftover stub.
+        failure = decode_payload(failure_json)
+        flights = decode_payload(flights_json)
+        locations = decode_payload(locations_json)
+        help_payload = decode_payload(help_payload_json)
         candidates = (failure, flights, locations, help_payload)
         chosen = {}
         for c in candidates:
