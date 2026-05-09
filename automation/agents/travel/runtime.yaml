@@ -250,9 +250,9 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
-        - step: amadeus_search_flights
+        - step: amadeus_call_flights
           when: "{{ parse_classification.intent == 'flights' }}"
-        - step: amadeus_search_locations
+        - step: amadeus_call_locations
           when: "{{ parse_classification.intent == 'locations' }}"
         # Hotels and activities are stubbed — they fall through to the
         # help renderer in phase 1. Phase 2 wires the real Amadeus calls.
@@ -261,48 +261,90 @@ workflow:
 
   # ---------------------------------------------------------------------
   # 4a. Flights branch.
+  #
+  # We call Amadeus from a Python step (not `kind: http`) because the
+  # noetl HTTP tool currently aborts the step on 5xx (see pending task
+  # #88: "noetl HTTP tool: preserve response body in error events").
+  # That abort prevents the `render_amadeus_failure` arc from firing
+  # — the workflow halts before the `when:` predicate can evaluate
+  # the response status. The Python wrapper catches HTTPError /
+  # URLError / Exception and returns a uniform envelope
+  # `{ ok, status_code, body, raw }` so the conditional arc can route
+  # to render_flights or render_amadeus_failure based on the body.
   # ---------------------------------------------------------------------
-  - step: amadeus_search_flights
-    desc: Call Amadeus Flight Offers Search
+  - step: amadeus_call_flights
+    desc: Call Amadeus Flight Offers Search via urllib (catches errors)
     tool:
-      kind: http
-      method: POST
-      url: "https://test.api.amadeus.com/v2/shopping/flight-offers"
-      headers:
-        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
-        Content-Type: application/json
-      payload:
-        currencyCode: USD
-        originDestinations:
-          - id: "1"
-            originLocationCode: "{{ parse_classification.origin | default('SFO') }}"
-            destinationLocationCode: "{{ parse_classification.destination | default('JFK') }}"
-            departureDateTimeRange:
-              date: "{{ parse_classification.departureDate | default('2026-07-15') }}"
-        travelers:
-          - id: "1"
-            travelerType: ADULT
-        sources: [GDS]
-        searchCriteria:
-          maxFlightOffers: 6
-      retry:
-        max_attempts: 3
-        retry_on_status: [429, 500, 502, 503, 504]
-        backoff_seconds: 2
+      kind: python
+      input:
+        access_token: "{{ keychain.amadeus_token.access_token }}"
+        origin: "{{ parse_classification.origin | default('SFO') }}"
+        destination: "{{ parse_classification.destination | default('JFK') }}"
+        departure_date: "{{ parse_classification.departureDate | default('2026-07-15') }}"
+      code: |
+        import json
+        import urllib.request
+        import urllib.error
+
+        url = "https://test.api.amadeus.com/v2/shopping/flight-offers"
+        payload = {
+            "currencyCode": "USD",
+            "originDestinations": [{
+                "id": "1",
+                "originLocationCode": origin,
+                "destinationLocationCode": destination,
+                "departureDateTimeRange": {"date": departure_date},
+            }],
+            "travelers": [{"id": "1", "travelerType": "ADULT"}],
+            "sources": ["GDS"],
+            "searchCriteria": {"maxFlightOffers": 6},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body_text = resp.read().decode("utf-8")
+                try:
+                    body = json.loads(body_text)
+                except Exception:
+                    body = {"raw": body_text[:2000]}
+                result = {"ok": True, "status_code": resp.status, "body": body}
+        except urllib.error.HTTPError as e:
+            err_text = ""
+            try:
+                err_text = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            try:
+                err_body = json.loads(err_text)
+            except Exception:
+                err_body = {"raw": err_text[:2000]}
+            result = {"ok": False, "status_code": e.code, "body": err_body}
+        except urllib.error.URLError as e:
+            result = {"ok": False, "status_code": 0, "body": {"error": str(getattr(e, "reason", e))}}
+        except Exception as e:
+            result = {"ok": False, "status_code": 0, "body": {"error": f"{type(e).__name__}: {e}"}}
     next:
       spec: { mode: exclusive }
       arcs:
         - step: render_flights
-          when: "{{ amadeus_search_flights.status == 'COMPLETED' or (amadeus_search_flights.data.status_code | default(0)) < 400 }}"
+          when: "{{ amadeus_call_flights.ok }}"
         - step: render_amadeus_failure
-          when: "{{ amadeus_search_flights.status != 'COMPLETED' or (amadeus_search_flights.data.status_code | default(0)) >= 400 }}"
+          when: "{{ not amadeus_call_flights.ok }}"
 
   - step: render_flights
     desc: Project flights into a widget tree
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_search_flights }}"
+        envelope: "{{ amadeus_call_flights }}"
         classification: "{{ parse_classification }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
@@ -310,18 +352,12 @@ workflow:
       code: |
         import json
 
-        # Pull Amadeus offers out of the http envelope.
-        data = {}
-        if isinstance(envelope, dict):
-            raw = envelope.get("data")
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    data = {}
-            elif isinstance(raw, dict):
-                data = raw
-        offers = data.get("data") if isinstance(data, dict) else None
+        # The Python wrapper for Amadeus emits {ok, status_code, body}.
+        # `body` is the parsed JSON response (or {raw: "..."} when not JSON).
+        body = envelope.get("body") if isinstance(envelope, dict) else {}
+        if not isinstance(body, dict):
+            body = {}
+        offers = body.get("data") if isinstance(body, dict) else None
         if not isinstance(offers, list):
             offers = []
 
@@ -427,53 +463,76 @@ workflow:
 
   # ---------------------------------------------------------------------
   # 4b. Locations branch — IATA / city lookup.
+  #
+  # Same Python-wrapper rationale as the flights branch above.
   # ---------------------------------------------------------------------
-  - step: amadeus_search_locations
-    desc: Call Amadeus Reference Data / Locations
+  - step: amadeus_call_locations
+    desc: Call Amadeus Reference Data Locations via urllib (catches errors)
     tool:
-      kind: http
-      method: GET
-      url: "https://test.api.amadeus.com/v1/reference-data/locations"
-      headers:
-        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
-      params:
+      kind: python
+      input:
+        access_token: "{{ keychain.amadeus_token.access_token }}"
         keyword: "{{ parse_classification.keyword | default(parse_classification.city) | default(parse_classification.origin) | default(workload.query) }}"
-        subType: "AIRPORT,CITY"
-      retry:
-        max_attempts: 2
-        retry_on_status: [429, 500, 502, 503, 504]
-        backoff_seconds: 2
+      code: |
+        import json
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+
+        params = {"keyword": keyword or "", "subType": "AIRPORT,CITY"}
+        url = "https://test.api.amadeus.com/v1/reference-data/locations?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body_text = resp.read().decode("utf-8")
+                try:
+                    body = json.loads(body_text)
+                except Exception:
+                    body = {"raw": body_text[:2000]}
+                result = {"ok": True, "status_code": resp.status, "body": body}
+        except urllib.error.HTTPError as e:
+            err_text = ""
+            try:
+                err_text = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            try:
+                err_body = json.loads(err_text)
+            except Exception:
+                err_body = {"raw": err_text[:2000]}
+            result = {"ok": False, "status_code": e.code, "body": err_body}
+        except urllib.error.URLError as e:
+            result = {"ok": False, "status_code": 0, "body": {"error": str(getattr(e, "reason", e))}}
+        except Exception as e:
+            result = {"ok": False, "status_code": 0, "body": {"error": f"{type(e).__name__}: {e}"}}
     next:
       spec: { mode: exclusive }
       arcs:
         - step: render_locations
-          when: "{{ amadeus_search_locations.status == 'COMPLETED' or (amadeus_search_locations.data.status_code | default(0)) < 400 }}"
+          when: "{{ amadeus_call_locations.ok }}"
         - step: render_amadeus_failure
-          when: "{{ amadeus_search_locations.status != 'COMPLETED' or (amadeus_search_locations.data.status_code | default(0)) >= 400 }}"
+          when: "{{ not amadeus_call_locations.ok }}"
 
   - step: render_locations
     desc: Project locations into a widget tree
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_search_locations }}"
+        envelope: "{{ amadeus_call_locations }}"
         classification: "{{ parse_classification }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ workload.ai_provider }}"
       code: |
         import json
-        data = {}
-        if isinstance(envelope, dict):
-            raw = envelope.get("data")
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    data = {}
-            elif isinstance(raw, dict):
-                data = raw
-        items = data.get("data") if isinstance(data, dict) else None
+        body = envelope.get("body") if isinstance(envelope, dict) else {}
+        if not isinstance(body, dict):
+            body = {}
+        items = body.get("data") if isinstance(body, dict) else None
         if not isinstance(items, list):
             items = []
 
@@ -580,21 +639,27 @@ workflow:
     tool:
       kind: python
       input:
-        flights_envelope: "{{ amadeus_search_flights | default({}) }}"
-        locations_envelope: "{{ amadeus_search_locations | default({}) }}"
+        flights_envelope: "{{ amadeus_call_flights | default({}) }}"
+        locations_envelope: "{{ amadeus_call_locations | default({}) }}"
         classification: "{{ parse_classification }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
       code: |
+        # Both branches now use the urllib Python wrapper, so the envelope
+        # shape is { ok, status_code, body }.
         envelope = flights_envelope if isinstance(flights_envelope, dict) and flights_envelope else locations_envelope
         if not isinstance(envelope, dict):
             envelope = {}
-        data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
-        status_code = data.get("status_code")
-        body = data.get("body") or data.get("response") or data.get("error")
+        status_code = envelope.get("status_code")
+        body = envelope.get("body")
         if isinstance(body, dict):
             errors = body.get("errors") if isinstance(body.get("errors"), list) else None
-            body_msg = "; ".join(str((e or {}).get("title") or (e or {}).get("detail") or e) for e in errors) if errors else str(body)[:600]
+            if errors:
+                body_msg = "; ".join(str((e or {}).get("title") or (e or {}).get("detail") or e) for e in errors)
+            elif body.get("error"):
+                body_msg = str(body.get("error"))[:600]
+            else:
+                body_msg = str(body)[:600]
         elif isinstance(body, str):
             body_msg = body[:600]
         else:

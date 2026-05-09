@@ -199,72 +199,78 @@ workflow:
 
   # ---------------------------------------------------------------------
   # 3a. tools/call search_flights
+  #
+  # Uses urllib in a Python step (not `kind: http`) because the noetl
+  # HTTP tool currently aborts the step on 5xx (pending task #88: "noetl
+  # HTTP tool: preserve response body in error events"). Wrapping the
+  # call lets us return an MCP-shaped envelope even when Amadeus replies
+  # with 5xx — clients see `isError: true` and the error message instead
+  # of an opaque "Tool returned error".
   # ---------------------------------------------------------------------
   - step: amadeus_search_flights
-    desc: Amadeus Flight Offers Search
-    tool:
-      kind: http
-      method: POST
-      url: "https://test.api.amadeus.com/v2/shopping/flight-offers"
-      headers:
-        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
-        Content-Type: application/json
-      payload:
-        currencyCode: "{{ workload.arguments.currencyCode | default('USD') }}"
-        originDestinations:
-          - id: "1"
-            originLocationCode: "{{ workload.arguments.origin }}"
-            destinationLocationCode: "{{ workload.arguments.destination }}"
-            departureDateTimeRange:
-              date: "{{ workload.arguments.departureDate }}"
-        travelers:
-          - id: "1"
-            travelerType: ADULT
-        sources: [GDS]
-        searchCriteria:
-          # Amadeus expects an integer. YAML-quoted Jinja values
-          # render as strings even after `| int`; the proven pattern
-          # in repos/e2e/.../amadeus_ai_api.yaml hardcodes the value.
-          # Workload-supplied maxFlightOffers becomes a follow-up
-          # once a Python-step indirection is in place.
-          maxFlightOffers: 10
-      retry:
-        max_attempts: 3
-        retry_on_status: [429, 500, 502, 503, 504]
-        backoff_seconds: 2
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: shape_search_flights
-
-  - step: shape_search_flights
-    desc: Shape Amadeus flights response into MCP tool result
+    desc: Amadeus Flight Offers Search via urllib (catches errors)
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_search_flights }}"
+        access_token: "{{ keychain.amadeus_token.access_token }}"
+        origin: "{{ workload.arguments.origin | default('') }}"
+        destination: "{{ workload.arguments.destination | default('') }}"
+        departure_date: "{{ workload.arguments.departureDate | default('') }}"
       code: |
         import json
-        data = {}
-        if isinstance(envelope, dict):
-            raw = envelope.get("data")
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    data = {}
-            elif isinstance(raw, dict):
-                data = raw
-        offers = data.get("data") if isinstance(data, dict) else None
+        import urllib.request
+        import urllib.error
+
+        url = "https://test.api.amadeus.com/v2/shopping/flight-offers"
+        payload = {
+            "currencyCode": "USD",
+            "originDestinations": [{
+                "id": "1",
+                "originLocationCode": origin,
+                "destinationLocationCode": destination,
+                "departureDateTimeRange": {"date": departure_date},
+            }],
+            "travelers": [{"id": "1", "travelerType": "ADULT"}],
+            "sources": ["GDS"],
+            "searchCriteria": {"maxFlightOffers": 10},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        body = None
+        ok = False
+        status_code = 0
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body_text = resp.read().decode("utf-8")
+                try: body = json.loads(body_text)
+                except Exception: body = {"raw": body_text[:2000]}
+                ok, status_code = True, resp.status
+        except urllib.error.HTTPError as e:
+            try: err_text = e.read().decode("utf-8", errors="replace")
+            except Exception: err_text = ""
+            try: body = json.loads(err_text)
+            except Exception: body = {"raw": err_text[:2000]}
+            status_code = e.code
+        except urllib.error.URLError as e:
+            body = {"error": str(getattr(e, "reason", e))}
+        except Exception as e:
+            body = {"error": f"{type(e).__name__}: {e}"}
+
+        offers = body.get("data") if (ok and isinstance(body, dict)) else []
         if not isinstance(offers, list):
             offers = []
-        ok = isinstance(envelope, dict) and (envelope.get("status") == "COMPLETED" or (data.get("status_code", 0) or 0) < 400)
         result = {
-            "status": "ok" if ok else "error",
-            "content": [{"type": "text", "text": json.dumps({"offers_total": len(offers), "offers": offers[:10]}, separators=(",", ":"))}],
+            # Keep the NoETL step green even when the upstream call fails;
+            # MCP clients read `isError` plus data.error for the upstream status.
+            "status": "ok",
+            "content": [{"type": "text", "text": json.dumps({"offers_total": len(offers), "offers": offers[:10], "status_code": status_code, "error": None if ok else body}, separators=(",", ":"))}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "search_flights", "offers_total": len(offers)},
-            "data": {"offers": offers, "offers_total": len(offers)},
+            "_meta": {"backend": "amadeus", "tool": "search_flights", "offers_total": len(offers), "status_code": status_code},
+            "data": {"offers": offers, "offers_total": len(offers), "status_code": status_code, "ok": ok, "error": None if ok else body},
         }
     next:
       spec: { mode: exclusive }
@@ -272,56 +278,60 @@ workflow:
         - step: end
 
   # ---------------------------------------------------------------------
-  # 3b. tools/call search_locations
+  # 3b. tools/call search_locations — same urllib pattern as 3a.
   # ---------------------------------------------------------------------
   - step: amadeus_search_locations
-    desc: Amadeus Reference Data / Locations
-    tool:
-      kind: http
-      method: GET
-      url: "https://test.api.amadeus.com/v1/reference-data/locations"
-      headers:
-        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
-      params:
-        keyword: "{{ workload.arguments.keyword }}"
-        subType: "{{ workload.arguments.subType | default('AIRPORT,CITY') }}"
-      retry:
-        max_attempts: 2
-        retry_on_status: [429, 500, 502, 503, 504]
-        backoff_seconds: 2
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: shape_search_locations
-
-  - step: shape_search_locations
-    desc: Shape Amadeus locations response into MCP tool result
+    desc: Amadeus Reference Data Locations via urllib (catches errors)
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_search_locations }}"
+        access_token: "{{ keychain.amadeus_token.access_token }}"
+        keyword: "{{ workload.arguments.keyword | default('') }}"
+        sub_type: "{{ workload.arguments.subType | default('AIRPORT,CITY') }}"
       code: |
         import json
-        data = {}
-        if isinstance(envelope, dict):
-            raw = envelope.get("data")
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    data = {}
-            elif isinstance(raw, dict):
-                data = raw
-        items = data.get("data") if isinstance(data, dict) else None
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+
+        params = {"keyword": keyword, "subType": sub_type}
+        url = "https://test.api.amadeus.com/v1/reference-data/locations?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            method="GET",
+        )
+        body = None
+        ok = False
+        status_code = 0
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body_text = resp.read().decode("utf-8")
+                try: body = json.loads(body_text)
+                except Exception: body = {"raw": body_text[:2000]}
+                ok, status_code = True, resp.status
+        except urllib.error.HTTPError as e:
+            try: err_text = e.read().decode("utf-8", errors="replace")
+            except Exception: err_text = ""
+            try: body = json.loads(err_text)
+            except Exception: body = {"raw": err_text[:2000]}
+            status_code = e.code
+        except urllib.error.URLError as e:
+            body = {"error": str(getattr(e, "reason", e))}
+        except Exception as e:
+            body = {"error": f"{type(e).__name__}: {e}"}
+
+        items = body.get("data") if (ok and isinstance(body, dict)) else []
         if not isinstance(items, list):
             items = []
-        ok = isinstance(envelope, dict) and (envelope.get("status") == "COMPLETED" or (data.get("status_code", 0) or 0) < 400)
         result = {
-            "status": "ok" if ok else "error",
-            "content": [{"type": "text", "text": json.dumps({"items_total": len(items), "items": items[:25]}, separators=(",", ":"))}],
+            # Keep the NoETL step green even when the upstream call fails;
+            # MCP clients read `isError` plus data.error for the upstream status.
+            "status": "ok",
+            "content": [{"type": "text", "text": json.dumps({"items_total": len(items), "items": items[:25], "status_code": status_code, "error": None if ok else body}, separators=(",", ":"))}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "search_locations", "items_total": len(items)},
-            "data": {"items": items, "items_total": len(items)},
+            "_meta": {"backend": "amadeus", "tool": "search_locations", "items_total": len(items), "status_code": status_code},
+            "data": {"items": items, "items_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
         }
     next:
       spec: { mode: exclusive }
@@ -329,55 +339,58 @@ workflow:
         - step: end
 
   # ---------------------------------------------------------------------
-  # 3c. tools/call search_hotels
+  # 3c. tools/call search_hotels — same urllib pattern as 3a.
   # ---------------------------------------------------------------------
   - step: amadeus_search_hotels
-    desc: Amadeus Hotel List by city
-    tool:
-      kind: http
-      method: GET
-      url: "https://test.api.amadeus.com/v1/reference-data/locations/hotels/by-city"
-      headers:
-        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
-      params:
-        cityCode: "{{ workload.arguments.cityCode }}"
-      retry:
-        max_attempts: 2
-        retry_on_status: [429, 500, 502, 503, 504]
-        backoff_seconds: 2
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: shape_search_hotels
-
-  - step: shape_search_hotels
-    desc: Shape Amadeus hotels response into MCP tool result
+    desc: Amadeus Hotel List by city via urllib (catches errors)
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_search_hotels }}"
+        access_token: "{{ keychain.amadeus_token.access_token }}"
+        city_code: "{{ workload.arguments.cityCode | default('') }}"
       code: |
         import json
-        data = {}
-        if isinstance(envelope, dict):
-            raw = envelope.get("data")
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    data = {}
-            elif isinstance(raw, dict):
-                data = raw
-        items = data.get("data") if isinstance(data, dict) else None
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+
+        url = "https://test.api.amadeus.com/v1/reference-data/locations/hotels/by-city?" + urllib.parse.urlencode({"cityCode": city_code})
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            method="GET",
+        )
+        body = None
+        ok = False
+        status_code = 0
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body_text = resp.read().decode("utf-8")
+                try: body = json.loads(body_text)
+                except Exception: body = {"raw": body_text[:2000]}
+                ok, status_code = True, resp.status
+        except urllib.error.HTTPError as e:
+            try: err_text = e.read().decode("utf-8", errors="replace")
+            except Exception: err_text = ""
+            try: body = json.loads(err_text)
+            except Exception: body = {"raw": err_text[:2000]}
+            status_code = e.code
+        except urllib.error.URLError as e:
+            body = {"error": str(getattr(e, "reason", e))}
+        except Exception as e:
+            body = {"error": f"{type(e).__name__}: {e}"}
+
+        items = body.get("data") if (ok and isinstance(body, dict)) else []
         if not isinstance(items, list):
             items = []
-        ok = isinstance(envelope, dict) and (envelope.get("status") == "COMPLETED" or (data.get("status_code", 0) or 0) < 400)
         result = {
-            "status": "ok" if ok else "error",
-            "content": [{"type": "text", "text": json.dumps({"hotels_total": len(items), "hotels": items[:25]}, separators=(",", ":"))}],
+            # Keep the NoETL step green even when the upstream call fails;
+            # MCP clients read `isError` plus data.error for the upstream status.
+            "status": "ok",
+            "content": [{"type": "text", "text": json.dumps({"hotels_total": len(items), "hotels": items[:25], "status_code": status_code, "error": None if ok else body}, separators=(",", ":"))}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "search_hotels", "hotels_total": len(items)},
-            "data": {"hotels": items, "hotels_total": len(items)},
+            "_meta": {"backend": "amadeus", "tool": "search_hotels", "hotels_total": len(items), "status_code": status_code},
+            "data": {"hotels": items, "hotels_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
         }
     next:
       spec: { mode: exclusive }
@@ -385,57 +398,64 @@ workflow:
         - step: end
 
   # ---------------------------------------------------------------------
-  # 3d. tools/call search_activities
+  # 3d. tools/call search_activities — same urllib pattern as 3a.
   # ---------------------------------------------------------------------
   - step: amadeus_search_activities
-    desc: Amadeus Activities by lat/long
-    tool:
-      kind: http
-      method: GET
-      url: "https://test.api.amadeus.com/v1/shopping/activities"
-      headers:
-        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
-      params:
-        latitude: "{{ workload.arguments.latitude }}"
-        longitude: "{{ workload.arguments.longitude }}"
-        radius: "{{ workload.arguments.radius | default(5) }}"
-      retry:
-        max_attempts: 2
-        retry_on_status: [429, 500, 502, 503, 504]
-        backoff_seconds: 2
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: shape_search_activities
-
-  - step: shape_search_activities
-    desc: Shape Amadeus activities response into MCP tool result
+    desc: Amadeus Activities by lat/long via urllib (catches errors)
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_search_activities }}"
+        access_token: "{{ keychain.amadeus_token.access_token }}"
+        latitude: "{{ workload.arguments.latitude | default('') }}"
+        longitude: "{{ workload.arguments.longitude | default('') }}"
+        radius: "{{ workload.arguments.radius | default(5) }}"
       code: |
         import json
-        data = {}
-        if isinstance(envelope, dict):
-            raw = envelope.get("data")
-            if isinstance(raw, str):
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    data = {}
-            elif isinstance(raw, dict):
-                data = raw
-        items = data.get("data") if isinstance(data, dict) else None
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+
+        url = "https://test.api.amadeus.com/v1/shopping/activities?" + urllib.parse.urlencode({
+            "latitude": latitude,
+            "longitude": longitude,
+            "radius": radius,
+        })
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            method="GET",
+        )
+        body = None
+        ok = False
+        status_code = 0
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body_text = resp.read().decode("utf-8")
+                try: body = json.loads(body_text)
+                except Exception: body = {"raw": body_text[:2000]}
+                ok, status_code = True, resp.status
+        except urllib.error.HTTPError as e:
+            try: err_text = e.read().decode("utf-8", errors="replace")
+            except Exception: err_text = ""
+            try: body = json.loads(err_text)
+            except Exception: body = {"raw": err_text[:2000]}
+            status_code = e.code
+        except urllib.error.URLError as e:
+            body = {"error": str(getattr(e, "reason", e))}
+        except Exception as e:
+            body = {"error": f"{type(e).__name__}: {e}"}
+
+        items = body.get("data") if (ok and isinstance(body, dict)) else []
         if not isinstance(items, list):
             items = []
-        ok = isinstance(envelope, dict) and (envelope.get("status") == "COMPLETED" or (data.get("status_code", 0) or 0) < 400)
         result = {
-            "status": "ok" if ok else "error",
-            "content": [{"type": "text", "text": json.dumps({"activities_total": len(items), "activities": items[:25]}, separators=(",", ":"))}],
+            # Keep the NoETL step green even when the upstream call fails;
+            # MCP clients read `isError` plus data.error for the upstream status.
+            "status": "ok",
+            "content": [{"type": "text", "text": json.dumps({"activities_total": len(items), "activities": items[:25], "status_code": status_code, "error": None if ok else body}, separators=(",", ":"))}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "search_activities", "activities_total": len(items)},
-            "data": {"activities": items, "activities_total": len(items)},
+            "_meta": {"backend": "amadeus", "tool": "search_activities", "activities_total": len(items), "status_code": status_code},
+            "data": {"activities": items, "activities_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
         }
     next:
       spec: { mode: exclusive }
