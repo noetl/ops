@@ -771,6 +771,40 @@ workflow:
         - step: end
 
   - step: end
-    desc: Done
+    desc: |
+      Bubble the selected render branch's payload into the execution-level
+      result so the GUI watcher (`extractAgentRender`) and the prompt's
+      `report` command can find it under `execution.result.render`. The
+      previous noop tail left `execution.result` empty, which made the
+      auto-render watcher silently miss the widget even though the
+      step-level render existed in events.
     tool:
-      kind: noop
+      kind: python
+      input:
+        flights: "{{ render_flights | default({}) }}"
+        locations: "{{ render_locations | default({}) }}"
+        help_payload: "{{ render_help | default({}) }}"
+        failure: "{{ render_amadeus_failure | default({}) }}"
+      code: |
+        # Pick whichever render_* step actually ran in this branch.
+        # Order doesn't really matter — only one fires per execution
+        # because the routing arcs from log_classification are exclusive
+        # — but we check failure first so an Amadeus 5xx surfaces over
+        # any leftover stub.
+        candidates = (failure, flights, locations, help_payload)
+        chosen = {}
+        for c in candidates:
+            if isinstance(c, dict) and c.get("render"):
+                chosen = c
+                break
+        # Mirror the upstream step's result fields at the execution
+        # level. `render` is the widget tree; `text`/`summary` keep the
+        # textual fallback for the canvas's plain-text path.
+        result = {
+            "render": chosen.get("render"),
+            "text": chosen.get("text") or chosen.get("summary") or "",
+            "summary": chosen.get("summary") or "",
+            "intent": chosen.get("intent"),
+            "outcome": chosen.get("outcome"),
+            "upstream_status_code": chosen.get("upstream_status_code"),
+        }
