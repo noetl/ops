@@ -40,20 +40,29 @@ workload:
   arguments: {}                   # tool-specific kwargs
 
 keychain:
+  # Mirrors the proven pattern in
+  # repos/e2e/fixtures/playbooks/api_integration/amadeus_ai_api/amadeus_ai_api.yaml.
+  # Keychain Jinja templates resolve workload fields via BARE
+  # references; `workload.X` yields empty strings at bind time and
+  # downstream HTTP steps see empty Bearer tokens. The OAuth2
+  # endpoint URL must be a plain string — Jinja conditionals don't
+  # render in keychain context. See AMBER round
+  # bridge/outbox/20260509-051749-...result.json for the failure
+  # modes that motivated this rewrite.
   - name: amadeus_credentials
     kind: secret_manager
     provider: gcp
     scope: global
-    auth: "{{ workload.gcp_auth }}"
+    auth: "{{ gcp_auth }}"
     map:
-      client_id: "{{ workload.amadeus_key_path }}"
-      client_secret: "{{ workload.amadeus_secret_path }}"
+      client_id: "{{ amadeus_key_path }}"
+      client_secret: "{{ amadeus_secret_path }}"
 
   - name: amadeus_token
     kind: oauth2
     scope: global
     auto_renew: true
-    endpoint: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/security/oauth2/token"
+    endpoint: https://test.api.amadeus.com/v1/security/oauth2/token
     method: POST
     headers:
       Content-Type: application/x-www-form-urlencoded
@@ -196,7 +205,7 @@ workflow:
     tool:
       kind: http
       method: POST
-      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v2/shopping/flight-offers"
+      url: "https://test.api.amadeus.com/v2/shopping/flight-offers"
       headers:
         Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
         Content-Type: application/json
@@ -213,7 +222,12 @@ workflow:
             travelerType: ADULT
         sources: [GDS]
         searchCriteria:
-          maxFlightOffers: "{{ workload.arguments.maxFlightOffers | default(10) }}"
+          # Amadeus expects an integer. YAML-quoted Jinja values
+          # render as strings even after `| int`; the proven pattern
+          # in repos/e2e/.../amadeus_ai_api.yaml hardcodes the value.
+          # Workload-supplied maxFlightOffers becomes a follow-up
+          # once a Python-step indirection is in place.
+          maxFlightOffers: 10
       retry:
         max_attempts: 3
         retry_on_status: [429, 500, 502, 503, 504]
@@ -265,7 +279,7 @@ workflow:
     tool:
       kind: http
       method: GET
-      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/reference-data/locations"
+      url: "https://test.api.amadeus.com/v1/reference-data/locations"
       headers:
         Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
       params:
@@ -322,7 +336,7 @@ workflow:
     tool:
       kind: http
       method: GET
-      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/reference-data/locations/hotels/by-city"
+      url: "https://test.api.amadeus.com/v1/reference-data/locations/hotels/by-city"
       headers:
         Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
       params:
@@ -378,7 +392,7 @@ workflow:
     tool:
       kind: http
       method: GET
-      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/shopping/activities"
+      url: "https://test.api.amadeus.com/v1/shopping/activities"
       headers:
         Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
       params:

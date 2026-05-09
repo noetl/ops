@@ -45,48 +45,43 @@ workload:
   amadeus_secret_path: projects/1014428265962/secrets/api-secret-test-api-amadeus-com/versions/1
 
 keychain:
-  # Only the AI provider that workload.ai_provider points at gets its
-  # token bound. The others are no-ops at run time. Vertex AI and
-  # Ollama don't need a static API key — Vertex uses GCP ADC, Ollama
-  # is unauthenticated in-cluster.
+  # Mirrors the proven pattern in
+  # repos/e2e/fixtures/playbooks/api_integration/amadeus_ai_api/amadeus_ai_api.yaml.
+  # Key learnings from the AMBER round at
+  # bridge/outbox/20260509-051749-travel-agent-amber-to-green.result.json:
+  #   1. Keychain Jinja templates resolve workload fields via BARE
+  #      references (`{{ gcp_auth }}`), not `{{ workload.gcp_auth }}`.
+  #      Mixing `workload.X` here yields empty strings at bind time,
+  #      which silently leaves keychain entries unbound and downstream
+  #      HTTP steps see empty Bearer tokens.
+  #   2. The OAuth2 endpoint URL must be a plain string — Jinja
+  #      conditionals on the endpoint don't render in keychain context.
+  #   3. `when:` predicates on keychain entries appear to be unsupported
+  #      today; entries are simply present-or-absent. Multi-provider
+  #      switching (anthropic, vertex-ai) belongs in a follow-up round
+  #      after this baseline is GREEN.
   - name: openai_token
     kind: secret_manager
     provider: gcp
     scope: global
-    when: "{{ workload.ai_provider == 'openai' }}"
-    auth: "{{ workload.gcp_auth }}"
+    auth: "{{ gcp_auth }}"
     map:
-      api_key: "{{ workload.openai_secret_path }}"
-
-  - name: anthropic_token
-    kind: secret_manager
-    provider: gcp
-    scope: global
-    when: "{{ workload.ai_provider == 'anthropic' }}"
-    auth: "{{ workload.gcp_auth }}"
-    map:
-      api_key: "{{ workload.anthropic_secret_path }}"
-
-  - name: vertex_token
-    kind: gcp_access_token
-    scope: global
-    when: "{{ workload.ai_provider == 'vertex-ai' }}"
-    auth: "{{ workload.gcp_auth }}"
+      api_key: "{{ openai_secret_path }}"
 
   - name: amadeus_credentials
     kind: secret_manager
     provider: gcp
     scope: global
-    auth: "{{ workload.gcp_auth }}"
+    auth: "{{ gcp_auth }}"
     map:
-      client_id: "{{ workload.amadeus_key_path }}"
-      client_secret: "{{ workload.amadeus_secret_path }}"
+      client_id: "{{ amadeus_key_path }}"
+      client_secret: "{{ amadeus_secret_path }}"
 
   - name: amadeus_token
     kind: oauth2
     scope: global
     auto_renew: true
-    endpoint: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/security/oauth2/token"
+    endpoint: https://test.api.amadeus.com/v1/security/oauth2/token
     method: POST
     headers:
       Content-Type: application/x-www-form-urlencoded
@@ -120,42 +115,45 @@ workflow:
         - step: classify_intent
 
   # ---------------------------------------------------------------------
-  # 2. Intent classification — the AI-provider-pluggable step.
+  # 2. Intent classification — OpenAI-only baseline.
+  #
+  # Multi-provider abstraction (Vertex AI / Anthropic / Ollama via
+  # workload.ai_provider) is a follow-up round once this baseline is
+  # GREEN. The keychain shape and the AMBER-round failure modes
+  # captured in
+  # bridge/outbox/20260509-051749-travel-agent-amber-to-green.result.json
+  # showed that conditionally-bound keychain entries leave the URL/
+  # header templates with empty values. Land OpenAI cleanly first;
+  # then layer the abstraction back.
   # ---------------------------------------------------------------------
   - step: classify_intent
-    desc: |
-      Ask the configured AI provider to classify intent + extract
-      structured params. URL/headers/body all template by
-      `workload.ai_provider`.
+    desc: Classify intent via OpenAI; extract structured params
     tool:
       kind: http
       method: POST
-      url: |
-        {{
-          'https://api.openai.com/v1/chat/completions' if workload.ai_provider == 'openai'
-          else ('https://us-central1-aiplatform.googleapis.com/v1/projects/' ~ workload.gcp_project ~ '/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent') if workload.ai_provider == 'vertex-ai'
-          else 'https://api.anthropic.com/v1/messages' if workload.ai_provider == 'anthropic'
-          else (workload.ollama_bridge_url ~ '/v1/chat/completions')
-        }}
-      headers: |
-        {%- if workload.ai_provider == 'openai' -%}
-        {"Authorization": "Bearer {{ keychain.openai_token.api_key }}", "Content-Type": "application/json"}
-        {%- elif workload.ai_provider == 'vertex-ai' -%}
-        {"Authorization": "Bearer {{ keychain.vertex_token.access_token }}", "Content-Type": "application/json"}
-        {%- elif workload.ai_provider == 'anthropic' -%}
-        {"x-api-key": "{{ keychain.anthropic_token.api_key }}", "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
-        {%- else -%}
-        {"Content-Type": "application/json"}
-        {%- endif -%}
-      payload: |
-        {%- set system = 'You are a travel agent classifier. Given a user query, return ONLY a JSON object with keys: intent (one of flights, hotels, locations, activities, help), origin (IATA), destination (IATA), departureDate (YYYY-MM-DD), adults (integer), city (for hotels), keyword (for locations or activities). Use null for fields that don\\u2019t apply. Convert relative dates to absolute. Default adults to 1.' -%}
-        {%- if workload.ai_provider == 'vertex-ai' -%}
-        {"contents": [{"role": "user", "parts": [{"text": "{{ system }}\n\nUser query: {{ workload.query }}"}]}], "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}}
-        {%- elif workload.ai_provider == 'anthropic' -%}
-        {"model": "claude-haiku-4-5-20251001", "max_tokens": 512, "system": "{{ system }}", "messages": [{"role": "user", "content": "{{ workload.query }}"}]}
-        {%- else -%}
-        {"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "{{ system }}"}, {"role": "user", "content": "{{ workload.query }}"}], "response_format": {"type": "json_object"}}
-        {%- endif -%}
+      url: "https://api.openai.com/v1/chat/completions"
+      headers:
+        Authorization: "Bearer {{ keychain.openai_token.api_key }}"
+        Content-Type: application/json
+      payload:
+        model: "gpt-4o-mini"
+        response_format:
+          type: json_object
+        messages:
+          - role: system
+            content: |
+              You are a travel agent classifier. Given a user query, return ONLY
+              a JSON object with these keys:
+              - intent: one of "flights", "hotels", "locations", "activities", "help"
+              - origin: IATA code (or null)
+              - destination: IATA code (or null)
+              - departureDate: YYYY-MM-DD (convert relative dates; or null)
+              - adults: integer, default 1
+              - city: for hotels (or null)
+              - keyword: for locations or activities (or null)
+              Use null for fields that don't apply.
+          - role: user
+            content: "{{ workload.query }}"
       retry:
         max_attempts: 2
         retry_on_status: [429, 500, 502, 503, 504]
@@ -169,12 +167,11 @@ workflow:
   # 3. Parse the AI response into a uniform shape regardless of provider.
   # ---------------------------------------------------------------------
   - step: parse_classification
-    desc: Marshal the AI provider's response into a uniform schema
+    desc: Marshal the OpenAI response into a uniform schema
     tool:
       kind: python
       input:
         ai_response: "{{ classify_intent }}"
-        provider: "{{ workload.ai_provider }}"
         query: "{{ workload.query }}"
       code: |
         import json, re
@@ -184,25 +181,15 @@ workflow:
                 return None
             return value
 
+        # OpenAI-only baseline; multi-provider response shapes
+        # (Vertex / Anthropic) come back in a follow-up round once
+        # this OpenAI path is GREEN end-to-end.
         text = ""
         if isinstance(ai_response, dict):
             data = ai_response.get("data", ai_response)
-            if provider == "vertex-ai":
-                # contents[0].candidates[0].content.parts[0].text
-                cands = (data or {}).get("candidates") or []
-                if cands:
-                    parts = ((cands[0].get("content") or {}).get("parts") or [])
-                    if parts:
-                        text = parts[0].get("text") or ""
-            elif provider == "anthropic":
-                content = (data or {}).get("content") or []
-                if content and isinstance(content, list):
-                    text = (content[0] or {}).get("text") or ""
-            else:
-                # openai + ollama-bridge openai-compatible
-                choices = (data or {}).get("choices") or []
-                if choices:
-                    text = ((choices[0] or {}).get("message") or {}).get("content") or ""
+            choices = (data or {}).get("choices") or []
+            if choices:
+                text = ((choices[0] or {}).get("message") or {}).get("content") or ""
 
         # Strip markdown fences if the AI ignored response_format.
         text = (text or "").strip()
@@ -280,7 +267,7 @@ workflow:
     tool:
       kind: http
       method: POST
-      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v2/shopping/flight-offers"
+      url: "https://test.api.amadeus.com/v2/shopping/flight-offers"
       headers:
         Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
         Content-Type: application/json
@@ -446,7 +433,7 @@ workflow:
     tool:
       kind: http
       method: GET
-      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/reference-data/locations"
+      url: "https://test.api.amadeus.com/v1/reference-data/locations"
       headers:
         Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
       params:
