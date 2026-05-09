@@ -456,10 +456,7 @@ workflow:
             "text": f"{len(offers)} flight offer(s) returned for {classification.get('origin') or '?'} → {classification.get('destination') or '?'}",
             "render": render,
         }
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: persist_and_callback
+    # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
   # 4b. Locations branch — IATA / city lookup.
@@ -576,10 +573,7 @@ workflow:
             "text": f"{len(items)} location(s) returned",
             "render": render,
         }
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: persist_and_callback
+    # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
   # 4c. Help / unsupported intent — render onboarding widget.
@@ -626,10 +620,7 @@ workflow:
             "text": note,
             "render": render,
         }
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: persist_and_callback
+    # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
   # 4d. Amadeus failure renderer — friendly error widget.
@@ -723,105 +714,34 @@ workflow:
             "text": user_message,
             "render": render,
         }
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: persist_and_callback
 
   # ---------------------------------------------------------------------
-  # 5. Persist + (optional) callback — same pattern as amadeus_ai_api.
+  # 5. Workflow tails.
+  #
+  # Each render_* step is the FINAL step on its branch — no further
+  # arcs. NoETL takes the last step's result as `execution.result`, so
+  # `execution.result.render` is automatically the widget tree the
+  # render_* step produced. The auto-render watcher and `report`
+  # command both find the widget at the top of the result.
+  #
+  # Earlier rounds chained render_* → persist_and_callback (postgres)
+  # → send_callback (http) → end (python). That chain broke render
+  # visibility in two ways: (a) postgres step's result overwrote the
+  # render step's result on the way to `end`, and (b) NoETL's
+  # variable scope from `end` couldn't see arbitrary upstream step
+  # outputs reliably (round 6 result file documents this). Letting
+  # render_* be the tail is the simplest correct shape.
+  #
+  # Audit trail: NoETL's own event log already records every step
+  # transition with input/output metadata, so dropping the explicit
+  # `travel_agent_events` postgres write is acceptable for round 6.
+  # If a dedicated audit table is needed later, add it as a SIDE
+  # EFFECT inside each render_* python step (psycopg) so it doesn't
+  # clobber the result. Don't reintroduce the trailing postgres step.
+  #
+  # Gateway SSE callback: only relevant in gateway-mode deploys (where
+  # workload.request_id is set). Local kind doesn't use it. When the
+  # gateway integration round picks this back up, do the callback as
+  # a SIDE EFFECT inside the render_* step (urllib POST) — same
+  # pattern as the audit, for the same reason.
   # ---------------------------------------------------------------------
-  - step: persist_and_callback
-    desc: Audit the final result; gateway callback if request_id is set
-    tool:
-      kind: postgres
-      auth: "{{ workload.pg_auth }}"
-      query: |
-        INSERT INTO travel_agent_events (execution_id, event_type, ai_provider, intent, payload)
-        VALUES (
-          '{{ execution_id }}',
-          'render_completed',
-          '{{ workload.ai_provider }}',
-          '{{ parse_classification.intent }}',
-          '{}'::jsonb
-        );
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: send_callback
-          when: "{{ workload.request_id }}"
-        - step: end
-          when: "{{ not workload.request_id }}"
-
-  - step: send_callback
-    desc: Send completion callback (gateway SSE delivery)
-    tool:
-      kind: http
-      method: POST
-      url: "{{ workload.callback_url }}"
-      headers:
-        Content-Type: application/json
-      data:
-        request_id: "{{ workload.request_id }}"
-        status: COMPLETED
-        execution_id: "{{ execution_id }}"
-    next:
-      spec: { mode: exclusive }
-      arcs:
-        - step: end
-
-  - step: end
-    desc: |
-      Bubble the selected render branch's payload into the execution-level
-      result so the GUI watcher (`extractAgentRender`) and the prompt's
-      `report` command can find it under `execution.result.render`. The
-      previous noop tail left `execution.result` empty, which made the
-      auto-render watcher silently miss the widget even though the
-      step-level render existed in events.
-    tool:
-      kind: python
-      input:
-        flights_json: '{{ render_flights | default({}) | tojson }}'
-        locations_json: '{{ render_locations | default({}) | tojson }}'
-        help_payload_json: '{{ render_help | default({}) | tojson }}'
-        failure_json: '{{ render_amadeus_failure | default({}) | tojson }}'
-      code: |
-        import json
-
-        def decode_payload(raw):
-            if isinstance(raw, dict):
-                return raw
-            if not raw:
-                return {}
-            try:
-                decoded = json.loads(raw)
-            except Exception:
-                return {}
-            return decoded if isinstance(decoded, dict) else {}
-
-        # Pick whichever render_* step actually ran in this branch.
-        # Order doesn't really matter — only one fires per execution
-        # because the routing arcs from log_classification are exclusive
-        # — but we check failure first so an Amadeus 5xx surfaces over
-        # any leftover stub.
-        failure = decode_payload(failure_json)
-        flights = decode_payload(flights_json)
-        locations = decode_payload(locations_json)
-        help_payload = decode_payload(help_payload_json)
-        candidates = (failure, flights, locations, help_payload)
-        chosen = {}
-        for c in candidates:
-            if isinstance(c, dict) and c.get("render"):
-                chosen = c
-                break
-        # Mirror the upstream step's result fields at the execution
-        # level. `render` is the widget tree; `text`/`summary` keep the
-        # textual fallback for the canvas's plain-text path.
-        result = {
-            "render": chosen.get("render"),
-            "text": chosen.get("text") or chosen.get("summary") or "",
-            "summary": chosen.get("summary") or "",
-            "intent": chosen.get("intent"),
-            "outcome": chosen.get("outcome"),
-            "upstream_status_code": chosen.get("upstream_status_code"),
-        }
