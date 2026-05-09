@@ -163,17 +163,22 @@ workflow:
         - keyword: for locations or activities (or null)
         Use null for fields that don't apply."""
 
-        def _post_json(url, headers, payload):
-            req = urllib.request.Request(
+        def _post_json(url, headers, payload, json=json, urllib_request=urllib.request):
+            req = urllib_request.Request(
                 url,
                 data=json.dumps(payload).encode("utf-8"),
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib_request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
 
-        def _openai_text():
+        def _openai_text(
+            system_prompt=system_prompt,
+            query=query,
+            openai_api_key=openai_api_key,
+            _post_json=_post_json,
+        ):
             body = {
                 "model": "gpt-4o-mini",
                 "response_format": {"type": "json_object"},
@@ -195,7 +200,12 @@ workflow:
                 return ((choices[0] or {}).get("message") or {}).get("content") or ""
             return ""
 
-        def _anthropic_text():
+        def _anthropic_text(
+            system_prompt=system_prompt,
+            query=query,
+            anthropic_api_key=anthropic_api_key,
+            _post_json=_post_json,
+        ):
             body = {
                 "model": "claude-3-5-haiku-latest",
                 "max_tokens": 512,
