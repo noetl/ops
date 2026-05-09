@@ -1,0 +1,705 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: travel_agent
+  path: automation/agents/travel/runtime
+  description: |
+    Travel agent — flagship demo of NoETL DSL as a templating library
+    for AI agents and MCP tooling using only playbooks.
+
+    Takes a natural-language query, classifies intent (flights / hotels
+    / locations / activities / help) via the configured AI provider,
+    routes to the right Amadeus endpoint, and emits the result as a
+    widget tree in `result.render`. The widget renderer in NoetlPrompt
+    materialises the tree in the terminal; the travel canvas in
+    GatewayAssistant renders the same shape.
+
+    The AI provider is parameterised via `workload.ai_provider` —
+    swap OpenAI for Vertex AI / Anthropic / Ollama by changing one
+    workload field. NoETL templates the URL, headers, and request
+    body; everything else is the same playbook.
+  version: "1.0"
+  agent: true
+  tags: [agent, travel, widgets, ai-os, flagship]
+  terminal:
+    visible: true
+    workspace: travel
+    scopes: [/mcp/amadeus]
+  capabilities: [mcp:amadeus, ai:openai, ai:vertex-ai, ai:anthropic, ai:ollama]
+
+workload:
+  pg_auth: pg_k8s
+  gcp_auth: google_oauth
+  ai_provider: openai            # openai | vertex-ai | anthropic | ollama
+  query: "Help"
+  request_id: ""
+  callback_url: ""
+  amadeus_env: test              # test | production
+  gcp_project: "noetl-cluster"
+  ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8080"
+  # Secret-manager paths. Per-provider; only the one matching
+  # workload.ai_provider is actually bound by the keychain block below.
+  openai_secret_path: projects/1014428265962/secrets/openai-api-key/versions/1
+  anthropic_secret_path: projects/1014428265962/secrets/anthropic-api-key/versions/1
+  amadeus_key_path: projects/1014428265962/secrets/api-key-test-api-amadeus-com/versions/1
+  amadeus_secret_path: projects/1014428265962/secrets/api-secret-test-api-amadeus-com/versions/1
+
+keychain:
+  # Only the AI provider that workload.ai_provider points at gets its
+  # token bound. The others are no-ops at run time. Vertex AI and
+  # Ollama don't need a static API key — Vertex uses GCP ADC, Ollama
+  # is unauthenticated in-cluster.
+  - name: openai_token
+    kind: secret_manager
+    provider: gcp
+    scope: global
+    when: "{{ workload.ai_provider == 'openai' }}"
+    auth: "{{ workload.gcp_auth }}"
+    map:
+      api_key: "{{ workload.openai_secret_path }}"
+
+  - name: anthropic_token
+    kind: secret_manager
+    provider: gcp
+    scope: global
+    when: "{{ workload.ai_provider == 'anthropic' }}"
+    auth: "{{ workload.gcp_auth }}"
+    map:
+      api_key: "{{ workload.anthropic_secret_path }}"
+
+  - name: vertex_token
+    kind: gcp_access_token
+    scope: global
+    when: "{{ workload.ai_provider == 'vertex-ai' }}"
+    auth: "{{ workload.gcp_auth }}"
+
+  - name: amadeus_credentials
+    kind: secret_manager
+    provider: gcp
+    scope: global
+    auth: "{{ workload.gcp_auth }}"
+    map:
+      client_id: "{{ workload.amadeus_key_path }}"
+      client_secret: "{{ workload.amadeus_secret_path }}"
+
+  - name: amadeus_token
+    kind: oauth2
+    scope: global
+    auto_renew: true
+    endpoint: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/security/oauth2/token"
+    method: POST
+    headers:
+      Content-Type: application/x-www-form-urlencoded
+    data:
+      grant_type: client_credentials
+      client_id: "{{ keychain.amadeus_credentials.client_id }}"
+      client_secret: "{{ keychain.amadeus_credentials.client_secret }}"
+
+workflow:
+  # ---------------------------------------------------------------------
+  # 1. Bootstrap the audit-log tables (idempotent).
+  # ---------------------------------------------------------------------
+  - step: start
+    desc: Ensure event-log tables exist
+    tool:
+      kind: postgres
+      auth: "{{ workload.pg_auth }}"
+      query: |
+        CREATE TABLE IF NOT EXISTS travel_agent_events (
+          id BIGSERIAL PRIMARY KEY,
+          execution_id TEXT NOT NULL,
+          event_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          event_type TEXT NOT NULL,
+          ai_provider TEXT,
+          intent TEXT,
+          payload JSONB
+        );
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: classify_intent
+
+  # ---------------------------------------------------------------------
+  # 2. Intent classification — the AI-provider-pluggable step.
+  # ---------------------------------------------------------------------
+  - step: classify_intent
+    desc: |
+      Ask the configured AI provider to classify intent + extract
+      structured params. URL/headers/body all template by
+      `workload.ai_provider`.
+    tool:
+      kind: http
+      method: POST
+      url: |
+        {{
+          'https://api.openai.com/v1/chat/completions' if workload.ai_provider == 'openai'
+          else ('https://us-central1-aiplatform.googleapis.com/v1/projects/' ~ workload.gcp_project ~ '/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent') if workload.ai_provider == 'vertex-ai'
+          else 'https://api.anthropic.com/v1/messages' if workload.ai_provider == 'anthropic'
+          else (workload.ollama_bridge_url ~ '/v1/chat/completions')
+        }}
+      headers: |
+        {%- if workload.ai_provider == 'openai' -%}
+        {"Authorization": "Bearer {{ keychain.openai_token.api_key }}", "Content-Type": "application/json"}
+        {%- elif workload.ai_provider == 'vertex-ai' -%}
+        {"Authorization": "Bearer {{ keychain.vertex_token.access_token }}", "Content-Type": "application/json"}
+        {%- elif workload.ai_provider == 'anthropic' -%}
+        {"x-api-key": "{{ keychain.anthropic_token.api_key }}", "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+        {%- else -%}
+        {"Content-Type": "application/json"}
+        {%- endif -%}
+      payload: |
+        {%- set system = 'You are a travel agent classifier. Given a user query, return ONLY a JSON object with keys: intent (one of flights, hotels, locations, activities, help), origin (IATA), destination (IATA), departureDate (YYYY-MM-DD), adults (integer), city (for hotels), keyword (for locations or activities). Use null for fields that don\\u2019t apply. Convert relative dates to absolute. Default adults to 1.' -%}
+        {%- if workload.ai_provider == 'vertex-ai' -%}
+        {"contents": [{"role": "user", "parts": [{"text": "{{ system }}\n\nUser query: {{ workload.query }}"}]}], "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}}
+        {%- elif workload.ai_provider == 'anthropic' -%}
+        {"model": "claude-haiku-4-5-20251001", "max_tokens": 512, "system": "{{ system }}", "messages": [{"role": "user", "content": "{{ workload.query }}"}]}
+        {%- else -%}
+        {"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "{{ system }}"}, {"role": "user", "content": "{{ workload.query }}"}], "response_format": {"type": "json_object"}}
+        {%- endif -%}
+      retry:
+        max_attempts: 2
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: parse_classification
+
+  # ---------------------------------------------------------------------
+  # 3. Parse the AI response into a uniform shape regardless of provider.
+  # ---------------------------------------------------------------------
+  - step: parse_classification
+    desc: Marshal the AI provider's response into a uniform schema
+    tool:
+      kind: python
+      input:
+        ai_response: "{{ classify_intent }}"
+        provider: "{{ workload.ai_provider }}"
+        query: "{{ workload.query }}"
+      code: |
+        import json, re
+
+        def _coerce(value):
+            if value in (None, "", "null"):
+                return None
+            return value
+
+        text = ""
+        if isinstance(ai_response, dict):
+            data = ai_response.get("data", ai_response)
+            if provider == "vertex-ai":
+                # contents[0].candidates[0].content.parts[0].text
+                cands = (data or {}).get("candidates") or []
+                if cands:
+                    parts = ((cands[0].get("content") or {}).get("parts") or [])
+                    if parts:
+                        text = parts[0].get("text") or ""
+            elif provider == "anthropic":
+                content = (data or {}).get("content") or []
+                if content and isinstance(content, list):
+                    text = (content[0] or {}).get("text") or ""
+            else:
+                # openai + ollama-bridge openai-compatible
+                choices = (data or {}).get("choices") or []
+                if choices:
+                    text = ((choices[0] or {}).get("message") or {}).get("content") or ""
+
+        # Strip markdown fences if the AI ignored response_format.
+        text = (text or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r'^```\w*\n?', '', text)
+            text = re.sub(r'\n?```$', '', text)
+            text = text.strip()
+
+        try:
+            parsed = json.loads(text) if text else {}
+        except Exception:
+            parsed = {}
+
+        intent = (parsed.get("intent") or "help").lower().strip()
+        if intent not in ("flights", "hotels", "locations", "activities", "help"):
+            intent = "help"
+
+        result = {
+            "intent": intent,
+            "origin": _coerce(parsed.get("origin")),
+            "destination": _coerce(parsed.get("destination")),
+            "departureDate": _coerce(parsed.get("departureDate")),
+            "adults": int(parsed.get("adults") or 1),
+            "city": _coerce(parsed.get("city")),
+            "keyword": _coerce(parsed.get("keyword")),
+            "raw_text": text[:600],
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: log_classification
+
+  - step: log_classification
+    desc: Audit the classification
+    tool:
+      kind: postgres
+      auth: "{{ workload.pg_auth }}"
+      query: |
+        INSERT INTO travel_agent_events (execution_id, event_type, ai_provider, intent, payload)
+        VALUES (
+          '{{ execution_id }}',
+          'classify_intent',
+          '{{ workload.ai_provider }}',
+          '{{ parse_classification.intent }}',
+          '{{ parse_classification | tojson | replace("'", "''") }}'::jsonb
+        );
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: amadeus_search_flights
+          when: "{{ parse_classification.intent == 'flights' }}"
+        - step: amadeus_search_locations
+          when: "{{ parse_classification.intent == 'locations' }}"
+        # Hotels and activities are stubbed — they fall through to the
+        # help renderer in phase 1. Phase 2 wires the real Amadeus calls.
+        - step: render_help
+          when: "{{ parse_classification.intent in ('hotels', 'activities', 'help') }}"
+
+  # ---------------------------------------------------------------------
+  # 4a. Flights branch.
+  # ---------------------------------------------------------------------
+  - step: amadeus_search_flights
+    desc: Call Amadeus Flight Offers Search
+    tool:
+      kind: http
+      method: POST
+      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v2/shopping/flight-offers"
+      headers:
+        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
+        Content-Type: application/json
+      payload:
+        currencyCode: USD
+        originDestinations:
+          - id: "1"
+            originLocationCode: "{{ parse_classification.origin | default('SFO') }}"
+            destinationLocationCode: "{{ parse_classification.destination | default('JFK') }}"
+            departureDateTimeRange:
+              date: "{{ parse_classification.departureDate | default('2026-07-15') }}"
+        travelers:
+          - id: "1"
+            travelerType: ADULT
+        sources: [GDS]
+        searchCriteria:
+          maxFlightOffers: 6
+      retry:
+        max_attempts: 3
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: render_flights
+          when: "{{ amadeus_search_flights.status == 'COMPLETED' or (amadeus_search_flights.data.status_code | default(0)) < 400 }}"
+        - step: render_amadeus_failure
+          when: "{{ amadeus_search_flights.status != 'COMPLETED' or (amadeus_search_flights.data.status_code | default(0)) >= 400 }}"
+
+  - step: render_flights
+    desc: Project flights into a widget tree
+    tool:
+      kind: python
+      input:
+        envelope: "{{ amadeus_search_flights }}"
+        classification: "{{ parse_classification }}"
+        query: "{{ workload.query }}"
+        execution_id: "{{ execution_id }}"
+        provider: "{{ workload.ai_provider }}"
+      code: |
+        import json
+
+        # Pull Amadeus offers out of the http envelope.
+        data = {}
+        if isinstance(envelope, dict):
+            raw = envelope.get("data")
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+            elif isinstance(raw, dict):
+                data = raw
+        offers = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(offers, list):
+            offers = []
+
+        def _seg(o):
+            its = o.get("itineraries") or []
+            segs = (its[0] or {}).get("segments") or [] if its else []
+            first = segs[0] if segs else {}
+            last = segs[-1] if segs else {}
+            return {
+                "carrier": first.get("carrierCode") or "?",
+                "flight": (first.get("number") or first.get("flightNumber") or ""),
+                "departure": (first.get("departure") or {}).get("at") or "?",
+                "arrival": (last.get("arrival") or {}).get("at") or "?",
+                "duration": (its[0] or {}).get("duration") if its else "?",
+                "stops": max(0, len(segs) - 1),
+            }
+
+        def _offer_card(o):
+            seg = _seg(o)
+            price = (o.get("price") or {}).get("total") or "?"
+            currency = (o.get("price") or {}).get("currency") or "USD"
+            data_rows = [
+                ["Carrier", f"{seg['carrier']} {seg['flight']}".strip()],
+                ["Departure", seg["departure"]],
+                ["Arrival", seg["arrival"]],
+                ["Duration", seg["duration"]],
+                ["Stops", str(seg["stops"])],
+                ["Price", f"{price} {currency}"],
+            ]
+            return {
+                "type": "app:column",
+                "args": {
+                    "gap": 6,
+                    "children": [
+                        {
+                            "type": "app:title",
+                            "args": {"text": f"{seg['carrier']} {seg['flight']} · {price} {currency}", "size": 16, "boldness": 600},
+                        },
+                        {
+                            "type": "app:grouped_table",
+                            "args": {"groups": [{"title": "Itinerary", "data": data_rows}]},
+                        },
+                    ],
+                },
+            }
+
+        if not offers:
+            render = {
+                "type": "app:column",
+                "args": {
+                    "gap": 8,
+                    "children": [
+                        {"type": "app:title", "args": {"text": "Travel agent · flights", "size": 18, "boldness": 700}},
+                        {"type": "app:text", "args": {"title": "Query", "message": query}},
+                        {"type": "app:alert", "args": {"variant": "warning", "message": f"No flights matched {classification.get('origin') or '?'} → {classification.get('destination') or '?'} on {classification.get('departureDate') or '?'}."}},
+                    ],
+                },
+            }
+        else:
+            cards = [_offer_card(o) for o in offers[:6]]
+            render = {
+                "type": "app:column",
+                "args": {
+                    "gap": 8,
+                    "children": [
+                        {"type": "app:title", "args": {"text": f"Travel agent · {len(offers)} flight{'s' if len(offers) != 1 else ''}", "size": 18, "boldness": 700}},
+                        {"type": "app:text", "args": {"title": "Query", "message": query}},
+                        {
+                            "type": "app:row",
+                            "args": {"gap": 8, "children": [
+                                {"type": "app:statusbar", "args": {"text": f"intent=flights", "styleKey": "success"}},
+                                {"type": "app:statusbar", "args": {"text": f"provider={provider}", "styleKey": "info"}},
+                                {"type": "app:statusbar", "args": {"text": f"{classification.get('origin') or '?'} → {classification.get('destination') or '?'}", "styleKey": "info"}},
+                                {"type": "app:statusbar", "args": {"text": classification.get("departureDate") or "?", "styleKey": "info"}},
+                            ]},
+                        },
+                        {
+                            "type": "app:carousel",
+                            "args": {"carouselHeight": 320, "widgets": cards},
+                        },
+                        {
+                            "type": "app:row",
+                            "args": {"gap": 8, "children": [
+                                {"type": "app:button", "args": {"text": "rerun this search", "variant": "outlined", "event": {"key": "command", "value": f"rerun {execution_id}"}}},
+                                {"type": "app:button", "args": {"text": "open execution detail", "variant": "outlined", "event": {"key": "navigate", "value": f"/execution/{execution_id}"}}},
+                            ]},
+                        },
+                    ],
+                },
+            }
+
+        result = {
+            "intent": "flights",
+            "offers_total": len(offers),
+            "summary": f"{len(offers)} flight offer(s) returned",
+            "text": f"{len(offers)} flight offer(s) returned for {classification.get('origin') or '?'} → {classification.get('destination') or '?'}",
+            "render": render,
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: persist_and_callback
+
+  # ---------------------------------------------------------------------
+  # 4b. Locations branch — IATA / city lookup.
+  # ---------------------------------------------------------------------
+  - step: amadeus_search_locations
+    desc: Call Amadeus Reference Data / Locations
+    tool:
+      kind: http
+      method: GET
+      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/reference-data/locations"
+      headers:
+        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
+      params:
+        keyword: "{{ parse_classification.keyword | default(parse_classification.city) | default(parse_classification.origin) | default(workload.query) }}"
+        subType: "AIRPORT,CITY"
+      retry:
+        max_attempts: 2
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: render_locations
+          when: "{{ amadeus_search_locations.status == 'COMPLETED' or (amadeus_search_locations.data.status_code | default(0)) < 400 }}"
+        - step: render_amadeus_failure
+          when: "{{ amadeus_search_locations.status != 'COMPLETED' or (amadeus_search_locations.data.status_code | default(0)) >= 400 }}"
+
+  - step: render_locations
+    desc: Project locations into a widget tree
+    tool:
+      kind: python
+      input:
+        envelope: "{{ amadeus_search_locations }}"
+        classification: "{{ parse_classification }}"
+        query: "{{ workload.query }}"
+        execution_id: "{{ execution_id }}"
+        provider: "{{ workload.ai_provider }}"
+      code: |
+        import json
+        data = {}
+        if isinstance(envelope, dict):
+            raw = envelope.get("data")
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+            elif isinstance(raw, dict):
+                data = raw
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = []
+
+        rows = []
+        for it in items[:25]:
+            rows.append({
+                "id": it.get("id") or it.get("iataCode") or "?",
+                "name": it.get("name") or "?",
+                "iataCode": it.get("iataCode") or "?",
+                "subType": it.get("subType") or "?",
+                "cityName": (it.get("address") or {}).get("cityName") or "",
+                "countryName": (it.get("address") or {}).get("countryName") or "",
+            })
+
+        render = {
+            "type": "app:column",
+            "args": {
+                "gap": 8,
+                "children": [
+                    {"type": "app:title", "args": {"text": f"Travel agent · {len(items)} location{'s' if len(items) != 1 else ''}", "size": 18, "boldness": 700}},
+                    {"type": "app:text", "args": {"title": "Query", "message": query}},
+                    {"type": "app:recordtable", "args": {
+                        "columns": [
+                            {"title": "Code", "dataIndex": "iataCode", "sorter": True},
+                            {"title": "Name", "dataIndex": "name", "sorter": True, "filter": True},
+                            {"title": "Type", "dataIndex": "subType", "sorter": True},
+                            {"title": "City", "dataIndex": "cityName", "sorter": True},
+                            {"title": "Country", "dataIndex": "countryName", "sorter": True},
+                        ],
+                        "data": rows,
+                        "pageSize": 12,
+                    }},
+                ],
+            },
+        }
+
+        result = {
+            "intent": "locations",
+            "items_total": len(items),
+            "summary": f"{len(items)} location(s) found",
+            "text": f"{len(items)} location(s) returned",
+            "render": render,
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: persist_and_callback
+
+  # ---------------------------------------------------------------------
+  # 4c. Help / unsupported intent — render onboarding widget.
+  # ---------------------------------------------------------------------
+  - step: render_help
+    desc: Render an onboarding widget when intent is help / hotels / activities (not yet wired)
+    tool:
+      kind: python
+      input:
+        classification: "{{ parse_classification }}"
+        query: "{{ workload.query }}"
+        execution_id: "{{ execution_id }}"
+        provider: "{{ workload.ai_provider }}"
+      code: |
+        intent = classification.get("intent") or "help"
+        if intent in ("hotels", "activities"):
+            note = f"Intent '{intent}' is recognised but not yet wired in phase 1. Phase 2 adds the Amadeus call."
+        else:
+            note = "I can search flights and locations today. Try: 'flights from SFO to JFK on July 15' or 'locations near Boston'."
+
+        examples = [
+            {"type": "app:button", "args": {"text": "flights SFO→JFK on 2026-07-15", "variant": "outlined", "event": {"key": "command", "value": "travel flights from SFO to JFK on 2026-07-15 for 2 adults"}}},
+            {"type": "app:button", "args": {"text": "locations near Boston", "variant": "outlined", "event": {"key": "command", "value": "travel locations near Boston"}}},
+        ]
+
+        render = {
+            "type": "app:column",
+            "args": {
+                "gap": 8,
+                "children": [
+                    {"type": "app:title", "args": {"text": "Travel agent · help", "size": 18, "boldness": 700}},
+                    {"type": "app:text", "args": {"title": "Query", "message": query}},
+                    {"type": "app:alert", "args": {"variant": "info", "message": note}},
+                    {"type": "app:row", "args": {"gap": 8, "children": examples}},
+                    {"type": "app:horizontalline", "args": {}},
+                    {"type": "app:text", "args": {"title": "Provider", "message": f"This run used {provider}. Re-run with --provider vertex-ai / anthropic / ollama to switch."}},
+                ],
+            },
+        }
+
+        result = {
+            "intent": intent,
+            "summary": note,
+            "text": note,
+            "render": render,
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: persist_and_callback
+
+  # ---------------------------------------------------------------------
+  # 4d. Amadeus failure renderer — friendly error widget.
+  # ---------------------------------------------------------------------
+  - step: render_amadeus_failure
+    desc: Surface a friendly Amadeus failure as a widget
+    tool:
+      kind: python
+      input:
+        flights_envelope: "{{ amadeus_search_flights | default({}) }}"
+        locations_envelope: "{{ amadeus_search_locations | default({}) }}"
+        classification: "{{ parse_classification }}"
+        query: "{{ workload.query }}"
+        execution_id: "{{ execution_id }}"
+      code: |
+        envelope = flights_envelope if isinstance(flights_envelope, dict) and flights_envelope else locations_envelope
+        if not isinstance(envelope, dict):
+            envelope = {}
+        data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+        status_code = data.get("status_code")
+        body = data.get("body") or data.get("response") or data.get("error")
+        if isinstance(body, dict):
+            errors = body.get("errors") if isinstance(body.get("errors"), list) else None
+            body_msg = "; ".join(str((e or {}).get("title") or (e or {}).get("detail") or e) for e in errors) if errors else str(body)[:600]
+        elif isinstance(body, str):
+            body_msg = body[:600]
+        else:
+            body_msg = "(no response body captured)"
+
+        if status_code and 500 <= int(status_code) <= 599:
+            user_message = "The flight provider's search service is temporarily unavailable. Please try again."
+        elif status_code == 429:
+            user_message = "We're being rate-limited by the flight provider. Try again in a few seconds."
+        elif status_code in (401, 403):
+            user_message = "Couldn't authenticate with the flight provider. Operator may need to refresh credentials."
+        elif status_code in (400, 422):
+            user_message = "The flight search query couldn't be parsed. Try rephrasing the query — include city pair, date, and number of travelers."
+        else:
+            user_message = "The flight search failed. Please try again, or contact support if it persists."
+
+        render = {
+            "type": "app:column",
+            "args": {
+                "gap": 8,
+                "children": [
+                    {"type": "app:title", "args": {"text": "Travel agent · search failed", "size": 18, "boldness": 700}},
+                    {"type": "app:text", "args": {"title": "Query", "message": query}},
+                    {"type": "app:alert", "args": {"variant": "error", "message": user_message}},
+                    {"type": "app:infotable", "args": {
+                        "data": {
+                            "intent": classification.get("intent"),
+                            "status_code": status_code,
+                            "upstream_message": body_msg,
+                        },
+                        "fields": [
+                            {"label": "Intent", "key": "intent"},
+                            {"label": "Upstream status", "key": "status_code"},
+                            {"label": "Upstream message", "key": "upstream_message"},
+                        ],
+                    }},
+                    {"type": "app:row", "args": {"gap": 8, "children": [
+                        {"type": "app:button", "args": {"text": "rerun this search", "variant": "outlined", "event": {"key": "command", "value": f"rerun {execution_id}"}}},
+                        {"type": "app:button", "args": {"text": "diagnose", "variant": "outlined", "event": {"key": "command", "value": f"fix {execution_id}"}}},
+                    ]}},
+                ],
+            },
+        }
+
+        result = {
+            "status": "failed",
+            "stage": "amadeus_search",
+            "intent": classification.get("intent"),
+            "user_message": user_message,
+            "upstream_status_code": status_code,
+            "upstream_message": body_msg,
+            "summary": user_message,
+            "text": user_message,
+            "render": render,
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: persist_and_callback
+
+  # ---------------------------------------------------------------------
+  # 5. Persist + (optional) callback — same pattern as amadeus_ai_api.
+  # ---------------------------------------------------------------------
+  - step: persist_and_callback
+    desc: Audit the final result; gateway callback if request_id is set
+    tool:
+      kind: postgres
+      auth: "{{ workload.pg_auth }}"
+      query: |
+        INSERT INTO travel_agent_events (execution_id, event_type, ai_provider, intent, payload)
+        VALUES (
+          '{{ execution_id }}',
+          'render_completed',
+          '{{ workload.ai_provider }}',
+          '{{ parse_classification.intent }}',
+          '{}'::jsonb
+        );
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: send_callback
+          when: "{{ workload.request_id }}"
+        - step: end
+          when: "{{ not workload.request_id }}"
+
+  - step: send_callback
+    desc: Send completion callback (gateway SSE delivery)
+    tool:
+      kind: http
+      method: POST
+      url: "{{ workload.callback_url }}"
+      headers:
+        Content-Type: application/json
+      data:
+        request_id: "{{ workload.request_id }}"
+        status: COMPLETED
+        execution_id: "{{ execution_id }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

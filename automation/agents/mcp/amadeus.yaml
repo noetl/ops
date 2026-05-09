@@ -1,0 +1,498 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: amadeus_mcp
+  path: automation/agents/mcp/amadeus
+  description: |
+    Amadeus MCP server playbook. Exposes Amadeus capabilities through
+    NoETL's playbook-as-MCP JSON-RPC endpoint so MCP clients (Claude
+    Desktop, NoetlPrompt's `cd /mcp/amadeus`, agent-to-agent calls) can
+    use Amadeus the same way they'd use any other MCP server.
+
+    Surface follows the MCP spec — `tools/list` returns the catalog,
+    `tools/call` dispatches by tool name to the right Amadeus endpoint.
+    Tools: search_flights, search_hotels, search_locations,
+    search_activities, get_token (debug).
+
+    Same Amadeus capability as automation/agents/travel/runtime, but
+    callable through MCP rather than as a single agent flow. The
+    travel agent could itself use this MCP server (agent → MCP hop)
+    for its Amadeus calls — phase 2 of the flagship round.
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  version: "1.0"
+  tags: [mcp, amadeus, travel, ai-os]
+  terminal:
+    visible: true
+    workspace: amadeus
+    scopes: [/mcp/amadeus]
+
+workload:
+  pg_auth: pg_k8s
+  gcp_auth: google_oauth
+  amadeus_env: test
+  amadeus_key_path: projects/1014428265962/secrets/api-key-test-api-amadeus-com/versions/1
+  amadeus_secret_path: projects/1014428265962/secrets/api-secret-test-api-amadeus-com/versions/1
+  # MCP request fields. Populated by the JSON-RPC dispatcher.
+  method: "tools/list"            # tools/list | tools/call
+  tool: ""                        # search_flights | search_hotels | search_locations | search_activities | get_token
+  arguments: {}                   # tool-specific kwargs
+
+keychain:
+  - name: amadeus_credentials
+    kind: secret_manager
+    provider: gcp
+    scope: global
+    auth: "{{ workload.gcp_auth }}"
+    map:
+      client_id: "{{ workload.amadeus_key_path }}"
+      client_secret: "{{ workload.amadeus_secret_path }}"
+
+  - name: amadeus_token
+    kind: oauth2
+    scope: global
+    auto_renew: true
+    endpoint: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/security/oauth2/token"
+    method: POST
+    headers:
+      Content-Type: application/x-www-form-urlencoded
+    data:
+      grant_type: client_credentials
+      client_id: "{{ keychain.amadeus_credentials.client_id }}"
+      client_secret: "{{ keychain.amadeus_credentials.client_secret }}"
+
+workflow:
+  # ---------------------------------------------------------------------
+  # 1. Dispatch on method/tool. tools/list returns the catalog;
+  # tools/call branches by tool name.
+  # ---------------------------------------------------------------------
+  - step: dispatch
+    desc: Branch on MCP method + tool name
+    tool:
+      kind: python
+      input:
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+      code: |
+        result = {
+            "method": str(method or "tools/list").strip().lower(),
+            "tool": str(tool or "").strip().lower(),
+            "arguments": arguments if isinstance(arguments, dict) else {},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: tools_list
+          when: "{{ dispatch.method == 'tools/list' }}"
+        - step: amadeus_search_flights
+          when: "{{ dispatch.method == 'tools/call' and dispatch.tool == 'search_flights' }}"
+        - step: amadeus_search_locations
+          when: "{{ dispatch.method == 'tools/call' and dispatch.tool == 'search_locations' }}"
+        - step: amadeus_search_hotels
+          when: "{{ dispatch.method == 'tools/call' and dispatch.tool == 'search_hotels' }}"
+        - step: amadeus_search_activities
+          when: "{{ dispatch.method == 'tools/call' and dispatch.tool == 'search_activities' }}"
+        - step: get_token_status
+          when: "{{ dispatch.method == 'tools/call' and dispatch.tool == 'get_token' }}"
+        - step: unknown_method
+          when: "{{ dispatch.method != 'tools/list' and dispatch.method != 'tools/call' }}"
+        - step: unknown_tool
+          when: "{{ dispatch.method == 'tools/call' and dispatch.tool not in ['search_flights', 'search_locations', 'search_hotels', 'search_activities', 'get_token'] }}"
+
+  # ---------------------------------------------------------------------
+  # 2. tools/list — return the catalog as MCP-shaped tools array.
+  # ---------------------------------------------------------------------
+  - step: tools_list
+    desc: Return the MCP tool catalog
+    tool:
+      kind: python
+      code: |
+        tools = [
+            {
+                "name": "search_flights",
+                "title": "Search flights",
+                "description": "Amadeus Flight Offers Search. Required: origin, destination, departureDate. Optional: adults, returnDate, cabin.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["origin", "destination", "departureDate"],
+                    "properties": {
+                        "origin": {"type": "string", "description": "IATA code"},
+                        "destination": {"type": "string", "description": "IATA code"},
+                        "departureDate": {"type": "string", "description": "YYYY-MM-DD"},
+                        "returnDate": {"type": "string"},
+                        "adults": {"type": "integer", "minimum": 1, "default": 1},
+                        "cabin": {"type": "string", "enum": ["ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"]},
+                    },
+                },
+            },
+            {
+                "name": "search_hotels",
+                "title": "Search hotels",
+                "description": "Amadeus Hotel Search by city. Required: cityCode (IATA city code, e.g. NYC, PAR).",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["cityCode"],
+                    "properties": {
+                        "cityCode": {"type": "string", "description": "IATA city code"},
+                        "checkInDate": {"type": "string"},
+                        "checkOutDate": {"type": "string"},
+                        "adults": {"type": "integer", "minimum": 1, "default": 1},
+                    },
+                },
+            },
+            {
+                "name": "search_locations",
+                "title": "Search locations / IATA lookup",
+                "description": "Amadeus Reference Data Locations. Lookup airports and cities by keyword.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["keyword"],
+                    "properties": {
+                        "keyword": {"type": "string"},
+                        "subType": {"type": "string", "default": "AIRPORT,CITY"},
+                    },
+                },
+            },
+            {
+                "name": "search_activities",
+                "title": "Search activities / points of interest",
+                "description": "Amadeus Activities by lat/long radius.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["latitude", "longitude"],
+                    "properties": {
+                        "latitude": {"type": "number"},
+                        "longitude": {"type": "number"},
+                        "radius": {"type": "integer", "default": 5},
+                    },
+                },
+            },
+            {
+                "name": "get_token",
+                "title": "Get OAuth token status (debug)",
+                "description": "Returns whether the Amadeus OAuth bind succeeded. Returns no secret material.",
+                "inputSchema": {"type": "object"},
+            },
+        ]
+        result = {
+            "status": "ok",
+            "content": [{"type": "text", "text": "Amadeus MCP — 5 tools available"}],
+            "isError": False,
+            "_meta": {"backend": "amadeus", "tool_count": len(tools)},
+            "data": {"tools": tools},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  # ---------------------------------------------------------------------
+  # 3a. tools/call search_flights
+  # ---------------------------------------------------------------------
+  - step: amadeus_search_flights
+    desc: Amadeus Flight Offers Search
+    tool:
+      kind: http
+      method: POST
+      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v2/shopping/flight-offers"
+      headers:
+        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
+        Content-Type: application/json
+      payload:
+        currencyCode: "{{ workload.arguments.currencyCode | default('USD') }}"
+        originDestinations:
+          - id: "1"
+            originLocationCode: "{{ workload.arguments.origin }}"
+            destinationLocationCode: "{{ workload.arguments.destination }}"
+            departureDateTimeRange:
+              date: "{{ workload.arguments.departureDate }}"
+        travelers:
+          - id: "1"
+            travelerType: ADULT
+        sources: [GDS]
+        searchCriteria:
+          maxFlightOffers: "{{ workload.arguments.maxFlightOffers | default(10) }}"
+      retry:
+        max_attempts: 3
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: shape_search_flights
+
+  - step: shape_search_flights
+    desc: Shape Amadeus flights response into MCP tool result
+    tool:
+      kind: python
+      input:
+        envelope: "{{ amadeus_search_flights }}"
+      code: |
+        import json
+        data = {}
+        if isinstance(envelope, dict):
+            raw = envelope.get("data")
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+            elif isinstance(raw, dict):
+                data = raw
+        offers = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(offers, list):
+            offers = []
+        ok = isinstance(envelope, dict) and (envelope.get("status") == "COMPLETED" or (data.get("status_code", 0) or 0) < 400)
+        result = {
+            "status": "ok" if ok else "error",
+            "content": [{"type": "text", "text": json.dumps({"offers_total": len(offers), "offers": offers[:10]}, separators=(",", ":"))}],
+            "isError": not ok,
+            "_meta": {"backend": "amadeus", "tool": "search_flights", "offers_total": len(offers)},
+            "data": {"offers": offers, "offers_total": len(offers)},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  # ---------------------------------------------------------------------
+  # 3b. tools/call search_locations
+  # ---------------------------------------------------------------------
+  - step: amadeus_search_locations
+    desc: Amadeus Reference Data / Locations
+    tool:
+      kind: http
+      method: GET
+      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/reference-data/locations"
+      headers:
+        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
+      params:
+        keyword: "{{ workload.arguments.keyword }}"
+        subType: "{{ workload.arguments.subType | default('AIRPORT,CITY') }}"
+      retry:
+        max_attempts: 2
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: shape_search_locations
+
+  - step: shape_search_locations
+    desc: Shape Amadeus locations response into MCP tool result
+    tool:
+      kind: python
+      input:
+        envelope: "{{ amadeus_search_locations }}"
+      code: |
+        import json
+        data = {}
+        if isinstance(envelope, dict):
+            raw = envelope.get("data")
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+            elif isinstance(raw, dict):
+                data = raw
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = []
+        ok = isinstance(envelope, dict) and (envelope.get("status") == "COMPLETED" or (data.get("status_code", 0) or 0) < 400)
+        result = {
+            "status": "ok" if ok else "error",
+            "content": [{"type": "text", "text": json.dumps({"items_total": len(items), "items": items[:25]}, separators=(",", ":"))}],
+            "isError": not ok,
+            "_meta": {"backend": "amadeus", "tool": "search_locations", "items_total": len(items)},
+            "data": {"items": items, "items_total": len(items)},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  # ---------------------------------------------------------------------
+  # 3c. tools/call search_hotels
+  # ---------------------------------------------------------------------
+  - step: amadeus_search_hotels
+    desc: Amadeus Hotel List by city
+    tool:
+      kind: http
+      method: GET
+      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/reference-data/locations/hotels/by-city"
+      headers:
+        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
+      params:
+        cityCode: "{{ workload.arguments.cityCode }}"
+      retry:
+        max_attempts: 2
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: shape_search_hotels
+
+  - step: shape_search_hotels
+    desc: Shape Amadeus hotels response into MCP tool result
+    tool:
+      kind: python
+      input:
+        envelope: "{{ amadeus_search_hotels }}"
+      code: |
+        import json
+        data = {}
+        if isinstance(envelope, dict):
+            raw = envelope.get("data")
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+            elif isinstance(raw, dict):
+                data = raw
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = []
+        ok = isinstance(envelope, dict) and (envelope.get("status") == "COMPLETED" or (data.get("status_code", 0) or 0) < 400)
+        result = {
+            "status": "ok" if ok else "error",
+            "content": [{"type": "text", "text": json.dumps({"hotels_total": len(items), "hotels": items[:25]}, separators=(",", ":"))}],
+            "isError": not ok,
+            "_meta": {"backend": "amadeus", "tool": "search_hotels", "hotels_total": len(items)},
+            "data": {"hotels": items, "hotels_total": len(items)},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  # ---------------------------------------------------------------------
+  # 3d. tools/call search_activities
+  # ---------------------------------------------------------------------
+  - step: amadeus_search_activities
+    desc: Amadeus Activities by lat/long
+    tool:
+      kind: http
+      method: GET
+      url: "{{ 'https://test.api.amadeus.com' if workload.amadeus_env == 'test' else 'https://api.amadeus.com' }}/v1/shopping/activities"
+      headers:
+        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
+      params:
+        latitude: "{{ workload.arguments.latitude }}"
+        longitude: "{{ workload.arguments.longitude }}"
+        radius: "{{ workload.arguments.radius | default(5) }}"
+      retry:
+        max_attempts: 2
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: shape_search_activities
+
+  - step: shape_search_activities
+    desc: Shape Amadeus activities response into MCP tool result
+    tool:
+      kind: python
+      input:
+        envelope: "{{ amadeus_search_activities }}"
+      code: |
+        import json
+        data = {}
+        if isinstance(envelope, dict):
+            raw = envelope.get("data")
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+            elif isinstance(raw, dict):
+                data = raw
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = []
+        ok = isinstance(envelope, dict) and (envelope.get("status") == "COMPLETED" or (data.get("status_code", 0) or 0) < 400)
+        result = {
+            "status": "ok" if ok else "error",
+            "content": [{"type": "text", "text": json.dumps({"activities_total": len(items), "activities": items[:25]}, separators=(",", ":"))}],
+            "isError": not ok,
+            "_meta": {"backend": "amadeus", "tool": "search_activities", "activities_total": len(items)},
+            "data": {"activities": items, "activities_total": len(items)},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  # ---------------------------------------------------------------------
+  # 3e. tools/call get_token (debug)
+  # ---------------------------------------------------------------------
+  - step: get_token_status
+    desc: Report Amadeus OAuth bind status (debug; returns no secret)
+    tool:
+      kind: python
+      input:
+        token_present: "{{ keychain.amadeus_token.access_token is defined and keychain.amadeus_token.access_token != '' }}"
+      code: |
+        ok = bool(token_present)
+        result = {
+            "status": "ok" if ok else "error",
+            "content": [{"type": "text", "text": "Amadeus OAuth bind " + ("OK" if ok else "FAILED")}],
+            "isError": not ok,
+            "_meta": {"backend": "amadeus", "tool": "get_token", "token_bound": ok},
+            "data": {"token_bound": ok},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  # ---------------------------------------------------------------------
+  # 4. Unknown method / tool — MCP error envelope.
+  # ---------------------------------------------------------------------
+  - step: unknown_method
+    desc: Unknown MCP method
+    tool:
+      kind: python
+      input:
+        method: "{{ workload.method }}"
+      code: |
+        result = {
+            "status": "error",
+            "content": [{"type": "text", "text": f"Unknown MCP method: {method}"}],
+            "isError": True,
+            "_meta": {"backend": "amadeus", "supported_methods": ["tools/list", "tools/call"]},
+            "data": {"method": str(method)},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: unknown_tool
+    desc: Unknown tool name
+    tool:
+      kind: python
+      input:
+        tool: "{{ workload.tool }}"
+      code: |
+        result = {
+            "status": "error",
+            "content": [{"type": "text", "text": f"Unknown tool: {tool}. Run tools/list to see the catalog."}],
+            "isError": True,
+            "_meta": {"backend": "amadeus", "supported_tools": ["search_flights", "search_hotels", "search_locations", "search_activities", "get_token"]},
+            "data": {"tool": str(tool)},
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
