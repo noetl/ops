@@ -230,6 +230,17 @@ workflow:
             "keyword": _coerce(parsed.get("keyword")),
             "raw_text": text[:600],
         }
+        # Pre-serialise to a JSON string for the audit SQL. This sidesteps
+        # the failure mode in the original cut where the audit step tried
+        # `{{ parse_classification | tojson | replace("'", "''") }}` inside
+        # a YAML `|` block — the apostrophes inside the replace filter
+        # collided with the SQL string delimiters and Postgres saw a
+        # malformed literal (see bridge/outbox/20260509-044651-...result.json
+        # phase 7). The proven pattern in repos/e2e/.../amadeus_ai_api.yaml
+        # is: dump JSON to a string in Python, then escape with
+        # `| replace("'", "''")` in the SQL template — which is a single
+        # field reference, not an inline dict serialisation.
+        result["json_str"] = json.dumps(result, separators=(",", ":"))
     next:
       spec: { mode: exclusive }
       arcs:
@@ -247,7 +258,7 @@ workflow:
           'classify_intent',
           '{{ workload.ai_provider }}',
           '{{ parse_classification.intent }}',
-          '{{ parse_classification | tojson | replace("'", "''") }}'::jsonb
+          '{{ parse_classification.json_str | default("{}") | replace("'", "''") }}'::jsonb
         );
     next:
       spec: { mode: exclusive }
