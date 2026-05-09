@@ -705,7 +705,15 @@ workflow:
         }
 
         result = {
-            "status": "failed",
+            # IMPORTANT: do NOT set `status: failed` here. NoETL treats
+            # `result.status == "failed"` at the step level as a step
+            # failure, which propagates to the whole execution. We want
+            # this step to *succeed at the NoETL level* — the upstream
+            # 5xx is captured in `upstream_status_code` + `user_message`
+            # and the widget renderer surfaces it as a friendly error.
+            # The execution itself completes normally so the auto-render
+            # watcher attaches the widget to the prompt.
+            "outcome": "amadeus_failure",
             "stage": "amadeus_search",
             "intent": classification.get("intent"),
             "user_message": user_message,
