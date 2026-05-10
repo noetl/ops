@@ -41,6 +41,8 @@ workload:
   vertex_region: "us-central1"
   vertex_model: "gemini-2.5-flash"
   ollama_model: "gemma3:4b"
+  openai_model: "gpt-4o-mini"
+  anthropic_model: "claude-haiku-4-5-20251001"
   ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
   classifier_system_prompt: |
     You are a travel agent classifier. Given a user query, return ONLY
@@ -164,6 +166,8 @@ workflow:
         query: "{{ workload.query }}"
         requested_provider: "{{ workload.ai_provider }}"
         system_prompt: "{{ workload.classifier_system_prompt }}"
+        openai_model: "{{ workload.openai_model }}"
+        anthropic_model: "{{ workload.anthropic_model }}"
         openai_api_key: "{{ keychain.openai_token.api_key | default('') }}"
         anthropic_api_key: "{{ keychain.anthropic_token.api_key | default('') }}"
       code: |
@@ -225,11 +229,12 @@ workflow:
         def _openai_text(
             system_prompt=system_prompt,
             query=query,
+            openai_model=openai_model,
             openai_api_key=openai_api_key,
             _post_json=_post_json,
         ):
             body = {
-                "model": "gpt-4o-mini",
+                "model": openai_model,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system_prompt},
@@ -252,11 +257,12 @@ workflow:
         def _anthropic_text(
             system_prompt=system_prompt,
             query=query,
+            anthropic_model=anthropic_model,
             anthropic_api_key=anthropic_api_key,
             _post_json=_post_json,
         ):
             body = {
-                "model": "claude-haiku-4-5-20251001",
+                "model": anthropic_model,
                 "max_tokens": 512,
                 "temperature": 0,
                 "system": system_prompt,
@@ -440,6 +446,7 @@ workflow:
         vertex_result: "{{ classify_via_vertex_mcp | default({}) }}"
         ollama_result: "{{ classify_via_ollama_mcp | default({}) }}"
         system_prompt: "{{ workload.classifier_system_prompt }}"
+        openai_model: "{{ workload.openai_model }}"
         openai_api_key: "{{ keychain.openai_token.api_key | default('') }}"
       code: |
         import json
@@ -527,11 +534,12 @@ workflow:
         def _openai_text(
             query=query,
             openai_api_key=openai_api_key,
+            openai_model=openai_model,
             system_prompt=system_prompt,
             _post_json=_post_json,
         ):
             body = {
-                "model": "gpt-4o-mini",
+                "model": openai_model,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system_prompt},
