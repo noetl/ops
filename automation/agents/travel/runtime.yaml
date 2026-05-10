@@ -36,8 +36,8 @@ workload:
   request_id: ""
   callback_url: ""
   amadeus_env: test              # test | production
-  gcp_project: "noetl-cluster"
-  vertex_project: "noetl-cluster"
+  gcp_project: "noetl-demo-19700101"
+  vertex_project: "noetl-demo-19700101"
   vertex_region: "us-central1"
   vertex_model: "gemini-2.5-flash"
   ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8080"
