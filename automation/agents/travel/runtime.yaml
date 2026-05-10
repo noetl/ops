@@ -8,7 +8,7 @@ metadata:
     for AI agents and MCP tooling using only playbooks.
 
     Takes a natural-language query, classifies intent (flights / hotels
-    / locations / activities / help) via OpenAI, Anthropic, or Vertex AI,
+    / locations / activities / help) via OpenAI, Anthropic, Vertex AI, or Ollama,
     routes to the right Amadeus endpoint, and emits the result as a
     widget tree in `result.render`. The widget renderer in NoetlPrompt
     materialises the tree in the terminal; the travel canvas in
@@ -16,9 +16,9 @@ metadata:
 
     The AI provider is parameterised via `workload.ai_provider`.
     OpenAI is the default; Anthropic is handled by the HTTP provider
-    branch, and Vertex AI routes through the Vertex AI MCP playbook so
-    GCP auth remains owned by that single MCP implementation. Ollama
-    stays deferred for an in-cluster bridge routing pass.
+    branch, Vertex AI routes through the Vertex AI MCP playbook so
+    GCP auth remains owned by that single MCP implementation, and
+    Ollama routes through the in-cluster Ollama MCP playbook.
   version: "1.0"
   agent: true
   tags: [agent, travel, widgets, ai-os, flagship]
@@ -26,12 +26,12 @@ metadata:
     visible: true
     workspace: travel
     scopes: [/mcp/amadeus]
-  capabilities: [mcp:amadeus, mcp:vertex-ai, ai:openai, ai:anthropic, ai:vertex-ai]
+  capabilities: [mcp:amadeus, mcp:vertex-ai, mcp:ollama, ai:openai, ai:anthropic, ai:vertex-ai, ai:ollama]
 
 workload:
   pg_auth: pg_k8s
   gcp_auth: google_oauth
-  ai_provider: openai            # openai | anthropic | vertex-ai
+  ai_provider: openai            # openai | anthropic | vertex-ai | ollama
   query: "Help"
   request_id: ""
   callback_url: ""
@@ -40,7 +40,8 @@ workload:
   vertex_project: "noetl-demo-19700101"
   vertex_region: "us-central1"
   vertex_model: "gemini-2.5-flash"
-  ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8080"
+  ollama_model: "gemma3:4b"
+  ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
   # Secret-manager paths. Provider keychain entries are bound
   # unconditionally with bare references; the Python classifier selects
   # the effective provider and falls back cleanly when Anthropic is
@@ -127,8 +128,10 @@ workflow:
       arcs:
         - step: classify_via_vertex_mcp
           when: "{{ workload.ai_provider == 'vertex-ai' }}"
+        - step: classify_via_ollama_mcp
+          when: "{{ workload.ai_provider == 'ollama' }}"
         - step: classify_via_http_provider
-          when: "{{ workload.ai_provider != 'vertex-ai' }}"
+          when: "{{ workload.ai_provider in ['openai', 'anthropic'] or workload.ai_provider == '' or workload.ai_provider is none }}"
 
   # ---------------------------------------------------------------------
   # 2a. Intent classification — OpenAI + Anthropic HTTP providers.
@@ -402,15 +405,57 @@ workflow:
         - step: classify_intent
 
   # ---------------------------------------------------------------------
-  # 2c. Intent classification merger.
+  # 2c. Intent classification — Ollama through the MCP playbook.
+  #
+  # Mirrors the Vertex AI branch: the travel runtime dispatches through
+  # a NoETL agent hop while automation/agents/mcp/ollama owns the
+  # in-cluster ollama-bridge JSON-RPC endpoint.
+  # ---------------------------------------------------------------------
+  - step: classify_via_ollama_mcp
+    desc: Classify intent via the Ollama MCP playbook
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/ollama
+      payload:
+        method: tools/call
+        tool: chat_completion
+        arguments:
+          messages:
+            - role: user
+              content: "{{ workload.query }}"
+          system: |
+            You are a travel agent classifier. Given a user query, return ONLY
+            a JSON object with these keys:
+            - intent: one of "flights", "hotels", "locations", "activities", "help"
+            - origin: IATA code (or null)
+            - destination: IATA code (or null)
+            - departureDate: YYYY-MM-DD (convert relative dates; or null)
+            - adults: integer, default 1
+            - city: human-readable city name for hotels (or null)
+            - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
+            - keyword: free-text filter for locations or activities (or null)
+            - latitude: decimal degrees for activities (or null)
+            - longitude: decimal degrees for activities (or null)
+            Use null for fields that don't apply.
+          temperature: 0
+          model: "{{ workload.ollama_model }}"
+          ollama_endpoint: "{{ workload.ollama_bridge_url }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: classify_intent
+
+  # ---------------------------------------------------------------------
+  # 2d. Intent classification merger.
   #
   # Downstream steps keep their long-lived `classify_intent.X` contract.
-  # The HTTP branch already produces that shape. The Vertex branch may
-  # only expose scalar agent metadata at the parent level, so this merger
-  # can read the child execution events to recover the MCP response text.
+  # The HTTP branch already produces that shape. MCP branches may only
+  # expose scalar agent metadata at the parent level, so this merger can
+  # read child execution events to recover the MCP response text.
   # ---------------------------------------------------------------------
   - step: classify_intent
-    desc: Normalize HTTP or Vertex MCP classification into the canonical shape
+    desc: Normalize HTTP, Vertex MCP, or Ollama MCP classification into the canonical shape
     tool:
       kind: python
       input:
@@ -418,6 +463,7 @@ workflow:
         requested_provider: "{{ workload.ai_provider }}"
         http_result: "{{ classify_via_http_provider | default({}) }}"
         vertex_result: "{{ classify_via_vertex_mcp | default({}) }}"
+        ollama_result: "{{ classify_via_ollama_mcp | default({}) }}"
         openai_api_key: "{{ keychain.openai_token.api_key | default('') }}"
       code: |
         import json
@@ -587,6 +633,50 @@ workflow:
                 return {"isError": True, "_meta": {"error": f"vertex child event lookup failed: {type(exc).__name__}: {exc}"}}
             return {}
 
+        def _extract_ollama_text_from_context(ctx):
+            if not isinstance(ctx, dict):
+                return "", False, None
+            is_error = bool(ctx.get("isError")) or str(ctx.get("status") or "").lower() == "error"
+            text = ctx.get("text") if isinstance(ctx.get("text"), str) else ""
+            if not text:
+                content = ctx.get("content")
+                if isinstance(content, list) and content:
+                    first = content[0] if isinstance(content[0], dict) else {}
+                    text = first.get("text") if isinstance(first.get("text"), str) else ""
+            if not text:
+                data = ctx.get("data") if isinstance(ctx.get("data"), dict) else {}
+                meta = data.get("_meta") if isinstance(data.get("_meta"), dict) else {}
+                text = meta.get("text") if isinstance(meta.get("text"), str) else ""
+            meta = ctx.get("_meta") if isinstance(ctx.get("_meta"), dict) else {}
+            error = meta.get("error") if isinstance(meta.get("error"), str) else None
+            return text, is_error, error
+
+        def _fetch_ollama_child_context(envelope):
+            if not isinstance(envelope, dict):
+                return {}
+            child_execution_id = (
+                envelope.get("execution_id")
+                or (envelope.get("context") or {}).get("execution_id")
+                or (envelope.get("data") or {}).get("execution_id")
+            )
+            if not child_execution_id:
+                return {}
+            server_url = os.getenv("NOETL_SERVER_URL", "http://noetl.noetl.svc.cluster.local:8082").rstrip("/")
+            if not server_url.endswith("/api"):
+                server_url = f"{server_url}/api"
+            try:
+                with urllib.request.urlopen(f"{server_url}/executions/{child_execution_id}/events", timeout=10) as resp:
+                    events_doc = json.loads(resp.read().decode("utf-8"))
+                for evt in events_doc.get("events", []):
+                    if evt.get("event_type") not in ("command.completed", "command.failed", "call.error"):
+                        continue
+                    if (evt.get("node_name") or evt.get("step")) != "ollama_chat_completion":
+                        continue
+                    return ((evt.get("result") or {}).get("context") or {})
+            except Exception as exc:
+                return {"isError": True, "_meta": {"error": f"ollama child event lookup failed: {type(exc).__name__}: {exc}"}}
+            return {}
+
         # NoETL executes snippets with separate globals/locals maps.
         # Helpers that call sibling helpers need those names published.
         globals().update({
@@ -603,10 +693,61 @@ workflow:
             "_openai_text": _openai_text,
             "_extract_vertex_text_from_context": _extract_vertex_text_from_context,
             "_fetch_vertex_child_context": _fetch_vertex_child_context,
+            "_extract_ollama_text_from_context": _extract_ollama_text_from_context,
+            "_fetch_ollama_child_context": _fetch_ollama_child_context,
         })
 
         requested = (requested_provider or "openai").strip().lower()
-        if requested != "vertex-ai":
+        if requested == "ollama":
+            ollama_envelope = ollama_result if isinstance(ollama_result, dict) else {}
+            text, is_error, provider_error = _extract_ollama_text_from_context(ollama_envelope)
+            if not text or is_error:
+                child_ctx = _fetch_ollama_child_context(ollama_envelope)
+                child_text, child_error, child_provider_error = _extract_ollama_text_from_context(child_ctx)
+                text = child_text or text
+                is_error = is_error or child_error
+                provider_error = child_provider_error or provider_error
+
+            text = _strip_fences(text)
+            parsed = {}
+            if text and not is_error:
+                try:
+                    parsed = json.loads(text)
+                except Exception as exc:
+                    is_error = True
+                    provider_error = f"ollama JSON parse failed: {type(exc).__name__}: {exc}"
+
+            if text and not is_error and isinstance(parsed, dict):
+                result = _normalise(
+                    parsed,
+                    requested="ollama",
+                    effective="ollama",
+                    raw_text=text,
+                )
+            else:
+                fallback_reason = provider_error or "ollama returned no usable classifier text"
+                try:
+                    fallback_text = _strip_fences(_openai_text())
+                    try:
+                        parsed = json.loads(fallback_text) if fallback_text else {}
+                    except Exception:
+                        parsed = {}
+                    result = _normalise(
+                        parsed,
+                        requested="ollama",
+                        effective="openai",
+                        fallback_reason=fallback_reason,
+                        raw_text=fallback_text,
+                    )
+                except Exception as exc:
+                    result = _normalise(
+                        {},
+                        requested="ollama",
+                        effective="openai",
+                        fallback_reason=fallback_reason,
+                        provider_error=f"openai fallback failed: {type(exc).__name__}: {exc}",
+                    )
+        elif requested != "vertex-ai":
             result = http_result if isinstance(http_result, dict) and http_result else {}
             if result:
                 result["json_str"] = result.get("json_str") or json.dumps(result, separators=(",", ":"))
@@ -1475,7 +1616,7 @@ workflow:
                     {"type": "app:row", "args": {"gap": 8, "children": examples}},
                     {"type": "app:horizontalline", "args": {}},
                     {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
-                    {"type": "app:text", "args": {"title": "Provider", "message": "Use --provider vertex-ai or --provider anthropic to switch classifiers. Ollama stays deferred for a separate routing round."}},
+                    {"type": "app:text", "args": {"title": "Provider", "message": "Use --provider vertex-ai, --provider anthropic, or --provider ollama to switch classifiers."}},
                 ],
             },
         }
