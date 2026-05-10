@@ -42,6 +42,20 @@ workload:
   vertex_model: "gemini-2.5-flash"
   ollama_model: "gemma3:4b"
   ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
+  classifier_system_prompt: |
+    You are a travel agent classifier. Given a user query, return ONLY
+    a JSON object with these keys:
+    - intent: one of "flights", "hotels", "locations", "activities", "help"
+    - origin: IATA code (or null)
+    - destination: IATA code (or null)
+    - departureDate: YYYY-MM-DD (convert relative dates; or null)
+    - adults: integer, default 1
+    - city: human-readable city name for hotels (or null)
+    - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
+    - keyword: free-text filter for locations or activities (or null)
+    - latitude: decimal degrees for activities (or null)
+    - longitude: decimal degrees for activities (or null)
+    Use null for fields that don't apply.
   # Secret-manager paths. Provider keychain entries are bound
   # unconditionally with bare references; the Python classifier selects
   # the effective provider and falls back cleanly when Anthropic is
@@ -149,6 +163,7 @@ workflow:
       input:
         query: "{{ workload.query }}"
         requested_provider: "{{ workload.ai_provider }}"
+        system_prompt: "{{ workload.classifier_system_prompt }}"
         openai_api_key: "{{ keychain.openai_token.api_key | default('') }}"
         anthropic_api_key: "{{ keychain.anthropic_token.api_key | default('') }}"
       code: |
@@ -196,20 +211,6 @@ workflow:
             "_coerce_float": _coerce_float,
             "_activity_coordinates": _activity_coordinates,
         })
-
-        system_prompt = """You are a travel agent classifier. Given a user query, return ONLY
-        a JSON object with these keys:
-        - intent: one of "flights", "hotels", "locations", "activities", "help"
-        - origin: IATA code (or null)
-        - destination: IATA code (or null)
-        - departureDate: YYYY-MM-DD (convert relative dates; or null)
-        - adults: integer, default 1
-        - city: human-readable city name for hotels (or null)
-        - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
-        - keyword: free-text filter for locations or activities (or null)
-        - latitude: decimal degrees for activities (or null)
-        - longitude: decimal degrees for activities (or null)
-        Use null for fields that don't apply."""
 
         def _post_json(url, headers, payload, json=json, urllib_request=urllib.request):
             req = urllib_request.Request(
@@ -381,20 +382,7 @@ workflow:
         messages:
           - role: user
             content: "{{ workload.query }}"
-        system: |
-          You are a travel agent classifier. Given a user query, return ONLY
-          a JSON object with these keys:
-          - intent: one of "flights", "hotels", "locations", "activities", "help"
-          - origin: IATA code (or null)
-          - destination: IATA code (or null)
-          - departureDate: YYYY-MM-DD (convert relative dates; or null)
-          - adults: integer, default 1
-          - city: human-readable city name for hotels (or null)
-          - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
-          - keyword: free-text filter for locations or activities (or null)
-          - latitude: decimal degrees for activities (or null)
-          - longitude: decimal degrees for activities (or null)
-          Use null for fields that don't apply.
+        system: "{{ workload.classifier_system_prompt }}"
         temperature: 0
         vertex_project: "{{ workload.vertex_project | default(workload.gcp_project) }}"
         vertex_region: "{{ workload.vertex_region }}"
@@ -424,20 +412,7 @@ workflow:
           messages:
             - role: user
               content: "{{ workload.query }}"
-          system: |
-            You are a travel agent classifier. Given a user query, return ONLY
-            a JSON object with these keys:
-            - intent: one of "flights", "hotels", "locations", "activities", "help"
-            - origin: IATA code (or null)
-            - destination: IATA code (or null)
-            - departureDate: YYYY-MM-DD (convert relative dates; or null)
-            - adults: integer, default 1
-            - city: human-readable city name for hotels (or null)
-            - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
-            - keyword: free-text filter for locations or activities (or null)
-            - latitude: decimal degrees for activities (or null)
-            - longitude: decimal degrees for activities (or null)
-            Use null for fields that don't apply.
+          system: "{{ workload.classifier_system_prompt }}"
           temperature: 0
           model: "{{ workload.ollama_model }}"
           ollama_endpoint: "{{ workload.ollama_bridge_url }}"
@@ -464,6 +439,7 @@ workflow:
         http_result: "{{ classify_via_http_provider | default({}) }}"
         vertex_result: "{{ classify_via_vertex_mcp | default({}) }}"
         ollama_result: "{{ classify_via_ollama_mcp | default({}) }}"
+        system_prompt: "{{ workload.classifier_system_prompt }}"
         openai_api_key: "{{ keychain.openai_token.api_key | default('') }}"
       code: |
         import json
@@ -547,20 +523,6 @@ workflow:
             )
             with urllib_request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-
-        system_prompt = """You are a travel agent classifier. Given a user query, return ONLY
-        a JSON object with these keys:
-        - intent: one of "flights", "hotels", "locations", "activities", "help"
-        - origin: IATA code (or null)
-        - destination: IATA code (or null)
-        - departureDate: YYYY-MM-DD (convert relative dates; or null)
-        - adults: integer, default 1
-        - city: human-readable city name for hotels (or null)
-        - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
-        - keyword: free-text filter for locations or activities (or null)
-        - latitude: decimal degrees for activities (or null)
-        - longitude: decimal degrees for activities (or null)
-        Use null for fields that don't apply."""
 
         def _openai_text(
             query=query,
