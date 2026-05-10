@@ -1,0 +1,260 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: chat_completion
+  path: automation/agents/mcp/ollama
+  description: |
+    Ollama MCP backend for in-cluster local inference. It wraps the
+    existing ollama-bridge JSON-RPC service and exposes the same
+    chat_completion contract as automation/agents/mcp/vertex-ai, so
+    travel and future agents can call Ollama through a NoETL playbook
+    hop instead of reaching directly into the bridge service.
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  tags:
+    - mcp
+    - ollama
+    - local-ai
+    - chat-completion
+
+workload:
+  # Standard MCP chat_completion surface.
+  model: "gemma3:4b"
+  messages: []
+  system: ""
+  temperature: 0.1
+
+  # MCP-style passthrough fields used when this playbook is called via
+  # `method: tools/call`, `tool: chat_completion`, and `arguments: {...}`.
+  method: "tools/call"
+  tool: "chat_completion"
+  arguments: {}
+
+  # Existing in-cluster bridge endpoint. The bridge's raw tool is named
+  # `chat`; this playbook translates the public chat_completion surface
+  # into that bridge call.
+  ollama_endpoint: "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
+
+workflow:
+  - step: ollama_chat_completion
+    desc: Call ollama-bridge and return MCP chat_completion shape
+    tool:
+      kind: python
+      code: |
+        import json
+        import time
+        import urllib.error
+        import urllib.request
+
+        def _as_dict(value):
+          return value if isinstance(value, dict) else {}
+
+        def _as_list(value):
+          return value if isinstance(value, list) else []
+
+        def _message_text(message):
+          if isinstance(message, str):
+            return message
+          if not isinstance(message, dict):
+            return str(message)
+          content = message.get("content", "")
+          if isinstance(content, str):
+            return content
+          if isinstance(content, list):
+            parts = []
+            for item in content:
+              if isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                  parts.append(item["text"])
+                elif isinstance(item.get("content"), str):
+                  parts.append(item["content"])
+              elif item is not None:
+                parts.append(str(item))
+            return "\n".join(parts)
+          return str(content)
+
+        def _normalise_messages(value):
+          normalised = []
+          for message in _as_list(value):
+            if isinstance(message, dict):
+              role = str(message.get("role") or "user")
+              text = _message_text(message).strip()
+            else:
+              role = "user"
+              text = str(message).strip()
+            if text:
+              normalised.append({"role": role, "content": text})
+          return normalised or [{"role": "user", "content": "ping"}]
+
+        def _extract_text(mcp_result):
+          if not isinstance(mcp_result, dict):
+            return ""
+          content = mcp_result.get("content")
+          if isinstance(content, list):
+            texts = []
+            for item in content:
+              if isinstance(item, dict) and isinstance(item.get("text"), str):
+                texts.append(item["text"])
+            if texts:
+              return "\n".join(texts).strip()
+          text = mcp_result.get("text")
+          return text.strip() if isinstance(text, str) else ""
+
+        def _usage_from_meta(meta):
+          response = meta.get("ollama_response") if isinstance(meta.get("ollama_response"), dict) else {}
+          prompt_tokens = int(response.get("prompt_eval_count") or 0)
+          completion_tokens = int(response.get("eval_count") or 0)
+          return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+          }
+
+        def _error_envelope(model_name, endpoint, message, detail=None):
+          error = {
+            "category": "tool_error",
+            "confidence": 1.0,
+            "root_cause": message,
+            "suggested_action": "Check ollama-bridge reachability, model availability, and local Ollama health.",
+            "user_message": "Ollama call failed.",
+            "source": "ollama",
+          }
+          meta = {
+            "backend": "ollama",
+            "model": model_name,
+            "endpoint": endpoint,
+            "usage": {},
+            "error": (detail or message)[:2000],
+          }
+          return {
+            "status": "error",
+            "content": [{"type": "text", "text": json.dumps(error, separators=(",", ":"))}],
+            "isError": True,
+            "_meta": meta,
+            "usage": {},
+            "usage_prompt_tokens": 0,
+            "usage_completion_tokens": 0,
+            "usage_total_tokens": 0,
+            "data": {"diagnosis": error, "_meta": meta},
+            "summary": message,
+            "text": json.dumps(error, separators=(",", ":")),
+          }
+
+        # NoETL executes snippets with separate globals/locals maps.
+        # Helpers that call sibling helpers need those names published.
+        globals().update({
+          "json": json,
+          "time": time,
+          "urllib": urllib,
+          "_as_dict": _as_dict,
+          "_as_list": _as_list,
+          "_message_text": _message_text,
+          "_normalise_messages": _normalise_messages,
+          "_extract_text": _extract_text,
+          "_usage_from_meta": _usage_from_meta,
+          "_error_envelope": _error_envelope,
+        })
+
+        call_args = _as_dict(arguments)
+        model_name = str(call_args.get("model") or model or "gemma3:4b").strip()
+        endpoint = str(call_args.get("ollama_endpoint") or ollama_endpoint or "").strip()
+        selected_messages = call_args.get("messages") if "messages" in call_args else messages
+        selected_system = str(call_args.get("system") if "system" in call_args else system or "").strip()
+        selected_temperature = call_args.get("temperature") if "temperature" in call_args else temperature
+        try:
+          selected_temperature = float(selected_temperature if selected_temperature is not None else 0.1)
+        except (TypeError, ValueError):
+          selected_temperature = 0.1
+
+        if not endpoint:
+          result = _error_envelope(model_name, endpoint, "mcp/ollama requires workload.ollama_endpoint.")
+        else:
+          bridge_payload = {
+            "jsonrpc": "2.0",
+            "id": int(time.time() * 1000),
+            "method": "tools/call",
+            "params": {
+              "name": "chat",
+              "arguments": {
+                "model": model_name,
+                "messages": _normalise_messages(selected_messages),
+                "temperature": selected_temperature,
+              },
+            },
+          }
+          if selected_system:
+            bridge_payload["params"]["arguments"]["system"] = selected_system
+
+          try:
+            req = urllib.request.Request(
+              endpoint,
+              data=json.dumps(bridge_payload).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+              ollama_response = json.loads(resp.read().decode("utf-8"))
+
+            if isinstance(ollama_response, dict) and isinstance(ollama_response.get("error"), dict):
+              detail = json.dumps(ollama_response.get("error"), separators=(",", ":"))
+              result = _error_envelope(model_name, endpoint, "ollama-bridge returned a JSON-RPC error.", detail)
+            else:
+              mcp_result = _as_dict(ollama_response.get("result") if isinstance(ollama_response, dict) else {})
+              text = _extract_text(mcp_result)
+              is_error = bool(mcp_result.get("isError"))
+              meta = mcp_result.get("_meta") if isinstance(mcp_result.get("_meta"), dict) else {}
+              usage = _usage_from_meta(meta)
+              meta = {
+                **meta,
+                "backend": "ollama",
+                "model": model_name,
+                "endpoint": endpoint,
+                "usage": usage,
+              }
+              if not text:
+                text = json.dumps(
+                  {
+                    "category": "unknown",
+                    "confidence": 0.0,
+                    "root_cause": "Ollama returned no assistant text.",
+                    "suggested_action": "Inspect ollama-bridge response metadata and model logs.",
+                    "user_message": "Ollama returned an empty response.",
+                    "source": "ollama",
+                  },
+                  separators=(",", ":"),
+                )
+              result = {
+                "status": "error" if is_error else "ok",
+                "content": [{"type": "text", "text": text}],
+                "isError": is_error,
+                "_meta": meta,
+                "usage": usage,
+                "usage_prompt_tokens": usage["prompt_tokens"],
+                "usage_completion_tokens": usage["completion_tokens"],
+                "usage_total_tokens": usage["total_tokens"],
+                "data": {"_meta": meta, "ollama_response": ollama_response},
+                "summary": "Ollama returned a chat completion." if not is_error else "Ollama returned an error response.",
+                "text": text,
+              }
+          except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            result = _error_envelope(model_name, endpoint, f"ollama-bridge failed with HTTP {exc.code}.", body)
+          except Exception as exc:
+            result = _error_envelope(model_name, endpoint, f"Ollama MCP call failed: {type(exc).__name__}: {exc}")
+      args:
+        model: "{{ workload.model }}"
+        messages: "{{ workload.messages }}"
+        system: "{{ workload.system }}"
+        temperature: "{{ workload.temperature }}"
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+        ollama_endpoint: "{{ workload.ollama_endpoint }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end
+    tool:
+      kind: noop
