@@ -168,11 +168,30 @@ workflow:
             except (TypeError, ValueError):
                 return None
 
+        def _activity_coordinates(parsed, intent):
+            latitude = _coerce_float(parsed.get("latitude"))
+            longitude = _coerce_float(parsed.get("longitude"))
+            if intent != "activities" or (latitude is not None and longitude is not None):
+                return latitude, longitude
+            hint = " ".join(str(parsed.get(k) or "") for k in ("keyword", "city")).lower()
+            known = {
+                "times square": (40.7580, -73.9855),
+                "new york": (40.7128, -74.0060),
+                "nyc": (40.7128, -74.0060),
+                "boston": (42.3601, -71.0589),
+                "paris": (48.8566, 2.3522),
+            }
+            for key, coords in known.items():
+                if key in hint:
+                    return coords
+            return 40.7128, -74.0060
+
         # NoETL executes snippets with separate globals/locals maps.
         # Helpers that call sibling helpers need those names published.
         globals().update({
             "_coerce": _coerce,
             "_coerce_float": _coerce_float,
+            "_activity_coordinates": _activity_coordinates,
         })
 
         system_prompt = """You are a travel agent classifier. Given a user query, return ONLY
@@ -306,6 +325,7 @@ workflow:
         intent = (parsed.get("intent") or "help").lower().strip()
         if intent not in ("flights", "hotels", "locations", "activities", "help"):
             intent = "help"
+        latitude, longitude = _activity_coordinates(parsed, intent)
 
         result = {
             "intent": intent,
@@ -316,8 +336,8 @@ workflow:
             "city": _coerce(parsed.get("city")),
             "cityCode": _coerce(parsed.get("cityCode")),
             "keyword": _coerce(parsed.get("keyword")),
-            "latitude": _coerce_float(parsed.get("latitude")),
-            "longitude": _coerce_float(parsed.get("longitude")),
+            "latitude": latitude,
+            "longitude": longitude,
             "requested_provider": requested,
             "effective_provider": effective_provider,
             "provider_fallback_reason": provider_fallback_reason,
@@ -420,6 +440,25 @@ workflow:
             except (TypeError, ValueError):
                 return None
 
+        def _activity_coordinates(parsed, intent):
+            parsed = parsed if isinstance(parsed, dict) else {}
+            latitude = _coerce_float(parsed.get("latitude"))
+            longitude = _coerce_float(parsed.get("longitude"))
+            if intent != "activities" or (latitude is not None and longitude is not None):
+                return latitude, longitude
+            hint = " ".join(str(parsed.get(k) or "") for k in ("keyword", "city")).lower()
+            known = {
+                "times square": (40.7580, -73.9855),
+                "new york": (40.7128, -74.0060),
+                "nyc": (40.7128, -74.0060),
+                "boston": (42.3601, -71.0589),
+                "paris": (48.8566, 2.3522),
+            }
+            for key, coords in known.items():
+                if key in hint:
+                    return coords
+            return 40.7128, -74.0060
+
         def _strip_fences(text):
             text = (text or "").strip()
             if text.startswith("```"):
@@ -432,6 +471,7 @@ workflow:
             intent = (parsed.get("intent") or "help").lower().strip()
             if intent not in ("flights", "hotels", "locations", "activities", "help"):
                 intent = "help"
+            latitude, longitude = _activity_coordinates(parsed, intent)
             result = {
                 "intent": intent,
                 "origin": _coerce(parsed.get("origin")),
@@ -441,8 +481,8 @@ workflow:
                 "city": _coerce(parsed.get("city")),
                 "cityCode": _coerce(parsed.get("cityCode")),
                 "keyword": _coerce(parsed.get("keyword")),
-                "latitude": _coerce_float(parsed.get("latitude")),
-                "longitude": _coerce_float(parsed.get("longitude")),
+                "latitude": latitude,
+                "longitude": longitude,
                 "requested_provider": requested,
                 "effective_provider": effective,
                 "provider_fallback_reason": fallback_reason,
@@ -556,6 +596,7 @@ workflow:
             "urllib": urllib,
             "_coerce": _coerce,
             "_coerce_float": _coerce_float,
+            "_activity_coordinates": _activity_coordinates,
             "_strip_fences": _strip_fences,
             "_normalise": _normalise,
             "_post_json": _post_json,
