@@ -328,9 +328,9 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
-        - step: amadeus_call_flights
+        - step: amadeus_via_mcp_flights
           when: "{{ classify_intent.intent == 'flights' }}"
-        - step: amadeus_call_locations
+        - step: amadeus_via_mcp_locations
           when: "{{ classify_intent.intent == 'locations' }}"
         # Hotels and activities are stubbed — they fall through to the
         # help renderer in phase 1. Phase 2 wires the real Amadeus calls.
@@ -340,89 +340,37 @@ workflow:
   # ---------------------------------------------------------------------
   # 4a. Flights branch.
   #
-  # We call Amadeus from a Python step (not `kind: http`) because the
-  # noetl HTTP tool currently aborts the step on 5xx (see pending task
-  # #88: "noetl HTTP tool: preserve response body in error events").
-  # That abort prevents the `render_amadeus_failure` arc from firing
-  # — the workflow halts before the `when:` predicate can evaluate
-  # the response status. The Python wrapper catches HTTPError /
-  # URLError / Exception and returns a uniform envelope
-  # `{ ok, status_code, body, raw }` so the conditional arc can route
-  # to render_flights or render_amadeus_failure based on the body.
+  # Phase 2 routes Amadeus calls through the Amadeus MCP playbook
+  # instead of direct urllib calls from this travel runtime. This keeps
+  # one Amadeus implementation shared by the travel agent and external
+  # MCP clients (`cd /mcp/amadeus; call search_flights ...`).
   # ---------------------------------------------------------------------
-  - step: amadeus_call_flights
-    desc: Call Amadeus Flight Offers Search via urllib (catches errors)
+  - step: amadeus_via_mcp_flights
+    desc: Call Amadeus MCP search_flights via a NoETL agent hop
     tool:
-      kind: python
-      input:
-        access_token: "{{ keychain.amadeus_token.access_token }}"
-        origin: "{{ classify_intent.origin | default('SFO') }}"
-        destination: "{{ classify_intent.destination | default('JFK') }}"
-        departure_date: "{{ classify_intent.departureDate | default('2026-07-15') }}"
-      code: |
-        import json
-        import urllib.request
-        import urllib.error
-
-        url = "https://test.api.amadeus.com/v2/shopping/flight-offers"
-        payload = {
-            "currencyCode": "USD",
-            "originDestinations": [{
-                "id": "1",
-                "originLocationCode": origin,
-                "destinationLocationCode": destination,
-                "departureDateTimeRange": {"date": departure_date},
-            }],
-            "travelers": [{"id": "1", "travelerType": "ADULT"}],
-            "sources": ["GDS"],
-            "searchCriteria": {"maxFlightOffers": 6},
-        }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body_text = resp.read().decode("utf-8")
-                try:
-                    body = json.loads(body_text)
-                except Exception:
-                    body = {"raw": body_text[:2000]}
-                result = {"ok": True, "status_code": resp.status, "body": body}
-        except urllib.error.HTTPError as e:
-            err_text = ""
-            try:
-                err_text = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            try:
-                err_body = json.loads(err_text)
-            except Exception:
-                err_body = {"raw": err_text[:2000]}
-            result = {"ok": False, "status_code": e.code, "body": err_body}
-        except urllib.error.URLError as e:
-            result = {"ok": False, "status_code": 0, "body": {"error": str(getattr(e, "reason", e))}}
-        except Exception as e:
-            result = {"ok": False, "status_code": 0, "body": {"error": f"{type(e).__name__}: {e}"}}
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/amadeus
+      payload:
+        method: tools/call
+        tool: search_flights
+        arguments:
+          origin: "{{ classify_intent.origin | default('SFO') }}"
+          destination: "{{ classify_intent.destination | default('JFK') }}"
+          departureDate: "{{ classify_intent.departureDate | default('2026-07-15') }}"
+          adults: "{{ classify_intent.adults | default(1) }}"
     next:
       spec: { mode: exclusive }
       arcs:
-        - step: render_flights
-          when: "{{ amadeus_call_flights.ok }}"
         - step: render_amadeus_failure
-          when: "{{ not amadeus_call_flights.ok }}"
+          when: "{{ True }}"
 
   - step: render_flights
     desc: Project flights into a widget tree
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_call_flights }}"
+        envelope: "{{ amadeus_via_mcp_flights }}"
         classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
@@ -430,12 +378,14 @@ workflow:
       code: |
         import json
 
-        # The Python wrapper for Amadeus emits {ok, status_code, body}.
-        # `body` is the parsed JSON response (or {raw: "..."} when not JSON).
-        body = envelope.get("body") if isinstance(envelope, dict) else {}
-        if not isinstance(body, dict):
-            body = {}
-        offers = body.get("data") if isinstance(body, dict) else None
+        # The Amadeus MCP playbook returns an MCP-shaped envelope.
+        # Agent executor versions may expose the sub-playbook result
+        # directly or nested under data, so normalize both shapes.
+        mcp = envelope.get("data") if isinstance(envelope, dict) and isinstance(envelope.get("data"), dict) and "offers" not in envelope else envelope
+        if not isinstance(mcp, dict):
+            mcp = {}
+        data = mcp.get("data") if isinstance(mcp.get("data"), dict) else mcp
+        offers = data.get("offers") if isinstance(data, dict) else None
         if not isinstance(offers, list):
             offers = []
 
@@ -541,77 +491,43 @@ workflow:
     # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
-  # 4b. Locations branch — IATA / city lookup.
-  #
-  # Same Python-wrapper rationale as the flights branch above.
+  # 4b. Locations branch — IATA / city lookup via MCP.
   # ---------------------------------------------------------------------
-  - step: amadeus_call_locations
-    desc: Call Amadeus Reference Data Locations via urllib (catches errors)
+  - step: amadeus_via_mcp_locations
+    desc: Call Amadeus MCP search_locations via a NoETL agent hop
     tool:
-      kind: python
-      input:
-        access_token: "{{ keychain.amadeus_token.access_token }}"
-        keyword: "{{ classify_intent.keyword | default(classify_intent.city) | default(classify_intent.origin) | default(workload.query) }}"
-      code: |
-        import json
-        import urllib.parse
-        import urllib.request
-        import urllib.error
-
-        params = {"keyword": keyword or "", "subType": "AIRPORT,CITY"}
-        url = "https://test.api.amadeus.com/v1/reference-data/locations?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(
-            url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body_text = resp.read().decode("utf-8")
-                try:
-                    body = json.loads(body_text)
-                except Exception:
-                    body = {"raw": body_text[:2000]}
-                result = {"ok": True, "status_code": resp.status, "body": body}
-        except urllib.error.HTTPError as e:
-            err_text = ""
-            try:
-                err_text = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            try:
-                err_body = json.loads(err_text)
-            except Exception:
-                err_body = {"raw": err_text[:2000]}
-            result = {"ok": False, "status_code": e.code, "body": err_body}
-        except urllib.error.URLError as e:
-            result = {"ok": False, "status_code": 0, "body": {"error": str(getattr(e, "reason", e))}}
-        except Exception as e:
-            result = {"ok": False, "status_code": 0, "body": {"error": f"{type(e).__name__}: {e}"}}
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/amadeus
+      payload:
+        method: tools/call
+        tool: search_locations
+        arguments:
+          keyword: "{{ classify_intent.keyword | default(classify_intent.city) | default(classify_intent.origin) | default(workload.query) }}"
+          subType: AIRPORT,CITY
     next:
       spec: { mode: exclusive }
       arcs:
-        - step: render_locations
-          when: "{{ amadeus_call_locations.ok }}"
         - step: render_amadeus_failure
-          when: "{{ not amadeus_call_locations.ok }}"
+          when: "{{ True }}"
 
   - step: render_locations
     desc: Project locations into a widget tree
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_call_locations }}"
+        envelope: "{{ amadeus_via_mcp_locations }}"
         classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
       code: |
         import json
-        body = envelope.get("body") if isinstance(envelope, dict) else {}
-        if not isinstance(body, dict):
-            body = {}
-        items = body.get("data") if isinstance(body, dict) else None
+        mcp = envelope.get("data") if isinstance(envelope, dict) and isinstance(envelope.get("data"), dict) and "items" not in envelope else envelope
+        if not isinstance(mcp, dict):
+            mcp = {}
+        data = mcp.get("data") if isinstance(mcp.get("data"), dict) else mcp
+        items = data.get("items") if isinstance(data, dict) else None
         if not isinstance(items, list):
             items = []
 
@@ -724,30 +640,73 @@ workflow:
     tool:
       kind: python
       input:
-        flights_envelope: "{{ amadeus_call_flights | default({}) }}"
-        locations_envelope: "{{ amadeus_call_locations | default({}) }}"
+        flights_envelope: "{{ amadeus_via_mcp_flights | default({}) }}"
+        locations_envelope: "{{ amadeus_via_mcp_locations | default({}) }}"
         classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
       code: |
-        # Both branches now use the urllib Python wrapper, so the envelope
-        # shape is { ok, status_code, body }.
+        import json
+        import os
+        import urllib.request
+
+        # Both branches now call the Amadeus MCP playbook via a NoETL
+        # agent hop. Normalize the MCP-shaped envelope whether it is
+        # returned directly or nested under data by the agent executor.
         envelope = flights_envelope if isinstance(flights_envelope, dict) and flights_envelope else locations_envelope
         if not isinstance(envelope, dict):
             envelope = {}
-        status_code = envelope.get("status_code")
-        body = envelope.get("body")
-        if isinstance(body, dict):
-            errors = body.get("errors") if isinstance(body.get("errors"), list) else None
+        mcp = envelope.get("data") if isinstance(envelope.get("data"), dict) and "status_code" not in envelope else envelope
+        data = mcp.get("data") if isinstance(mcp, dict) and isinstance(mcp.get("data"), dict) else mcp
+        if not isinstance(data, dict):
+            data = {}
+
+        # The NoETL agent envelope preserves scalar control metadata
+        # (`execution_id`, `status`) but projects away the child `data` field.
+        # That is enough for this phase: the travel runtime no longer calls
+        # Amadeus directly, and the child MCP execution still records the
+        # upstream status in its command.completed metadata.
+        child_execution_id = (
+            envelope.get("execution_id")
+            or (envelope.get("context") or {}).get("execution_id")
+            or data.get("execution_id")
+        )
+        if child_execution_id and not data.get("status_code"):
+            server_url = os.getenv("NOETL_SERVER_URL", "http://noetl.noetl.svc.cluster.local:8082").rstrip("/")
+            if not server_url.endswith("/api"):
+                server_url = f"{server_url}/api"
+            try:
+                with urllib.request.urlopen(f"{server_url}/executions/{child_execution_id}/events", timeout=10) as resp:
+                    events_doc = json.loads(resp.read().decode("utf-8"))
+                for evt in events_doc.get("events", []):
+                    if evt.get("event_type") != "command.completed":
+                        continue
+                    node = evt.get("node_name") or evt.get("step") or ""
+                    if not str(node).startswith("amadeus_search_"):
+                        continue
+                    ctx = ((evt.get("result") or {}).get("context") or {})
+                    meta = ctx.get("_meta") if isinstance(ctx.get("_meta"), dict) else {}
+                    if meta.get("status_code"):
+                        data["status_code"] = meta.get("status_code")
+                    data["isError"] = ctx.get("isError")
+                    data["mcp_tool"] = meta.get("tool") or node
+                    break
+            except Exception as exc:
+                data["mcp_event_lookup_error"] = f"{type(exc).__name__}: {exc}"
+
+        status_code = data.get("status_code")
+        error_body = data.get("error")
+        if isinstance(error_body, dict):
+            errors = error_body.get("errors") if isinstance(error_body.get("errors"), list) else None
             if errors:
                 body_msg = "; ".join(str((e or {}).get("title") or (e or {}).get("detail") or e) for e in errors)
-            elif body.get("error"):
-                body_msg = str(body.get("error"))[:600]
+            elif error_body.get("error"):
+                body_msg = str(error_body.get("error"))[:600]
             else:
-                body_msg = str(body)[:600]
-        elif isinstance(body, str):
-            body_msg = body[:600]
+                body_msg = str(error_body)[:600]
+        elif isinstance(error_body, str):
+            body_msg = error_body[:600]
         else:
             body_msg = "(no response body captured)"
 
