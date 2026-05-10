@@ -732,6 +732,7 @@ workflow:
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
+        pg_auth: "{{ workload.pg_auth }}"
       code: |
         import json
 
@@ -869,6 +870,55 @@ workflow:
             "text": f"{len(offers)} flight offer(s) returned for {classification.get('origin') or '?'} → {classification.get('destination') or '?'}",
             "render": render,
         }
+
+        def _audit_pg_conn_info(pg_auth_name):
+            from noetl.worker.secrets import fetch_credential_by_key as _audit_fetch_credential
+            _credential = _audit_fetch_credential(str(pg_auth_name or "pg_k8s"))
+            _data = _credential.get("data") if isinstance(_credential, dict) and isinstance(_credential.get("data"), dict) else _credential
+            if not isinstance(_data, dict):
+                raise RuntimeError("postgres credential missing")
+            _dsn = _data.get("dsn") or _data.get("connection_string") or _data.get("db_conn_string")
+            if _dsn:
+                return _dsn
+            return {
+                "host": _data.get("db_host") or _data.get("host") or _data.get("pg_host"),
+                "port": int(_data.get("db_port") or _data.get("port") or 5432),
+                "dbname": _data.get("db_name") or _data.get("database") or _data.get("dbname"),
+                "user": _data.get("db_user") or _data.get("user") or _data.get("username"),
+                "password": _data.get("db_password") or _data.get("password"),
+            }
+
+        try:
+            import psycopg as _audit_psycopg
+            _audit_payload = {
+                "render_kind": "flights",
+                "render_type": render.get("type"),
+                "envelope_status_code": data.get("status_code") if isinstance(data, dict) else None,
+                "envelope_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
+                "envelope_total": len(offers),
+                "provider_fallback_reason": classification.get("provider_fallback_reason"),
+                "classified_intent": classification,
+            }
+            _conn_info = _audit_pg_conn_info(pg_auth)
+            _conn = _audit_psycopg.connect(_conn_info, connect_timeout=5) if isinstance(_conn_info, str) else _audit_psycopg.connect(**_conn_info, connect_timeout=5)
+            try:
+                with _conn.cursor() as _cur:
+                    _cur.execute(
+                        "INSERT INTO travel_agent_events (execution_id, event_type, ai_provider, intent, payload) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                        (
+                            execution_id,
+                            "render_flights",
+                            classification.get("effective_provider"),
+                            classification.get("intent"),
+                            json.dumps(_audit_payload, separators=(",", ":"), default=str),
+                        ),
+                    )
+                    _conn.commit()
+            finally:
+                _conn.close()
+        except Exception as _audit_exc:
+            print(f"travel_agent_events audit insert failed: {type(_audit_exc).__name__}: {_audit_exc}")
     # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
@@ -902,6 +952,7 @@ workflow:
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
+        pg_auth: "{{ workload.pg_auth }}"
       code: |
         import json
         mcp = envelope.get("data") if isinstance(envelope, dict) and isinstance(envelope.get("data"), dict) and "items" not in envelope else envelope
@@ -977,6 +1028,55 @@ workflow:
             "text": f"{len(items)} location(s) returned",
             "render": render,
         }
+
+        def _audit_pg_conn_info(pg_auth_name):
+            from noetl.worker.secrets import fetch_credential_by_key as _audit_fetch_credential
+            _credential = _audit_fetch_credential(str(pg_auth_name or "pg_k8s"))
+            _data = _credential.get("data") if isinstance(_credential, dict) and isinstance(_credential.get("data"), dict) else _credential
+            if not isinstance(_data, dict):
+                raise RuntimeError("postgres credential missing")
+            _dsn = _data.get("dsn") or _data.get("connection_string") or _data.get("db_conn_string")
+            if _dsn:
+                return _dsn
+            return {
+                "host": _data.get("db_host") or _data.get("host") or _data.get("pg_host"),
+                "port": int(_data.get("db_port") or _data.get("port") or 5432),
+                "dbname": _data.get("db_name") or _data.get("database") or _data.get("dbname"),
+                "user": _data.get("db_user") or _data.get("user") or _data.get("username"),
+                "password": _data.get("db_password") or _data.get("password"),
+            }
+
+        try:
+            import psycopg as _audit_psycopg
+            _audit_payload = {
+                "render_kind": "locations",
+                "render_type": render.get("type"),
+                "envelope_status_code": data.get("status_code") if isinstance(data, dict) else None,
+                "envelope_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
+                "envelope_total": len(items),
+                "provider_fallback_reason": classification.get("provider_fallback_reason"),
+                "classified_intent": classification,
+            }
+            _conn_info = _audit_pg_conn_info(pg_auth)
+            _conn = _audit_psycopg.connect(_conn_info, connect_timeout=5) if isinstance(_conn_info, str) else _audit_psycopg.connect(**_conn_info, connect_timeout=5)
+            try:
+                with _conn.cursor() as _cur:
+                    _cur.execute(
+                        "INSERT INTO travel_agent_events (execution_id, event_type, ai_provider, intent, payload) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                        (
+                            execution_id,
+                            "render_locations",
+                            classification.get("effective_provider"),
+                            classification.get("intent"),
+                            json.dumps(_audit_payload, separators=(",", ":"), default=str),
+                        ),
+                    )
+                    _conn.commit()
+            finally:
+                _conn.close()
+        except Exception as _audit_exc:
+            print(f"travel_agent_events audit insert failed: {type(_audit_exc).__name__}: {_audit_exc}")
     # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
@@ -1013,6 +1113,7 @@ workflow:
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
+        pg_auth: "{{ workload.pg_auth }}"
       code: |
         import json
 
@@ -1102,6 +1203,55 @@ workflow:
             "text": f"{len(items)} hotel(s) returned for {city_code}",
             "render": render,
         }
+
+        def _audit_pg_conn_info(pg_auth_name):
+            from noetl.worker.secrets import fetch_credential_by_key as _audit_fetch_credential
+            _credential = _audit_fetch_credential(str(pg_auth_name or "pg_k8s"))
+            _data = _credential.get("data") if isinstance(_credential, dict) and isinstance(_credential.get("data"), dict) else _credential
+            if not isinstance(_data, dict):
+                raise RuntimeError("postgres credential missing")
+            _dsn = _data.get("dsn") or _data.get("connection_string") or _data.get("db_conn_string")
+            if _dsn:
+                return _dsn
+            return {
+                "host": _data.get("db_host") or _data.get("host") or _data.get("pg_host"),
+                "port": int(_data.get("db_port") or _data.get("port") or 5432),
+                "dbname": _data.get("db_name") or _data.get("database") or _data.get("dbname"),
+                "user": _data.get("db_user") or _data.get("user") or _data.get("username"),
+                "password": _data.get("db_password") or _data.get("password"),
+            }
+
+        try:
+            import psycopg as _audit_psycopg
+            _audit_payload = {
+                "render_kind": "hotels",
+                "render_type": render.get("type"),
+                "envelope_status_code": data.get("status_code") if isinstance(data, dict) else None,
+                "envelope_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
+                "envelope_total": len(items),
+                "provider_fallback_reason": classification.get("provider_fallback_reason"),
+                "classified_intent": classification,
+            }
+            _conn_info = _audit_pg_conn_info(pg_auth)
+            _conn = _audit_psycopg.connect(_conn_info, connect_timeout=5) if isinstance(_conn_info, str) else _audit_psycopg.connect(**_conn_info, connect_timeout=5)
+            try:
+                with _conn.cursor() as _cur:
+                    _cur.execute(
+                        "INSERT INTO travel_agent_events (execution_id, event_type, ai_provider, intent, payload) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                        (
+                            execution_id,
+                            "render_hotels",
+                            classification.get("effective_provider"),
+                            classification.get("intent"),
+                            json.dumps(_audit_payload, separators=(",", ":"), default=str),
+                        ),
+                    )
+                    _conn.commit()
+            finally:
+                _conn.close()
+        except Exception as _audit_exc:
+            print(f"travel_agent_events audit insert failed: {type(_audit_exc).__name__}: {_audit_exc}")
     # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
@@ -1138,6 +1288,7 @@ workflow:
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
+        pg_auth: "{{ workload.pg_auth }}"
       code: |
         import json
 
@@ -1239,6 +1390,55 @@ workflow:
             "text": f"{len(items)} activit{'ies' if len(items) != 1 else 'y'} returned near ({lat}, {lng})",
             "render": render,
         }
+
+        def _audit_pg_conn_info(pg_auth_name):
+            from noetl.worker.secrets import fetch_credential_by_key as _audit_fetch_credential
+            _credential = _audit_fetch_credential(str(pg_auth_name or "pg_k8s"))
+            _data = _credential.get("data") if isinstance(_credential, dict) and isinstance(_credential.get("data"), dict) else _credential
+            if not isinstance(_data, dict):
+                raise RuntimeError("postgres credential missing")
+            _dsn = _data.get("dsn") or _data.get("connection_string") or _data.get("db_conn_string")
+            if _dsn:
+                return _dsn
+            return {
+                "host": _data.get("db_host") or _data.get("host") or _data.get("pg_host"),
+                "port": int(_data.get("db_port") or _data.get("port") or 5432),
+                "dbname": _data.get("db_name") or _data.get("database") or _data.get("dbname"),
+                "user": _data.get("db_user") or _data.get("user") or _data.get("username"),
+                "password": _data.get("db_password") or _data.get("password"),
+            }
+
+        try:
+            import psycopg as _audit_psycopg
+            _audit_payload = {
+                "render_kind": "activities",
+                "render_type": render.get("type"),
+                "envelope_status_code": data.get("status_code") if isinstance(data, dict) else None,
+                "envelope_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
+                "envelope_total": len(items),
+                "provider_fallback_reason": classification.get("provider_fallback_reason"),
+                "classified_intent": classification,
+            }
+            _conn_info = _audit_pg_conn_info(pg_auth)
+            _conn = _audit_psycopg.connect(_conn_info, connect_timeout=5) if isinstance(_conn_info, str) else _audit_psycopg.connect(**_conn_info, connect_timeout=5)
+            try:
+                with _conn.cursor() as _cur:
+                    _cur.execute(
+                        "INSERT INTO travel_agent_events (execution_id, event_type, ai_provider, intent, payload) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                        (
+                            execution_id,
+                            "render_activities",
+                            classification.get("effective_provider"),
+                            classification.get("intent"),
+                            json.dumps(_audit_payload, separators=(",", ":"), default=str),
+                        ),
+                    )
+                    _conn.commit()
+            finally:
+                _conn.close()
+        except Exception as _audit_exc:
+            print(f"travel_agent_events audit insert failed: {type(_audit_exc).__name__}: {_audit_exc}")
     # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
@@ -1307,6 +1507,7 @@ workflow:
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
+        pg_auth: "{{ workload.pg_auth }}"
       code: |
         import json
         import os
@@ -1502,6 +1703,55 @@ workflow:
             "render": render,
         }
 
+        def _audit_pg_conn_info(pg_auth_name):
+            from noetl.worker.secrets import fetch_credential_by_key as _audit_fetch_credential
+            _credential = _audit_fetch_credential(str(pg_auth_name or "pg_k8s"))
+            _data = _credential.get("data") if isinstance(_credential, dict) and isinstance(_credential.get("data"), dict) else _credential
+            if not isinstance(_data, dict):
+                raise RuntimeError("postgres credential missing")
+            _dsn = _data.get("dsn") or _data.get("connection_string") or _data.get("db_conn_string")
+            if _dsn:
+                return _dsn
+            return {
+                "host": _data.get("db_host") or _data.get("host") or _data.get("pg_host"),
+                "port": int(_data.get("db_port") or _data.get("port") or 5432),
+                "dbname": _data.get("db_name") or _data.get("database") or _data.get("dbname"),
+                "user": _data.get("db_user") or _data.get("user") or _data.get("username"),
+                "password": _data.get("db_password") or _data.get("password"),
+            }
+
+        try:
+            import psycopg as _audit_psycopg
+            _audit_payload = {
+                "render_kind": intent,
+                "render_type": render.get("type"),
+                "envelope_status_code": status_code,
+                "envelope_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
+                "envelope_total": 0,
+                "provider_fallback_reason": classification.get("provider_fallback_reason"),
+                "classified_intent": classification,
+            }
+            _conn_info = _audit_pg_conn_info(pg_auth)
+            _conn = _audit_psycopg.connect(_conn_info, connect_timeout=5) if isinstance(_conn_info, str) else _audit_psycopg.connect(**_conn_info, connect_timeout=5)
+            try:
+                with _conn.cursor() as _cur:
+                    _cur.execute(
+                        "INSERT INTO travel_agent_events (execution_id, event_type, ai_provider, intent, payload) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                        (
+                            execution_id,
+                            "render_amadeus_failure",
+                            classification.get("effective_provider"),
+                            classification.get("intent"),
+                            json.dumps(_audit_payload, separators=(",", ":"), default=str),
+                        ),
+                    )
+                    _conn.commit()
+            finally:
+                _conn.close()
+        except Exception as _audit_exc:
+            print(f"travel_agent_events audit insert failed: {type(_audit_exc).__name__}: {_audit_exc}")
+
   # ---------------------------------------------------------------------
   # 5. Workflow tails.
   #
@@ -1519,12 +1769,11 @@ workflow:
   # outputs reliably (round 6 result file documents this). Letting
   # render_* be the tail is the simplest correct shape.
   #
-  # Audit trail: NoETL's own event log already records every step
-  # transition with input/output metadata, so dropping the explicit
-  # `travel_agent_events` postgres write is acceptable for round 6.
-  # If a dedicated audit table is needed later, add it as a SIDE
-  # EFFECT inside each render_* python step (psycopg) so it doesn't
-  # clobber the result. Don't reintroduce the trailing postgres step.
+  # Audit trail: the render_flights/render_hotels/render_locations/
+  # render_activities/render_amadeus_failure steps now write
+  # `travel_agent_events` rows as best-effort side effects inside the
+  # render_* python step. Keep audit/callback work inside the render
+  # tail so it cannot clobber `execution.result.render`.
   #
   # Gateway SSE callback: only relevant in gateway-mode deploys (where
   # workload.request_id is set). Local kind doesn't use it. When the
