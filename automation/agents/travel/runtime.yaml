@@ -168,6 +168,13 @@ workflow:
             except (TypeError, ValueError):
                 return None
 
+        # NoETL executes snippets with separate globals/locals maps.
+        # Helpers that call sibling helpers need those names published.
+        globals().update({
+            "_coerce": _coerce,
+            "_coerce_float": _coerce_float,
+        })
+
         system_prompt = """You are a travel agent classifier. Given a user query, return ONLY
         a JSON object with these keys:
         - intent: one of "flights", "hotels", "locations", "activities", "help"
