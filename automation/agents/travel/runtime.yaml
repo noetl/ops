@@ -159,6 +159,15 @@ workflow:
                 return None
             return value
 
+        def _coerce_float(value):
+            value = _coerce(value)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
         system_prompt = """You are a travel agent classifier. Given a user query, return ONLY
         a JSON object with these keys:
         - intent: one of "flights", "hotels", "locations", "activities", "help"
@@ -166,8 +175,11 @@ workflow:
         - destination: IATA code (or null)
         - departureDate: YYYY-MM-DD (convert relative dates; or null)
         - adults: integer, default 1
-        - city: for hotels (or null)
-        - keyword: for locations or activities (or null)
+        - city: human-readable city name for hotels (or null)
+        - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
+        - keyword: free-text filter for locations or activities (or null)
+        - latitude: decimal degrees for activities (or null)
+        - longitude: decimal degrees for activities (or null)
         Use null for fields that don't apply."""
 
         def _post_json(url, headers, payload, json=json, urllib_request=urllib.request):
@@ -295,7 +307,10 @@ workflow:
             "departureDate": _coerce(parsed.get("departureDate")),
             "adults": int(parsed.get("adults") or 1),
             "city": _coerce(parsed.get("city")),
+            "cityCode": _coerce(parsed.get("cityCode")),
             "keyword": _coerce(parsed.get("keyword")),
+            "latitude": _coerce_float(parsed.get("latitude")),
+            "longitude": _coerce_float(parsed.get("longitude")),
             "requested_provider": requested,
             "effective_provider": effective_provider,
             "provider_fallback_reason": provider_fallback_reason,
@@ -344,8 +359,11 @@ workflow:
           - destination: IATA code (or null)
           - departureDate: YYYY-MM-DD (convert relative dates; or null)
           - adults: integer, default 1
-          - city: for hotels (or null)
-          - keyword: for locations or activities (or null)
+          - city: human-readable city name for hotels (or null)
+          - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
+          - keyword: free-text filter for locations or activities (or null)
+          - latitude: decimal degrees for activities (or null)
+          - longitude: decimal degrees for activities (or null)
           Use null for fields that don't apply.
         temperature: 0
         vertex_project: "{{ workload.vertex_project | default(workload.gcp_project) }}"
@@ -386,6 +404,15 @@ workflow:
                 return None
             return value
 
+        def _coerce_float(value):
+            value = _coerce(value)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
         def _strip_fences(text):
             text = (text or "").strip()
             if text.startswith("```"):
@@ -405,7 +432,10 @@ workflow:
                 "departureDate": _coerce(parsed.get("departureDate")),
                 "adults": int(parsed.get("adults") or 1),
                 "city": _coerce(parsed.get("city")),
+                "cityCode": _coerce(parsed.get("cityCode")),
                 "keyword": _coerce(parsed.get("keyword")),
+                "latitude": _coerce_float(parsed.get("latitude")),
+                "longitude": _coerce_float(parsed.get("longitude")),
                 "requested_provider": requested,
                 "effective_provider": effective,
                 "provider_fallback_reason": fallback_reason,
@@ -432,8 +462,11 @@ workflow:
         - destination: IATA code (or null)
         - departureDate: YYYY-MM-DD (convert relative dates; or null)
         - adults: integer, default 1
-        - city: for hotels (or null)
-        - keyword: for locations or activities (or null)
+        - city: human-readable city name for hotels (or null)
+        - cityCode: IATA city code for hotels, e.g. NYC, PAR, LON (or null)
+        - keyword: free-text filter for locations or activities (or null)
+        - latitude: decimal degrees for activities (or null)
+        - longitude: decimal degrees for activities (or null)
         Use null for fields that don't apply."""
 
         def _openai_text(
@@ -515,6 +548,7 @@ workflow:
             "re": re,
             "urllib": urllib,
             "_coerce": _coerce,
+            "_coerce_float": _coerce_float,
             "_strip_fences": _strip_fences,
             "_normalise": _normalise,
             "_post_json": _post_json,
@@ -605,10 +639,12 @@ workflow:
           when: "{{ classify_intent.intent == 'flights' }}"
         - step: amadeus_via_mcp_locations
           when: "{{ classify_intent.intent == 'locations' }}"
-        # Hotels and activities are stubbed — they fall through to the
-        # help renderer in phase 1. Phase 2 wires the real Amadeus calls.
+        - step: amadeus_via_mcp_hotels
+          when: "{{ classify_intent.intent == 'hotels' }}"
+        - step: amadeus_via_mcp_activities
+          when: "{{ classify_intent.intent == 'activities' }}"
         - step: render_help
-          when: "{{ classify_intent.intent in ('hotels', 'activities', 'help') }}"
+          when: "{{ classify_intent.intent == 'help' }}"
 
   # ---------------------------------------------------------------------
   # 4a. Flights branch.
@@ -855,10 +891,238 @@ workflow:
     # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
-  # 4c. Help / unsupported intent — render onboarding widget.
+  # 4c. Hotels branch — hotel lookup via MCP.
+  # ---------------------------------------------------------------------
+  - step: amadeus_via_mcp_hotels
+    desc: Call Amadeus MCP search_hotels via a NoETL agent hop
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/amadeus
+      payload:
+        method: tools/call
+        tool: search_hotels
+        arguments:
+          cityCode: "{{ classify_intent.cityCode or 'NYC' }}"
+          checkInDate: "{{ classify_intent.departureDate or '2026-07-15' }}"
+          checkOutDate: "{{ classify_intent.departureDate or '2026-07-15' }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: render_hotels
+          when: "{{ amadeus_via_mcp_hotels.data.ok | default(false) }}"
+        - step: render_amadeus_failure
+          when: "{{ True }}"
+
+  - step: render_hotels
+    desc: Project hotels into a widget tree
+    tool:
+      kind: python
+      input:
+        envelope: "{{ amadeus_via_mcp_hotels }}"
+        classification: "{{ classify_intent }}"
+        query: "{{ workload.query }}"
+        execution_id: "{{ execution_id }}"
+        provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
+      code: |
+        import json
+
+        mcp = envelope.get("data") if isinstance(envelope, dict) and isinstance(envelope.get("data"), dict) and "items" not in envelope else envelope
+        if not isinstance(mcp, dict):
+            mcp = {}
+        data = mcp.get("data") if isinstance(mcp.get("data"), dict) else mcp
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = []
+
+        def _geo_text(value):
+            if isinstance(value, dict):
+                lat = value.get("latitude")
+                lng = value.get("longitude")
+                if lat is not None and lng is not None:
+                    return f"{lat}, {lng}"
+                return json.dumps(value, separators=(",", ":"))[:120]
+            return value or ""
+
+        rows = []
+        for it in items[:25]:
+            rows.append({
+                "id": it.get("hotelId") or it.get("id") or it.get("name") or "?",
+                "name": it.get("name") or "?",
+                "chainCode": it.get("chainCode") or "",
+                "iataCode": it.get("iataCode") or classification.get("cityCode") or "",
+                "geoCode": _geo_text(it.get("geoCode")),
+            })
+
+        city_code = classification.get("cityCode") or "NYC"
+        render = {
+            "type": "app:column",
+            "args": {
+                "gap": 8,
+                "children": [
+                    {"type": "app:title", "args": {"text": f"Travel agent · {len(items)} hotel{'s' if len(items) != 1 else ''} in {city_code}", "size": 18, "boldness": 700}},
+                    {"type": "app:text", "args": {"title": "Query", "message": query}},
+                    {"type": "app:row", "args": {"gap": 8, "children": [
+                        {"type": "app:statusbar", "args": {"text": "intent=hotels", "styleKey": "success"}},
+                        {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
+                        {"type": "app:statusbar", "args": {"text": f"cityCode={city_code}", "styleKey": "info"}},
+                    ]}},
+                    {"type": "app:recordtable", "args": {
+                        "columns": [
+                            {"title": "Name", "dataIndex": "name", "sorter": True, "filter": True},
+                            {"title": "Chain", "dataIndex": "chainCode", "sorter": True},
+                            {"title": "City", "dataIndex": "iataCode", "sorter": True},
+                            {"title": "Geo", "dataIndex": "geoCode"},
+                        ],
+                        "data": rows,
+                        "pageSize": 12,
+                    }},
+                    {"type": "app:row", "args": {"gap": 8, "children": [
+                        {"type": "app:button", "args": {"text": "rerun this search", "variant": "outlined", "event": {"key": "command", "value": f"rerun {execution_id}"}}},
+                        {"type": "app:button", "args": {"text": "open execution detail", "variant": "outlined", "event": {"key": "navigate", "value": f"/execution/{execution_id}"}}},
+                    ]}},
+                ],
+            },
+        }
+
+        result = {
+            "intent": "hotels",
+            "items_total": len(items),
+            "cityCode": city_code,
+            "requested_provider": classification.get("requested_provider"),
+            "effective_provider": provider,
+            "provider_fallback_reason": classification.get("provider_fallback_reason"),
+            "summary": f"{len(items)} hotel(s) found in {city_code}",
+            "text": f"{len(items)} hotel(s) returned for {city_code}",
+            "render": render,
+        }
+    # Workflow tail — see comment block before the render_* steps.
+
+  # ---------------------------------------------------------------------
+  # 4d. Activities branch — tours and activities lookup via MCP.
+  # ---------------------------------------------------------------------
+  - step: amadeus_via_mcp_activities
+    desc: Call Amadeus MCP search_activities via a NoETL agent hop
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/amadeus
+      payload:
+        method: tools/call
+        tool: search_activities
+        arguments:
+          latitude: "{{ classify_intent.latitude or 40.7128 }}"
+          longitude: "{{ classify_intent.longitude or -74.0060 }}"
+          radius: 5
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: render_activities
+          when: "{{ amadeus_via_mcp_activities.data.ok | default(false) }}"
+        - step: render_amadeus_failure
+          when: "{{ True }}"
+
+  - step: render_activities
+    desc: Project activities into a widget tree
+    tool:
+      kind: python
+      input:
+        envelope: "{{ amadeus_via_mcp_activities }}"
+        classification: "{{ classify_intent }}"
+        query: "{{ workload.query }}"
+        execution_id: "{{ execution_id }}"
+        provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
+      code: |
+        import json
+
+        mcp = envelope.get("data") if isinstance(envelope, dict) and isinstance(envelope.get("data"), dict) and "items" not in envelope else envelope
+        if not isinstance(mcp, dict):
+            mcp = {}
+        data = mcp.get("data") if isinstance(mcp.get("data"), dict) else mcp
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = []
+
+        def _geo_text(value):
+            if isinstance(value, dict):
+                lat = value.get("latitude")
+                lng = value.get("longitude")
+                if lat is not None and lng is not None:
+                    return f"{lat}, {lng}"
+                return json.dumps(value, separators=(",", ":"))[:120]
+            return value or ""
+
+        def _price_text(value):
+            if isinstance(value, dict):
+                amount = value.get("amount") or value.get("total")
+                currency = value.get("currencyCode") or value.get("currency")
+                if amount and currency:
+                    return f"{amount} {currency}"
+                return json.dumps(value, separators=(",", ":"))[:120]
+            return value or ""
+
+        rows = []
+        for it in items[:25]:
+            rows.append({
+                "id": it.get("id") or it.get("name") or "?",
+                "name": it.get("name") or "?",
+                "type": it.get("type") or it.get("category") or "",
+                "geoCode": _geo_text(it.get("geoCode")),
+                "price": _price_text(it.get("price")),
+            })
+
+        lat = classification.get("latitude") if classification.get("latitude") is not None else 40.7128
+        lng = classification.get("longitude") if classification.get("longitude") is not None else -74.0060
+        render = {
+            "type": "app:column",
+            "args": {
+                "gap": 8,
+                "children": [
+                    {"type": "app:title", "args": {"text": f"Travel agent · {len(items)} activit{'ies' if len(items) != 1 else 'y'} near ({lat}, {lng})", "size": 18, "boldness": 700}},
+                    {"type": "app:text", "args": {"title": "Query", "message": query}},
+                    {"type": "app:row", "args": {"gap": 8, "children": [
+                        {"type": "app:statusbar", "args": {"text": "intent=activities", "styleKey": "success"}},
+                        {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
+                        {"type": "app:statusbar", "args": {"text": f"lat={lat}", "styleKey": "info"}},
+                        {"type": "app:statusbar", "args": {"text": f"lng={lng}", "styleKey": "info"}},
+                    ]}},
+                    {"type": "app:recordtable", "args": {
+                        "columns": [
+                            {"title": "Name", "dataIndex": "name", "sorter": True, "filter": True},
+                            {"title": "Type", "dataIndex": "type", "sorter": True},
+                            {"title": "Geo", "dataIndex": "geoCode"},
+                            {"title": "Price", "dataIndex": "price", "sorter": True},
+                        ],
+                        "data": rows,
+                        "pageSize": 12,
+                    }},
+                    {"type": "app:row", "args": {"gap": 8, "children": [
+                        {"type": "app:button", "args": {"text": "rerun this search", "variant": "outlined", "event": {"key": "command", "value": f"rerun {execution_id}"}}},
+                        {"type": "app:button", "args": {"text": "open execution detail", "variant": "outlined", "event": {"key": "navigate", "value": f"/execution/{execution_id}"}}},
+                    ]}},
+                ],
+            },
+        }
+
+        result = {
+            "intent": "activities",
+            "items_total": len(items),
+            "latitude": lat,
+            "longitude": lng,
+            "requested_provider": classification.get("requested_provider"),
+            "effective_provider": provider,
+            "provider_fallback_reason": classification.get("provider_fallback_reason"),
+            "summary": f"{len(items)} activit{'ies' if len(items) != 1 else 'y'} found near ({lat}, {lng})",
+            "text": f"{len(items)} activit{'ies' if len(items) != 1 else 'y'} returned near ({lat}, {lng})",
+            "render": render,
+        }
+    # Workflow tail — see comment block before the render_* steps.
+
+  # ---------------------------------------------------------------------
+  # 4e. Help / unsupported intent — render onboarding widget.
   # ---------------------------------------------------------------------
   - step: render_help
-    desc: Render an onboarding widget when intent is help / hotels / activities (not yet wired)
+    desc: Render an onboarding widget when intent is help
     tool:
       kind: python
       input:
@@ -868,14 +1132,13 @@ workflow:
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
       code: |
         intent = classification.get("intent") or "help"
-        if intent in ("hotels", "activities"):
-            note = f"Intent '{intent}' is recognised but not yet wired in phase 1. Phase 2 adds the Amadeus call."
-        else:
-            note = "I can search flights and locations today. Try: 'flights from SFO to JFK on July 15' or 'locations near Boston'."
+        note = "I can search flights, hotels, locations, and activities. Try one of the examples below."
 
         examples = [
             {"type": "app:button", "args": {"text": "flights SFO→JFK on 2026-07-15", "variant": "outlined", "event": {"key": "command", "value": "travel flights from SFO to JFK on 2026-07-15 for 2 adults"}}},
             {"type": "app:button", "args": {"text": "locations near Boston", "variant": "outlined", "event": {"key": "command", "value": "travel locations near Boston"}}},
+            {"type": "app:button", "args": {"text": "hotels in Paris", "variant": "outlined", "event": {"key": "command", "value": "travel hotels in Paris on 2026-08-15"}}},
+            {"type": "app:button", "args": {"text": "activities near Times Square", "variant": "outlined", "event": {"key": "command", "value": "travel activities near Times Square"}}},
         ]
 
         render = {
@@ -889,7 +1152,7 @@ workflow:
                     {"type": "app:row", "args": {"gap": 8, "children": examples}},
                     {"type": "app:horizontalline", "args": {}},
                     {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
-                    {"type": "app:text", "args": {"title": "Provider", "message": "Use --provider anthropic to switch classifiers. Vertex AI and Ollama stay deferred for separate auth/routing rounds."}},
+                    {"type": "app:text", "args": {"title": "Provider", "message": "Use --provider vertex-ai or --provider anthropic to switch classifiers. Ollama stays deferred for a separate routing round."}},
                 ],
             },
         }
@@ -906,7 +1169,7 @@ workflow:
     # Workflow tail — see comment block before the render_* steps.
 
   # ---------------------------------------------------------------------
-  # 4d. Amadeus failure renderer — friendly error widget.
+  # 4f. Amadeus failure renderer — friendly error widget.
   # ---------------------------------------------------------------------
   - step: render_amadeus_failure
     desc: Surface a friendly Amadeus failure as a widget
@@ -915,6 +1178,8 @@ workflow:
       input:
         flights_envelope: "{{ amadeus_via_mcp_flights | default({}) }}"
         locations_envelope: "{{ amadeus_via_mcp_locations | default({}) }}"
+        hotels_envelope: "{{ amadeus_via_mcp_hotels | default({}) }}"
+        activities_envelope: "{{ amadeus_via_mcp_activities | default({}) }}"
         classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
@@ -924,10 +1189,14 @@ workflow:
         import os
         import urllib.request
 
-        # Both branches now call the Amadeus MCP playbook via a NoETL
+        # All Amadeus branches now call the Amadeus MCP playbook via a NoETL
         # agent hop. Normalize the MCP-shaped envelope whether it is
         # returned directly or nested under data by the agent executor.
-        envelope = flights_envelope if isinstance(flights_envelope, dict) and flights_envelope else locations_envelope
+        envelope = {}
+        for candidate in (flights_envelope, locations_envelope, hotels_envelope, activities_envelope):
+            if isinstance(candidate, dict) and candidate:
+                envelope = candidate
+                break
         if not isinstance(envelope, dict):
             envelope = {}
         mcp = envelope.get("data") if isinstance(envelope.get("data"), dict) and "status_code" not in envelope else envelope
@@ -983,16 +1252,17 @@ workflow:
         else:
             body_msg = "(no response body captured)"
 
+        intent = classification.get("intent") or "travel"
         if status_code and 500 <= int(status_code) <= 599:
-            user_message = "The flight provider's search service is temporarily unavailable. Please try again."
+            user_message = "The travel provider's search service is temporarily unavailable. Please try again."
         elif status_code == 429:
-            user_message = "We're being rate-limited by the flight provider. Try again in a few seconds."
+            user_message = "We're being rate-limited by the travel provider. Try again in a few seconds."
         elif status_code in (401, 403):
-            user_message = "Couldn't authenticate with the flight provider. Operator may need to refresh credentials."
+            user_message = "Couldn't authenticate with the travel provider. Operator may need to refresh credentials."
         elif status_code in (400, 422):
-            user_message = "The flight search query couldn't be parsed. Try rephrasing the query — include city pair, date, and number of travelers."
+            user_message = f"The {intent} query couldn't be parsed. Try rephrasing it with the location and date details."
         else:
-            user_message = "The flight search failed. Please try again, or contact support if it persists."
+            user_message = f"The {intent} search failed. Please try again, or contact support if it persists."
 
         render = {
             "type": "app:column",
