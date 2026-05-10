@@ -8,16 +8,17 @@ metadata:
     for AI agents and MCP tooling using only playbooks.
 
     Takes a natural-language query, classifies intent (flights / hotels
-    / locations / activities / help) via OpenAI or Anthropic,
+    / locations / activities / help) via OpenAI, Anthropic, or Vertex AI,
     routes to the right Amadeus endpoint, and emits the result as a
     widget tree in `result.render`. The widget renderer in NoetlPrompt
     materialises the tree in the terminal; the travel canvas in
     GatewayAssistant renders the same shape.
 
     The AI provider is parameterised via `workload.ai_provider`.
-    OpenAI is the default; Anthropic is supported by the same merged
-    Python classification step. Vertex AI and Ollama stay deferred
-    because they need different auth and in-cluster routing designs.
+    OpenAI is the default; Anthropic is handled by the HTTP provider
+    branch, and Vertex AI routes through the Vertex AI MCP playbook so
+    GCP auth remains owned by that single MCP implementation. Ollama
+    stays deferred for an in-cluster bridge routing pass.
   version: "1.0"
   agent: true
   tags: [agent, travel, widgets, ai-os, flagship]
@@ -25,17 +26,20 @@ metadata:
     visible: true
     workspace: travel
     scopes: [/mcp/amadeus]
-  capabilities: [mcp:amadeus, ai:openai, ai:anthropic]
+  capabilities: [mcp:amadeus, mcp:vertex-ai, ai:openai, ai:anthropic, ai:vertex-ai]
 
 workload:
   pg_auth: pg_k8s
   gcp_auth: google_oauth
-  ai_provider: openai            # openai | anthropic
+  ai_provider: openai            # openai | anthropic | vertex-ai
   query: "Help"
   request_id: ""
   callback_url: ""
   amadeus_env: test              # test | production
   gcp_project: "noetl-cluster"
+  vertex_project: "noetl-cluster"
+  vertex_region: "us-central1"
+  vertex_model: "gemini-2.5-flash"
   ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8080"
   # Secret-manager paths. Provider keychain entries are bound
   # unconditionally with bare references; the Python classifier selects
@@ -121,10 +125,13 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
-        - step: classify_intent
+        - step: classify_via_vertex_mcp
+          when: "{{ workload.ai_provider == 'vertex-ai' }}"
+        - step: classify_via_http_provider
+          when: "{{ workload.ai_provider != 'vertex-ai' }}"
 
   # ---------------------------------------------------------------------
-  # 2. Intent classification — OpenAI + Anthropic.
+  # 2a. Intent classification — OpenAI + Anthropic HTTP providers.
   #
   # Provider switching happens inside this Python step, not through
   # keychain `when:` predicates or Jinja conditionals on URL/headers/body.
@@ -132,7 +139,7 @@ workflow:
   # provider tokens unconditionally with bare keychain refs, then choose
   # request shape and response unwrap in normal code.
   # ---------------------------------------------------------------------
-  - step: classify_intent
+  - step: classify_via_http_provider
     desc: Classify intent via OpenAI or Anthropic; extract structured params
     tool:
       kind: python
@@ -306,6 +313,272 @@ workflow:
         # `| replace("'", "''")` in the SQL template — which is a single
         # field reference, not an inline dict serialisation.
         result["json_str"] = json.dumps(result, separators=(",", ":"))
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: classify_intent
+
+  # ---------------------------------------------------------------------
+  # 2b. Intent classification — Vertex AI through the MCP playbook.
+  #
+  # Mirrors the Phase 2 Amadeus agent→MCP hop: the travel runtime
+  # dispatches, while automation/agents/mcp/vertex-ai owns Workload
+  # Identity / metadata server / env-token / service-account auth.
+  # ---------------------------------------------------------------------
+  - step: classify_via_vertex_mcp
+    desc: Classify intent via the Vertex AI MCP playbook
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/vertex-ai
+      payload:
+        model: "{{ workload.vertex_model }}"
+        messages:
+          - role: user
+            content: "{{ workload.query }}"
+        system: |
+          You are a travel agent classifier. Given a user query, return ONLY
+          a JSON object with these keys:
+          - intent: one of "flights", "hotels", "locations", "activities", "help"
+          - origin: IATA code (or null)
+          - destination: IATA code (or null)
+          - departureDate: YYYY-MM-DD (convert relative dates; or null)
+          - adults: integer, default 1
+          - city: for hotels (or null)
+          - keyword: for locations or activities (or null)
+          Use null for fields that don't apply.
+        temperature: 0
+        vertex_project: "{{ workload.vertex_project | default(workload.gcp_project) }}"
+        vertex_region: "{{ workload.vertex_region }}"
+        vertex_model: "{{ workload.vertex_model }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: classify_intent
+
+  # ---------------------------------------------------------------------
+  # 2c. Intent classification merger.
+  #
+  # Downstream steps keep their long-lived `classify_intent.X` contract.
+  # The HTTP branch already produces that shape. The Vertex branch may
+  # only expose scalar agent metadata at the parent level, so this merger
+  # can read the child execution events to recover the MCP response text.
+  # ---------------------------------------------------------------------
+  - step: classify_intent
+    desc: Normalize HTTP or Vertex MCP classification into the canonical shape
+    tool:
+      kind: python
+      input:
+        query: "{{ workload.query }}"
+        requested_provider: "{{ workload.ai_provider }}"
+        http_result: "{{ classify_via_http_provider | default({}) }}"
+        vertex_result: "{{ classify_via_vertex_mcp | default({}) }}"
+        openai_api_key: "{{ keychain.openai_token.api_key | default('') }}"
+      code: |
+        import json
+        import os
+        import re
+        import urllib.error
+        import urllib.request
+
+        def _coerce(value):
+            if value in (None, "", "null"):
+                return None
+            return value
+
+        def _strip_fences(text):
+            text = (text or "").strip()
+            if text.startswith("```"):
+                text = re.sub(r'^```\w*\n?', '', text)
+                text = re.sub(r'\n?```$', '', text)
+            return text.strip()
+
+        def _normalise(parsed, *, requested, effective, fallback_reason=None, provider_error=None, raw_text=""):
+            parsed = parsed if isinstance(parsed, dict) else {}
+            intent = (parsed.get("intent") or "help").lower().strip()
+            if intent not in ("flights", "hotels", "locations", "activities", "help"):
+                intent = "help"
+            result = {
+                "intent": intent,
+                "origin": _coerce(parsed.get("origin")),
+                "destination": _coerce(parsed.get("destination")),
+                "departureDate": _coerce(parsed.get("departureDate")),
+                "adults": int(parsed.get("adults") or 1),
+                "city": _coerce(parsed.get("city")),
+                "keyword": _coerce(parsed.get("keyword")),
+                "requested_provider": requested,
+                "effective_provider": effective,
+                "provider_fallback_reason": fallback_reason,
+                "provider_error": provider_error,
+                "raw_text": (raw_text or "")[:600],
+            }
+            result["json_str"] = json.dumps(result, separators=(",", ":"))
+            return result
+
+        def _post_json(url, headers, payload, json=json, urllib_request=urllib.request):
+            req = urllib_request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib_request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        system_prompt = """You are a travel agent classifier. Given a user query, return ONLY
+        a JSON object with these keys:
+        - intent: one of "flights", "hotels", "locations", "activities", "help"
+        - origin: IATA code (or null)
+        - destination: IATA code (or null)
+        - departureDate: YYYY-MM-DD (convert relative dates; or null)
+        - adults: integer, default 1
+        - city: for hotels (or null)
+        - keyword: for locations or activities (or null)
+        Use null for fields that don't apply."""
+
+        def _openai_text(
+            query=query,
+            openai_api_key=openai_api_key,
+            system_prompt=system_prompt,
+            _post_json=_post_json,
+        ):
+            body = {
+                "model": "gpt-4o-mini",
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+            }
+            data = _post_json(
+                "https://api.openai.com/v1/chat/completions",
+                {
+                    "Authorization": f"Bearer {openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                body,
+            )
+            choices = (data or {}).get("choices") or []
+            if choices:
+                return ((choices[0] or {}).get("message") or {}).get("content") or ""
+            return ""
+
+        def _extract_vertex_text_from_context(ctx):
+            if not isinstance(ctx, dict):
+                return "", False, None
+            is_error = bool(ctx.get("isError")) or str(ctx.get("status") or "").lower() == "error"
+            text = ctx.get("text") if isinstance(ctx.get("text"), str) else ""
+            if not text:
+                content = ctx.get("content")
+                if isinstance(content, list) and content:
+                    first = content[0] if isinstance(content[0], dict) else {}
+                    text = first.get("text") if isinstance(first.get("text"), str) else ""
+            if not text:
+                data = ctx.get("data") if isinstance(ctx.get("data"), dict) else {}
+                meta = data.get("_meta") if isinstance(data.get("_meta"), dict) else {}
+                text = meta.get("text") if isinstance(meta.get("text"), str) else ""
+            meta = ctx.get("_meta") if isinstance(ctx.get("_meta"), dict) else {}
+            error = meta.get("error") if isinstance(meta.get("error"), str) else None
+            return text, is_error, error
+
+        def _fetch_vertex_child_context(envelope):
+            if not isinstance(envelope, dict):
+                return {}
+            child_execution_id = (
+                envelope.get("execution_id")
+                or (envelope.get("context") or {}).get("execution_id")
+                or (envelope.get("data") or {}).get("execution_id")
+            )
+            if not child_execution_id:
+                return {}
+            server_url = os.getenv("NOETL_SERVER_URL", "http://noetl.noetl.svc.cluster.local:8082").rstrip("/")
+            if not server_url.endswith("/api"):
+                server_url = f"{server_url}/api"
+            try:
+                with urllib.request.urlopen(f"{server_url}/executions/{child_execution_id}/events", timeout=10) as resp:
+                    events_doc = json.loads(resp.read().decode("utf-8"))
+                for evt in events_doc.get("events", []):
+                    if evt.get("event_type") not in ("command.completed", "command.failed", "call.error"):
+                        continue
+                    if (evt.get("node_name") or evt.get("step")) != "vertex_generate_content":
+                        continue
+                    return ((evt.get("result") or {}).get("context") or {})
+            except Exception as exc:
+                return {"isError": True, "_meta": {"error": f"vertex child event lookup failed: {type(exc).__name__}: {exc}"}}
+            return {}
+
+        # NoETL executes snippets with separate globals/locals maps.
+        # Helpers that call sibling helpers need those names published.
+        globals().update({
+            "json": json,
+            "os": os,
+            "re": re,
+            "urllib": urllib,
+            "_coerce": _coerce,
+            "_strip_fences": _strip_fences,
+            "_normalise": _normalise,
+            "_post_json": _post_json,
+            "_openai_text": _openai_text,
+            "_extract_vertex_text_from_context": _extract_vertex_text_from_context,
+            "_fetch_vertex_child_context": _fetch_vertex_child_context,
+        })
+
+        requested = (requested_provider or "openai").strip().lower()
+        if requested != "vertex-ai":
+            result = http_result if isinstance(http_result, dict) and http_result else {}
+            if result:
+                result["json_str"] = result.get("json_str") or json.dumps(result, separators=(",", ":"))
+            else:
+                result = _normalise({}, requested=requested, effective="openai", fallback_reason="empty http classifier result")
+        else:
+            vertex_envelope = vertex_result if isinstance(vertex_result, dict) else {}
+            text, is_error, provider_error = _extract_vertex_text_from_context(vertex_envelope)
+            if not text or is_error:
+                child_ctx = _fetch_vertex_child_context(vertex_envelope)
+                child_text, child_error, child_provider_error = _extract_vertex_text_from_context(child_ctx)
+                text = child_text or text
+                is_error = is_error or child_error
+                provider_error = child_provider_error or provider_error
+
+            text = _strip_fences(text)
+            parsed = {}
+            if text and not is_error:
+                try:
+                    parsed = json.loads(text)
+                except Exception as exc:
+                    is_error = True
+                    provider_error = f"vertex-ai JSON parse failed: {type(exc).__name__}: {exc}"
+
+            if text and not is_error and isinstance(parsed, dict):
+                result = _normalise(
+                    parsed,
+                    requested="vertex-ai",
+                    effective="vertex-ai",
+                    raw_text=text,
+                )
+            else:
+                fallback_reason = provider_error or "vertex-ai returned no usable classifier text"
+                try:
+                    fallback_text = _strip_fences(_openai_text())
+                    try:
+                        parsed = json.loads(fallback_text) if fallback_text else {}
+                    except Exception:
+                        parsed = {}
+                    result = _normalise(
+                        parsed,
+                        requested="vertex-ai",
+                        effective="openai",
+                        fallback_reason=fallback_reason,
+                        raw_text=fallback_text,
+                    )
+                except Exception as exc:
+                    result = _normalise(
+                        {},
+                        requested="vertex-ai",
+                        effective="openai",
+                        fallback_reason=fallback_reason,
+                        provider_error=f"openai fallback failed: {type(exc).__name__}: {exc}",
+                    )
     next:
       spec: { mode: exclusive }
       arcs:
