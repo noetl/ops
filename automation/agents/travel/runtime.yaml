@@ -789,6 +789,28 @@ workflow:
                 },
             }
 
+        refine_form = {
+            "type": "app:form",
+            "args": {
+                "fields": [
+                    {"id": "origin", "title": "Origin (IATA)", "default_value": classification.get("origin") or "SFO"},
+                    {"id": "destination", "title": "Destination (IATA)", "default_value": classification.get("destination") or "JFK"},
+                    {"id": "departureDate", "title": "Departure date", "default_value": classification.get("departureDate") or "2026-07-15"},
+                    {"id": "adults", "title": "Adults", "default_value": str(classification.get("adults") or 1)},
+                ],
+                "buttons": [
+                    {
+                        "text": "Refine search",
+                        "colorType": "primary",
+                        "event": {
+                            "key": "command",
+                            "value": "travel flights from {origin} to {destination} on {departureDate} for {adults} adults",
+                        },
+                    }
+                ],
+            },
+        }
+
         if not offers:
             render = {
                 "type": "app:column",
@@ -834,6 +856,8 @@ workflow:
                     ],
                 },
             }
+
+        render["args"]["children"].append(refine_form)
 
         result = {
             "intent": "flights",
@@ -899,6 +923,22 @@ workflow:
                 "countryName": (it.get("address") or {}).get("countryName") or "",
             })
 
+        refine_form = {
+            "type": "app:form",
+            "args": {
+                "fields": [
+                    {"id": "keyword", "title": "Keyword", "default_value": classification.get("keyword") or classification.get("city") or "Boston"},
+                ],
+                "buttons": [
+                    {
+                        "text": "Refine search",
+                        "colorType": "primary",
+                        "event": {"key": "command", "value": "travel locations near {keyword}"},
+                    }
+                ],
+            },
+        }
+
         render = {
             "type": "app:column",
             "args": {
@@ -925,6 +965,7 @@ workflow:
                 ],
             },
         }
+        render["args"]["children"].append(refine_form)
 
         result = {
             "intent": "locations",
@@ -1003,6 +1044,22 @@ workflow:
             })
 
         city_code = classification.get("cityCode") or "NYC"
+        refine_form = {
+            "type": "app:form",
+            "args": {
+                "fields": [
+                    {"id": "cityCode", "title": "City (IATA)", "default_value": city_code},
+                    {"id": "departureDate", "title": "Check-in date", "default_value": classification.get("departureDate") or "2026-08-15"},
+                ],
+                "buttons": [
+                    {
+                        "text": "Refine search",
+                        "colorType": "primary",
+                        "event": {"key": "command", "value": "travel hotels in {cityCode} on {departureDate}"},
+                    }
+                ],
+            },
+        }
         render = {
             "type": "app:column",
             "args": {
@@ -1032,6 +1089,7 @@ workflow:
                 ],
             },
         }
+        render["args"]["children"].append(refine_form)
 
         result = {
             "intent": "hotels",
@@ -1121,6 +1179,22 @@ workflow:
 
         lat = classification.get("latitude") if classification.get("latitude") is not None else 40.7128
         lng = classification.get("longitude") if classification.get("longitude") is not None else -74.0060
+        keyword = classification.get("keyword") or classification.get("city") or "Times Square"
+        refine_form = {
+            "type": "app:form",
+            "args": {
+                "fields": [
+                    {"id": "keyword", "title": "Place or landmark", "default_value": keyword},
+                ],
+                "buttons": [
+                    {
+                        "text": "Refine search",
+                        "colorType": "primary",
+                        "event": {"key": "command", "value": "travel activities near {keyword}"},
+                    }
+                ],
+            },
+        }
         render = {
             "type": "app:column",
             "args": {
@@ -1151,6 +1225,7 @@ workflow:
                 ],
             },
         }
+        render["args"]["children"].append(refine_form)
 
         result = {
             "intent": "activities",
@@ -1312,6 +1387,67 @@ workflow:
         else:
             user_message = f"The {intent} search failed. Please try again, or contact support if it persists."
 
+        def _refine_form_for_intent(intent_name):
+            if intent_name == "flights":
+                return {
+                    "type": "app:form",
+                    "args": {
+                        "fields": [
+                            {"id": "origin", "title": "Origin (IATA)", "default_value": classification.get("origin") or "SFO"},
+                            {"id": "destination", "title": "Destination (IATA)", "default_value": classification.get("destination") or "JFK"},
+                            {"id": "departureDate", "title": "Departure date", "default_value": classification.get("departureDate") or "2026-07-15"},
+                            {"id": "adults", "title": "Adults", "default_value": str(classification.get("adults") or 1)},
+                        ],
+                        "buttons": [{
+                            "text": "Try again with new values",
+                            "colorType": "primary",
+                            "event": {"key": "command", "value": "travel flights from {origin} to {destination} on {departureDate} for {adults} adults"},
+                        }],
+                    },
+                }
+            if intent_name == "hotels":
+                return {
+                    "type": "app:form",
+                    "args": {
+                        "fields": [
+                            {"id": "cityCode", "title": "City (IATA)", "default_value": classification.get("cityCode") or "NYC"},
+                            {"id": "departureDate", "title": "Check-in date", "default_value": classification.get("departureDate") or "2026-08-15"},
+                        ],
+                        "buttons": [{
+                            "text": "Try again with new values",
+                            "colorType": "primary",
+                            "event": {"key": "command", "value": "travel hotels in {cityCode} on {departureDate}"},
+                        }],
+                    },
+                }
+            if intent_name == "activities":
+                return {
+                    "type": "app:form",
+                    "args": {
+                        "fields": [
+                            {"id": "keyword", "title": "Place or landmark", "default_value": classification.get("keyword") or classification.get("city") or "Times Square"},
+                        ],
+                        "buttons": [{
+                            "text": "Try again with new values",
+                            "colorType": "primary",
+                            "event": {"key": "command", "value": "travel activities near {keyword}"},
+                        }],
+                    },
+                }
+            return {
+                "type": "app:form",
+                "args": {
+                    "fields": [
+                        {"id": "keyword", "title": "Keyword", "default_value": classification.get("keyword") or classification.get("city") or "Boston"},
+                    ],
+                    "buttons": [{
+                        "text": "Try again with new values",
+                        "colorType": "primary",
+                        "event": {"key": "command", "value": "travel locations near {keyword}"},
+                    }],
+                },
+            }
+
         render = {
             "type": "app:column",
             "args": {
@@ -1338,6 +1474,7 @@ workflow:
                         {"type": "app:button", "args": {"text": "rerun this search", "variant": "outlined", "event": {"key": "command", "value": f"rerun {execution_id}"}}},
                         {"type": "app:button", "args": {"text": "diagnose", "variant": "outlined", "event": {"key": "command", "value": f"fix {execution_id}"}}},
                     ]}},
+                    _refine_form_for_intent(intent),
                 ],
             },
         }
