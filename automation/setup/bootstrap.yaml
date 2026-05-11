@@ -13,6 +13,7 @@ workload:
   build_rust_cli: false
   deploy_gateway: true
   kind_config: ci/kind/config.yaml
+  objectstore_kind: seaweedfs
 workflow:
 - step: start
   desc: Begin bootstrap process
@@ -202,16 +203,18 @@ workflow:
     input:
       action: "{{ input.action }}"
   next:
-  - step: deploy_minio
-- step: deploy_minio
-  desc: Deploy MinIO object storage
+  - step: deploy_object_store
+- step: deploy_object_store
+  desc: Deploy S3-compatible object-store backend
   input:
     action: deploy
+    objectstore_kind: "{{ workload.objectstore_kind }}"
   tool:
     kind: playbook
-    path: ../infrastructure/minio.yaml
+    path: ../infrastructure/object_store.yaml
     input:
       action: "{{ input.action }}"
+      objectstore_kind: "{{ input.objectstore_kind }}"
   next:
   - step: deploy_monitoring
 - step: deploy_monitoring
@@ -254,9 +257,9 @@ workflow:
       || true
 
 
-      echo "Waiting for MinIO..."
+      echo "Waiting for object-store..."
 
-      kubectl wait --for=condition=ready pod -l app=minio -n minio --timeout=90s
+      kubectl wait --for=condition=ready pod -l app={{ workload.objectstore_kind }} -n object-store --timeout=90s
       || true
 
 
@@ -551,7 +554,7 @@ workflow:
 
       echo "  PostgreSQL: ${LAN_HOST}:54321"
 
-      echo "  MinIO API: http://${LAN_HOST}:9000 (Console: http://${LAN_HOST}:9001)"
+      echo "  Object Store API: http://${LAN_HOST}:9000 (backend: {{ workload.objectstore_kind }})"
 
       echo "  Grafana: http://${LAN_HOST}:3000"
 

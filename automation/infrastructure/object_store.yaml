@@ -1,0 +1,171 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: object_store_automation
+  path: automation/infrastructure/object_store
+  description: Deploy the NoETL in-cluster S3-compatible object-store backend.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help # deploy, remove, status, logs, clear-cache
+  objectstore_kind: seaweedfs # seaweedfs | rustfs
+
+workflow:
+  - step: start
+    desc: Entry point for object-store automation
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          KIND="{{ workload.objectstore_kind }}"
+          case "$KIND" in
+            seaweedfs|rustfs) ;;
+            *)
+              echo "ERROR: objectstore_kind must be 'seaweedfs' or 'rustfs' (got '$KIND')"
+              exit 1
+              ;;
+          esac
+          echo "Object-store Automation - Action '{{ workload.action }}' backend '$KIND'"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: deploy_object_store
+          when: "{{ workload.action == 'deploy' }}"
+        - step: remove_object_store
+          when: "{{ workload.action == 'remove' }}"
+        - step: check_status
+          when: "{{ workload.action == 'status' }}"
+        - step: show_logs
+          when: "{{ workload.action == 'logs' }}"
+        - step: clear_cache
+          when: "{{ workload.action == 'clear-cache' }}"
+        - step: show_help
+
+  - step: deploy_object_store
+    desc: Deploy selected object-store backend to kind cluster
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          KIND="{{ workload.objectstore_kind }}"
+          echo ""
+          echo "Deploying object-store backend '$KIND' to kind cluster..."
+          kubectl config use-context kind-noetl
+          kubectl apply -f "ci/manifests/${KIND}/00-namespace.yaml"
+          sleep 2
+          kubectl apply -f "ci/manifests/${KIND}/"
+          kubectl wait --for=condition=available "deployment/${KIND}" -n object-store --timeout=120s
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: remove_object_store
+    desc: Remove object-store backends from kind cluster
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          echo ""
+          echo "Removing object-store backends from kind cluster..."
+          kubectl config use-context kind-noetl
+          kubectl delete -f ci/manifests/seaweedfs/ --ignore-not-found=true
+          kubectl delete -f ci/manifests/rustfs/ --ignore-not-found=true
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: check_status
+    desc: Check object-store deployment status
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo ""
+          echo "Object-store Status:"
+          echo "===================="
+          kubectl get pods -n object-store
+          echo ""
+          kubectl get svc -n object-store
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: show_logs
+    desc: Show object-store logs
+    tool:
+      kind: shell
+      cmds:
+        - |
+          KIND="{{ workload.objectstore_kind }}"
+          echo ""
+          echo "Object-store logs for backend '$KIND':"
+          kubectl logs -n object-store -l "app=${KIND}" --tail=80
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: clear_cache
+    desc: Clear object-store data cache directory
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo ""
+          echo "Clearing object-store cache directory..."
+          rm -rf ci/kind/cache/object-store-data/*
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: show_help
+    desc: Display available actions
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo "====================================="
+          echo " Object-store Automation"
+          echo "====================================="
+          echo ""
+          echo "Usage:"
+          echo "  noetl run automation/infrastructure/object_store.yaml --set action=<action> --set objectstore_kind=<seaweedfs|rustfs>"
+          echo ""
+          echo "Available actions:"
+          echo "  deploy        - Deploy selected S3-compatible object-store backend"
+          echo "  remove        - Remove object-store backends"
+          echo "  status        - Check deployment status"
+          echo "  logs          - Show selected backend logs"
+          echo "  clear-cache   - Clear object-store data cache directory"
+          echo ""
+          echo "Default backend: seaweedfs"
+          echo "Canonical endpoint: http://object-store.object-store.svc.cluster.local:9000"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: End workflow
+    tool:
+      kind: noop
+    input:
+      action: "{{ workload.action }}"
+      objectstore_kind: "{{ workload.objectstore_kind }}"

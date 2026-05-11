@@ -2,8 +2,7 @@
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: minio
-  namespace: minio
+  name: object-store-rustfs
 spec:
   storageClassName: standard
   accessModes:
@@ -11,16 +10,16 @@ spec:
   capacity:
     storage: 5Gi
   hostPath:
-    path: /mnt/data/minio-data
+    path: /mnt/data/object-store-data
 
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: minio
-  namespace: minio
+  name: object-store-data
+  namespace: object-store
 spec:
-  volumeName: minio
+  volumeName: object-store-rustfs
   accessModes:
     - ReadWriteOnce
   resources:

@@ -1,0 +1,11 @@
+{{- if .Values.objectStore.enabled }}
+{{- if ne .Values.objectStore.namespace .Values.namespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.objectStore.namespace }}
+  labels:
+    app: object-store
+    object-store.noetl.io/backend: {{ .Values.objectStore.kind | quote }}
+{{- end }}
+{{- end }}

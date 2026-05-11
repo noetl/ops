@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+  namespace: object-store
+  labels:
+    app: seaweedfs
+    object-store.noetl.io/backend: seaweedfs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seaweedfs
+  template:
+    metadata:
+      labels:
+        app: seaweedfs
+        object-store.noetl.io/backend: seaweedfs
+    spec:
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs:3.97
+          command:
+            - weed
+          args:
+            - server
+            - -dir=/data
+            - -master.port=9333
+            - -volume.port=8080
+            - -filer
+            - -filer.port=8888
+            - -s3
+            - -s3.port=9000
+            - -ip.bind=0.0.0.0
+          ports:
+            - name: s3
+              containerPort: 9000
+            - name: filer
+              containerPort: 8888
+            - name: master
+              containerPort: 9333
+          volumeMounts:
+            - name: object-store-data
+              mountPath: /data
+          livenessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: object-store-data
+          persistentVolumeClaim:
+            claimName: object-store-data
