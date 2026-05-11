@@ -88,15 +88,9 @@ nodes:
         listenAddress: "0.0.0.0"
         protocol: TCP
 
-        # MinIO API
-      - containerPort: 30900
+        # S3-compatible object-store API
+      - containerPort: 30902
         hostPort: 9000
-        listenAddress: "0.0.0.0"
-        protocol: TCP
-
-        # MinIO Console
-      - containerPort: 30901
-        hostPort: 9001
         listenAddress: "0.0.0.0"
         protocol: TCP
 
@@ -126,8 +120,8 @@ nodes:
       - hostPath: ci/kind/cache/noetl-data
         containerPath: /mnt/data/noetl-data
 
-      - hostPath: ci/kind/cache/minio-data
-        containerPath: /mnt/data/minio-data
+      - hostPath: ci/kind/cache/object-store-data
+        containerPath: /mnt/data/object-store-data
 
       - hostPath: ci/kind/cache/noetl-logs
         containerPath: /mnt/data/noetl-logs

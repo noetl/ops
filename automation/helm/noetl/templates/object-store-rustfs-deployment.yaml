@@ -1,0 +1,78 @@
+{{- if and .Values.objectStore.enabled (eq .Values.objectStore.kind "rustfs") }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+  namespace: {{ .Values.objectStore.namespace }}
+  labels:
+    app: rustfs
+    object-store.noetl.io/backend: rustfs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rustfs
+  template:
+    metadata:
+      labels:
+        app: rustfs
+        object-store.noetl.io/backend: rustfs
+    spec:
+      securityContext:
+        fsGroup: 10001
+      initContainers:
+        - name: prepare-rustfs-volumes
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - mkdir -p /data /logs && chown -R 10001:10001 /data /logs && chmod -R u+rwX,g+rwX /data /logs
+          volumeMounts:
+            - name: object-store-data
+              mountPath: /data
+            - name: rustfs-logs
+              mountPath: /logs
+      containers:
+        - name: rustfs
+          image: "{{ .Values.objectStore.image.rustfs.repository }}:{{ .Values.objectStore.image.rustfs.tag }}"
+          imagePullPolicy: {{ .Values.objectStore.image.rustfs.pullPolicy }}
+          args:
+            - /data
+          env:
+            - name: RUSTFS_ADDRESS
+              value: ":{{ .Values.objectStore.port }}"
+            - name: RUSTFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: object-store-credentials
+                  key: access-key
+            - name: RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: object-store-credentials
+                  key: secret-key
+          ports:
+            - name: s3
+              containerPort: {{ .Values.objectStore.port }}
+          volumeMounts:
+            - name: object-store-data
+              mountPath: /data
+            - name: rustfs-logs
+              mountPath: /logs
+          livenessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: object-store-data
+          persistentVolumeClaim:
+            claimName: {{ .Values.objectStore.storage.name }}
+        - name: rustfs-logs
+          emptyDir: {}
+{{- end }}

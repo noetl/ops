@@ -1,0 +1,28 @@
+{{- if .Values.objectStore.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.objectStore.serviceName }}
+  namespace: {{ .Values.objectStore.namespace }}
+  labels:
+    app: object-store
+    object-store.noetl.io/backend: {{ .Values.objectStore.kind | quote }}
+spec:
+  type: {{ .Values.objectStore.service.type }}
+  ports:
+    - port: {{ .Values.objectStore.port }}
+      targetPort: s3
+      protocol: TCP
+      name: s3
+{{- if and (eq .Values.objectStore.service.type "NodePort") .Values.objectStore.service.nodePort }}
+      nodePort: {{ .Values.objectStore.service.nodePort }}
+{{- end }}
+  selector:
+{{- if eq .Values.objectStore.kind "seaweedfs" }}
+    app: seaweedfs
+{{- else if eq .Values.objectStore.kind "rustfs" }}
+    app: rustfs
+{{- else }}
+    app: unsupported-object-store-kind
+{{- end }}
+{{- end }}

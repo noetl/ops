@@ -93,6 +93,34 @@ persistence:
     size: 5Gi
     storageClassName: standard
 
+objectStore:
+  enabled: true
+  kind: seaweedfs # seaweedfs | rustfs
+  namespace: object-store
+  serviceName: object-store
+  port: 9000
+  bucket: noetl
+  credentials:
+    accessKey: noetl-access
+    secretKey: noetl-secret
+  image:
+    seaweedfs:
+      repository: chrislusf/seaweedfs
+      tag: "3.97"
+      pullPolicy: IfNotPresent
+    rustfs:
+      repository: rustfs/rustfs
+      tag: latest
+      pullPolicy: IfNotPresent
+  storage:
+    name: object-store-data
+    size: 50Gi
+    storageClassName: ""
+    hostPath: ""
+  service:
+    type: ClusterIP
+    nodePort: null
+
 config:
   server:
     TZ: "UTC"
@@ -145,6 +173,13 @@ config:
     NOETL_COMMAND_CLAIM_RETRY_AFTER_SECONDS: "2"
     NOETL_TEMPSTORE_MAX_REF_CACHE_ENTRIES: "50000"
     NOETL_TEMPSTORE_MAX_MEMORY_CACHE_ENTRIES: "20000"
+    # S3-compatible object-store configuration (SeaweedFS by default, RustFS opt-in).
+    NOETL_STORAGE_CLOUD_TIER: "s3"
+    NOETL_S3_ENDPOINT: "http://object-store.object-store.svc.cluster.local:9000"
+    NOETL_S3_BUCKET: "noetl"
+    NOETL_S3_REGION: "us-east-1"
+    AWS_ACCESS_KEY_ID: "noetl-access"
+    AWS_SECRET_ACCESS_KEY: "noetl-secret"
   worker:
     TZ: "UTC"
     LOG_LEVEL: "INFO"
@@ -186,11 +221,13 @@ config:
     NOETL_POSTGRES_POOL_MAX_SIZE: "8"
     NOETL_POSTGRES_POOL_MAX_WAITING: "100"
     NOETL_POSTGRES_POOL_TIMEOUT_SECONDS: "30"
-    # Cloud durable tier for DISK async spill. 's3' covers MinIO via NOETL_S3_ENDPOINT.
+    # Cloud durable tier for DISK async spill. 's3' covers any S3-compatible endpoint.
     NOETL_STORAGE_CLOUD_TIER: "s3"
-    NOETL_S3_ENDPOINT: "http://minio.minio.svc.cluster.local:9000"
-    NOETL_S3_BUCKET: "noetl-results"
+    NOETL_S3_ENDPOINT: "http://object-store.object-store.svc.cluster.local:9000"
+    NOETL_S3_BUCKET: "noetl"
     NOETL_S3_REGION: "us-east-1"
+    AWS_ACCESS_KEY_ID: "noetl-access"
+    AWS_SECRET_ACCESS_KEY: "noetl-secret"
     # DISK tier (phase 1 DiskCacheBackend) uses the shared PVC at NOETL_DATA_DIR.
     # 2 GB data pool (~90%) + 256 MB meta pool (~10%) fit inside 10Gi RWX PVC.
     NOETL_STORAGE_LOCAL_CACHE_DIR: "/opt/noetl/data/disk_cache"

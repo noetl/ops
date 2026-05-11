@@ -1,0 +1,61 @@
+{{- if and .Values.objectStore.enabled (eq .Values.objectStore.kind "seaweedfs") }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+  namespace: {{ .Values.objectStore.namespace }}
+  labels:
+    app: seaweedfs
+    object-store.noetl.io/backend: seaweedfs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seaweedfs
+  template:
+    metadata:
+      labels:
+        app: seaweedfs
+        object-store.noetl.io/backend: seaweedfs
+    spec:
+      containers:
+        - name: seaweedfs
+          image: "{{ .Values.objectStore.image.seaweedfs.repository }}:{{ .Values.objectStore.image.seaweedfs.tag }}"
+          imagePullPolicy: {{ .Values.objectStore.image.seaweedfs.pullPolicy }}
+          command:
+            - weed
+          args:
+            - server
+            - -dir=/data
+            - -master.port=9333
+            - -volume.port=8080
+            - -filer
+            - -filer.port=8888
+            - -s3
+            - -s3.port={{ .Values.objectStore.port }}
+            - -ip.bind=0.0.0.0
+          ports:
+            - name: s3
+              containerPort: {{ .Values.objectStore.port }}
+            - name: filer
+              containerPort: 8888
+            - name: master
+              containerPort: 9333
+          volumeMounts:
+            - name: object-store-data
+              mountPath: /data
+          livenessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: object-store-data
+          persistentVolumeClaim:
+            claimName: {{ .Values.objectStore.storage.name }}
+{{- end }}
