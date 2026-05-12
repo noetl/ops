@@ -577,32 +577,6 @@ workflow:
             error = meta.get("error") if isinstance(meta.get("error"), str) else None
             return text, is_error, error
 
-        def _fetch_vertex_child_context(envelope):
-            if not isinstance(envelope, dict):
-                return {}
-            child_execution_id = (
-                envelope.get("execution_id")
-                or (envelope.get("context") or {}).get("execution_id")
-                or (envelope.get("data") or {}).get("execution_id")
-            )
-            if not child_execution_id:
-                return {}
-            server_url = os.getenv("NOETL_SERVER_URL", "http://noetl.noetl.svc.cluster.local:8082").rstrip("/")
-            if not server_url.endswith("/api"):
-                server_url = f"{server_url}/api"
-            try:
-                with urllib.request.urlopen(f"{server_url}/executions/{child_execution_id}/events", timeout=10) as resp:
-                    events_doc = json.loads(resp.read().decode("utf-8"))
-                for evt in events_doc.get("events", []):
-                    if evt.get("event_type") not in ("command.completed", "command.failed", "call.error"):
-                        continue
-                    if (evt.get("node_name") or evt.get("step")) != "vertex_generate_content":
-                        continue
-                    return ((evt.get("result") or {}).get("context") or {})
-            except Exception as exc:
-                return {"isError": True, "_meta": {"error": f"vertex child event lookup failed: {type(exc).__name__}: {exc}"}}
-            return {}
-
         def _extract_ollama_text_from_context(ctx):
             if not isinstance(ctx, dict):
                 return "", False, None
@@ -621,32 +595,6 @@ workflow:
             error = meta.get("error") if isinstance(meta.get("error"), str) else None
             return text, is_error, error
 
-        def _fetch_ollama_child_context(envelope):
-            if not isinstance(envelope, dict):
-                return {}
-            child_execution_id = (
-                envelope.get("execution_id")
-                or (envelope.get("context") or {}).get("execution_id")
-                or (envelope.get("data") or {}).get("execution_id")
-            )
-            if not child_execution_id:
-                return {}
-            server_url = os.getenv("NOETL_SERVER_URL", "http://noetl.noetl.svc.cluster.local:8082").rstrip("/")
-            if not server_url.endswith("/api"):
-                server_url = f"{server_url}/api"
-            try:
-                with urllib.request.urlopen(f"{server_url}/executions/{child_execution_id}/events", timeout=10) as resp:
-                    events_doc = json.loads(resp.read().decode("utf-8"))
-                for evt in events_doc.get("events", []):
-                    if evt.get("event_type") not in ("command.completed", "command.failed", "call.error"):
-                        continue
-                    if (evt.get("node_name") or evt.get("step")) != "ollama_chat_completion":
-                        continue
-                    return ((evt.get("result") or {}).get("context") or {})
-            except Exception as exc:
-                return {"isError": True, "_meta": {"error": f"ollama child event lookup failed: {type(exc).__name__}: {exc}"}}
-            return {}
-
         # NoETL executes snippets with separate globals/locals maps.
         # Helpers that call sibling helpers need those names published.
         globals().update({
@@ -662,21 +610,14 @@ workflow:
             "_post_json": _post_json,
             "_openai_text": _openai_text,
             "_extract_vertex_text_from_context": _extract_vertex_text_from_context,
-            "_fetch_vertex_child_context": _fetch_vertex_child_context,
             "_extract_ollama_text_from_context": _extract_ollama_text_from_context,
-            "_fetch_ollama_child_context": _fetch_ollama_child_context,
         })
 
         requested = (requested_provider or "openai").strip().lower()
         if requested == "ollama":
             ollama_envelope = ollama_result if isinstance(ollama_result, dict) else {}
-            text, is_error, provider_error = _extract_ollama_text_from_context(ollama_envelope)
-            if not text or is_error:
-                child_ctx = _fetch_ollama_child_context(ollama_envelope)
-                child_text, child_error, child_provider_error = _extract_ollama_text_from_context(child_ctx)
-                text = child_text or text
-                is_error = is_error or child_error
-                provider_error = child_provider_error or provider_error
+            ollama_context = ollama_envelope.get("data") if isinstance(ollama_envelope.get("data"), dict) else ollama_envelope
+            text, is_error, provider_error = _extract_ollama_text_from_context(ollama_context)
 
             text = _strip_fences(text)
             parsed = {}
@@ -725,13 +666,8 @@ workflow:
                 result = _normalise({}, requested=requested, effective="openai", fallback_reason="empty http classifier result")
         else:
             vertex_envelope = vertex_result if isinstance(vertex_result, dict) else {}
-            text, is_error, provider_error = _extract_vertex_text_from_context(vertex_envelope)
-            if not text or is_error:
-                child_ctx = _fetch_vertex_child_context(vertex_envelope)
-                child_text, child_error, child_provider_error = _extract_vertex_text_from_context(child_ctx)
-                text = child_text or text
-                is_error = is_error or child_error
-                provider_error = child_provider_error or provider_error
+            vertex_context = vertex_envelope.get("data") if isinstance(vertex_envelope.get("data"), dict) else vertex_envelope
+            text, is_error, provider_error = _extract_vertex_text_from_context(vertex_context)
 
             text = _strip_fences(text)
             parsed = {}
