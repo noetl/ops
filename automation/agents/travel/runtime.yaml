@@ -25,8 +25,8 @@ metadata:
   terminal:
     visible: true
     workspace: travel
-    scopes: [/mcp/amadeus, /mcp/google-places]
-  capabilities: [mcp:amadeus, mcp:google-places, mcp:vertex-ai, mcp:ollama, ai:openai, ai:anthropic, ai:vertex-ai, ai:ollama]
+    scopes: [/mcp/amadeus, /mcp/duffel, /mcp/google-places]
+  capabilities: [mcp:amadeus, mcp:duffel, mcp:google-places, mcp:vertex-ai, mcp:ollama, ai:openai, ai:anthropic, ai:vertex-ai, ai:ollama]
 
 workload:
   pg_auth: pg_k8s
@@ -36,6 +36,8 @@ workload:
   request_id: ""
   callback_url: ""
   amadeus_env: test              # test | production
+  flight_provider: duffel        # duffel | amadeus
+  duffel_env: test               # test only in the search-only round
   gcp_project: "noetl-demo-19700101"
   vertex_project: "noetl-demo-19700101"
   vertex_region: "us-central1"
@@ -731,8 +733,10 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
+        - step: duffel_via_mcp_flights
+          when: "{{ classify_intent.intent == 'flights' and (workload.flight_provider | default('duffel')) == 'duffel' }}"
         - step: amadeus_via_mcp_flights
-          when: "{{ classify_intent.intent == 'flights' }}"
+          when: "{{ classify_intent.intent == 'flights' and (workload.flight_provider | default('duffel')) == 'amadeus' }}"
         - step: amadeus_via_mcp_locations
           when: "{{ classify_intent.intent == 'locations' }}"
         - step: amadeus_via_mcp_hotels
@@ -745,11 +749,33 @@ workflow:
   # ---------------------------------------------------------------------
   # 4a. Flights branch.
   #
-  # Phase 2 routes Amadeus calls through the Amadeus MCP playbook
-  # instead of direct urllib calls from this travel runtime. This keeps
-  # one Amadeus implementation shared by the travel agent and external
-  # MCP clients (`cd /mcp/amadeus; call search_flights ...`).
+  # Duffel is the default flight provider. Amadeus remains available as an
+  # explicit opt-out with `flight_provider: amadeus`.
   # ---------------------------------------------------------------------
+  - step: duffel_via_mcp_flights
+    desc: Call Duffel MCP search_offers via a NoETL agent hop
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/duffel
+      payload:
+        method: tools/call
+        tool: search_offers
+        duffel_env: "{{ workload.duffel_env | default('test') }}"
+        arguments:
+          origin: "{{ classify_intent.origin | default('SFO') }}"
+          destination: "{{ classify_intent.destination | default('JFK') }}"
+          departure_date: "{{ classify_intent.departureDate | default('2026-07-15') }}"
+          adults: "{{ classify_intent.adults | default(1) }}"
+          cabin_class: economy
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: render_flights
+          when: "{{ duffel_via_mcp_flights.data.ok == true }}"
+        - step: render_amadeus_failure
+          when: "{{ True }}"
+
   - step: amadeus_via_mcp_flights
     desc: Call Amadeus MCP search_flights via a NoETL agent hop
     tool:
@@ -767,6 +793,8 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
+        - step: render_flights
+          when: "{{ amadeus_via_mcp_flights.data.ok == true }}"
         - step: render_amadeus_failure
           when: "{{ True }}"
 
@@ -775,11 +803,12 @@ workflow:
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_via_mcp_flights }}"
+        envelope: "{{ duffel_via_mcp_flights | default(amadeus_via_mcp_flights | default({})) }}"
         classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
         provider: "{{ classify_intent.effective_provider | default(workload.ai_provider) }}"
+        flight_provider: "{{ workload.flight_provider | default('duffel') }}"
         pg_auth: "{{ workload.pg_auth }}"
       code: |
         import json
@@ -794,6 +823,7 @@ workflow:
         offers = data.get("offers") if isinstance(data, dict) else None
         if not isinstance(offers, list):
             offers = []
+        effective_flight_provider = (data.get("source") if isinstance(data, dict) else None) or flight_provider or "duffel"
 
         def _seg(o):
             its = o.get("itineraries") or []
@@ -837,6 +867,11 @@ workflow:
                     ],
                 },
             }
+
+        globals().update({
+            "_seg": _seg,
+            "_offer_card": _offer_card,
+        })
 
         refine_form = {
             "type": "app:form",
@@ -887,6 +922,7 @@ workflow:
                             "args": {"gap": 8, "children": [
                                 {"type": "app:statusbar", "args": {"text": f"intent=flights", "styleKey": "success"}},
                                 {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
+                                {"type": "app:statusbar", "args": {"text": f"flight_provider={effective_flight_provider}", "styleKey": "info"}},
                                 {"type": "app:statusbar", "args": {"text": f"{classification.get('origin') or '?'} → {classification.get('destination') or '?'}", "styleKey": "info"}},
                                 {"type": "app:statusbar", "args": {"text": classification.get("departureDate") or "?", "styleKey": "info"}},
                             ]},
@@ -913,6 +949,8 @@ workflow:
             "offers_total": len(offers),
             "requested_provider": classification.get("requested_provider"),
             "effective_provider": provider,
+            "requested_flight_provider": flight_provider,
+            "effective_flight_provider": effective_flight_provider,
             "provider_fallback_reason": classification.get("provider_fallback_reason"),
             "summary": f"{len(offers)} flight offer(s) returned",
             "text": f"{len(offers)} flight offer(s) returned for {classification.get('origin') or '?'} → {classification.get('destination') or '?'}",
@@ -944,6 +982,7 @@ workflow:
                 "envelope_status_code": data.get("status_code") if isinstance(data, dict) else None,
                 "envelope_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
                 "envelope_total": len(offers),
+                "flight_provider": effective_flight_provider,
                 "provider_fallback_reason": classification.get("provider_fallback_reason"),
                 "classified_intent": classification,
             }
@@ -1651,6 +1690,7 @@ workflow:
     tool:
       kind: python
       input:
+        duffel_envelope: "{{ duffel_via_mcp_flights | default({}) }}"
         flights_envelope: "{{ amadeus_via_mcp_flights | default({}) }}"
         locations_envelope: "{{ amadeus_via_mcp_locations | default({}) }}"
         hotels_envelope: "{{ amadeus_via_mcp_hotels | default({}) }}"
@@ -1665,11 +1705,11 @@ workflow:
         import os
         import urllib.request
 
-        # All Amadeus branches now call the Amadeus MCP playbook via a NoETL
-        # agent hop. Normalize the MCP-shaped envelope whether it is
-        # returned directly or nested under data by the agent executor.
+        # Provider branches call MCP playbooks via NoETL agent hops.
+        # Normalize the MCP-shaped envelope whether it is returned directly
+        # or nested under data by the agent executor.
         envelope = {}
-        for candidate in (flights_envelope, locations_envelope, hotels_envelope, activities_envelope):
+        for candidate in (duffel_envelope, flights_envelope, locations_envelope, hotels_envelope, activities_envelope):
             if isinstance(candidate, dict) and candidate:
                 envelope = candidate
                 break
@@ -1701,7 +1741,7 @@ workflow:
                     if evt.get("event_type") != "command.completed":
                         continue
                     node = evt.get("node_name") or evt.get("step") or ""
-                    if not str(node).startswith("amadeus_search_"):
+                    if not (str(node).startswith("amadeus_search_") or str(node) == "duffel_dispatch"):
                         continue
                     ctx = ((evt.get("result") or {}).get("context") or {})
                     meta = ctx.get("_meta") if isinstance(ctx.get("_meta"), dict) else {}

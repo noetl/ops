@@ -1,0 +1,376 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: duffel_mcp
+  path: automation/agents/mcp/duffel
+  description: |
+    Duffel MCP server playbook for search-only flight capabilities.
+
+    The first cut is deliberately limited to test-environment search and
+    reference data. Booking, order creation, seat maps, payments, and live
+    tokens are out of scope for this playbook version.
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  version: "1.0"
+  tags: [mcp, duffel, travel, flights, ai-os]
+  terminal:
+    visible: true
+    workspace: duffel
+    scopes: [/mcp/duffel]
+
+workload:
+  gcp_auth: google_oauth
+  duffel_env: test
+  duffel_test_token_path: projects/1014428265962/secrets/duffel-api-test/versions/1
+  # Placeholder only. Do not provision or exercise live mode in the search-only round.
+  duffel_live_token_path: projects/1014428265962/secrets/duffel-api-live/versions/1
+  duffel_api_base: https://api.duffel.com
+  duffel_api_version: v2
+  method: "tools/list"
+  tool: ""
+  arguments: {}
+
+keychain:
+  # Keychain Jinja templates resolve workload fields via bare references.
+  # Keep `gcp_auth`, `duffel_env`, and token paths unqualified here.
+  - name: duffel_token
+    kind: secret_manager
+    provider: gcp
+    scope: global
+    auth: "{{ gcp_auth }}"
+    map:
+      token: "{{ duffel_live_token_path if duffel_env == 'live' else duffel_test_token_path }}"
+
+workflow:
+  - step: duffel_dispatch
+    desc: Dispatch Duffel MCP tools
+    tool:
+      kind: python
+      input:
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+        duffel_env: "{{ workload.duffel_env | default('test') }}"
+        duffel_api_base: "{{ workload.duffel_api_base | default('https://api.duffel.com') }}"
+        duffel_api_version: "{{ workload.duffel_api_version | default('v2') }}"
+        duffel_token: "{{ keychain.duffel_token.token }}"
+      code: |
+        import json
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        def _as_dict(value):
+            return value if isinstance(value, dict) else {}
+
+        def _as_list(value):
+            return value if isinstance(value, list) else []
+
+        def _cap(value, default=10, maximum=10):
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(1, min(parsed, maximum))
+
+        def _text(value, default=""):
+            value = default if value is None else value
+            return str(value).strip()
+
+        def _error(tool_name, message, detail=None, status_code=0):
+            text = message if detail is None else f"{message}: {str(detail)[:700]}"
+            payload = {"ok": False, "error": text[:2000], "status_code": status_code}
+            return {
+                "status": "error",
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+                "_meta": {"backend": "duffel", "tool": tool_name, "duffel_env": duffel_env, "status_code": status_code, "error": text[:2000]},
+                "data": payload,
+                "control_data": payload,
+                "summary": text,
+                "text": text,
+            }
+
+        def _ok(tool_name, data, text=None, meta=None):
+            meta = meta if isinstance(meta, dict) else {}
+            payload = data if isinstance(data, dict) else {"value": data}
+            payload.setdefault("ok", True)
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text or f"Duffel {tool_name} ok"}],
+                "isError": False,
+                "_meta": {"backend": "duffel", "tool": tool_name, "duffel_env": duffel_env, **meta},
+                "data": payload,
+                "control_data": payload,
+                "summary": text or f"Duffel {tool_name} ok",
+                "text": text or f"Duffel {tool_name} ok",
+            }
+
+        def _request(http_method, path, payload=None, params=None):
+            base = _text(duffel_api_base, "https://api.duffel.com").rstrip("/")
+            url = base + path
+            if params:
+                url += "?" + urllib.parse.urlencode(params, doseq=True)
+            headers = {
+                "Authorization": f"Bearer {duffel_token}",
+                "Accept": "application/json",
+                "Duffel-Version": _text(duffel_api_version, "v2"),
+            }
+            body = None
+            if payload is not None:
+                headers["Content-Type"] = "application/json"
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers=headers, method=http_method)
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    raw = resp.read().decode("utf-8")
+                    parsed = json.loads(raw or "{}")
+                    return True, resp.status, parsed
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(raw or "{}")
+                except Exception:
+                    parsed = {"raw": raw[:2000]}
+                return False, exc.code, parsed
+            except urllib.error.URLError as exc:
+                return False, 0, {"error": str(getattr(exc, "reason", exc))}
+            except Exception as exc:
+                return False, 0, {"error": f"{type(exc).__name__}: {exc}"}
+
+        def _duration(value):
+            return _text(value, "?") or "?"
+
+        def _iata(place):
+            if isinstance(place, dict):
+                return place.get("iata_code") or place.get("iataCode") or place.get("id") or "?"
+            return "?"
+
+        def _carrier(segment):
+            for key in ("marketing_carrier", "operating_carrier"):
+                carrier = segment.get(key)
+                if isinstance(carrier, dict) and carrier.get("iata_code"):
+                    return carrier.get("iata_code")
+            return segment.get("marketing_carrier_iata_code") or segment.get("operating_carrier_iata_code") or "?"
+
+        def _normalise_segment(segment):
+            origin = segment.get("origin") if isinstance(segment.get("origin"), dict) else {}
+            destination = segment.get("destination") if isinstance(segment.get("destination"), dict) else {}
+            return {
+                "departure": {"iataCode": _iata(origin), "at": segment.get("departing_at") or segment.get("departure_time") or "?"},
+                "arrival": {"iataCode": _iata(destination), "at": segment.get("arriving_at") or segment.get("arrival_time") or "?"},
+                "carrierCode": _carrier(segment),
+                "number": _text(segment.get("marketing_carrier_flight_number") or segment.get("flight_number")),
+                "duration": _duration(segment.get("duration")),
+                "numberOfStops": 0,
+            }
+
+        def _normalise_offer(offer):
+            slices = _as_list(offer.get("slices"))
+            itineraries = []
+            validating = []
+            for item in slices:
+                segments = [_normalise_segment(seg) for seg in _as_list(item.get("segments")) if isinstance(seg, dict)]
+                for seg in segments:
+                    code = seg.get("carrierCode")
+                    if code and code != "?" and code not in validating:
+                        validating.append(code)
+                itineraries.append({
+                    "duration": _duration(item.get("duration")),
+                    "segments": segments,
+                })
+            return {
+                "id": offer.get("id"),
+                "source": "duffel",
+                "price": {
+                    "total": offer.get("total_amount") or offer.get("base_amount") or "?",
+                    "currency": offer.get("total_currency") or offer.get("base_currency") or "USD",
+                },
+                "itineraries": itineraries,
+                "validatingAirlineCodes": validating,
+                "expires_at": offer.get("expires_at"),
+                "live_mode": offer.get("live_mode"),
+            }
+
+        def _tools_list():
+            tools = [
+                {
+                    "name": "search_offers",
+                    "title": "Search flight offers",
+                    "description": "Duffel flight offers search. Required: origin, destination, departure_date. Optional: return_date, adults, cabin_class.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["origin", "destination", "departure_date"],
+                        "properties": {
+                            "origin": {"type": "string", "description": "IATA airport or city code"},
+                            "destination": {"type": "string", "description": "IATA airport or city code"},
+                            "departure_date": {"type": "string", "description": "YYYY-MM-DD"},
+                            "return_date": {"type": "string", "description": "YYYY-MM-DD"},
+                            "adults": {"type": "integer", "minimum": 1, "default": 1},
+                            "cabin_class": {"type": "string", "enum": ["economy", "premium_economy", "business", "first"], "default": "economy"},
+                        },
+                    },
+                },
+                {
+                    "name": "get_offer",
+                    "title": "Get offer",
+                    "description": "Fetch one Duffel offer by id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["offer_id"],
+                        "properties": {"offer_id": {"type": "string"}},
+                    },
+                },
+                {
+                    "name": "search_places",
+                    "title": "Search flight places",
+                    "description": "Duffel airport/city autocomplete for flight origin and destination fields.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string"},
+                            "lat": {"type": "number"},
+                            "lng": {"type": "number"},
+                            "rad": {"type": "integer"},
+                        },
+                    },
+                },
+                {
+                    "name": "get_airlines",
+                    "title": "Get airlines",
+                    "description": "Duffel airline reference data, first page only.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 200}},
+                    },
+                },
+            ]
+            return _ok("tools/list", {"tools": tools, "tool_count": len(tools)}, f"Duffel MCP - {len(tools)} tools available", {"tool_count": len(tools)})
+
+        def _search_offers(args):
+            origin = _text(args.get("origin")).upper()
+            destination = _text(args.get("destination")).upper()
+            departure_date = _text(args.get("departure_date") or args.get("departureDate"))
+            if not origin or not destination or not departure_date:
+                return _error("search_offers", "origin, destination, and departure_date are required")
+            adults = _cap(args.get("adults"), default=1, maximum=9)
+            cabin = _text(args.get("cabin_class") or args.get("cabin") or "economy").lower()
+            if cabin == "premium-economy":
+                cabin = "premium_economy"
+            if cabin not in ("economy", "premium_economy", "business", "first"):
+                cabin = "economy"
+            slices = [{"origin": origin, "destination": destination, "departure_date": departure_date}]
+            return_date = _text(args.get("return_date") or args.get("returnDate"))
+            if return_date:
+                slices.append({"origin": destination, "destination": origin, "departure_date": return_date})
+            payload = {
+                "data": {
+                    "slices": slices,
+                    "passengers": [{"type": "adult"} for _ in range(adults)],
+                    "cabin_class": cabin,
+                }
+            }
+            ok, status_code, body = _request("POST", "/air/offer_requests", payload=payload, params={"return_offers": "true"})
+            data = body.get("data") if isinstance(body, dict) else {}
+            offers = _as_list(data.get("offers") if isinstance(data, dict) else [])
+            cap = _cap(args.get("max_offers"), default=10, maximum=10)
+            normalised = [_normalise_offer(offer) for offer in offers[:cap] if isinstance(offer, dict)]
+            if not ok:
+                return _error("search_offers", "Duffel search_offers failed", body, status_code)
+            currency = None
+            for offer in normalised:
+                currency = (offer.get("price") or {}).get("currency")
+                if currency:
+                    break
+            return _ok(
+                "search_offers",
+                {
+                    "source": "duffel",
+                    "duffel_env": duffel_env,
+                    "ok": True,
+                    "status_code": status_code,
+                    "offer_request_id": data.get("id") if isinstance(data, dict) else None,
+                    "offers": normalised,
+                    "offers_total": len(normalised),
+                    "raw_offers_total": len(offers),
+                    "meta": {"count": len(normalised), "source": "duffel", "currency": currency},
+                },
+                f"{len(normalised)} Duffel flight offer(s)",
+                {"status_code": status_code, "offers_total": len(normalised)},
+            )
+
+        def _get_offer(args):
+            offer_id = _text(args.get("offer_id") or args.get("id"))
+            if not offer_id:
+                return _error("get_offer", "offer_id is required")
+            ok, status_code, body = _request("GET", f"/air/offers/{urllib.parse.quote(offer_id, safe='')}")
+            if not ok:
+                return _error("get_offer", "Duffel get_offer failed", body, status_code)
+            return _ok("get_offer", {"source": "duffel", "status_code": status_code, "offer": body.get("data") if isinstance(body, dict) else body}, "Duffel offer fetched", {"status_code": status_code})
+
+        def _search_places(args):
+            query = _text(args.get("query"))
+            if not query and not (args.get("lat") and args.get("lng")):
+                return _error("search_places", "query or lat/lng is required")
+            params = {}
+            if query:
+                params["query"] = query
+            for key in ("lat", "lng", "rad"):
+                if args.get(key) not in (None, ""):
+                    params[key] = args.get(key)
+            ok, status_code, body = _request("GET", "/places/suggestions", params=params)
+            if not ok:
+                return _error("search_places", "Duffel search_places failed", body, status_code)
+            items = _as_list(body.get("data") if isinstance(body, dict) else [])
+            return _ok("search_places", {"source": "duffel", "status_code": status_code, "places": items, "places_total": len(items)}, f"{len(items)} Duffel place suggestion(s)", {"status_code": status_code, "places_total": len(items)})
+
+        def _get_airlines(args):
+            limit = _cap(args.get("limit"), default=200, maximum=200)
+            ok, status_code, body = _request("GET", "/air/airlines", params={"limit": limit})
+            if not ok:
+                return _error("get_airlines", "Duffel get_airlines failed", body, status_code)
+            items = _as_list(body.get("data") if isinstance(body, dict) else [])
+            meta = body.get("meta") if isinstance(body, dict) and isinstance(body.get("meta"), dict) else {}
+            return _ok("get_airlines", {"source": "duffel", "status_code": status_code, "airlines": items, "airlines_total": len(items), "meta": meta}, f"{len(items)} Duffel airline(s)", {"status_code": status_code, "airlines_total": len(items)})
+
+        globals().update({
+            "_as_dict": _as_dict,
+            "_as_list": _as_list,
+            "_cap": _cap,
+            "_text": _text,
+            "_error": _error,
+            "_ok": _ok,
+            "_request": _request,
+            "_duration": _duration,
+            "_iata": _iata,
+            "_carrier": _carrier,
+            "_normalise_segment": _normalise_segment,
+            "_normalise_offer": _normalise_offer,
+            "_tools_list": _tools_list,
+            "_search_offers": _search_offers,
+            "_get_offer": _get_offer,
+            "_search_places": _search_places,
+            "_get_airlines": _get_airlines,
+            "json": json,
+            "urllib": urllib,
+        })
+
+        method_name = _text(method, "tools/list").lower()
+        tool_name = _text(tool).lower()
+        args = _as_dict(arguments)
+        if method_name == "tools/list":
+            result = _tools_list()
+        elif method_name != "tools/call":
+            result = _error(method_name, f"Unknown MCP method: {method_name}")
+        elif tool_name == "search_offers":
+            result = _search_offers(args)
+        elif tool_name == "get_offer":
+            result = _get_offer(args)
+        elif tool_name == "search_places":
+            result = _search_places(args)
+        elif tool_name == "get_airlines":
+            result = _get_airlines(args)
+        else:
+            result = _error(tool_name or "unknown", f"Unknown tool: {tool_name}. Run tools/list to see the catalog.")
