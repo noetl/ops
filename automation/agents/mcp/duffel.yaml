@@ -4,11 +4,11 @@ metadata:
   name: duffel_mcp
   path: automation/agents/mcp/duffel
   description: |
-    Duffel MCP server playbook for search-only flight capabilities.
+    Duffel MCP server playbook for flight search and test-order capabilities.
 
-    The first cut is deliberately limited to test-environment search and
-    reference data. Booking, order creation, seat maps, payments, and live
-    tokens are out of scope for this playbook version.
+    Order creation is test-environment only and uses Duffel wallet balance
+    payments. Live orders, seat maps, card payments, and payment collection
+    are out of scope for this playbook version.
   agent: true
   exposes_as_mcp: true
   exposed_in_ui: false
@@ -57,6 +57,7 @@ workflow:
         duffel_token: "{{ keychain.duffel_token.token }}"
       code: |
         import json
+        from datetime import datetime, timezone
         import urllib.error
         import urllib.parse
         import urllib.request
@@ -78,14 +79,18 @@ workflow:
             value = default if value is None else value
             return str(value).strip()
 
-        def _error(tool_name, message, detail=None, status_code=0):
+        def _error(tool_name, message, detail=None, status_code=0, code=None):
             text = message if detail is None else f"{message}: {str(detail)[:700]}"
-            payload = {"ok": False, "error": text[:2000], "status_code": status_code}
+            payload = {"ok": False, "status": "error", "error": text[:2000], "status_code": status_code}
+            if code:
+                payload["code"] = code
             return {
-                "status": "error",
+                # Keep the NoETL step green; MCP clients read isError plus
+                # control_data.status for the upstream/tool-level error.
+                "status": "ok",
                 "content": [{"type": "text", "text": text}],
                 "isError": True,
-                "_meta": {"backend": "duffel", "tool": tool_name, "duffel_env": duffel_env, "status_code": status_code, "error": text[:2000]},
+                "_meta": {"backend": "duffel", "tool": tool_name, "duffel_env": duffel_env, "status_code": status_code, "error": text[:2000], "code": code},
                 "data": payload,
                 "control_data": payload,
                 "summary": text,
@@ -246,6 +251,62 @@ workflow:
                         "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 200}},
                     },
                 },
+                {
+                    "name": "create_order",
+                    "title": "Create test order",
+                    "description": "Create a Duffel test-environment order for one selected offer using wallet balance payment.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["offer_id", "passengers"],
+                        "properties": {
+                            "offer_id": {"type": "string"},
+                            "passengers": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["given_name", "family_name", "born_on", "email", "phone_number"],
+                                    "properties": {
+                                        "id": {"type": "string", "description": "Duffel passenger id from the selected offer; filled by index when omitted"},
+                                        "title": {"type": "string", "default": "mr"},
+                                        "given_name": {"type": "string"},
+                                        "family_name": {"type": "string"},
+                                        "born_on": {"type": "string", "description": "YYYY-MM-DD"},
+                                        "email": {"type": "string"},
+                                        "phone_number": {"type": "string"},
+                                        "gender": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "payment_amount": {"type": "string"},
+                            "payment_currency": {"type": "string"},
+                        },
+                    },
+                },
+                {
+                    "name": "get_order",
+                    "title": "Get order",
+                    "description": "Fetch one Duffel order by id. Payment details are reduced to type, amount, and currency.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["order_id"],
+                        "properties": {"order_id": {"type": "string"}},
+                    },
+                },
+                {
+                    "name": "list_orders",
+                    "title": "List orders",
+                    "description": "List Duffel orders, first page only. Payment details are reduced to type, amount, and currency.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 50},
+                            "created_at_after": {"type": "string", "description": "ISO timestamp lower bound"},
+                            "passenger_name": {"type": "string"},
+                            "booking_reference": {"type": "string"},
+                        },
+                    },
+                },
             ]
             return _ok("tools/list", {"tools": tools, "tool_count": len(tools)}, f"Duffel MCP - {len(tools)} tools available", {"tool_count": len(tools)})
 
@@ -335,6 +396,145 @@ workflow:
             meta = body.get("meta") if isinstance(body, dict) and isinstance(body.get("meta"), dict) else {}
             return _ok("get_airlines", {"source": "duffel", "status_code": status_code, "airlines": items, "airlines_total": len(items), "meta": meta}, f"{len(items)} Duffel airline(s)", {"status_code": status_code, "airlines_total": len(items)})
 
+        def _parse_ts(value):
+            text = _text(value)
+            if not text:
+                return None
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        def _safe_payment(payment):
+            if not isinstance(payment, dict):
+                return {}
+            return {
+                "type": payment.get("type"),
+                "amount": payment.get("amount"),
+                "currency": payment.get("currency"),
+            }
+
+        def _safe_order(order):
+            if not isinstance(order, dict):
+                return {}
+            return {
+                "id": order.get("id"),
+                "booking_reference": order.get("booking_reference"),
+                "type": order.get("type"),
+                "live_mode": order.get("live_mode"),
+                "created_at": order.get("created_at"),
+                "confirmed_at": order.get("confirmed_at"),
+                "cancelled_at": order.get("cancelled_at"),
+                "total_amount": order.get("total_amount"),
+                "total_currency": order.get("total_currency"),
+                "base_amount": order.get("base_amount"),
+                "base_currency": order.get("base_currency"),
+                "tax_amount": order.get("tax_amount"),
+                "tax_currency": order.get("tax_currency"),
+                "passengers": order.get("passengers") if isinstance(order.get("passengers"), list) else [],
+                "slices": order.get("slices") if isinstance(order.get("slices"), list) else [],
+                "payments": [_safe_payment(p) for p in _as_list(order.get("payments"))],
+            }
+
+        def _offer_by_id(offer_id):
+            return _request("GET", f"/air/offers/{urllib.parse.quote(offer_id, safe='')}")
+
+        def _normalise_passengers(input_passengers, offer):
+            passengers = _as_list(input_passengers)
+            if not passengers:
+                return None, "passengers must be a non-empty array"
+            offer_passengers = _as_list(offer.get("passengers") if isinstance(offer, dict) else [])
+            normalised = []
+            required = ("given_name", "family_name", "born_on", "email", "phone_number")
+            for idx, passenger in enumerate(passengers):
+                if not isinstance(passenger, dict):
+                    return None, f"passenger[{idx}] must be an object"
+                missing = [key for key in required if not _text(passenger.get(key))]
+                if missing:
+                    return None, f"passenger[{idx}] missing required field(s): {', '.join(missing)}"
+                item = {
+                    "id": _text(passenger.get("id") or ((offer_passengers[idx] or {}).get("id") if idx < len(offer_passengers) and isinstance(offer_passengers[idx], dict) else "")),
+                    "title": _text(passenger.get("title") or "mr").lower(),
+                    "given_name": _text(passenger.get("given_name")),
+                    "family_name": _text(passenger.get("family_name")),
+                    "born_on": _text(passenger.get("born_on")),
+                    "email": _text(passenger.get("email")),
+                    "phone_number": _text(passenger.get("phone_number")),
+                }
+                gender = _text(passenger.get("gender")).lower()
+                if gender:
+                    item["gender"] = gender
+                if not item["id"]:
+                    return None, f"passenger[{idx}] missing Duffel passenger id and offer had no matching passenger id"
+                normalised.append(item)
+            return normalised, None
+
+        def _create_order(args):
+            if duffel_env != "test":
+                return _error("create_order", "create_order is enabled only for duffel_env=test in this round", code="live_orders_disabled")
+            offer_id = _text(args.get("offer_id") or args.get("id"))
+            if not offer_id:
+                return _error("create_order", "offer_id is required", code="validation_error")
+            ok, status_code, offer_body = _offer_by_id(offer_id)
+            if not ok:
+                return _error("create_order", "Duffel get_offer failed before order creation", offer_body, status_code)
+            offer = offer_body.get("data") if isinstance(offer_body, dict) and isinstance(offer_body.get("data"), dict) else {}
+            expires_at = _parse_ts(offer.get("expires_at"))
+            if expires_at and expires_at <= datetime.now(timezone.utc):
+                return _error("create_order", f"Offer {offer_id} is expired", code="offer_expired")
+            passengers, passenger_error = _normalise_passengers(args.get("passengers"), offer)
+            if passenger_error:
+                return _error("create_order", passenger_error, code="validation_error")
+            amount = _text(args.get("payment_amount") or offer.get("total_amount"))
+            currency = _text(args.get("payment_currency") or offer.get("total_currency"))
+            if not amount or not currency:
+                return _error("create_order", "payment amount/currency could not be determined from offer", code="validation_error")
+            payload = {
+                "data": {
+                    "type": "instant",
+                    "selected_offers": [offer_id],
+                    "passengers": passengers,
+                    "payments": [{"type": "balance", "amount": amount, "currency": currency}],
+                }
+            }
+            ok, status_code, body = _request("POST", "/air/orders", payload=payload)
+            if not ok:
+                return _error("create_order", "Duffel create_order failed", body, status_code)
+            order = body.get("data") if isinstance(body, dict) else {}
+            safe = _safe_order(order)
+            return _ok(
+                "create_order",
+                {"source": "duffel", "status_code": status_code, "order": safe, "order_id": safe.get("id"), "booking_reference": safe.get("booking_reference")},
+                f"Duffel test order created {safe.get('booking_reference') or safe.get('id')}",
+                {"status_code": status_code, "order_id": safe.get("id"), "booking_reference": safe.get("booking_reference")},
+            )
+
+        def _get_order(args):
+            order_id = _text(args.get("order_id") or args.get("id"))
+            if not order_id:
+                return _error("get_order", "order_id is required", code="validation_error")
+            ok, status_code, body = _request("GET", f"/air/orders/{urllib.parse.quote(order_id, safe='')}")
+            if not ok:
+                return _error("get_order", "Duffel get_order failed", body, status_code)
+            order = body.get("data") if isinstance(body, dict) else {}
+            safe = _safe_order(order)
+            return _ok("get_order", {"source": "duffel", "status_code": status_code, "order": safe, "order_id": safe.get("id"), "booking_reference": safe.get("booking_reference")}, f"Duffel order {safe.get('booking_reference') or safe.get('id')} fetched", {"status_code": status_code})
+
+        def _list_orders(args):
+            params = {"limit": _cap(args.get("limit"), default=50, maximum=50)}
+            if _text(args.get("booking_reference")):
+                params["booking_reference"] = _text(args.get("booking_reference"))
+            if _text(args.get("created_at_after")):
+                params["created_at[after]"] = _text(args.get("created_at_after"))
+            if _text(args.get("passenger_name")):
+                params["passenger_name[]"] = _text(args.get("passenger_name"))
+            ok, status_code, body = _request("GET", "/air/orders", params=params)
+            if not ok:
+                return _error("list_orders", "Duffel list_orders failed", body, status_code)
+            orders = [_safe_order(order) for order in _as_list(body.get("data") if isinstance(body, dict) else []) if isinstance(order, dict)]
+            meta = body.get("meta") if isinstance(body, dict) and isinstance(body.get("meta"), dict) else {}
+            return _ok("list_orders", {"source": "duffel", "status_code": status_code, "orders": orders, "orders_total": len(orders), "meta": meta}, f"{len(orders)} Duffel order(s)", {"status_code": status_code, "orders_total": len(orders)})
+
         globals().update({
             "_as_dict": _as_dict,
             "_as_list": _as_list,
@@ -353,7 +553,17 @@ workflow:
             "_get_offer": _get_offer,
             "_search_places": _search_places,
             "_get_airlines": _get_airlines,
+            "_parse_ts": _parse_ts,
+            "_safe_payment": _safe_payment,
+            "_safe_order": _safe_order,
+            "_offer_by_id": _offer_by_id,
+            "_normalise_passengers": _normalise_passengers,
+            "_create_order": _create_order,
+            "_get_order": _get_order,
+            "_list_orders": _list_orders,
             "json": json,
+            "datetime": datetime,
+            "timezone": timezone,
             "urllib": urllib,
         })
 
@@ -372,5 +582,11 @@ workflow:
             result = _search_places(args)
         elif tool_name == "get_airlines":
             result = _get_airlines(args)
+        elif tool_name == "create_order":
+            result = _create_order(args)
+        elif tool_name == "get_order":
+            result = _get_order(args)
+        elif tool_name == "list_orders":
+            result = _list_orders(args)
         else:
             result = _error(tool_name or "unknown", f"Unknown tool: {tool_name}. Run tools/list to see the catalog.")
