@@ -25,8 +25,8 @@ metadata:
   terminal:
     visible: true
     workspace: travel
-    scopes: [/mcp/amadeus]
-  capabilities: [mcp:amadeus, mcp:vertex-ai, mcp:ollama, ai:openai, ai:anthropic, ai:vertex-ai, ai:ollama]
+    scopes: [/mcp/amadeus, /mcp/google-places]
+  capabilities: [mcp:amadeus, mcp:google-places, mcp:vertex-ai, mcp:ollama, ai:openai, ai:anthropic, ai:vertex-ai, ai:ollama]
 
 workload:
   pg_auth: pg_k8s
@@ -44,6 +44,7 @@ workload:
   openai_model: "gpt-4o-mini"
   anthropic_model: "claude-haiku-4-5-20251001"
   ollama_bridge_url: "http://ollama-bridge.noetl.svc.cluster.local:8765/jsonrpc"
+  enrich_with_google_places: false
   classifier_system_prompt: |
     You are a travel agent classifier. Given a user query, return ONLY
     a JSON object with these keys:
@@ -986,7 +987,31 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
+        - step: enrich_google_places_locations
+          when: "{{ workload.enrich_with_google_places == true and amadeus_via_mcp_locations.data.ok | default(false) }}"
+        - step: render_locations
+          when: "{{ amadeus_via_mcp_locations.data.ok | default(false) }}"
         - step: render_amadeus_failure
+          when: "{{ True }}"
+
+  - step: enrich_google_places_locations
+    desc: Best-effort Google Places enrichment for Amadeus locations
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/google-places
+      payload:
+        method: tools/call
+        tool: search_text
+        arguments:
+          intent: locations
+          query: "{{ workload.query }}"
+          max_enrichments: 10
+          items: "{{ amadeus_via_mcp_locations.data.data.items | default(amadeus_via_mcp_locations.data.items) | default([]) }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: render_locations
           when: "{{ True }}"
 
   - step: render_locations
@@ -994,7 +1019,7 @@ workflow:
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_via_mcp_locations }}"
+        envelope: "{{ enrich_google_places_locations | default(amadeus_via_mcp_locations) }}"
         classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
@@ -1012,6 +1037,7 @@ workflow:
 
         rows = []
         for it in items[:25]:
+            google = it.get("_google") if isinstance(it.get("_google"), dict) else {}
             rows.append({
                 "id": it.get("id") or it.get("iataCode") or "?",
                 "name": it.get("name") or "?",
@@ -1019,7 +1045,12 @@ workflow:
                 "subType": it.get("subType") or "?",
                 "cityName": (it.get("address") or {}).get("cityName") or "",
                 "countryName": (it.get("address") or {}).get("countryName") or "",
+                "rating": google.get("rating") or "",
+                "reviews": google.get("user_rating_count") or "",
+                "googleAddress": google.get("address") or "",
             })
+        enriched_count = sum(1 for it in items if isinstance(it, dict) and isinstance(it.get("_google"), dict))
+        first_google = next((it.get("_google") for it in items if isinstance(it, dict) and isinstance(it.get("_google"), dict) and it.get("_google", {}).get("image_url")), {})
 
         refine_form = {
             "type": "app:form",
@@ -1048,14 +1079,19 @@ workflow:
                         {"type": "app:statusbar", "args": {"text": "intent=locations", "styleKey": "success"}},
                         {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
                         {"type": "app:statusbar", "args": {"text": f"keyword={classification.get('keyword') or query}", "styleKey": "info"}},
+                        {"type": "app:statusbar", "args": {"text": f"google_enriched={enriched_count}", "styleKey": "info" if enriched_count else "default"}},
                     ]}},
+                    *([{"type": "app:picture", "args": {"imageUrl": first_google.get("image_url"), "altText": first_google.get("name") or "Google Places image", "maxWidth": 420, "maxHeight": 260}}] if first_google else []),
                     {"type": "app:recordtable", "args": {
                         "columns": [
                             {"title": "Code", "dataIndex": "iataCode", "sorter": True},
                             {"title": "Name", "dataIndex": "name", "sorter": True, "filter": True},
                             {"title": "Type", "dataIndex": "subType", "sorter": True},
+                            {"title": "Rating", "dataIndex": "rating", "sorter": True},
+                            {"title": "Reviews", "dataIndex": "reviews", "sorter": True},
                             {"title": "City", "dataIndex": "cityName", "sorter": True},
                             {"title": "Country", "dataIndex": "countryName", "sorter": True},
+                            {"title": "Google address", "dataIndex": "googleAddress"},
                         ],
                         "data": rows,
                         "pageSize": 12,
@@ -1068,6 +1104,7 @@ workflow:
         result = {
             "intent": "locations",
             "items_total": len(items),
+            "google_enriched_count": enriched_count,
             "requested_provider": classification.get("requested_provider"),
             "effective_provider": provider,
             "provider_fallback_reason": classification.get("provider_fallback_reason"),
@@ -1145,9 +1182,31 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
+        - step: enrich_google_places_hotels
+          when: "{{ workload.enrich_with_google_places == true and amadeus_via_mcp_hotels.data.ok | default(false) }}"
         - step: render_hotels
           when: "{{ amadeus_via_mcp_hotels.data.ok | default(false) }}"
         - step: render_amadeus_failure
+          when: "{{ True }}"
+
+  - step: enrich_google_places_hotels
+    desc: Best-effort Google Places enrichment for Amadeus hotels
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/google-places
+      payload:
+        method: tools/call
+        tool: search_text
+        arguments:
+          intent: hotels
+          query: "{{ workload.query }}"
+          max_enrichments: 10
+          items: "{{ amadeus_via_mcp_hotels.data.data.items | default(amadeus_via_mcp_hotels.data.items) | default([]) }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: render_hotels
           when: "{{ True }}"
 
   - step: render_hotels
@@ -1155,7 +1214,7 @@ workflow:
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_via_mcp_hotels }}"
+        envelope: "{{ enrich_google_places_hotels | default(amadeus_via_mcp_hotels) }}"
         classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
@@ -1183,13 +1242,19 @@ workflow:
 
         rows = []
         for it in items[:25]:
+            google = it.get("_google") if isinstance(it.get("_google"), dict) else {}
             rows.append({
                 "id": it.get("hotelId") or it.get("id") or it.get("name") or "?",
                 "name": it.get("name") or "?",
                 "chainCode": it.get("chainCode") or "",
                 "iataCode": it.get("iataCode") or classification.get("cityCode") or "",
                 "geoCode": _geo_text(it.get("geoCode")),
+                "rating": google.get("rating") or "",
+                "reviews": google.get("user_rating_count") or "",
+                "googleAddress": google.get("address") or "",
             })
+        enriched_count = sum(1 for it in items if isinstance(it, dict) and isinstance(it.get("_google"), dict))
+        first_google = next((it.get("_google") for it in items if isinstance(it, dict) and isinstance(it.get("_google"), dict) and it.get("_google", {}).get("image_url")), {})
 
         city_code = classification.get("cityCode") or "NYC"
         refine_form = {
@@ -1219,13 +1284,18 @@ workflow:
                         {"type": "app:statusbar", "args": {"text": "intent=hotels", "styleKey": "success"}},
                         {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
                         {"type": "app:statusbar", "args": {"text": f"cityCode={city_code}", "styleKey": "info"}},
+                        {"type": "app:statusbar", "args": {"text": f"google_enriched={enriched_count}", "styleKey": "info" if enriched_count else "default"}},
                     ]}},
+                    *([{"type": "app:picture", "args": {"imageUrl": first_google.get("image_url"), "altText": first_google.get("name") or "Google Places hotel image", "maxWidth": 420, "maxHeight": 260}}] if first_google else []),
                     {"type": "app:recordtable", "args": {
                         "columns": [
                             {"title": "Name", "dataIndex": "name", "sorter": True, "filter": True},
                             {"title": "Chain", "dataIndex": "chainCode", "sorter": True},
                             {"title": "City", "dataIndex": "iataCode", "sorter": True},
+                            {"title": "Rating", "dataIndex": "rating", "sorter": True},
+                            {"title": "Reviews", "dataIndex": "reviews", "sorter": True},
                             {"title": "Geo", "dataIndex": "geoCode"},
+                            {"title": "Google address", "dataIndex": "googleAddress"},
                         ],
                         "data": rows,
                         "pageSize": 12,
@@ -1242,6 +1312,7 @@ workflow:
         result = {
             "intent": "hotels",
             "items_total": len(items),
+            "google_enriched_count": enriched_count,
             "cityCode": city_code,
             "requested_provider": classification.get("requested_provider"),
             "effective_provider": provider,
@@ -1320,9 +1391,31 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
+        - step: enrich_google_places_activities
+          when: "{{ workload.enrich_with_google_places == true and amadeus_via_mcp_activities.data.ok | default(false) }}"
         - step: render_activities
           when: "{{ amadeus_via_mcp_activities.data.ok | default(false) }}"
         - step: render_amadeus_failure
+          when: "{{ True }}"
+
+  - step: enrich_google_places_activities
+    desc: Best-effort Google Places enrichment for Amadeus activities
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: automation/agents/mcp/google-places
+      payload:
+        method: tools/call
+        tool: search_text
+        arguments:
+          intent: activities
+          query: "{{ workload.query }}"
+          max_enrichments: 10
+          items: "{{ amadeus_via_mcp_activities.data.data.items | default(amadeus_via_mcp_activities.data.items) | default([]) }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: render_activities
           when: "{{ True }}"
 
   - step: render_activities
@@ -1330,7 +1423,7 @@ workflow:
     tool:
       kind: python
       input:
-        envelope: "{{ amadeus_via_mcp_activities }}"
+        envelope: "{{ enrich_google_places_activities | default(amadeus_via_mcp_activities) }}"
         classification: "{{ classify_intent }}"
         query: "{{ workload.query }}"
         execution_id: "{{ execution_id }}"
@@ -1367,13 +1460,19 @@ workflow:
 
         rows = []
         for it in items[:25]:
+            google = it.get("_google") if isinstance(it.get("_google"), dict) else {}
             rows.append({
                 "id": it.get("id") or it.get("name") or "?",
                 "name": it.get("name") or "?",
                 "type": it.get("type") or it.get("category") or "",
                 "geoCode": _geo_text(it.get("geoCode")),
                 "price": _price_text(it.get("price")),
+                "rating": google.get("rating") or "",
+                "reviews": google.get("user_rating_count") or "",
+                "openNow": google.get("open_now") if google.get("open_now") is not None else "",
             })
+        enriched_count = sum(1 for it in items if isinstance(it, dict) and isinstance(it.get("_google"), dict))
+        first_google = next((it.get("_google") for it in items if isinstance(it, dict) and isinstance(it.get("_google"), dict) and it.get("_google", {}).get("image_url")), {})
 
         lat = classification.get("latitude") if classification.get("latitude") is not None else 40.7128
         lng = classification.get("longitude") if classification.get("longitude") is not None else -74.0060
@@ -1405,11 +1504,16 @@ workflow:
                         {"type": "app:statusbar", "args": {"text": f"effective_provider={provider}", "styleKey": "info"}},
                         {"type": "app:statusbar", "args": {"text": f"lat={lat}", "styleKey": "info"}},
                         {"type": "app:statusbar", "args": {"text": f"lng={lng}", "styleKey": "info"}},
+                        {"type": "app:statusbar", "args": {"text": f"google_enriched={enriched_count}", "styleKey": "info" if enriched_count else "default"}},
                     ]}},
+                    *([{"type": "app:picture", "args": {"imageUrl": first_google.get("image_url"), "altText": first_google.get("name") or "Google Places activity image", "maxWidth": 420, "maxHeight": 260}}] if first_google else []),
                     {"type": "app:recordtable", "args": {
                         "columns": [
                             {"title": "Name", "dataIndex": "name", "sorter": True, "filter": True},
                             {"title": "Type", "dataIndex": "type", "sorter": True},
+                            {"title": "Rating", "dataIndex": "rating", "sorter": True},
+                            {"title": "Reviews", "dataIndex": "reviews", "sorter": True},
+                            {"title": "Open now", "dataIndex": "openNow"},
                             {"title": "Geo", "dataIndex": "geoCode"},
                             {"title": "Price", "dataIndex": "price", "sorter": True},
                         ],
@@ -1428,6 +1532,7 @@ workflow:
         result = {
             "intent": "activities",
             "items_total": len(items),
+            "google_enriched_count": enriched_count,
             "latitude": lat,
             "longitude": lng,
             "requested_provider": classification.get("requested_provider"),
