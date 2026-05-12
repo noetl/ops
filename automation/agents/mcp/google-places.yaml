@@ -39,6 +39,13 @@ workflow:
     desc: Dispatch Google Places MCP tools with Pattern C hybrid auth
     tool:
       kind: python
+      input:
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+        google_project: "{{ workload.google_project }}"
+        widget_key_secret: "{{ workload.widget_key_secret }}"
+        max_enrichments: "{{ workload.max_enrichments }}"
       code: |
         import base64
         import json
