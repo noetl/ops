@@ -1,0 +1,78 @@
+{{- if .Values.ollama.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: ollama
+    noetl.io/component: ai-backend
+spec:
+  replicas: {{ .Values.ollama.replicas | default 1 }}
+  strategy:
+{{- toYaml (.Values.ollama.strategy | default dict) | nindent 4 }}
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+        noetl.io/component: ai-backend
+    spec:
+      containers:
+        - name: ollama
+          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
+          imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ollama.service.port | default 11434 }}
+              protocol: TCP
+          env:
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:{{ .Values.ollama.service.port | default 11434 }}"
+{{- with .Values.ollama.extraEnv }}
+{{- toYaml . | nindent 12 }}
+{{- end }}
+          resources:
+{{- toYaml .Values.ollama.resources | nindent 12 }}
+          volumeMounts:
+            - name: ollama-data
+              mountPath: /root/.ollama
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: {{ .Values.ollama.service.port | default 11434 }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: {{ .Values.ollama.service.port | default 11434 }}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: ollama-data
+{{- if .Values.ollama.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.ollama.persistence.name }}
+{{- else }}
+          emptyDir: {}
+{{- end }}
+{{- with .Values.ollama.nodeSelector }}
+      nodeSelector:
+{{- toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.ollama.tolerations }}
+      tolerations:
+{{- toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.ollama.affinity }}
+      affinity:
+{{- toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}
