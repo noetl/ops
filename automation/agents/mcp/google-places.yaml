@@ -384,6 +384,15 @@ workflow:
             return _ok("place_photo_url", {"url": url, "calls_made": 0}, "place photo URL built")
 
         globals().update({
+            "base64": base64,
+            "json": json,
+            "time": time,
+            "urllib": urllib,
+            "SCOPE": SCOPE,
+            "PLACES_SEARCH_TEXT": PLACES_SEARCH_TEXT,
+            "PLACES_SEARCH_NEARBY": PLACES_SEARCH_NEARBY,
+            "DETAILS_FIELDS": DETAILS_FIELDS,
+            "SEARCH_FIELDS": SEARCH_FIELDS,
             "_as_dict": _as_dict,
             "_as_list": _as_list,
             "_cap": _cap,
