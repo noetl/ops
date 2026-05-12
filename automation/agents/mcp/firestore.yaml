@@ -1,0 +1,603 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: firestore_mcp
+  path: automation/agents/mcp/firestore
+  description: |
+    Generic Firestore MCP playbook for document storage and event-sourced
+    append/replay workflows.
+
+    Authentication uses the worker service account through Workload Identity
+    / Application Default Credentials. The playbook intentionally hand-rolls
+    Firestore REST JSON encoding so the worker image does not need a
+    google-cloud-firestore dependency.
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  version: "1.0"
+  tags: [mcp, firestore, event-sourcing, ai-os]
+  terminal:
+    visible: true
+    workspace: firestore
+    scopes: [/mcp/firestore]
+
+workload:
+  gcp_auth: google_oauth
+  gcp_project: noetl-demo-19700101
+  firestore_database: "(default)"
+  firestore_api_base: https://firestore.googleapis.com/v1
+  method: "tools/list"
+  tool: ""
+  arguments: {}
+
+workflow:
+  - step: firestore_dispatch
+    desc: Dispatch generic Firestore MCP tools
+    tool:
+      kind: python
+      input:
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+        gcp_project: "{{ workload.gcp_project }}"
+        firestore_database: "{{ workload.firestore_database | default('(default)') }}"
+        firestore_api_base: "{{ workload.firestore_api_base | default('https://firestore.googleapis.com/v1') }}"
+      code: |
+        import json
+        import re
+        import uuid
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        DATASTORE_SCOPE = "https://www.googleapis.com/auth/datastore"
+        REDACT_KEYS = {
+            "authorization",
+            "proxy-authorization",
+            "x-goog-user-project",
+            "x-goog-api-key",
+            "x-figma-token",
+            "x-api-key",
+            "api-key",
+            "apikey",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "client_secret",
+            "password",
+            "secret",
+            "token",
+            "set-cookie",
+            "cookie",
+        }
+        REDACT_RE = re.compile(r"(token|secret|password|api[-_]?key|client[-_]?secret)", re.IGNORECASE)
+
+        def _as_dict(value):
+            return value if isinstance(value, dict) else {}
+
+        def _as_list(value):
+            return value if isinstance(value, list) else []
+
+        def _clean_path(path):
+            return str(path or "").strip().strip("/")
+
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _cap(value, default=50, maximum=500):
+            parsed = _safe_int(value, default)
+            return max(1, min(parsed, maximum))
+
+        def _error(tool_name, message, detail=None, status_code=0):
+            text = message if detail is None else f"{message}: {str(detail)[:700]}"
+            payload = {
+                "ok": False,
+                "status": "error",
+                "error": text[:2000],
+                "status_code": status_code,
+            }
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+                "_meta": {"backend": "firestore", "tool": tool_name, "status_code": status_code, "error": text[:2000]},
+                "data": payload,
+                "control_data": payload,
+                "summary": text,
+                "text": text,
+            }
+
+        def _ok(tool_name, data, text=None, meta=None):
+            meta = meta if isinstance(meta, dict) else {}
+            payload = data if isinstance(data, dict) else {"value": data}
+            payload.setdefault("ok", True)
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text or f"Firestore {tool_name} ok"}],
+                "isError": False,
+                "_meta": {"backend": "firestore", "tool": tool_name, **meta},
+                "data": payload,
+                "control_data": payload,
+                "summary": text or f"Firestore {tool_name} ok",
+                "text": text or f"Firestore {tool_name} ok",
+            }
+
+        def _token():
+            try:
+                import google.auth
+                import google.auth.transport.requests
+            except Exception as exc:
+                raise RuntimeError(f"google-auth unavailable in worker image: {type(exc).__name__}: {exc}")
+            credentials, _ = google.auth.default(scopes=[DATASTORE_SCOPE])
+            credentials.refresh(google.auth.transport.requests.Request())
+            if not getattr(credentials, "token", None):
+                raise RuntimeError("ADC returned no access token")
+            return credentials.token
+
+        def _database_root():
+            base = str(firestore_api_base or "https://firestore.googleapis.com/v1").rstrip("/")
+            db = str(firestore_database or "(default)")
+            return f"{base}/projects/{gcp_project}/databases/{urllib.parse.quote(db, safe='()')}"
+
+        def _document_root():
+            return _database_root() + "/documents"
+
+        def _relative_from_name(name):
+            marker = "/documents/"
+            if marker in str(name):
+                return str(name).split(marker, 1)[1]
+            return str(name)
+
+        def _full_doc_name(path):
+            return f"projects/{gcp_project}/databases/{firestore_database}/documents/{_clean_path(path)}"
+
+        def _doc_url(path):
+            return _document_root() + "/" + urllib.parse.quote(_clean_path(path), safe="/")
+
+        def _request(http_method, url, payload=None, params=None):
+            if params:
+                encoded = urllib.parse.urlencode(params, doseq=True)
+                url = f"{url}?{encoded}"
+            body = None
+            headers = {"Authorization": f"Bearer {_token()}", "Accept": "application/json"}
+            if payload is not None:
+                headers["Content-Type"] = "application/json"
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers=headers, method=http_method)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return True, resp.status, json.loads(raw or "{}")
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(raw or "{}")
+                except Exception:
+                    parsed = {"raw": raw[:2000]}
+                return False, exc.code, parsed
+            except urllib.error.URLError as exc:
+                return False, 0, {"error": str(getattr(exc, "reason", exc))}
+            except Exception as exc:
+                return False, 0, {"error": f"{type(exc).__name__}: {exc}"}
+
+        def _encode_value(value):
+            if value is None:
+                return {"nullValue": None}
+            if isinstance(value, bool):
+                return {"booleanValue": value}
+            if isinstance(value, int) and not isinstance(value, bool):
+                return {"integerValue": str(value)}
+            if isinstance(value, float):
+                return {"doubleValue": value}
+            if isinstance(value, list):
+                encoded = [_encode_value(item) for item in value]
+                return {"arrayValue": {"values": encoded} if encoded else {}}
+            if isinstance(value, dict):
+                return {"mapValue": {"fields": {str(key): _encode_value(item) for key, item in value.items()}}}
+            return {"stringValue": str(value)}
+
+        def _decode_value(value):
+            value = _as_dict(value)
+            if "nullValue" in value:
+                return None
+            if "booleanValue" in value:
+                return bool(value.get("booleanValue"))
+            if "integerValue" in value:
+                return _safe_int(value.get("integerValue"), 0)
+            if "doubleValue" in value:
+                try:
+                    return float(value.get("doubleValue"))
+                except (TypeError, ValueError):
+                    return 0.0
+            if "timestampValue" in value:
+                return value.get("timestampValue")
+            if "stringValue" in value:
+                return value.get("stringValue")
+            if "bytesValue" in value:
+                return value.get("bytesValue")
+            if "referenceValue" in value:
+                return value.get("referenceValue")
+            if "geoPointValue" in value:
+                return value.get("geoPointValue")
+            if "arrayValue" in value:
+                return [_decode_value(item) for item in _as_list(_as_dict(value.get("arrayValue")).get("values"))]
+            if "mapValue" in value:
+                fields = _as_dict(_as_dict(value.get("mapValue")).get("fields"))
+                return {key: _decode_value(item) for key, item in fields.items()}
+            return value
+
+        def _encode_fields(data):
+            return {str(key): _encode_value(item) for key, item in _as_dict(data).items()}
+
+        def _plain_doc(document):
+            document = _as_dict(document)
+            fields = _as_dict(document.get("fields"))
+            return {
+                "name": document.get("name"),
+                "path": _relative_from_name(document.get("name")),
+                "createTime": document.get("createTime"),
+                "updateTime": document.get("updateTime"),
+                "data": {key: _decode_value(item) for key, item in fields.items()},
+            }
+
+        def _collection_parent(collection_path):
+            path = _clean_path(collection_path)
+            parts = [part for part in path.split("/") if part]
+            if not parts or len(parts) % 2 == 0:
+                raise ValueError("collection_path must point to a collection and have an odd number of path segments")
+            collection_id = parts[-1]
+            parent_doc = "/".join(parts[:-1])
+            parent_url = _document_root()
+            if parent_doc:
+                parent_url += "/" + urllib.parse.quote(parent_doc, safe="/")
+            return parent_url, collection_id
+
+        def _field_filter(item):
+            ops = {
+                "=": "EQUAL",
+                "==": "EQUAL",
+                "<": "LESS_THAN",
+                "<=": "LESS_THAN_OR_EQUAL",
+                ">": "GREATER_THAN",
+                ">=": "GREATER_THAN_OR_EQUAL",
+                "in": "IN",
+                "array-contains": "ARRAY_CONTAINS",
+            }
+            field = str(item.get("field") or "").strip()
+            op = str(item.get("op") or "=").strip().lower()
+            if not field:
+                raise ValueError("where filter requires field")
+            if op not in ops:
+                raise ValueError(f"unsupported where op: {op}")
+            return {
+                "fieldFilter": {
+                    "field": {"fieldPath": field},
+                    "op": ops[op],
+                    "value": _encode_value(item.get("value")),
+                }
+            }
+
+        def _structured_query(collection_path, where=None, order_by=None, limit=50):
+            _, collection_id = _collection_parent(collection_path)
+            query = {"from": [{"collectionId": collection_id}], "limit": _cap(limit, 50, 500)}
+            filters = [_field_filter(item) for item in _as_list(where) if isinstance(item, dict)]
+            if len(filters) == 1:
+                query["where"] = filters[0]
+            elif len(filters) > 1:
+                query["where"] = {"compositeFilter": {"op": "AND", "filters": filters}}
+            order_by = _as_dict(order_by)
+            if order_by.get("field"):
+                direction = str(order_by.get("direction") or "ASCENDING").upper()
+                if direction in ("ASC", "ASCENDING"):
+                    direction = "ASCENDING"
+                elif direction in ("DESC", "DESCENDING"):
+                    direction = "DESCENDING"
+                else:
+                    raise ValueError("order_by.direction must be ASCENDING or DESCENDING")
+                query["orderBy"] = [{"field": {"fieldPath": str(order_by["field"])}, "direction": direction}]
+            return query
+
+        def _run_query(collection_path, where=None, order_by=None, limit=50, transaction=None):
+            parent_url, _ = _collection_parent(collection_path)
+            body = {"structuredQuery": _structured_query(collection_path, where, order_by, limit)}
+            if transaction:
+                body["transaction"] = transaction
+            ok, status_code, payload = _request("POST", parent_url + ":runQuery", body)
+            if not ok:
+                raise RuntimeError(f"Firestore runQuery failed ({status_code}): {json.dumps(payload)[:700]}")
+            documents = []
+            for row in _as_list(payload):
+                if isinstance(row, dict) and isinstance(row.get("document"), dict):
+                    documents.append(_plain_doc(row["document"]))
+            return documents
+
+        def _set_doc(args):
+            path = _clean_path(args.get("path"))
+            if not path:
+                return _error("set_doc", "path is required")
+            data = _as_dict(args.get("data"))
+            merge = bool(args.get("merge", False))
+            params = {}
+            if merge and data:
+                params["updateMask.fieldPaths"] = list(data.keys())
+            ok, status_code, payload = _request("PATCH", _doc_url(path), {"fields": _encode_fields(data)}, params)
+            if not ok:
+                return _error("set_doc", "Firestore set_doc failed", json.dumps(payload)[:700], status_code)
+            doc = _plain_doc(payload)
+            return _ok("set_doc", {"path": doc["path"], "document": doc}, f"set_doc {doc['path']}")
+
+        def _get_doc(args):
+            path = _clean_path(args.get("path"))
+            if not path:
+                return _error("get_doc", "path is required")
+            ok, status_code, payload = _request("GET", _doc_url(path))
+            if status_code == 404:
+                return _ok("get_doc", {"found": False, "path": path, "document": None}, f"get_doc {path} not found")
+            if not ok:
+                return _error("get_doc", "Firestore get_doc failed", json.dumps(payload)[:700], status_code)
+            doc = _plain_doc(payload)
+            return _ok("get_doc", {"found": True, "path": doc["path"], "document": doc}, f"get_doc {doc['path']}")
+
+        def _query_collection(args):
+            collection_path = _clean_path(args.get("collection_path"))
+            if not collection_path:
+                return _error("query_collection", "collection_path is required")
+            try:
+                docs = _run_query(collection_path, args.get("where"), args.get("order_by"), args.get("limit", 50))
+            except Exception as exc:
+                return _error("query_collection", "Firestore query_collection failed", exc)
+            return _ok("query_collection", {"collection_path": collection_path, "count": len(docs), "documents": docs}, f"query_collection {collection_path}: {len(docs)}")
+
+        def _delete_doc(args):
+            path = _clean_path(args.get("path"))
+            if not path:
+                return _error("delete_doc", "path is required")
+            ok, status_code, payload = _request("DELETE", _doc_url(path))
+            if ok or status_code == 404:
+                return _ok("delete_doc", {"path": path, "deleted": status_code != 404, "not_found": status_code == 404}, f"delete_doc {path}")
+            return _error("delete_doc", "Firestore delete_doc failed", json.dumps(payload)[:700], status_code)
+
+        def _redact(value):
+            if isinstance(value, list):
+                return [_redact(item) for item in value]
+            if isinstance(value, dict):
+                redacted = {}
+                for key, item in value.items():
+                    key_text = str(key)
+                    key_lower = key_text.lower()
+                    if key_lower in REDACT_KEYS or (isinstance(item, str) and REDACT_RE.search(key_text)):
+                        redacted[key_text] = "<REDACTED>"
+                    else:
+                        redacted[key_text] = _redact(item)
+                return redacted
+            return value
+
+        def _begin_transaction():
+            ok, status_code, payload = _request("POST", _document_root() + ":beginTransaction", {"options": {"readWrite": {}}})
+            if not ok or not payload.get("transaction"):
+                raise RuntimeError(f"beginTransaction failed ({status_code}): {json.dumps(payload)[:700]}")
+            return payload["transaction"]
+
+        def _commit_event(transaction, doc_path, event_data):
+            fields = _encode_fields(event_data)
+            write = {
+                "update": {"name": _full_doc_name(doc_path), "fields": fields},
+                "updateTransforms": [{"fieldPath": "server_time", "setToServerValue": "REQUEST_TIME"}],
+            }
+            ok, status_code, payload = _request("POST", _document_root() + ":commit", {"transaction": transaction, "writes": [write]})
+            if not ok:
+                raise RuntimeError(f"commit failed ({status_code}): {json.dumps(payload)[:700]}")
+            return payload
+
+        def _append_event(args):
+            thread_path = _clean_path(args.get("thread_path"))
+            event = _as_dict(args.get("event"))
+            if not thread_path:
+                return _error("append_event", "thread_path is required")
+            if not event:
+                return _error("append_event", "event is required and must be an object")
+            try:
+                transaction = _begin_transaction()
+                collection_path = f"{thread_path}/events"
+                existing = _run_query(collection_path, order_by={"field": "seq", "direction": "DESCENDING"}, limit=1, transaction=transaction)
+                max_seq = 0
+                if existing:
+                    max_seq = _safe_int(_as_dict(existing[0].get("data")).get("seq"), 0)
+                seq = max_seq + 1
+                event_type = str(event.get("type") or "event")
+                payload = _redact(_as_dict(event.get("payload")))
+                parent_seq = event.get("parent_seq")
+                event_data = {
+                    "seq": seq,
+                    "type": event_type,
+                    "payload": payload,
+                    "thread_path": thread_path,
+                }
+                if parent_seq is not None:
+                    event_data["parent_seq"] = _safe_int(parent_seq, 0)
+                doc_path = f"{thread_path}/events/{uuid.uuid4().hex}"
+                _commit_event(transaction, doc_path, event_data)
+                return _ok("append_event", {"thread_path": thread_path, "path": doc_path, "seq": seq, "event": event_data}, f"append_event {thread_path} seq={seq}")
+            except Exception as exc:
+                return _error("append_event", "Firestore append_event failed", exc)
+
+        def _replay_events(args):
+            thread_path = _clean_path(args.get("thread_path"))
+            if not thread_path:
+                return _error("replay_events", "thread_path is required")
+            seq_from = _safe_int(args.get("seq_from"), 0)
+            seq_to_raw = args.get("seq_to")
+            seq_to = None if seq_to_raw in (None, "", "inf") else _safe_int(seq_to_raw, 0)
+            type_filter = [str(item) for item in _as_list(args.get("type_filter")) if str(item)]
+            where = [{"field": "seq", "op": ">=", "value": seq_from}]
+            if seq_to is not None:
+                where.append({"field": "seq", "op": "<=", "value": seq_to})
+            try:
+                docs = _run_query(f"{thread_path}/events", where=where, order_by={"field": "seq", "direction": "ASCENDING"}, limit=args.get("limit", 500))
+            except Exception as exc:
+                return _error("replay_events", "Firestore replay_events failed", exc)
+            events = []
+            for doc in docs:
+                data = _as_dict(doc.get("data"))
+                if type_filter and data.get("type") not in type_filter:
+                    continue
+                events.append({"path": doc.get("path"), **data})
+            return _ok("replay_events", {"thread_path": thread_path, "count": len(events), "events": events}, f"replay_events {thread_path}: {len(events)}")
+
+        def _tools_list():
+            tools = [
+                {
+                    "name": "set_doc",
+                    "title": "Set Firestore document",
+                    "description": "Create or update a Firestore document. Optional merge updates only top-level fields.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["path", "data"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "data": {"type": "object"},
+                            "merge": {"type": "boolean", "default": False},
+                        },
+                    },
+                },
+                {
+                    "name": "get_doc",
+                    "title": "Get Firestore document",
+                    "description": "Fetch a Firestore document. Missing documents return found=false without failing the MCP call.",
+                    "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
+                },
+                {
+                    "name": "query_collection",
+                    "title": "Query Firestore collection",
+                    "description": "Run a simple collection query with optional filters, order, and limit.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["collection_path"],
+                        "properties": {
+                            "collection_path": {"type": "string"},
+                            "where": {"type": "array"},
+                            "order_by": {"type": "object"},
+                            "limit": {"type": "integer", "default": 50, "maximum": 500},
+                        },
+                    },
+                },
+                {
+                    "name": "delete_doc",
+                    "title": "Delete Firestore document",
+                    "description": "Delete a Firestore document. Subcollections are intentionally not recursively deleted.",
+                    "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
+                },
+                {
+                    "name": "append_event",
+                    "title": "Append event",
+                    "description": "Transactionally append an event to {thread_path}/events with a monotonically increasing seq. Sensitive headers are always redacted.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["thread_path", "event"],
+                        "properties": {
+                            "thread_path": {"type": "string"},
+                            "event": {"type": "object"},
+                        },
+                    },
+                },
+                {
+                    "name": "replay_events",
+                    "title": "Replay events",
+                    "description": "Replay events from a thread in seq order, with optional seq range and type filter.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["thread_path"],
+                        "properties": {
+                            "thread_path": {"type": "string"},
+                            "seq_from": {"type": "integer", "default": 0},
+                            "seq_to": {"type": "integer"},
+                            "type_filter": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                },
+            ]
+            return _ok("tools/list", {"tools": tools, "count": len(tools)}, f"{len(tools)} Firestore MCP tools")
+
+        def _tools_call():
+            args = _as_dict(arguments)
+            tool_args = _as_dict(args.get("arguments")) if "arguments" in args else args
+            dispatch = {
+                "set_doc": _set_doc,
+                "get_doc": _get_doc,
+                "query_collection": _query_collection,
+                "delete_doc": _delete_doc,
+                "append_event": _append_event,
+                "replay_events": _replay_events,
+            }
+            if tool not in dispatch:
+                return _error("tools/call", f"unknown Firestore tool: {tool}")
+            return dispatch[tool](tool_args)
+
+        globals().update({
+            "json": json,
+            "re": re,
+            "uuid": uuid,
+            "urllib": urllib,
+            "DATASTORE_SCOPE": DATASTORE_SCOPE,
+            "REDACT_KEYS": REDACT_KEYS,
+            "REDACT_RE": REDACT_RE,
+            "_as_dict": _as_dict,
+            "_as_list": _as_list,
+            "_clean_path": _clean_path,
+            "_safe_int": _safe_int,
+            "_cap": _cap,
+            "_error": _error,
+            "_ok": _ok,
+            "_token": _token,
+            "_database_root": _database_root,
+            "_document_root": _document_root,
+            "_relative_from_name": _relative_from_name,
+            "_full_doc_name": _full_doc_name,
+            "_doc_url": _doc_url,
+            "_request": _request,
+            "_encode_value": _encode_value,
+            "_decode_value": _decode_value,
+            "_encode_fields": _encode_fields,
+            "_plain_doc": _plain_doc,
+            "_collection_parent": _collection_parent,
+            "_field_filter": _field_filter,
+            "_structured_query": _structured_query,
+            "_run_query": _run_query,
+            "_set_doc": _set_doc,
+            "_get_doc": _get_doc,
+            "_query_collection": _query_collection,
+            "_delete_doc": _delete_doc,
+            "_redact": _redact,
+            "_begin_transaction": _begin_transaction,
+            "_commit_event": _commit_event,
+            "_append_event": _append_event,
+            "_replay_events": _replay_events,
+            "_tools_list": _tools_list,
+            "_tools_call": _tools_call,
+        })
+
+        method = str(method or "tools/list")
+        tool = str(tool or "")
+        arguments = _as_dict(arguments)
+        gcp_project = str(gcp_project or "noetl-demo-19700101")
+        firestore_database = str(firestore_database or "(default)")
+        firestore_api_base = str(firestore_api_base or "https://firestore.googleapis.com/v1")
+
+        globals().update({
+            "method": method,
+            "tool": tool,
+            "arguments": arguments,
+            "gcp_project": gcp_project,
+            "firestore_database": firestore_database,
+            "firestore_api_base": firestore_api_base,
+        })
+
+        if method == "tools/list":
+            result = _tools_list()
+        elif method == "tools/call":
+            result = _tools_call()
+        else:
+            result = _error(method, f"unsupported Firestore MCP method: {method}")
