@@ -344,10 +344,10 @@ ollama:
   resources:
     requests:
       cpu: "500m"
-      memory: "4Gi"
+      memory: "8Gi"
     limits:
       cpu: "2"
-      memory: "6Gi"
+      memory: "10Gi"
   nodeSelector: {}
   tolerations: []
   affinity: {}
