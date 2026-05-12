@@ -1,0 +1,449 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: google_places_mcp
+  path: automation/agents/mcp/google-places
+  description: |
+    Google Places + Maps enrichment MCP playbook for the travel agent.
+
+    Pattern C hybrid auth:
+    - backend Places API calls use the worker service account via
+      Workload Identity / Application Default Credentials and send
+      Authorization: Bearer plus X-Goog-User-Project.
+    - widget image URLs use the restricted google-maps-widget-key API
+      key from Secret Manager because browsers cannot fetch Maps Static
+      or Place Photos with a service-account token.
+
+    Setup reference:
+    playbooks/google-maps-platform-setup-pattern-c.md in ai-meta.
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  version: "1.0"
+  tags: [mcp, google-places, maps, travel, enrichment]
+  terminal:
+    visible: true
+    workspace: google-places
+    scopes: [/mcp/google-places]
+
+workload:
+  method: "tools/list"
+  tool: ""
+  arguments: {}
+  google_project: "noetl-demo-19700101"
+  widget_key_secret: "google-maps-widget-key"
+  max_enrichments: 10
+
+workflow:
+  - step: google_places_dispatch
+    desc: Dispatch Google Places MCP tools with Pattern C hybrid auth
+    tool:
+      kind: python
+      code: |
+        import base64
+        import json
+        import time
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+        PLACES_SEARCH_TEXT = "https://places.googleapis.com/v1/places:searchText"
+        PLACES_SEARCH_NEARBY = "https://places.googleapis.com/v1/places:searchNearby"
+        DETAILS_FIELDS = ",".join([
+            "id",
+            "displayName",
+            "formattedAddress",
+            "location",
+            "rating",
+            "userRatingCount",
+            "types",
+            "photos",
+            "regularOpeningHours",
+            "editorialSummary",
+        ])
+        SEARCH_FIELDS = ",".join([
+            "places.id",
+            "places.displayName",
+            "places.formattedAddress",
+            "places.location",
+            "places.rating",
+            "places.userRatingCount",
+            "places.types",
+            "places.photos",
+            "places.regularOpeningHours",
+            "places.editorialSummary",
+        ])
+
+        def _as_dict(value):
+            return value if isinstance(value, dict) else {}
+
+        def _as_list(value):
+            return value if isinstance(value, list) else []
+
+        def _cap(value, default=10):
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(1, min(parsed, 10))
+
+        def _error(tool_name, message, detail=None, status_code=0):
+            text = message if detail is None else f"{message}: {str(detail)[:500]}"
+            return {
+                "status": "error",
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+                "_meta": {"backend": "google-places", "tool": tool_name, "status_code": status_code, "error": text[:2000]},
+                "data": {"ok": False, "error": text[:2000], "items": []},
+                "summary": text,
+                "text": text,
+            }
+
+        def _ok(tool_name, data, text=None, meta=None):
+            meta = meta if isinstance(meta, dict) else {}
+            payload = data if isinstance(data, dict) else {"value": data}
+            payload.setdefault("ok", True)
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text or f"google-places {tool_name} ok"}],
+                "isError": False,
+                "_meta": {"backend": "google-places", "tool": tool_name, **meta},
+                "data": payload,
+                "summary": text or f"google-places {tool_name} ok",
+                "text": text or f"google-places {tool_name} ok",
+            }
+
+        def _token():
+            try:
+                import google.auth
+                import google.auth.transport.requests
+            except Exception as exc:
+                raise RuntimeError(f"google-auth unavailable in worker image: {type(exc).__name__}: {exc}")
+            credentials, _ = google.auth.default(scopes=[SCOPE])
+            credentials.refresh(google.auth.transport.requests.Request())
+            if not getattr(credentials, "token", None):
+                raise RuntimeError("ADC returned no access token")
+            return credentials.token
+
+        def _post_google(url, payload, field_mask, project):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {_token()}",
+                    "X-Goog-User-Project": project,
+                    "X-Goog-FieldMask": field_mask,
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(body)
+                except Exception:
+                    parsed = {"raw": body[:2000]}
+                return exc.code, parsed
+
+        def _get_google(url, field_mask, project):
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": f"Bearer {_token()}",
+                    "X-Goog-User-Project": project,
+                    "X-Goog-FieldMask": field_mask,
+                },
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(body)
+                except Exception:
+                    parsed = {"raw": body[:2000]}
+                return exc.code, parsed
+
+        def _secret_value(project, secret_name):
+            token = _token()
+            name = f"projects/{project}/secrets/{secret_name}/versions/latest:access"
+            req = urllib.request.Request(
+                f"https://secretmanager.googleapis.com/v1/{name}",
+                headers={"Authorization": f"Bearer {token}"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            encoded = ((payload.get("payload") or {}).get("data") or "").strip()
+            if not encoded:
+                return ""
+            return base64.b64decode(encoded).decode("utf-8").strip()
+
+        def _display_name(place):
+            display = place.get("displayName") if isinstance(place, dict) else {}
+            if isinstance(display, dict):
+                return display.get("text") or ""
+            return str(display or "")
+
+        def _photo_name(place):
+            photos = place.get("photos") if isinstance(place, dict) else []
+            if isinstance(photos, list) and photos and isinstance(photos[0], dict):
+                return photos[0].get("name") or ""
+            return ""
+
+        def _static_map_url(lat, lng, key, label=""):
+            if lat is None or lng is None or not key:
+                return None
+            center = urllib.parse.quote(f"{lat},{lng}", safe="")
+            marker_label = urllib.parse.quote(str(label or "")[:12], safe="")
+            return (
+                "https://maps.googleapis.com/maps/api/staticmap"
+                f"?center={center}&zoom=13&size=400x260&scale=2"
+                f"&markers=color:red%7Clabel:{marker_label}%7C{center}&key={urllib.parse.quote(key, safe='')}"
+            )
+
+        def _place_photo_url(photo_resource, key, max_width=400):
+            if not photo_resource or not key:
+                return None
+            resource = str(photo_resource).strip().lstrip("/")
+            return f"https://places.googleapis.com/v1/{resource}/media?maxWidthPx={int(max_width)}&key={urllib.parse.quote(key, safe='')}"
+
+        def _lat_lng_from_item(item):
+            geo = item.get("geoCode") if isinstance(item, dict) else {}
+            if not isinstance(geo, dict):
+                geo = item.get("location") if isinstance(item, dict) and isinstance(item.get("location"), dict) else {}
+            lat = geo.get("latitude") if isinstance(geo, dict) else None
+            lng = geo.get("longitude") if isinstance(geo, dict) else None
+            if lat is None:
+                lat = geo.get("lat") if isinstance(geo, dict) else None
+            if lng is None:
+                lng = geo.get("lng") if isinstance(geo, dict) else None
+            return lat, lng
+
+        def _query_for_item(item, intent, fallback_query):
+            if not isinstance(item, dict):
+                return str(fallback_query or "")
+            parts = []
+            name = item.get("name") or item.get("iataCode") or item.get("hotelId") or item.get("id")
+            if name:
+                parts.append(str(name))
+            address = item.get("address") if isinstance(item.get("address"), dict) else {}
+            for key in ("cityName", "countryName"):
+                if address.get(key):
+                    parts.append(str(address[key]))
+            if item.get("iataCode") and intent in ("locations", "hotels"):
+                parts.append(str(item["iataCode"]))
+            if not parts:
+                parts.append(str(fallback_query or "travel"))
+            if intent == "hotels":
+                parts.append("hotel")
+            elif intent == "activities":
+                parts.append("attraction")
+            return " ".join(parts)
+
+        def _google_summary(place, widget_key):
+            loc = place.get("location") if isinstance(place.get("location"), dict) else {}
+            lat = loc.get("latitude")
+            lng = loc.get("longitude")
+            photo_resource = _photo_name(place)
+            image_url = _place_photo_url(photo_resource, widget_key) or _static_map_url(lat, lng, widget_key, _display_name(place))
+            opening = place.get("regularOpeningHours") if isinstance(place.get("regularOpeningHours"), dict) else {}
+            editorial = place.get("editorialSummary") if isinstance(place.get("editorialSummary"), dict) else {}
+            return {
+                "place_id": place.get("id"),
+                "name": _display_name(place),
+                "address": place.get("formattedAddress"),
+                "rating": place.get("rating"),
+                "user_rating_count": place.get("userRatingCount"),
+                "types": place.get("types") if isinstance(place.get("types"), list) else [],
+                "open_now": opening.get("openNow"),
+                "summary": editorial.get("text"),
+                "photo_resource": photo_resource,
+                "image_url": image_url,
+                "maps_static_url": _static_map_url(lat, lng, widget_key, _display_name(place)),
+            }
+
+        def _enrich_items(args, project, widget_key, limit):
+            intent = str(args.get("intent") or "").strip().lower()
+            fallback_query = args.get("query") or ""
+            source_items = _as_list(args.get("items"))[:limit]
+            enriched = []
+            calls = 0
+            errors = []
+            for item in source_items:
+                if not isinstance(item, dict):
+                    continue
+                query = _query_for_item(item, intent, fallback_query)
+                payload = {"textQuery": query, "maxResultCount": 1}
+                lat, lng = _lat_lng_from_item(item)
+                if lat is not None and lng is not None:
+                    try:
+                        payload["locationBias"] = {
+                            "circle": {
+                                "center": {"latitude": float(lat), "longitude": float(lng)},
+                                "radius": 5000.0,
+                            }
+                        }
+                    except Exception:
+                        pass
+                status, body = _post_google(PLACES_SEARCH_TEXT, payload, SEARCH_FIELDS, project)
+                calls += 1
+                merged = dict(item)
+                if status == 200 and isinstance(body.get("places"), list) and body["places"]:
+                    merged["_google"] = _google_summary(body["places"][0], widget_key)
+                else:
+                    errors.append({"query": query, "status_code": status, "body": body})
+                enriched.append(merged)
+            return {
+                "ok": True,
+                "items": enriched,
+                "enriched_count": sum(1 for item in enriched if isinstance(item.get("_google"), dict)),
+                "calls_made": calls,
+                "errors": errors[:5],
+            }
+
+        def _search_text(args, project, widget_key, limit):
+            if isinstance(args.get("items"), list):
+                return _ok("search_text", _enrich_items(args, project, widget_key, limit), "google-places enriched items")
+            query = str(args.get("query") or args.get("textQuery") or "").strip()
+            if not query:
+                return _error("search_text", "query is required")
+            payload = {"textQuery": query, "maxResultCount": min(int(args.get("maxResultCount") or limit), limit)}
+            lat = args.get("lat")
+            lng = args.get("lng")
+            radius = float(args.get("radius") or 5000)
+            if lat is not None and lng is not None:
+                payload["locationBias"] = {"circle": {"center": {"latitude": float(lat), "longitude": float(lng)}, "radius": radius}}
+            status, body = _post_google(PLACES_SEARCH_TEXT, payload, SEARCH_FIELDS, project)
+            if status != 200:
+                return _error("search_text", f"Places searchText failed HTTP {status}", body, status)
+            places = body.get("places") if isinstance(body.get("places"), list) else []
+            items = [{**place, "_google": _google_summary(place, widget_key)} for place in places[:limit]]
+            return _ok("search_text", {"items": items, "calls_made": 1, "enriched_count": len(items)}, f"{len(items)} Google place(s)")
+
+        def _nearby_search(args, project, widget_key, limit):
+            try:
+                lat = float(args.get("lat") if args.get("lat") is not None else args.get("latitude"))
+                lng = float(args.get("lng") if args.get("lng") is not None else args.get("longitude"))
+            except Exception:
+                return _error("nearby_search", "lat/lng are required")
+            included_type = args.get("type")
+            payload = {
+                "maxResultCount": min(int(args.get("maxResultCount") or limit), limit),
+                "locationRestriction": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(args.get("radius") or 5000)}},
+            }
+            if included_type:
+                payload["includedTypes"] = [str(included_type)]
+            status, body = _post_google(PLACES_SEARCH_NEARBY, payload, SEARCH_FIELDS, project)
+            if status != 200:
+                return _error("nearby_search", f"Places nearbySearch failed HTTP {status}", body, status)
+            places = body.get("places") if isinstance(body.get("places"), list) else []
+            items = [{**place, "_google": _google_summary(place, widget_key)} for place in places[:limit]]
+            return _ok("nearby_search", {"items": items, "calls_made": 1, "enriched_count": len(items)}, f"{len(items)} nearby Google place(s)")
+
+        def _place_details(args, project, widget_key, limit):
+            raw_ids = args.get("place_ids") or args.get("placeIds") or args.get("place_id") or args.get("placeId")
+            ids = raw_ids if isinstance(raw_ids, list) else [raw_ids]
+            ids = [str(value).strip() for value in ids if str(value or "").strip()][:limit]
+            if not ids:
+                return _error("place_details", "place_id or place_ids is required")
+            details = []
+            errors = []
+            for place_id in ids:
+                url = "https://places.googleapis.com/v1/places/" + urllib.parse.quote(place_id, safe="")
+                status, body = _get_google(url, DETAILS_FIELDS, project)
+                if status == 200:
+                    details.append({**body, "_google": _google_summary(body, widget_key)})
+                else:
+                    errors.append({"place_id": place_id, "status_code": status, "body": body})
+            return _ok("place_details", {"items": details, "errors": errors[:5], "calls_made": len(ids), "enriched_count": len(details)}, f"{len(details)} place detail(s)")
+
+        def _static_map(args, project, widget_key):
+            lat = args.get("lat") if args.get("lat") is not None else args.get("latitude")
+            lng = args.get("lng") if args.get("lng") is not None else args.get("longitude")
+            url = _static_map_url(lat, lng, widget_key, args.get("label") or "")
+            return _ok("static_map_url", {"url": url, "calls_made": 0}, "static map URL built")
+
+        def _place_photo(args, project, widget_key):
+            resource = args.get("photo_resource") or args.get("photoResource") or args.get("name")
+            width = args.get("maxWidthPx") or args.get("max_width") or 400
+            url = _place_photo_url(resource, widget_key, int(width))
+            return _ok("place_photo_url", {"url": url, "calls_made": 0}, "place photo URL built")
+
+        globals().update({
+            "_as_dict": _as_dict,
+            "_as_list": _as_list,
+            "_cap": _cap,
+            "_error": _error,
+            "_ok": _ok,
+            "_token": _token,
+            "_post_google": _post_google,
+            "_get_google": _get_google,
+            "_secret_value": _secret_value,
+            "_display_name": _display_name,
+            "_photo_name": _photo_name,
+            "_static_map_url": _static_map_url,
+            "_place_photo_url": _place_photo_url,
+            "_lat_lng_from_item": _lat_lng_from_item,
+            "_query_for_item": _query_for_item,
+            "_google_summary": _google_summary,
+            "_enrich_items": _enrich_items,
+            "_search_text": _search_text,
+            "_nearby_search": _nearby_search,
+            "_place_details": _place_details,
+            "_static_map": _static_map,
+            "_place_photo": _place_photo,
+        })
+
+        tools = [
+            {"name": "search_text", "title": "Search Google Places by text", "description": "Text search, or batch-enrich up to 10 supplied travel items.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "items": {"type": "array"}, "intent": {"type": "string"}}}},
+            {"name": "place_details", "title": "Google Place Details", "description": "Fetch details for one place_id or up to 10 place_ids.", "inputSchema": {"type": "object", "properties": {"place_id": {"type": "string"}, "place_ids": {"type": "array"}}}},
+            {"name": "nearby_search", "title": "Search nearby Google Places", "description": "Nearby search by latitude/longitude.", "inputSchema": {"type": "object", "required": ["lat", "lng"], "properties": {"lat": {"type": "number"}, "lng": {"type": "number"}, "radius": {"type": "number"}, "type": {"type": "string"}}}},
+            {"name": "static_map_url", "title": "Build Maps Static URL", "description": "Builds a browser-fetchable Maps Static URL using the restricted widget key.", "inputSchema": {"type": "object", "required": ["lat", "lng"], "properties": {"lat": {"type": "number"}, "lng": {"type": "number"}, "label": {"type": "string"}}}},
+            {"name": "place_photo_url", "title": "Build Place Photo URL", "description": "Builds a browser-fetchable Place Photo media URL using the restricted widget key.", "inputSchema": {"type": "object", "required": ["photo_resource"], "properties": {"photo_resource": {"type": "string"}, "maxWidthPx": {"type": "integer"}}}},
+        ]
+
+        selected_method = str(method or "tools/list").strip().lower()
+        selected_tool = str(tool or "").strip()
+        args = _as_dict(arguments)
+        project = str(args.get("google_project") or google_project or "noetl-demo-19700101").strip()
+        secret_name = str(args.get("widget_key_secret") or widget_key_secret or "google-maps-widget-key").strip()
+        limit = _cap(args.get("max_enrichments") or max_enrichments)
+
+        if selected_method == "tools/list":
+            result = _ok("tools/list", {"tools": tools}, "Google Places MCP — 5 tools available", {"tool_count": len(tools)})
+        elif selected_method != "tools/call":
+            result = _error("unknown_method", f"Unsupported method {selected_method!r}")
+        elif selected_tool not in {tool_def["name"] for tool_def in tools}:
+            result = _error("unknown_tool", f"Unsupported tool {selected_tool!r}")
+        else:
+            widget_key = ""
+            try:
+                widget_key = _secret_value(project, secret_name)
+            except Exception as exc:
+                # Backend enrichment still works without photos. URL builders
+                # return null rather than failing the caller.
+                if selected_tool in ("static_map_url", "place_photo_url"):
+                    result = _ok(selected_tool, {"url": None, "calls_made": 0, "widget_key_error": f"{type(exc).__name__}: {exc}"}, f"{selected_tool} unavailable: widget key unreadable")
+                else:
+                    widget_key = ""
+            if "result" not in locals():
+                try:
+                    if selected_tool == "search_text":
+                        result = _search_text(args, project, widget_key, limit)
+                    elif selected_tool == "nearby_search":
+                        result = _nearby_search(args, project, widget_key, limit)
+                    elif selected_tool == "place_details":
+                        result = _place_details(args, project, widget_key, limit)
+                    elif selected_tool == "static_map_url":
+                        result = _static_map(args, project, widget_key)
+                    elif selected_tool == "place_photo_url":
+                        result = _place_photo(args, project, widget_key)
+                except Exception as exc:
+                    result = _error(selected_tool, "Google Places tool failed", f"{type(exc).__name__}: {exc}")
