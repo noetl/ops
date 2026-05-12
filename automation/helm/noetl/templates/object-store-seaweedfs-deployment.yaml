@@ -8,7 +8,7 @@ metadata:
     app: seaweedfs
     object-store.noetl.io/backend: seaweedfs
 spec:
-  replicas: 1
+  replicas: {{ .Values.objectStore.replicas }}
   selector:
     matchLabels:
       app: seaweedfs

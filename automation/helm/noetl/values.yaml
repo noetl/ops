@@ -96,6 +96,7 @@ persistence:
 objectStore:
   enabled: true
   kind: seaweedfs # seaweedfs | rustfs
+  replicas: 1
   namespace: object-store
   serviceName: object-store
   port: 9000
