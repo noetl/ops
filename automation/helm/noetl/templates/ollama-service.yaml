@@ -1,0 +1,19 @@
+{{- if .Values.ollama.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: ollama
+    noetl.io/component: ai-backend
+spec:
+  type: {{ .Values.ollama.service.type | default "ClusterIP" }}
+  ports:
+    - name: http
+      port: {{ .Values.ollama.service.port | default 11434 }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    app: ollama
+{{- end }}

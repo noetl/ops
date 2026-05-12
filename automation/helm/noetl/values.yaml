@@ -321,6 +321,38 @@ ollamaBridge:
   # logging targets, etc.) without forking the chart.
   extraEnv: []
 
+ollama:
+  enabled: false
+  replicas: 1
+  strategy:
+    type: Recreate
+  image:
+    repository: ollama/ollama
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 11434
+  models:
+    default: gemma3:4b
+  persistence:
+    enabled: true
+    name: ollama-data
+    accessMode: ReadWriteOnce
+    size: 20Gi
+    storageClassName: standard
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "4Gi"
+    limits:
+      cpu: "2"
+      memory: "6Gi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
 secrets:
   postgresPassword: "demo"
   noetlPassword: "noetl"
