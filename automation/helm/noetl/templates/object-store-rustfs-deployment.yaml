@@ -8,7 +8,7 @@ metadata:
     app: rustfs
     object-store.noetl.io/backend: rustfs
 spec:
-  replicas: 1
+  replicas: {{ .Values.objectStore.replicas }}
   selector:
     matchLabels:
       app: rustfs
