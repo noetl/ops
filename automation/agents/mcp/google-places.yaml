@@ -77,7 +77,6 @@ workflow:
             "places.rating",
             "places.userRatingCount",
             "places.types",
-            "places.photos",
             "places.regularOpeningHours",
             "places.editorialSummary",
         ])
@@ -261,7 +260,7 @@ workflow:
             lat = loc.get("latitude")
             lng = loc.get("longitude")
             photo_resource = _photo_name(place)
-            image_url = _place_photo_url(photo_resource, widget_key) or _static_map_url(lat, lng, widget_key, _display_name(place))
+            image_url = _static_map_url(lat, lng, widget_key, _display_name(place)) or _place_photo_url(photo_resource, widget_key)
             opening = place.get("regularOpeningHours") if isinstance(place.get("regularOpeningHours"), dict) else {}
             editorial = place.get("editorialSummary") if isinstance(place.get("editorialSummary"), dict) else {}
             return {
