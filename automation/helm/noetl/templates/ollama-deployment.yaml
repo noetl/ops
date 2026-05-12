@@ -8,7 +8,7 @@ metadata:
     app: ollama
     noetl.io/component: ai-backend
 spec:
-  replicas: {{ .Values.ollama.replicas | default 1 }}
+  replicas: {{ .Values.ollama.replicas }}
   strategy:
 {{- toYaml (.Values.ollama.strategy | default dict) | nindent 4 }}
   selector:
