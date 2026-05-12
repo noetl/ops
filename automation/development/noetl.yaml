@@ -226,11 +226,6 @@ workflow:
 
             kubectl apply -f "$NOETL_REPO/ci/manifests/noetl/namespace/"
 
-            if ! kubectl get secret gcs-credentials -n noetl >/dev/null 2>&1; then
-              kubectl create secret generic gcs-credentials -n noetl \
-                --from-literal=gcs-key.json='{}'
-            fi
-
             kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/namespace/namespace.yaml"
             kubectl create configmap postgres-schema-ddl --namespace postgres \
               --from-file=schema_ddl.sql.norun="$SCHEMA_DDL" \
