@@ -103,6 +103,7 @@ workflow:
                 "isError": True,
                 "_meta": {"backend": "google-places", "tool": tool_name, "status_code": status_code, "error": text[:2000]},
                 "data": {"ok": False, "error": text[:2000], "items": []},
+                "control_data": {"ok": False, "error": text[:2000], "items": []},
                 "summary": text,
                 "text": text,
             }
@@ -117,6 +118,7 @@ workflow:
                 "isError": False,
                 "_meta": {"backend": "google-places", "tool": tool_name, **meta},
                 "data": payload,
+                "control_data": payload,
                 "summary": text or f"google-places {tool_name} ok",
                 "text": text or f"google-places {tool_name} ok",
             }
