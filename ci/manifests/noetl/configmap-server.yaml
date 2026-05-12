@@ -68,7 +68,7 @@ data:
   # Default storage tier: kv, object, s3, gcs
   NOETL_DEFAULT_STORAGE_TIER: "kv"
   # Durable cloud spill tier for disk-backed large results.
-  NOETL_STORAGE_CLOUD_TIER: "s3"
+  NOETL_STORAGE_CLOUD_TIER: "gcs"
   # S3-compatible object-store configuration (SeaweedFS by default, RustFS opt-in)
   NOETL_S3_ENDPOINT: "http://object-store.object-store.svc.cluster.local:9000"
   AWS_ACCESS_KEY_ID: "noetl-access"

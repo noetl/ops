@@ -173,8 +173,12 @@ config:
     NOETL_COMMAND_CLAIM_RETRY_AFTER_SECONDS: "2"
     NOETL_TEMPSTORE_MAX_REF_CACHE_ENTRIES: "50000"
     NOETL_TEMPSTORE_MAX_MEMORY_CACHE_ENTRIES: "20000"
+    # GKE production cloud spillover tier. Keep the S3-compatible object-store
+    # env below available for direct callers and rollback.
+    NOETL_STORAGE_CLOUD_TIER: "gcs"
+    NOETL_GCS_BUCKET: "noetl-demo-output"
+    NOETL_GCS_PREFIX: "results/"
     # S3-compatible object-store configuration (SeaweedFS by default, RustFS opt-in).
-    NOETL_STORAGE_CLOUD_TIER: "s3"
     NOETL_S3_ENDPOINT: "http://object-store.object-store.svc.cluster.local:9000"
     NOETL_S3_BUCKET: "noetl"
     NOETL_S3_REGION: "us-east-1"
@@ -221,8 +225,12 @@ config:
     NOETL_POSTGRES_POOL_MAX_SIZE: "8"
     NOETL_POSTGRES_POOL_MAX_WAITING: "100"
     NOETL_POSTGRES_POOL_TIMEOUT_SECONDS: "30"
-    # Cloud durable tier for DISK async spill. 's3' covers any S3-compatible endpoint.
-    NOETL_STORAGE_CLOUD_TIER: "s3"
+    # Cloud durable tier for DISK async spill. GKE uses GCS; the
+    # S3-compatible object-store env below stays available for direct callers
+    # and rollback.
+    NOETL_STORAGE_CLOUD_TIER: "gcs"
+    NOETL_GCS_BUCKET: "noetl-demo-output"
+    NOETL_GCS_PREFIX: "results/"
     NOETL_S3_ENDPOINT: "http://object-store.object-store.svc.cluster.local:9000"
     NOETL_S3_BUCKET: "noetl"
     NOETL_S3_REGION: "us-east-1"
