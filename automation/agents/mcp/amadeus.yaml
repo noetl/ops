@@ -34,6 +34,8 @@ workload:
   amadeus_env: test
   amadeus_key_path: projects/1014428265962/secrets/api-key-test-api-amadeus-com/versions/1
   amadeus_secret_path: projects/1014428265962/secrets/api-secret-test-api-amadeus-com/versions/1
+  amadeus_production_key_path: projects/1014428265962/secrets/amadeus-production-client-id/versions/1
+  amadeus_production_secret_path: projects/1014428265962/secrets/amadeus-production-client-secret/versions/1
   # MCP request fields. Populated by the JSON-RPC dispatcher.
   method: "tools/list"            # tools/list | tools/call
   tool: ""                        # search_flights | search_hotels | search_locations | search_activities | get_token
@@ -44,25 +46,23 @@ keychain:
   # repos/e2e/fixtures/playbooks/api_integration/amadeus_ai_api/amadeus_ai_api.yaml.
   # Keychain Jinja templates resolve workload fields via BARE
   # references; `workload.X` yields empty strings at bind time and
-  # downstream HTTP steps see empty Bearer tokens. The OAuth2
-  # endpoint URL must be a plain string — Jinja conditionals don't
-  # render in keychain context. See AMBER round
-  # bridge/outbox/20260509-051749-...result.json for the failure
-  # modes that motivated this rewrite.
+  # downstream HTTP steps see empty Bearer tokens. Keep the endpoint
+  # conditional simple and validate both modes before relying on a new
+  # environment switch.
   - name: amadeus_credentials
     kind: secret_manager
     provider: gcp
     scope: global
     auth: "{{ gcp_auth }}"
     map:
-      client_id: "{{ amadeus_key_path }}"
-      client_secret: "{{ amadeus_secret_path }}"
+      client_id: "{{ amadeus_production_key_path if amadeus_env == 'production' else amadeus_key_path }}"
+      client_secret: "{{ amadeus_production_secret_path if amadeus_env == 'production' else amadeus_secret_path }}"
 
   - name: amadeus_token
     kind: oauth2
     scope: global
     auto_renew: true
-    endpoint: https://test.api.amadeus.com/v1/security/oauth2/token
+    endpoint: "{{ 'https://api.amadeus.com' if amadeus_env == 'production' else 'https://test.api.amadeus.com' }}/v1/security/oauth2/token"
     method: POST
     headers:
       Content-Type: application/x-www-form-urlencoded
@@ -212,6 +212,8 @@ workflow:
     tool:
       kind: python
       input:
+        amadeus_env: "{{ workload.amadeus_env | default('test') }}"
+        amadeus_base_url: "{{ 'https://api.amadeus.com' if workload.amadeus_env == 'production' else 'https://test.api.amadeus.com' }}"
         access_token: "{{ keychain.amadeus_token.access_token }}"
         origin: "{{ workload.arguments.origin | default('') }}"
         destination: "{{ workload.arguments.destination | default('') }}"
@@ -221,7 +223,8 @@ workflow:
         import urllib.request
         import urllib.error
 
-        url = "https://test.api.amadeus.com/v2/shopping/flight-offers"
+        base_url = str(amadeus_base_url or "https://test.api.amadeus.com").rstrip("/")
+        url = f"{base_url}/v2/shopping/flight-offers"
         payload = {
             "currencyCode": "USD",
             "originDestinations": [{
@@ -269,8 +272,8 @@ workflow:
             "status": "ok",
             "content": [{"type": "text", "text": json.dumps({"offers_total": len(offers), "offers": offers[:10], "status_code": status_code, "error": None if ok else body}, separators=(",", ":"))}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "search_flights", "offers_total": len(offers), "status_code": status_code},
-            "data": {"offers": offers, "offers_total": len(offers), "status_code": status_code, "ok": ok, "error": None if ok else body},
+            "_meta": {"backend": "amadeus", "tool": "search_flights", "amadeus_env": amadeus_env, "offers_total": len(offers), "status_code": status_code},
+            "data": {"amadeus_env": amadeus_env, "offers": offers, "offers_total": len(offers), "status_code": status_code, "ok": ok, "error": None if ok else body},
         }
     next:
       spec: { mode: exclusive }
@@ -285,6 +288,8 @@ workflow:
     tool:
       kind: python
       input:
+        amadeus_env: "{{ workload.amadeus_env | default('test') }}"
+        amadeus_base_url: "{{ 'https://api.amadeus.com' if workload.amadeus_env == 'production' else 'https://test.api.amadeus.com' }}"
         access_token: "{{ keychain.amadeus_token.access_token }}"
         keyword: "{{ workload.arguments.keyword | default('') }}"
         sub_type: "{{ workload.arguments.subType | default('AIRPORT,CITY') }}"
@@ -295,7 +300,8 @@ workflow:
         import urllib.error
 
         params = {"keyword": keyword, "subType": sub_type}
-        url = "https://test.api.amadeus.com/v1/reference-data/locations?" + urllib.parse.urlencode(params)
+        base_url = str(amadeus_base_url or "https://test.api.amadeus.com").rstrip("/")
+        url = f"{base_url}/v1/reference-data/locations?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(
             url,
             headers={"Authorization": f"Bearer {access_token}"},
@@ -330,8 +336,8 @@ workflow:
             "status": "ok",
             "content": [{"type": "text", "text": json.dumps({"items_total": len(items), "items": items[:25], "status_code": status_code, "error": None if ok else body}, separators=(",", ":"))}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "search_locations", "items_total": len(items), "status_code": status_code},
-            "data": {"items": items, "items_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
+            "_meta": {"backend": "amadeus", "tool": "search_locations", "amadeus_env": amadeus_env, "items_total": len(items), "status_code": status_code},
+            "data": {"amadeus_env": amadeus_env, "items": items, "items_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
         }
     next:
       spec: { mode: exclusive }
@@ -346,6 +352,8 @@ workflow:
     tool:
       kind: python
       input:
+        amadeus_env: "{{ workload.amadeus_env | default('test') }}"
+        amadeus_base_url: "{{ 'https://api.amadeus.com' if workload.amadeus_env == 'production' else 'https://test.api.amadeus.com' }}"
         access_token: "{{ keychain.amadeus_token.access_token }}"
         city_code: "{{ workload.arguments.cityCode | default('') }}"
       code: |
@@ -354,7 +362,8 @@ workflow:
         import urllib.request
         import urllib.error
 
-        url = "https://test.api.amadeus.com/v1/reference-data/locations/hotels/by-city?" + urllib.parse.urlencode({"cityCode": city_code})
+        base_url = str(amadeus_base_url or "https://test.api.amadeus.com").rstrip("/")
+        url = f"{base_url}/v1/reference-data/locations/hotels/by-city?" + urllib.parse.urlencode({"cityCode": city_code})
         req = urllib.request.Request(
             url,
             headers={"Authorization": f"Bearer {access_token}"},
@@ -389,8 +398,8 @@ workflow:
             "status": "ok",
             "content": [{"type": "text", "text": json.dumps({"hotels_total": len(items), "hotels": items[:25], "status_code": status_code, "error": None if ok else body}, separators=(",", ":"))}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "search_hotels", "hotels_total": len(items), "status_code": status_code},
-            "data": {"hotels": items, "hotels_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
+            "_meta": {"backend": "amadeus", "tool": "search_hotels", "amadeus_env": amadeus_env, "hotels_total": len(items), "status_code": status_code},
+            "data": {"amadeus_env": amadeus_env, "hotels": items, "hotels_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
         }
     next:
       spec: { mode: exclusive }
@@ -405,6 +414,8 @@ workflow:
     tool:
       kind: python
       input:
+        amadeus_env: "{{ workload.amadeus_env | default('test') }}"
+        amadeus_base_url: "{{ 'https://api.amadeus.com' if workload.amadeus_env == 'production' else 'https://test.api.amadeus.com' }}"
         access_token: "{{ keychain.amadeus_token.access_token }}"
         latitude: "{{ workload.arguments.latitude | default('') }}"
         longitude: "{{ workload.arguments.longitude | default('') }}"
@@ -415,7 +426,8 @@ workflow:
         import urllib.request
         import urllib.error
 
-        url = "https://test.api.amadeus.com/v1/shopping/activities?" + urllib.parse.urlencode({
+        base_url = str(amadeus_base_url or "https://test.api.amadeus.com").rstrip("/")
+        url = f"{base_url}/v1/shopping/activities?" + urllib.parse.urlencode({
             "latitude": latitude,
             "longitude": longitude,
             "radius": radius,
@@ -454,8 +466,8 @@ workflow:
             "status": "ok",
             "content": [{"type": "text", "text": json.dumps({"activities_total": len(items), "activities": items[:25], "status_code": status_code, "error": None if ok else body}, separators=(",", ":"))}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "search_activities", "activities_total": len(items), "status_code": status_code},
-            "data": {"activities": items, "activities_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
+            "_meta": {"backend": "amadeus", "tool": "search_activities", "amadeus_env": amadeus_env, "activities_total": len(items), "status_code": status_code},
+            "data": {"amadeus_env": amadeus_env, "activities": items, "activities_total": len(items), "status_code": status_code, "ok": ok, "error": None if ok else body},
         }
     next:
       spec: { mode: exclusive }
@@ -470,6 +482,7 @@ workflow:
     tool:
       kind: python
       input:
+        amadeus_env: "{{ workload.amadeus_env | default('test') }}"
         token_present: "{{ keychain.amadeus_token.access_token is defined and keychain.amadeus_token.access_token != '' }}"
       code: |
         ok = bool(token_present)
@@ -477,8 +490,8 @@ workflow:
             "status": "ok" if ok else "error",
             "content": [{"type": "text", "text": "Amadeus OAuth bind " + ("OK" if ok else "FAILED")}],
             "isError": not ok,
-            "_meta": {"backend": "amadeus", "tool": "get_token", "token_bound": ok},
-            "data": {"token_bound": ok},
+            "_meta": {"backend": "amadeus", "tool": "get_token", "amadeus_env": amadeus_env, "token_bound": ok},
+            "data": {"amadeus_env": amadeus_env, "token_bound": ok},
         }
     next:
       spec: { mode: exclusive }
