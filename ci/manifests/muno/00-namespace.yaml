@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: muno
-  labels:
-    app.kubernetes.io/name: muno
-    app.kubernetes.io/part-of: noetl
