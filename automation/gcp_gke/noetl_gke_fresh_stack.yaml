@@ -184,7 +184,7 @@ workload:
   # Bare domains are expanded to both https:// and http://.
   gateway_cors_allowed_origins: ""
   # Additional bare domains for CORS expansion.
-  gateway_cors_allowed_domains: ""
+  gateway_cors_allowed_domains: "travel.mestumre.dev"
   # Auto-include https://{gui_public_host} and https://{gateway_public_host}.
   gateway_cors_include_public_hosts: true
   # Keep local UI development enabled.
@@ -1813,6 +1813,8 @@ workflow:
 
           if os.environ.get("CORS_INCLUDE_LOCALHOST", "true").lower() == "true":
               add_origin("http://localhost:3001")
+              add_origin("http://localhost:5173")
+              add_origin("http://127.0.0.1:5173")
 
           if os.environ.get("CORS_INCLUDE_PUBLIC_HOSTS", "true").lower() == "true":
               gui_host = os.environ.get("GUI_PUBLIC_HOST", "").strip()
