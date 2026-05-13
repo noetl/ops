@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: muno
+  namespace: muno
+  labels:
+    app.kubernetes.io/name: muno
+    app.kubernetes.io/part-of: noetl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: muno
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: muno
+        app.kubernetes.io/part-of: noetl
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: muno
+          image: ghcr.io/noetl/muno:20260513-auth0-amd64-050223
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
