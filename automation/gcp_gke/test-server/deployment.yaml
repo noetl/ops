@@ -6,7 +6,7 @@ metadata:
   labels:
     app: paginated-api
 spec:
-  replicas: 8
+  replicas: 1
   selector:
     matchLabels:
       app: paginated-api
@@ -34,6 +34,34 @@ spec:
             port: 5555
           initialDelaySeconds: 3
           periodSeconds: 5
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            ephemeral-storage: 1Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: paginated-api
+  namespace: test-server
+  labels:
+    app: paginated-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: paginated-api
+  minReplicas: 1
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
 ---
 apiVersion: v1
 kind: Service
