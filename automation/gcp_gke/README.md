@@ -110,8 +110,16 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set pgbouncer_reserve_pool_size=1 \
   --set pgbouncer_max_db_connections=6 \
   --set pgbouncer_server_idle_timeout=300 \
-  --set gateway_cors_allowed_domains='mestumre.dev,gateway.mestumre.dev'
+  --set gateway_cors_allowed_domains='mestumre.dev,gateway.mestumre.dev,travel.mestumre.dev'
 ```
+
+`gateway_cors_allowed_domains` is a single string. Each `--set` invocation
+**replaces** the playbook default, so the comma-separated list above must
+include every browser-facing host that calls the gateway (here:
+`mestumre.dev` for the GUI on Cloudflare Pages, `gateway.mestumre.dev` for
+the gateway tunnel itself, and `travel.mestumre.dev` for the travel app).
+See the [Multi-domain CORS pitfall](#pitfall-set-on-the-allowed-domains-list-replaces-it-does-not-merge)
+section below.
 
 With `deploy_gui=false`, the playbook skips GUI static IP reservation,
 skips the in-cluster GUI Helm deployment, and removes any existing
