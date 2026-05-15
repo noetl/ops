@@ -110,8 +110,16 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set pgbouncer_reserve_pool_size=1 \
   --set pgbouncer_max_db_connections=6 \
   --set pgbouncer_server_idle_timeout=300 \
-  --set gateway_cors_allowed_domains='mestumre.dev,gateway.mestumre.dev'
+  --set gateway_cors_allowed_domains='mestumre.dev,gateway.mestumre.dev,travel.mestumre.dev'
 ```
+
+`gateway_cors_allowed_domains` is a single string. Each `--set` invocation
+**replaces** the playbook default, so the comma-separated list above must
+include every browser-facing host that calls the gateway (here:
+`mestumre.dev` for the GUI on Cloudflare Pages, `gateway.mestumre.dev` for
+the gateway tunnel itself, and `travel.mestumre.dev` for the travel app).
+See the [Multi-domain CORS pitfall](#pitfall-set-on-the-allowed-domains-list-replaces-it-does-not-merge)
+section below.
 
 With `deploy_gui=false`, the playbook skips GUI static IP reservation,
 skips the in-cluster GUI Helm deployment, and removes any existing
@@ -186,7 +194,7 @@ Gateway CORS is now assembled from multiple inputs so it is easier to manage mul
 - `gateway_cors_allowed_origins` accepts comma/space/newline-separated origins or bare domains
 - `gateway_cors_allowed_domains` accepts additional bare domains
 
-Every browser app that calls the gateway directly must be included here. Otherwise an identity provider can redirect back to the app, but the browser will block the app from exchanging the identity token with `/api/auth/login`.
+Every browser app that calls the gateway directly must be included here. Otherwise an identity provider can redirect back to the app, but the browser will block the app from exchanging the identity token with `/api/auth/login`. The browser surfaces this as `NetworkError when attempting to fetch resource` (Firefox) or `Failed to fetch` (Chrome) — the Gateway returns HTTP 200 on the preflight but omits the `access-control-allow-origin` header, so the browser blocks the response.
 
 Example:
 
@@ -199,6 +207,42 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set gateway_cors_allowed_domains='app.example.com,staging.example.com' \
   --set gateway_cors_allowed_origins='https://preview.example.com'
 ```
+
+### Pitfall: `--set` on the allowed-domains list **replaces**, it does not merge
+
+`gateway_cors_allowed_domains` is a single string. Passing
+`--set gateway_cors_allowed_domains='new.example.com'` **overwrites** the
+playbook default, dropping every domain that was there before (including the
+production frontends already in the default like `travel.mestumre.dev`).
+
+Whenever you add a new browser-callable domain to a deployed cluster:
+
+1. Read the current default in
+   [`automation/gcp_gke/noetl_gke_fresh_stack.yaml`](noetl_gke_fresh_stack.yaml)
+   (`gateway_cors_allowed_domains:` workload variable) and copy every domain
+   you want to keep.
+2. Append the new domain to that list.
+3. Pass the **full** list to `--set gateway_cors_allowed_domains=...`.
+4. After the helm upgrade, verify the running deployment with:
+
+   ```bash
+   kubectl get deploy -n gateway gateway \
+     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CORS_ALLOWED_ORIGINS")].value}'
+   ```
+
+   and confirm every browser-facing host appears as both `https://...` and
+   (if applicable) `http://...`.
+
+If a deployment has already shipped a regressed list, the in-cluster hotfix is:
+
+```bash
+kubectl set env -n gateway deployment/gateway \
+  CORS_ALLOWED_ORIGINS="<full,comma,separated,list>"
+kubectl rollout status -n gateway deployment/gateway
+```
+
+The hotfix lasts only until the next `helm upgrade`. Always follow it with a
+playbook re-deploy that bakes the corrected list into the helm release.
 
 ## PostgreSQL Stability (Autopilot)
 
