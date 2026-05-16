@@ -434,6 +434,15 @@ workflow:
                 "passengers": order.get("passengers") if isinstance(order.get("passengers"), list) else [],
                 "slices": order.get("slices") if isinstance(order.get("slices"), list) else [],
                 "payments": [_safe_payment(p) for p in _as_list(order.get("payments"))],
+                "documents": [
+                    {
+                        "unique_identifier": doc.get("unique_identifier"),
+                        "type": doc.get("type"),
+                        "document_url": doc.get("document_url"),
+                    }
+                    for doc in _as_list(order.get("documents"))
+                    if isinstance(doc, dict)
+                ],
             }
 
         def _offer_by_id(offer_id):
@@ -501,6 +510,18 @@ workflow:
             if not ok:
                 return _error("create_order", "Duffel create_order failed", body, status_code)
             order = body.get("data") if isinstance(body, dict) else {}
+            # Duffel issues itinerary receipt documents asynchronously after
+            # order creation; the create response usually has documents=[].
+            # Re-fetch the order so callers (e.g. travel UI) get document_url
+            # values they can link to without a second round-trip.
+            order_id_for_refresh = order.get("id") if isinstance(order, dict) else None
+            if order_id_for_refresh and not _as_list(order.get("documents")):
+                ok2, _status2, refresh = _request(
+                    "GET",
+                    f"/air/orders/{urllib.parse.quote(str(order_id_for_refresh), safe='')}",
+                )
+                if ok2 and isinstance(refresh, dict) and isinstance(refresh.get("data"), dict):
+                    order = refresh["data"]
             safe = _safe_order(order)
             return _ok(
                 "create_order",
