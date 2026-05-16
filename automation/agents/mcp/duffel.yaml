@@ -434,6 +434,11 @@ workflow:
                 "passengers": order.get("passengers") if isinstance(order.get("passengers"), list) else [],
                 "slices": order.get("slices") if isinstance(order.get("slices"), list) else [],
                 "payments": [_safe_payment(p) for p in _as_list(order.get("payments"))],
+                # Only surface documents Duffel actually hosts. Test-environment
+                # orders return electronic_ticket entries with document_url=null;
+                # filter those out so downstream widget schemas that require a
+                # string url never see a null and clients can simply hide the
+                # download CTA when the list is empty.
                 "documents": [
                     {
                         "unique_identifier": doc.get("unique_identifier"),
@@ -441,7 +446,7 @@ workflow:
                         "document_url": doc.get("document_url"),
                     }
                     for doc in _as_list(order.get("documents"))
-                    if isinstance(doc, dict)
+                    if isinstance(doc, dict) and isinstance(doc.get("document_url"), str) and doc.get("document_url")
                 ],
             }
 
