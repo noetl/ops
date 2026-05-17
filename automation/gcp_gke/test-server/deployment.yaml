@@ -24,7 +24,7 @@ spec:
           name: http
         env:
         - name: PFT_RATE_LIMIT
-          value: "100"
+          value: "500"
         livenessProbe:
           httpGet:
             path: /health
