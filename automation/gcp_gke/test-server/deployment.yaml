@@ -6,7 +6,7 @@ metadata:
   labels:
     app: paginated-api
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: paginated-api
@@ -53,7 +53,7 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: paginated-api
-  minReplicas: 1
+  minReplicas: 3
   maxReplicas: 8
   metrics:
   - type: Resource
