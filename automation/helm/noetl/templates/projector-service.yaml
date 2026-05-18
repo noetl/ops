@@ -1,0 +1,18 @@
+{{- if .Values.projector.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.projector.serviceName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: noetl-projector
+    component: projector
+spec:
+  clusterIP: None
+  selector:
+    app: noetl-projector
+  ports:
+    - name: projector
+      port: 9090
+      targetPort: 9090
+{{- end }}

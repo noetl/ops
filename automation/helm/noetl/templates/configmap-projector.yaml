@@ -1,0 +1,15 @@
+{{- if .Values.projector.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noetl-projector-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: noetl-projector
+    component: projector
+data:
+{{- range $key, $value := .Values.config.projector }}
+  {{ $key }}: {{ $value | quote }}
+{{- end }}
+  NOETL_PROJECTOR_SHARD_COUNT: {{ .Values.projector.replicas | quote }}
+{{- end }}

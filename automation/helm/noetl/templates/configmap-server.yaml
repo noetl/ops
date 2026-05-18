@@ -9,3 +9,7 @@ data:
 {{- range $key, $value := .Values.config.server }}
   {{ $key }}: {{ $value | quote }}
 {{- end }}
+  NOETL_EVENT_MIRROR_ENABLED: {{ ternary "true" "false" .Values.projector.enabled | quote }}
+  NOETL_EVENT_NATS_STREAM: {{ .Values.config.projector.NOETL_PROJECTOR_NATS_STREAM | quote }}
+  NOETL_EVENT_NATS_SUBJECT_PREFIX: "noetl.events"
+  NOETL_EVENT_NATS_SHARD_COUNT: {{ .Values.projector.replicas | quote }}
