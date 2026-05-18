@@ -59,6 +59,25 @@ worker:
       cpu: "1000m"
       memory: "2Gi"
 
+projector:
+  enabled: false
+  replicas: 1
+  serviceName: noetl-projector
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
 # Rust-based worker pool (noetl-tools)
 workerPool:
   enabled: false
@@ -275,6 +294,28 @@ config:
     NOETL_STORAGE_LOCAL_CACHE_INSERT_RATE_MB: "200"
     # Quiet = re-index cache on worker restart for warm replay performance.
     NOETL_STORAGE_LOCAL_CACHE_RECOVER_MODE: "Quiet"
+  projector:
+    TZ: "UTC"
+    LOG_LEVEL: "INFO"
+    PYTHONPATH: "/opt/noetl"
+    NOETL_RUN_MODE: "projector"
+    NOETL_LOG_FORMAT: "json"
+    NATS_URL: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
+    NOETL_PROJECTOR_NATS_STREAM: "NOETL_EVENTS"
+    NOETL_PROJECTOR_NATS_SUBJECT: "noetl.events.>"
+    NOETL_PROJECTOR_MAX_INFLIGHT: "8"
+    NOETL_PROJECTOR_NATS_MAX_ACK_PENDING: "64"
+    NOETL_PROJECTOR_NATS_FETCH_TIMEOUT_SECONDS: "30"
+    NOETL_PROJECTOR_NATS_FETCH_HEARTBEAT_SECONDS: "5"
+    POSTGRES_HOST: "postgres.postgres.svc.cluster.local"
+    POSTGRES_PORT: "5432"
+    NOETL_POSTGRES_DB: "noetl"
+    NOETL_USER: "noetl"
+    NOETL_SCHEMA: "noetl"
+    NOETL_POSTGRES_POOL_MIN_SIZE: "1"
+    NOETL_POSTGRES_POOL_MAX_SIZE: "4"
+    NOETL_POSTGRES_POOL_MAX_WAITING: "50"
+    NOETL_POSTGRES_POOL_TIMEOUT_SECONDS: "30"
   workerPool:
     RUST_LOG: "info,worker_pool=debug,noetl_tools=debug"
     WORKER_POOL_NAME: "worker-rust-pool"
