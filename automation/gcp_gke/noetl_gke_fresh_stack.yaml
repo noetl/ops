@@ -106,9 +106,9 @@ workload:
   pgbouncer_max_client_conn: 600
   pgbouncer_default_pool_size: 6
   pgbouncer_min_pool_size: 1
-  pgbouncer_reserve_pool_size: 1
+  pgbouncer_reserve_pool_size: 2
   pgbouncer_reserve_pool_timeout: "5"
-  pgbouncer_max_db_connections: 6
+  pgbouncer_max_db_connections: 8
   pgbouncer_server_lifetime: "21600"
   pgbouncer_server_idle_timeout: "300"
   cloud_sql_proxy_gsa_name: noetl-cloudsql-proxy
@@ -136,7 +136,7 @@ workload:
   noetl_worker_replicas: 2
   noetl_worker_autoscaling_enabled: true
   noetl_worker_autoscaling_min_replicas: 2
-  noetl_worker_autoscaling_max_replicas: 16
+  noetl_worker_autoscaling_max_replicas: 4
   noetl_worker_autoscaling_target_cpu: 70
   noetl_worker_autoscaling_target_memory: ""
   noetl_server_rollout_max_surge: 0
@@ -150,28 +150,27 @@ workload:
   # NoETL connection pool tuning for Cloud SQL f1-micro via PgBouncer
   #
   # Cloud SQL f1-micro: max_connections=25, 3 reserved for superuser => 22 usable.
-  # PgBouncer: pgbouncer_replicas=2, MAX_DB_CONNECTIONS=6 per pod per database.
+  # PgBouncer: pgbouncer_replicas=2, MAX_DB_CONNECTIONS=8 per pod per database.
   # Server connects to `noetl` db; workers connect to `demo_noetl` db (separate pools).
   #
   # Connection budget per database:
-  #   noetl db    : server pool max=4  (1 server pod x 4) <= pgbouncer 2x6=12 cap
-  #   demo_noetl  : workers can burst above Cloud SQL's backend cap; PgBouncer
-  #                 queues those bursts rather than letting every worker open a
-  #                 backend connection.
+  #   noetl db    : server pool max=8  (1 server pod x 8) <= pgbouncer 2x8=16 cap
+  #   demo_noetl  : worker HPA max=4, worker pool max=3, and DB-command
+  #                 concurrency=3 keep client pressure aligned with the
+  #                 PgBouncer backend cap instead of stampeding Cloud SQL.
   #
-  # Inflight commands per worker: max_inflight_commands=8, max_inflight_db_commands=4.
-  # PFT cursor workloads must also keep cursor max_in_flight bounded; the e2e
-  # fixture defaults to 10 to avoid stampeding Cloud SQL through PgBouncer.
+  # Inflight commands per worker: max_inflight_commands=6, max_inflight_db_commands=3.
+  # PFT cursor workloads must also keep cursor max_in_flight bounded.
   noetl_server_postgres_pool_min_size: 2
-  noetl_server_postgres_pool_max_size: 4
-  noetl_server_postgres_pool_max_waiting: 50
-  noetl_server_postgres_pool_timeout_seconds: 30
+  noetl_server_postgres_pool_max_size: 8
+  noetl_server_postgres_pool_max_waiting: 200
+  noetl_server_postgres_pool_timeout_seconds: 60
   noetl_worker_postgres_pool_min_size: 1
-  noetl_worker_postgres_pool_max_size: 4
+  noetl_worker_postgres_pool_max_size: 3
   noetl_worker_postgres_pool_max_waiting: 40
   noetl_worker_postgres_pool_timeout_seconds: 60
-  noetl_worker_max_inflight_commands: 8
-  noetl_worker_max_inflight_db_commands: 4
+  noetl_worker_max_inflight_commands: 6
+  noetl_worker_max_inflight_db_commands: 3
   noetl_worker_nats_max_deliver: 1000
   noetl_worker_nats_max_ack_pending: 64
   noetl_tempstore_max_ref_cache_entries: 50000

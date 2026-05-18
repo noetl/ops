@@ -107,8 +107,8 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set gui_gateway_public_url=https://gateway.mestumre.dev \
   --set pgbouncer_default_pool_size=6 \
   --set pgbouncer_min_pool_size=1 \
-  --set pgbouncer_reserve_pool_size=1 \
-  --set pgbouncer_max_db_connections=6 \
+  --set pgbouncer_reserve_pool_size=2 \
+  --set pgbouncer_max_db_connections=8 \
   --set pgbouncer_server_idle_timeout=300 \
   --set gateway_cors_allowed_domains='mestumre.dev,gateway.mestumre.dev,travel.mestumre.dev'
 ```
@@ -124,14 +124,14 @@ section below.
 Worker autoscaling is enabled by default for this GKE shape:
 
 - `noetl_worker_autoscaling_min_replicas=2`
-- `noetl_worker_autoscaling_max_replicas=16`
+- `noetl_worker_autoscaling_max_replicas=4`
 - `noetl_worker_autoscaling_target_cpu=70`
 
-The HPA scales down after the workload settles, so burst tests do not leave
-16 workers running indefinitely. For the PFT 10k fixture specifically, the
-hot path is a single bulk Python command with its own internal thread pool;
-extra worker pods are mainly useful for surrounding distributed work and for
-keeping the cluster ready for mixed workloads.
+The default cap is intentionally conservative for the demo Cloud SQL f1-micro
+shape. PFT v2 can generate many frame heartbeats and commits, so allowing the
+HPA to scale well beyond the PgBouncer/Cloud SQL backend budget causes pool
+timeouts before it improves throughput. Increase the cap only when the database
+tier and PgBouncer limits are raised together.
 
 With `deploy_gui=false`, the playbook skips GUI static IP reservation,
 skips the in-cluster GUI Helm deployment, and removes any existing
