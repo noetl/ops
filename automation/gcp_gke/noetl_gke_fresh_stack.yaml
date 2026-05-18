@@ -1473,6 +1473,23 @@ workflow:
             --set secrets.noetlPassword={{ workload.noetl_password }} \
             $INGRESS_ARGS
 
+          # Older GKE test deployments carried direct env overrides on the
+          # Deployment containers. They take precedence over envFrom
+          # ConfigMaps, so remove them after Helm reconciliation to ensure
+          # the tuned DB/concurrency budget above is what pods actually run.
+          kubectl -n noetl set env deployment/noetl-server \
+            NOETL_POSTGRES_POOL_MIN_SIZE- \
+            NOETL_POSTGRES_POOL_MAX_SIZE- \
+            NOETL_POSTGRES_POOL_MAX_WAITING- \
+            NOETL_POSTGRES_POOL_TIMEOUT_SECONDS- || true
+          kubectl -n noetl set env deployment/noetl-worker \
+            NOETL_POSTGRES_POOL_MIN_SIZE- \
+            NOETL_POSTGRES_POOL_MAX_SIZE- \
+            NOETL_POSTGRES_POOL_MAX_WAITING- \
+            NOETL_POSTGRES_POOL_TIMEOUT_SECONDS- \
+            NOETL_WORKER_MAX_INFLIGHT_COMMANDS- \
+            NOETL_WORKER_MAX_INFLIGHT_DB_COMMANDS- || true
+
           if [ "{{ workload.build_noetl_image }}" = "true" ]; then
             echo "NoETL image was rebuilt. Forcing rollout restart to refresh pods for tag {{ workload.noetl_image_tag }}."
             kubectl rollout restart deployment/noetl-server -n noetl
