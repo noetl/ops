@@ -123,15 +123,15 @@ section below.
 
 Worker autoscaling is enabled by default for this GKE shape:
 
-- `noetl_worker_autoscaling_min_replicas=2`
-- `noetl_worker_autoscaling_max_replicas=4`
+- `noetl_worker_autoscaling_min_replicas=8`
+- `noetl_worker_autoscaling_max_replicas=8`
 - `noetl_worker_autoscaling_target_cpu=70`
 
-The default cap is intentionally conservative for the demo Cloud SQL f1-micro
-shape. PFT v2 can generate many frame heartbeats and commits, so allowing the
-HPA to scale well beyond the PgBouncer/Cloud SQL backend budget causes pool
-timeouts before it improves throughput. Increase the cap only when the database
-tier and PgBouncer limits are raised together.
+The default keeps enough warm workers for the PFT v2 cursor fanout and avoids
+CPU-driven scale-down while long cursor commands are active. Worker DB pool max
+and DB-command concurrency are capped at 2 so the 8-worker shape stays aligned
+with the demo PgBouncer/Cloud SQL backend budget. Increase the cap only when
+the database tier and PgBouncer limits are raised together.
 
 With `deploy_gui=false`, the playbook skips GUI static IP reservation,
 skips the in-cluster GUI Helm deployment, and removes any existing

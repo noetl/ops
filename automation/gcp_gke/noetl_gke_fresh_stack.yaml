@@ -133,10 +133,10 @@ workload:
   clickhouse_storage_size: 10Gi
 
   # NoETL settings
-  noetl_worker_replicas: 2
+  noetl_worker_replicas: 8
   noetl_worker_autoscaling_enabled: true
-  noetl_worker_autoscaling_min_replicas: 2
-  noetl_worker_autoscaling_max_replicas: 4
+  noetl_worker_autoscaling_min_replicas: 8
+  noetl_worker_autoscaling_max_replicas: 8
   noetl_worker_autoscaling_target_cpu: 70
   noetl_worker_autoscaling_target_memory: ""
   noetl_server_rollout_max_surge: 0
@@ -155,22 +155,23 @@ workload:
   #
   # Connection budget per database:
   #   noetl db    : server pool max=8  (1 server pod x 8) <= pgbouncer 2x8=16 cap
-  #   demo_noetl  : worker HPA max=4, worker pool max=3, and DB-command
-  #                 concurrency=3 keep client pressure aligned with the
-  #                 PgBouncer backend cap instead of stampeding Cloud SQL.
+  #   demo_noetl  : worker HPA fixed at 8 for PFT-sized cursor fanout.
+  #                 Worker pool max=2 and DB-command concurrency=2 keep
+  #                 client pressure aligned with the PgBouncer backend cap
+  #                 instead of stampeding Cloud SQL.
   #
-  # Inflight commands per worker: max_inflight_commands=6, max_inflight_db_commands=3.
+  # Inflight commands per worker: max_inflight_commands=6, max_inflight_db_commands=2.
   # PFT cursor workloads must also keep cursor max_in_flight bounded.
   noetl_server_postgres_pool_min_size: 2
   noetl_server_postgres_pool_max_size: 8
   noetl_server_postgres_pool_max_waiting: 200
   noetl_server_postgres_pool_timeout_seconds: 60
   noetl_worker_postgres_pool_min_size: 1
-  noetl_worker_postgres_pool_max_size: 3
+  noetl_worker_postgres_pool_max_size: 2
   noetl_worker_postgres_pool_max_waiting: 40
   noetl_worker_postgres_pool_timeout_seconds: 60
   noetl_worker_max_inflight_commands: 6
-  noetl_worker_max_inflight_db_commands: 3
+  noetl_worker_max_inflight_db_commands: 2
   noetl_worker_nats_max_deliver: 1000
   noetl_worker_nats_max_ack_pending: 64
   noetl_tempstore_max_ref_cache_entries: 50000
