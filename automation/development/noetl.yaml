@@ -18,6 +18,8 @@ workload:
   noetl_repo_dir: "../noetl"
   e2e_repo_dir: "../e2e"
   expected_kube_context: "kind-noetl"
+  force_test_server_build: "false"
+  verify_test_server_contract: "true"
 
   # Podman machine name to require when running build/load/deploy on
   # macOS. Set to the empty string ("") to skip the check entirely —
@@ -44,6 +46,15 @@ workflow:
           IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
           EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
           PODMAN_MACHINE="{{ workload.podman_machine }}"
+          FORCE_TEST_SERVER_BUILD="{{ workload.force_test_server_build }}"
+          VERIFY_TEST_SERVER_CONTRACT="{{ workload.verify_test_server_contract }}"
+
+          is_truthy() {
+            case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+              1|true|yes|y|on) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
 
           detect_lan_host() {
             local host=""
@@ -241,20 +252,67 @@ workflow:
             kubectl apply -f "$NOETL_REPO/ci/manifests/nats/namespace.yaml"
             kubectl apply -f "$NOETL_REPO/ci/manifests/nats/nats.yaml"
 
-            if ! podman image inspect local/test-server:latest >/dev/null 2>&1; then
+            if is_truthy "$FORCE_TEST_SERVER_BUILD" || ! podman image inspect local/test-server:latest >/dev/null 2>&1; then
               echo "Building local test-server from $TEST_SERVER_REPO"
               podman build --platform linux/arm64 \
                 -t local/test-server:latest \
                 -f "$TEST_SERVER_DOCKERFILE" "$TEST_SERVER_REPO"
+            else
+              echo "Using existing local/test-server:latest (set force_test_server_build=true to refresh)"
             fi
             kind_load_image local/test-server:latest
             kubectl apply -f "$NOETL_REPO/ci/manifests/test-server/namespace.yaml"
             kubectl apply -f "$NOETL_REPO/ci/manifests/test-server/deployment.yaml"
             kubectl set image deployment/paginated-api -n test-server api=localhost/local/test-server:latest
+            kubectl rollout restart deployment/paginated-api -n test-server
 
             kubectl rollout status deployment/postgres -n postgres --timeout=180s
             kubectl rollout status statefulset/nats -n nats --timeout=180s
             kubectl rollout status deployment/paginated-api -n test-server --timeout=180s
+
+            if is_truthy "$VERIFY_TEST_SERVER_CONTRACT"; then
+              verify_test_server_contract
+            fi
+          }
+
+          verify_test_server_contract() {
+            kubectl exec -i deployment/paginated-api -n test-server -- python - <<'PY'
+          import json
+          import urllib.error
+          import urllib.request
+
+          BASE_URL = "http://127.0.0.1:5555"
+
+
+          def get(path: str):
+              return urllib.request.urlopen(f"{BASE_URL}{path}", timeout=10)
+
+
+          with get("/health") as response:
+              if response.status != 200:
+                  raise SystemExit(f"health check returned {response.status}")
+
+          comma_path = "/api/v1/pft/batch/assessments?patientIds=1%2C2&pageSize=1&patientsPerFacility=1000"
+          try:
+              get(comma_path)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 400:
+                  raise SystemExit(f"comma-separated patientIds returned {exc.code}, expected 400") from exc
+          else:
+              raise SystemExit("comma-separated patientIds were accepted; expected HTTP 400")
+
+          repeated_path = "/api/v1/pft/batch/assessments?patientIds=1&patientIds=2&pageSize=1&patientsPerFacility=1000"
+          with get(repeated_path) as response:
+              payload = json.loads(response.read().decode("utf-8"))
+              if response.status != 200:
+                  raise SystemExit(f"repeated patientIds returned {response.status}")
+              if payload.get("patientCount") != 2:
+                  raise SystemExit(f"repeated patientIds returned unexpected patientCount: {payload.get('patientCount')}")
+              if "rows" not in payload:
+                  raise SystemExit("repeated patientIds response is missing rows")
+
+          print("test-server contract ok: repeated patientIds accepted, comma-separated patientIds rejected")
+          PY
           }
 
           build() {
@@ -381,6 +439,8 @@ workflow:
               echo "Actions: build, load, deploy, redeploy, status"
               echo "Optional: --set noetl_repo_dir=../noetl"
               echo "Optional: --set e2e_repo_dir=../e2e"
+              echo "Optional: --set force_test_server_build=true"
+              echo "Optional: --set verify_test_server_contract=false"
               echo "Registry deploy without building:"
               echo "  --set registry=ghcr.io/noetl --set image_name=noetl --set image_tag=v2.23.2 --set image_pull_policy=Always"
               echo ""
