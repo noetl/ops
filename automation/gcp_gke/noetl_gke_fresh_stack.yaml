@@ -831,6 +831,10 @@ workflow:
           if gcloud sql instances describe "$INSTANCE" --project "$PROJECT" >/dev/null 2>&1; then
             echo "Cloud SQL instance '$INSTANCE' already exists"
             PATCH_EXTRA=""
+            CURRENT_TIER=$(gcloud sql instances describe "$INSTANCE" --project "$PROJECT" --format='value(settings.tier)' 2>/dev/null || true)
+            if [ "$CURRENT_TIER" != "{{ workload.cloud_sql_tier }}" ]; then
+              PATCH_EXTRA="$PATCH_EXTRA --tier={{ workload.cloud_sql_tier }}"
+            fi
             if [ -n "$NETWORK_ARG" ]; then
               PATCH_EXTRA="$PATCH_EXTRA $NETWORK_ARG"
             fi
@@ -1491,11 +1495,9 @@ workflow:
             NOETL_WORKER_MAX_INFLIGHT_COMMANDS- \
             NOETL_WORKER_MAX_INFLIGHT_DB_COMMANDS- || true
 
-          if [ "{{ workload.build_noetl_image }}" = "true" ]; then
-            echo "NoETL image was rebuilt. Forcing rollout restart to refresh pods for tag {{ workload.noetl_image_tag }}."
-            kubectl rollout restart deployment/noetl-server -n noetl
-            kubectl rollout restart deployment/noetl-worker -n noetl
-          fi
+          echo "Forcing NoETL rollout restart to refresh image and ConfigMap-derived runtime settings."
+          kubectl rollout restart deployment/noetl-server -n noetl
+          kubectl rollout restart deployment/noetl-worker -n noetl
 
           kubectl rollout status deployment/noetl-server -n noetl --timeout=300s
           kubectl rollout status deployment/noetl-worker -n noetl --timeout=300s
