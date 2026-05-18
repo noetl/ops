@@ -300,6 +300,7 @@ config:
     PYTHONPATH: "/opt/noetl"
     NOETL_RUN_MODE: "projector"
     NOETL_LOG_FORMAT: "json"
+    NOETL_SERVER_URL: "http://noetl.noetl.svc.cluster.local:8082"
     NATS_URL: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
     NOETL_PROJECTOR_NATS_STREAM: "NOETL_EVENTS"
     NOETL_PROJECTOR_NATS_SUBJECT: "noetl.events.>"
