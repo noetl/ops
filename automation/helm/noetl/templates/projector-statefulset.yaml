@@ -40,6 +40,9 @@ spec:
           args:
             - -m
             - noetl.projector
+          ports:
+            - name: metrics
+              containerPort: 9090
           env:
             - name: NOETL_PROJECTOR_SHARD_ID
               valueFrom:

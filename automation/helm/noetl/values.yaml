@@ -289,8 +289,8 @@ config:
     NOETL_STORAGE_LOCAL_CACHE_DIR: "/opt/noetl/data/disk_cache"
     NOETL_STORAGE_LOCAL_DATA_CACHE_CAPACITY_MB: "2048"
     NOETL_STORAGE_LOCAL_META_CACHE_CAPACITY_MB: "256"
-    # Rate limit bytes/sec. RisingWave recommends ~90% of sequential write
-    # for local SSD, 50-80% for cloud block storage. 200 MB/s is safe for NVMe.
+    # Rate limit bytes/sec. Keep sustained writes below device saturation;
+    # 200 MB/s is conservative for local NVMe and typical cloud block storage.
     NOETL_STORAGE_LOCAL_CACHE_INSERT_RATE_MB: "200"
     # Quiet = re-index cache on worker restart for warm replay performance.
     NOETL_STORAGE_LOCAL_CACHE_RECOVER_MODE: "Quiet"
@@ -307,6 +307,7 @@ config:
     NOETL_PROJECTOR_NATS_MAX_ACK_PENDING: "64"
     NOETL_PROJECTOR_NATS_FETCH_TIMEOUT_SECONDS: "30"
     NOETL_PROJECTOR_NATS_FETCH_HEARTBEAT_SECONDS: "5"
+    NOETL_PROJECTOR_METRICS_PORT: "9090"
     POSTGRES_HOST: "postgres.postgres.svc.cluster.local"
     POSTGRES_PORT: "5432"
     NOETL_POSTGRES_DB: "noetl"
