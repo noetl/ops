@@ -12,7 +12,7 @@ spec:
   selector:
     app: noetl-projector
   ports:
-    - name: projector
+    - name: metrics
       port: 9090
       targetPort: 9090
 {{- end }}
