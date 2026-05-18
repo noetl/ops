@@ -85,7 +85,7 @@ workload:
   cloud_sql_instance_name: noetl-shared-pg
   cloud_sql_edition: ENTERPRISE
   cloud_sql_database_version: POSTGRES_15
-  cloud_sql_tier: db-f1-micro
+  cloud_sql_tier: db-g1-small
   cloud_sql_storage_size_gb: 10
   cloud_sql_storage_type: HDD
   cloud_sql_availability_type: ZONAL
@@ -104,11 +104,11 @@ workload:
   pgbouncer_service_name: pgbouncer
   pgbouncer_replicas: 2
   pgbouncer_max_client_conn: 600
-  pgbouncer_default_pool_size: 6
+  pgbouncer_default_pool_size: 12
   pgbouncer_min_pool_size: 1
-  pgbouncer_reserve_pool_size: 2
+  pgbouncer_reserve_pool_size: 4
   pgbouncer_reserve_pool_timeout: "5"
-  pgbouncer_max_db_connections: 8
+  pgbouncer_max_db_connections: 16
   pgbouncer_server_lifetime: "21600"
   pgbouncer_server_idle_timeout: "300"
   cloud_sql_proxy_gsa_name: noetl-cloudsql-proxy
@@ -163,7 +163,7 @@ workload:
   # Inflight commands per worker: max_inflight_commands=6, max_inflight_db_commands=2.
   # PFT cursor workloads must also keep cursor max_in_flight bounded.
   noetl_server_postgres_pool_min_size: 2
-  noetl_server_postgres_pool_max_size: 8
+  noetl_server_postgres_pool_max_size: 16
   noetl_server_postgres_pool_max_waiting: 200
   noetl_server_postgres_pool_timeout_seconds: 60
   noetl_worker_postgres_pool_min_size: 1
