@@ -1,0 +1,14 @@
+{{- if .Values.outboxPublisher.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noetl-outbox-publisher-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: noetl-outbox-publisher
+    component: outbox-publisher
+data:
+{{- range $key, $value := .Values.config.outboxPublisher }}
+  {{ $key }}: {{ $value | quote }}
+{{- end }}
+{{- end }}

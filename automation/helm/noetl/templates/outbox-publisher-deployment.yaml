@@ -1,0 +1,48 @@
+{{- if .Values.outboxPublisher.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-outbox-publisher
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: noetl-outbox-publisher
+    component: outbox-publisher
+spec:
+  replicas: {{ .Values.outboxPublisher.replicas }}
+  strategy:
+{{- toYaml .Values.outboxPublisher.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      app: noetl-outbox-publisher
+  template:
+    metadata:
+      labels:
+        app: noetl-outbox-publisher
+        component: outbox-publisher
+    spec:
+      serviceAccountName: noetl-worker
+      initContainers:
+        - name: wait-for-api
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "until curl -sf http://noetl.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.service.port }}/api/health; do echo 'Waiting for NoETL API...'; sleep 3; done"
+      containers:
+        - name: outbox-publisher
+          image: "{{ default .Values.image.repository .Values.outboxPublisher.image.repository }}:{{ default .Values.image.tag .Values.outboxPublisher.image.tag }}"
+          imagePullPolicy: {{ default .Values.image.pullPolicy .Values.outboxPublisher.image.pullPolicy }}
+          command:
+            - python
+          args:
+            - -m
+            - noetl.outbox
+          envFrom:
+            - configMapRef:
+                name: noetl-outbox-publisher-config
+            - secretRef:
+                name: noetl-secret
+          resources:
+{{- toYaml .Values.outboxPublisher.resources | nindent 12 }}
+{{- end }}
