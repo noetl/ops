@@ -22,6 +22,10 @@ server:
 
 worker:
   replicas: 6
+  metrics:
+    enabled: true
+    serviceName: noetl-worker-metrics
+    port: 9091
   autoscaling:
     enabled: false
     minReplicas: 2
@@ -197,6 +201,8 @@ config:
     PAGINATION_API_URL: "http://paginated-api.test-server.svc.cluster.local:5555"
     NOETL_SERVER_URL: "http://noetl.noetl.svc.cluster.local:8082"
     NOETL_DISABLE_METRICS: "true"
+    NOETL_WORKER_METRICS_HOST: "0.0.0.0"
+    NOETL_WORKER_METRICS_PORT: "9091"
     NOETL_VICTORIALOGS_URL: ""
     NOETL_LOG_FORMAT: "json"
     NATS_URL: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
@@ -283,7 +289,7 @@ config:
     NOETL_COMMAND_HEARTBEAT_MAX_RETRIES: "2"
     NOETL_CURSOR_FRAME_EVENT_TIMEOUT_SECONDS: "30"
     NOETL_CURSOR_FRAME_EVENT_MAX_RETRIES: "3"
-    # Result Storage Configuration (RisingWave-aligned, phase 1)
+    # Result storage configuration (tiered hot/warm/cold cache, phase 1).
     NOETL_INLINE_MAX_BYTES: "65536"
     NOETL_PREVIEW_MAX_BYTES: "1024"
     NOETL_DEFAULT_STORAGE_TIER: "kv"
