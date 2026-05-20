@@ -43,6 +43,11 @@ spec:
                 name: noetl-outbox-publisher-config
             - secretRef:
                 name: noetl-secret
+          env:
+            - name: NOETL_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           resources:
 {{- toYaml .Values.outboxPublisher.resources | nindent 12 }}
 {{- end }}

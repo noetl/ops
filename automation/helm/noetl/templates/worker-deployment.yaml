@@ -52,6 +52,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: noetl-worker-config
+          env:
+            - name: NOETL_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           volumeMounts:
 {{- if .Values.persistence.data.enabled }}
             - name: noetl-data
