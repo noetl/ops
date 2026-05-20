@@ -32,6 +32,17 @@ worker:
     maxReplicas: 16
     targetCPUUtilizationPercentage: 70
     targetMemoryUtilizationPercentage: null
+    keda:
+      enabled: false
+      pollingInterval: 30
+      cooldownPeriod: 300
+      sslmode: disable
+      targetQueryValue: "1"
+      activationTargetQueryValue: "0"
+      query: >-
+        SELECT COUNT(*)::int
+        FROM noetl.frame
+        WHERE status IN ('PENDING','CLAIMED','RUNNING')
     behavior:
       scaleUp:
         stabilizationWindowSeconds: 0

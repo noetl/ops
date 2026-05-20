@@ -1,0 +1,46 @@
+{{- if and .Values.worker.autoscaling.enabled .Values.worker.autoscaling.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: noetl-worker-postgres
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: noetl-worker
+    component: worker
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: noetl-secret
+      key: POSTGRES_PASSWORD
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: noetl-worker
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: noetl-worker
+    component: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: noetl-worker
+  pollingInterval: {{ .Values.worker.autoscaling.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.worker.autoscaling.keda.cooldownPeriod }}
+  minReplicaCount: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.worker.autoscaling.maxReplicas }}
+  triggers:
+    - type: postgresql
+      metadata:
+        host: {{ .Values.config.worker.POSTGRES_HOST | quote }}
+        port: {{ .Values.config.worker.POSTGRES_PORT | quote }}
+        userName: {{ .Values.config.worker.NOETL_USER | quote }}
+        dbName: {{ .Values.config.worker.NOETL_POSTGRES_DB | quote }}
+        sslmode: {{ .Values.worker.autoscaling.keda.sslmode | quote }}
+        query: {{ .Values.worker.autoscaling.keda.query | quote }}
+        targetQueryValue: {{ .Values.worker.autoscaling.keda.targetQueryValue | quote }}
+        activationTargetQueryValue: {{ .Values.worker.autoscaling.keda.activationTargetQueryValue | quote }}
+      authenticationRef:
+        name: noetl-worker-postgres
+{{- end }}
