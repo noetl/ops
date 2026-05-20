@@ -1,0 +1,333 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: nats_supercluster_automation
+  path: automation/infrastructure/nats_supercluster
+  description: Render and deploy a gateway-enabled NATS JetStream cluster member.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help # render, deploy, status, gatewayz, remove
+  namespace: nats
+  cluster_name: noetl-a
+  server_name: nats-a
+  replicas: 1
+  storage_size: 5Gi
+  gateway_port: 7522
+  gateway_advertise: ""
+  remote_gateways: "" # comma-separated cluster=url entries, for example noetl-b=nats://host-b:7522
+  output_dir: /tmp/noetl-nats-supercluster
+
+workflow:
+  - step: start
+    desc: Entry point for NATS supercluster automation
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          echo "NATS supercluster automation - action '{{ workload.action }}'"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: render_manifest
+          when: "{{ workload.action == 'render' }}"
+        - step: deploy_manifest
+          when: "{{ workload.action == 'deploy' }}"
+        - step: check_status
+          when: "{{ workload.action == 'status' }}"
+        - step: show_gatewayz
+          when: "{{ workload.action == 'gatewayz' }}"
+        - step: remove_manifest
+          when: "{{ workload.action == 'remove' }}"
+        - step: show_help
+
+  - step: render_manifest
+    desc: Render the gateway-enabled NATS manifest
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          OUT="{{ workload.output_dir }}"
+          NS="{{ workload.namespace }}"
+          CLUSTER="{{ workload.cluster_name }}"
+          SERVER="{{ workload.server_name }}"
+          REPLICAS="{{ workload.replicas }}"
+          STORAGE="{{ workload.storage_size }}"
+          GATEWAY_PORT="{{ workload.gateway_port }}"
+          GATEWAY_ADVERTISE="{{ workload.gateway_advertise }}"
+          REMOTES="{{ workload.remote_gateways }}"
+          mkdir -p "$OUT"
+          MANIFEST="$OUT/nats-supercluster-${CLUSTER}.yaml"
+
+          remote_file="$(mktemp)"
+          if [ -n "$REMOTES" ]; then
+            IFS=',' read -ra PAIRS <<< "$REMOTES"
+            for pair in "${PAIRS[@]}"; do
+              name="${pair%%=*}"
+              url="${pair#*=}"
+              if [ -z "$name" ] || [ -z "$url" ] || [ "$name" = "$url" ]; then
+                echo "ERROR: remote_gateways entries must use cluster=url (got '$pair')"
+                exit 1
+              fi
+              {
+                echo "        - name: ${name}"
+                echo "          urls:"
+                echo "            - ${url}"
+              } >> "$remote_file"
+            done
+          fi
+
+          advertise_line=""
+          if [ -n "$GATEWAY_ADVERTISE" ]; then
+            advertise_line="      advertise: ${GATEWAY_ADVERTISE}"
+          fi
+
+          cat > "$MANIFEST" <<EOF
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${NS}
+          ---
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: nats-config
+            namespace: ${NS}
+          data:
+            nats.conf: |
+              server_name: ${SERVER}
+              port: 4222
+              http_port: 8222
+
+              jetstream {
+                store_dir: /data/jetstream
+                max_memory_store: 1GB
+                max_file_store: 5GB
+              }
+
+              gateway {
+                name: ${CLUSTER}
+                port: ${GATEWAY_PORT}
+          ${advertise_line}
+                gateways [
+          $(cat "$remote_file")
+                ]
+              }
+
+              accounts {
+                \$SYS {
+                  users: [
+                    { user: sys, password: sys }
+                  ]
+                }
+                NOETL {
+                  jetstream: enabled
+                  users: [
+                    { user: noetl, password: noetl }
+                  ]
+                }
+              }
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: nats-storage
+            namespace: ${NS}
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: ${STORAGE}
+          ---
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: nats
+            namespace: ${NS}
+            labels:
+              app: nats
+          spec:
+            serviceName: nats
+            replicas: ${REPLICAS}
+            selector:
+              matchLabels:
+                app: nats
+            template:
+              metadata:
+                labels:
+                  app: nats
+              spec:
+                containers:
+                  - name: nats
+                    image: nats:latest
+                    ports:
+                      - containerPort: 4222
+                        name: client
+                      - containerPort: 8222
+                        name: monitoring
+                      - containerPort: ${GATEWAY_PORT}
+                        name: gateway
+                    args:
+                      - "-c"
+                      - "/etc/nats/nats.conf"
+                    volumeMounts:
+                      - name: nats-config
+                        mountPath: /etc/nats
+                      - name: nats-storage
+                        mountPath: /data
+                    readinessProbe:
+                      httpGet:
+                        path: /healthz
+                        port: 8222
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                volumes:
+                  - name: nats-config
+                    configMap:
+                      name: nats-config
+                  - name: nats-storage
+                    persistentVolumeClaim:
+                      claimName: nats-storage
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: nats
+            namespace: ${NS}
+            labels:
+              app: nats
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 4222
+                targetPort: 4222
+                name: client
+              - port: 8222
+                targetPort: 8222
+                name: monitoring
+              - port: ${GATEWAY_PORT}
+                targetPort: ${GATEWAY_PORT}
+                name: gateway
+            selector:
+              app: nats
+          EOF
+
+          echo "Rendered $MANIFEST"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: deploy_manifest
+    desc: Render and deploy the gateway-enabled NATS manifest
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          noetl run automation/infrastructure/nats_supercluster.yaml \
+            --runtime local \
+            --set action=render \
+            --set namespace="{{ workload.namespace }}" \
+            --set cluster_name="{{ workload.cluster_name }}" \
+            --set server_name="{{ workload.server_name }}" \
+            --set replicas="{{ workload.replicas }}" \
+            --set storage_size="{{ workload.storage_size }}" \
+            --set gateway_port="{{ workload.gateway_port }}" \
+            --set gateway_advertise="{{ workload.gateway_advertise }}" \
+            --set remote_gateways="{{ workload.remote_gateways }}" \
+            --set output_dir="{{ workload.output_dir }}"
+          kubectl apply -f "{{ workload.output_dir }}/nats-supercluster-{{ workload.cluster_name }}.yaml"
+          kubectl wait --for=condition=ready pod -l app=nats -n "{{ workload.namespace }}" --timeout=180s
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: check_status
+
+  - step: check_status
+    desc: Check NATS supercluster resources
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          kubectl get namespace "{{ workload.namespace }}" 2>/dev/null || true
+          kubectl get all -n "{{ workload.namespace }}" -l app=nats 2>/dev/null || true
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: show_gatewayz
+    desc: Show NATS gateway monitoring data
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          POD=$(kubectl get pod -n "{{ workload.namespace }}" -l app=nats -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -z "$POD" ]; then
+            echo "No NATS pod found"
+            exit 1
+          fi
+          kubectl exec -n "{{ workload.namespace }}" "$POD" -- nats server request gatewayz --user=sys --password=sys
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: remove_manifest
+    desc: Remove the rendered NATS supercluster manifest
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          MANIFEST="{{ workload.output_dir }}/nats-supercluster-{{ workload.cluster_name }}.yaml"
+          if [ -f "$MANIFEST" ]; then
+            kubectl delete -f "$MANIFEST" --ignore-not-found=true
+          else
+            echo "Manifest not found: $MANIFEST"
+          fi
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: show_help
+    desc: Show available NATS supercluster actions
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo "Usage: noetl run automation/infrastructure/nats_supercluster.yaml --set action=<render|deploy|status|gatewayz|remove>"
+          echo ""
+          echo "Required for multi-cluster:"
+          echo "  --set cluster_name=<logical-cluster-name>"
+          echo "  --set gateway_advertise=<externally-reachable-host:7522>"
+          echo "  --set remote_gateways=<other-cluster>=nats://<other-host>:7522"
+          echo ""
+          echo "Example:"
+          echo "  noetl run automation/infrastructure/nats_supercluster.yaml --runtime local --set action=deploy --set cluster_name=noetl-a --set gateway_advertise=a.example:7522 --set remote_gateways=noetl-b=nats://b.example:7522"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: End workflow
+    tool:
+      kind: noop
