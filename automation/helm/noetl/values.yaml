@@ -32,6 +32,15 @@ worker:
     maxReplicas: 16
     targetCPUUtilizationPercentage: 70
     targetMemoryUtilizationPercentage: null
+    keda:
+      enabled: false
+      pollingInterval: 30
+      cooldownPeriod: 300
+      metricName: noetl_frame_backlog_total
+      activationTargetQueryValue: "0"
+      threshold: "1"
+      query: 'sum(noetl_frame_backlog_total{stage_kind="all",status="all"})'
+      serverAddress: "http://vmselect-vmstack-victoria-metrics-k8s-stack.monitoring.svc.cluster.local:8481/select/0/prometheus"
     behavior:
       scaleUp:
         stabilizationWindowSeconds: 0
