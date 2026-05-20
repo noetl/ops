@@ -213,6 +213,26 @@ noetl run automation/infrastructure/nats.yaml --set action=restart
 noetl run automation/infrastructure/nats.yaml --set action=undeploy
 ```
 
+**NATS Supercluster Gateway (opt-in multi-cluster):**
+```bash
+# Render a gateway-enabled manifest for review
+noetl run automation/infrastructure/nats_supercluster.yaml \
+  --set action=render \
+  --set cluster_name=noetl-a \
+  --set gateway_advertise=a.example:7522 \
+  --set remote_gateways=noetl-b=nats://b.example:7522
+
+# Deploy the rendered member into the active Kubernetes context
+noetl run automation/infrastructure/nats_supercluster.yaml \
+  --set action=deploy \
+  --set cluster_name=noetl-a \
+  --set gateway_advertise=a.example:7522 \
+  --set remote_gateways=noetl-b=nats://b.example:7522
+
+# Inspect gateway links
+noetl run automation/infrastructure/nats_supercluster.yaml --set action=gatewayz
+```
+
 **Observability Aggregate Operations:**
 ```bash
 # Activate all observability services (ClickHouse + Qdrant + NATS)
