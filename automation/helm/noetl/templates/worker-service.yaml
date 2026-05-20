@@ -1,0 +1,18 @@
+{{- if .Values.worker.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.worker.metrics.serviceName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: noetl-worker
+    component: worker
+spec:
+  clusterIP: None
+  selector:
+    app: noetl-worker
+  ports:
+    - name: metrics
+      port: {{ .Values.worker.metrics.port }}
+      targetPort: {{ .Values.worker.metrics.port }}
+{{- end }}

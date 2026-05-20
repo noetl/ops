@@ -39,6 +39,11 @@ spec:
         - name: worker
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+{{- if .Values.worker.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.worker.metrics.port }}
+{{- end }}
           command:
             - python
           args:
