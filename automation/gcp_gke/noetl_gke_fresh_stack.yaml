@@ -102,7 +102,11 @@ workload:
   pgbouncer_enabled: true
   pgbouncer_namespace: postgres
   pgbouncer_service_name: pgbouncer
-  pgbouncer_replicas: 2
+  pgbouncer_replicas: 1
+  pgbouncer_autoscaling_enabled: true
+  pgbouncer_autoscaling_min_replicas: 1
+  pgbouncer_autoscaling_max_replicas: 2
+  pgbouncer_autoscaling_target_cpu: 70
   pgbouncer_max_client_conn: 600
   pgbouncer_default_pool_size: 12
   pgbouncer_min_pool_size: 1
@@ -133,9 +137,9 @@ workload:
   clickhouse_storage_size: 10Gi
 
   # NoETL settings
-  noetl_worker_replicas: 8
+  noetl_worker_replicas: 1
   noetl_worker_autoscaling_enabled: true
-  noetl_worker_autoscaling_min_replicas: 8
+  noetl_worker_autoscaling_min_replicas: 1
   noetl_worker_autoscaling_max_replicas: 8
   noetl_worker_autoscaling_target_cpu: 70
   noetl_worker_autoscaling_target_memory: ""
@@ -150,12 +154,12 @@ workload:
   # NoETL connection pool tuning for Cloud SQL f1-micro via PgBouncer
   #
   # Cloud SQL f1-micro: max_connections=25, 3 reserved for superuser => 22 usable.
-  # PgBouncer: pgbouncer_replicas=2, MAX_DB_CONNECTIONS=8 per pod per database.
+  # PgBouncer: pgbouncer_replicas=1 by default, autoscaling 1..2 on CPU.
   # Server connects to `noetl` db; workers connect to `demo_noetl` db (separate pools).
   #
   # Connection budget per database:
-  #   noetl db    : server pool max=8  (1 server pod x 8) <= pgbouncer 2x8=16 cap
-  #   demo_noetl  : worker HPA fixed at 8 for PFT-sized cursor fanout.
+  #   noetl db    : server pool max=8  (1 server pod x 8) <= pgbouncer 1x8=8 cap
+  #   demo_noetl  : worker HPA scales 1..8 for PFT-sized cursor fanout.
   #                 Worker pool max=2 and DB-command concurrency=2 keep
   #                 client pressure aligned with the PgBouncer backend cap
   #                 instead of stampeding Cloud SQL.
@@ -1124,6 +1128,34 @@ workflow:
                         cpu: 500m
                         memory: 512Mi
           EOF
+
+          if [ "{{ workload.pgbouncer_autoscaling_enabled }}" = "true" ]; then
+            cat <<EOF | kubectl apply -f -
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: ${APP}
+            namespace: ${NS}
+            labels:
+              app: ${APP}
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: ${APP}
+            minReplicas: {{ workload.pgbouncer_autoscaling_min_replicas }}
+            maxReplicas: {{ workload.pgbouncer_autoscaling_max_replicas }}
+            metrics:
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: {{ workload.pgbouncer_autoscaling_target_cpu }}
+          EOF
+          else
+            kubectl -n "${NS}" delete hpa "${APP}" --ignore-not-found
+          fi
 
           kubectl rollout status deployment/${APP} -n ${NS} --timeout=300s
           kubectl get svc ${APP} -n ${NS} -o wide
