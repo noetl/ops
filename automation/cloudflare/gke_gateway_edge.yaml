@@ -37,7 +37,11 @@ workload:
   tunnel_namespace: cloudflare
   tunnel_secret_name: noetl-gke-gateway-tunnel
   tunnel_deployment_name: noetl-gke-gateway-tunnel
-  tunnel_replicas: "2"
+  tunnel_replicas: "1"
+  tunnel_autoscaling_enabled: "true"
+  tunnel_autoscaling_min_replicas: "1"
+  tunnel_autoscaling_max_replicas: "2"
+  tunnel_autoscaling_target_cpu: "70"
   cloudflared_image: cloudflare/cloudflared:latest
 
   # Cloudflare Pages GUI
@@ -81,6 +85,10 @@ workflow:
           TUNNEL_SECRET_NAME="{{ workload.tunnel_secret_name }}"
           TUNNEL_DEPLOYMENT_NAME="{{ workload.tunnel_deployment_name }}"
           TUNNEL_REPLICAS="{{ workload.tunnel_replicas }}"
+          TUNNEL_AUTOSCALING_ENABLED="{{ workload.tunnel_autoscaling_enabled }}"
+          TUNNEL_AUTOSCALING_MIN_REPLICAS="{{ workload.tunnel_autoscaling_min_replicas }}"
+          TUNNEL_AUTOSCALING_MAX_REPLICAS="{{ workload.tunnel_autoscaling_max_replicas }}"
+          TUNNEL_AUTOSCALING_TARGET_CPU="{{ workload.tunnel_autoscaling_target_cpu }}"
           CLOUDFLARED_IMAGE="{{ workload.cloudflared_image }}"
           DEPLOY_PAGES="{{ workload.deploy_pages }}"
           GUI_REPO_DIR="{{ workload.gui_repo_dir }}"
@@ -416,6 +424,34 @@ workflow:
                         cpu: 500m
                         memory: 256Mi
           YAML
+
+            if [ "$TUNNEL_AUTOSCALING_ENABLED" = "true" ]; then
+              cat <<YAML | kubectl apply -f -
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: ${TUNNEL_DEPLOYMENT_NAME}
+            namespace: ${TUNNEL_NAMESPACE}
+            labels:
+              app: ${TUNNEL_DEPLOYMENT_NAME}
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: ${TUNNEL_DEPLOYMENT_NAME}
+            minReplicas: ${TUNNEL_AUTOSCALING_MIN_REPLICAS}
+            maxReplicas: ${TUNNEL_AUTOSCALING_MAX_REPLICAS}
+            metrics:
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: ${TUNNEL_AUTOSCALING_TARGET_CPU}
+          YAML
+            else
+              kubectl -n "$TUNNEL_NAMESPACE" delete hpa "$TUNNEL_DEPLOYMENT_NAME" --ignore-not-found
+            fi
 
             kubectl -n "$TUNNEL_NAMESPACE" rollout status "deployment/$TUNNEL_DEPLOYMENT_NAME" --timeout=180s
             kubectl -n "$TUNNEL_NAMESPACE" get pods -l "app=$TUNNEL_DEPLOYMENT_NAME"

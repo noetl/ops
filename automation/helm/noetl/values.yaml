@@ -21,15 +21,15 @@ server:
       memory: "256Mi"
 
 worker:
-  replicas: 6
+  replicas: 1
   metrics:
     enabled: true
     serviceName: noetl-worker-metrics
     port: 9091
   autoscaling:
     enabled: false
-    minReplicas: 2
-    maxReplicas: 16
+    minReplicas: 1
+    maxReplicas: 8
     targetCPUUtilizationPercentage: 70
     targetMemoryUtilizationPercentage: null
     keda:

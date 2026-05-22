@@ -296,22 +296,28 @@ workflow:
           try:
               get(comma_path)
           except urllib.error.HTTPError as exc:
-              if exc.code != 400:
-                  raise SystemExit(f"comma-separated patientIds returned {exc.code}, expected 400") from exc
+              if exc.code != 410:
+                  raise SystemExit(f"disabled batch endpoint returned {exc.code}, expected 410") from exc
           else:
-              raise SystemExit("comma-separated patientIds were accepted; expected HTTP 400")
+              raise SystemExit("disabled batch endpoint was accepted; expected HTTP 410")
 
           repeated_path = "/api/v1/pft/batch/assessments?patientIds=1&patientIds=2&pageSize=1&patientsPerFacility=1000"
-          with get(repeated_path) as response:
+          try:
+              get(repeated_path)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 410:
+                  raise SystemExit(f"disabled batch endpoint returned {exc.code}, expected 410") from exc
+          else:
+              raise SystemExit("disabled batch endpoint was accepted; expected HTTP 410")
+
+          with get("/api/v1/pft/mds/details?assessmentId=MDS-contract-check") as response:
               payload = json.loads(response.read().decode("utf-8"))
               if response.status != 200:
-                  raise SystemExit(f"repeated patientIds returned {response.status}")
-              if payload.get("patientCount") != 2:
-                  raise SystemExit(f"repeated patientIds returned unexpected patientCount: {payload.get('patientCount')}")
-              if "rows" not in payload:
-                  raise SystemExit("repeated patientIds response is missing rows")
+                  raise SystemExit(f"single MDS detail returned {response.status}")
+              if payload.get("rowCount") != 1:
+                  raise SystemExit(f"single MDS detail returned unexpected rowCount: {payload.get('rowCount')}")
 
-          print("test-server contract ok: repeated patientIds accepted, comma-separated patientIds rejected")
+          print("test-server contract ok: batch endpoints disabled, singular MDS detail accepted")
           PY
           }
 
