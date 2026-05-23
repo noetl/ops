@@ -10,7 +10,7 @@ executor:
   version: noetl-runtime/1
 
 workload:
-  action: help # build, load, deploy, redeploy, status
+  action: help # build, load, deploy, redeploy, status, reset
   registry: local
   image_name: noetl
   image_tag: ""
@@ -276,8 +276,28 @@ workflow:
           }
 
           verify_test_server_contract() {
-            kubectl exec -i deployment/paginated-api -n test-server -- python - <<'PY'
+            # `kubectl rollout status` returns once the new ReplicaSet is
+            # available, but the old pod may still be in Terminating
+            # state for a few seconds. `kubectl exec deployment/foo`
+            # would happily pick the terminating pod, and the contract
+            # script then dies with exit 137 when the pod is killed
+            # mid-script. Wait for at least one fully Ready pod before
+            # we exec.
+            kubectl wait --for=condition=ready --timeout=60s \
+              pod -n test-server -l app=paginated-api >/dev/null 2>&1 \
+              || true
+            local pod
+            pod="$(kubectl get pod -n test-server -l app=paginated-api \
+              --field-selector=status.phase=Running \
+              -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}' \
+              | head -1)"
+            if [ -z "$pod" ]; then
+              echo "verify_test_server_contract: no Ready paginated-api pod found; skipping"
+              return 0
+            fi
+            kubectl exec -i -n test-server "$pod" -- python - <<'PY'
           import json
+          import time
           import urllib.error
           import urllib.request
 
@@ -288,9 +308,27 @@ workflow:
               return urllib.request.urlopen(f"{BASE_URL}{path}", timeout=10)
 
 
-          with get("/health") as response:
-              if response.status != 200:
-                  raise SystemExit(f"health check returned {response.status}")
+          # Wait for the uvicorn worker inside this pod to finish binding
+          # its port. Right after `kubectl rollout restart`, the readiness
+          # gate may report Ready before uvicorn finishes accepting on
+          # 127.0.0.1:5555, which surfaces as `Errno 111 Connection
+          # refused` on the very first /health call. Six 2-second
+          # attempts (12s total) covers the observed gap without
+          # masking real failures.
+          last_error = None
+          for attempt in range(6):
+              try:
+                  with get("/health") as response:
+                      if response.status != 200:
+                          raise SystemExit(f"health check returned {response.status}")
+                      break
+              except (urllib.error.URLError, ConnectionError) as exc:
+                  last_error = exc
+                  time.sleep(2)
+          else:
+              raise SystemExit(
+                  f"health check could not reach 127.0.0.1:5555 after 6 attempts; last error: {last_error}"
+              )
 
           comma_path = "/api/v1/pft/batch/assessments?patientIds=1%2C2&pageSize=1&patientsPerFacility=1000"
           try:
@@ -419,6 +457,50 @@ workflow:
             echo "Local fallback endpoint: http://localhost:8082"
           }
 
+          reset() {
+            ensure_kind_context
+            echo "=== tearing down NoETL-deployed namespaces ==="
+            kubectl delete ns noetl nats postgres test-server --wait=false --ignore-not-found 2>&1 || true
+            echo "=== waiting for namespaces to drain (up to 120s) ==="
+            local attempts=0
+            while [ "$attempts" -lt 24 ]; do
+              # `kubectl get` returns non-zero when no resources match,
+              # which would trip `set -e`; `|| true` keeps the loop alive
+              # so the wait terminates by attempt count rather than the
+              # first "all-gone" tick.
+              local remaining
+              remaining="$( (kubectl get ns noetl nats postgres test-server -o name 2>/dev/null || true) | wc -l | tr -d ' ')"
+              if [ "$remaining" = "0" ]; then
+                echo "  all four namespaces gone"
+                break
+              fi
+              sleep 5
+              attempts=$((attempts + 1))
+            done
+
+            # Static PVs use reclaimPolicy: Retain so data persists across
+            # teardowns. After the bound PVC is deleted, the PV still
+            # carries a `spec.claimRef` pointing at the now-gone claim,
+            # which blocks rebinding to a fresh PVC during the next
+            # deploy. Clear claimRef on every static PV the deploy
+            # provisions so the next `deploy` action can rebind cleanly.
+            #
+            # Without this, the operator has to manually patch each PV
+            # ('kubectl patch pv <name> --type=json -p
+            # [{"op":"remove","path":"/spec/claimRef"}]') after every
+            # reset, which is the kind of footgun that derails repeated
+            # local dev cycles.
+            echo "=== unbinding static PVs (clearing claimRefs so deploy can rebind) ==="
+            for pv in postgres noetl-data noetl-logs noetl-data-pv; do
+              if kubectl get pv "$pv" >/dev/null 2>&1; then
+                kubectl patch pv "$pv" --type=json \
+                  -p='[{"op":"remove","path":"/spec/claimRef"}]' 2>&1 \
+                  | sed "s/^/  $pv: /" || true
+              fi
+            done
+            echo "=== reset complete; run action=deploy to provision ==="
+          }
+
           case "$ACTION" in
             build)
               build
@@ -438,11 +520,14 @@ workflow:
             status)
               status
               ;;
+            reset)
+              reset
+              ;;
             help|*)
               echo "Usage:"
               echo "  noetl run automation/development/noetl.yaml --runtime local --set action=<action>"
               echo ""
-              echo "Actions: build, load, deploy, redeploy, status"
+              echo "Actions: build, load, deploy, redeploy, status, reset"
               echo "Optional: --set noetl_repo_dir=../noetl"
               echo "Optional: --set e2e_repo_dir=../e2e"
               echo "Optional: --set force_test_server_build=true"
