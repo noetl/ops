@@ -6,9 +6,7 @@ metadata:
   labels:
     app: noetl-server
 spec:
-  # Two API pods let worker claim/event traffic spread across the service
-  # during local distributed benchmarks.
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: noetl-server

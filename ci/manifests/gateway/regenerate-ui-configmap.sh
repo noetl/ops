@@ -1,13 +1,13 @@
 #!/bin/bash
 # Regenerate gateway-ui-files ConfigMap from source files
-# Run this script whenever you update UI files in ../e2e/fixtures/gateway_ui/
+# Run this script whenever you update UI files in tests/fixtures/gateway_ui/
 
 set -e
 
 echo "Regenerating gateway-ui-files ConfigMap manifest..."
 
 kubectl create configmap gateway-ui-files \
-  --from-file=../e2e/fixtures/gateway_ui/ \
+  --from-file=tests/fixtures/gateway_ui/ \
   --namespace=gateway \
   --dry-run=client \
   -o yaml > ci/manifests/gateway/configmap-ui-files.yaml
