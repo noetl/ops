@@ -15,7 +15,7 @@ data:
     files make HTTP requests to:\n- `http://localhost:8090/api/auth/*` - Authentication
     endpoints\n- `http://localhost:8090/graphql` - GraphQL endpoint\n\n**You can serve
     these files any way you want:**\n\n### Local Development Options\n\n**Option 1:
-    Python (Quick & Easy)**\n```bash\ncd ../e2e/fixtures/gateway_ui\npython3 -m http.server
+    Python (Quick & Easy)**\n```bash\ncd tests/fixtures/gateway_ui\npython3 -m http.server
     8080\n```\n\n**Option 2: Node.js**\n```bash\nnpx http-server -p 8080 --cors\n```\n\nThe
     UI connects to the Gateway API. Update these URLs if needed:\n\n**For local development
     with different ports:**\n\nIn `auth.js`:\n```javascript\n// Change this if gateway
@@ -24,7 +24,7 @@ data:
     auth.js which calls ${API_BASE}/graphql\n```\n\n**For production:**\n```javascript\nconst
     API_BASE = 'https://api.yourdomain.com'; // Your production gateway\n```\n\nThe
     HTML/JS files are **completely separate** from the gateway - they're just a frontend
-    that makes API calls.n ../e2e/fixtures/gateway_ui/login.html\n# or double-click
+    that makes API calls.n tests/fixtures/gateway_ui/login.html\n# or double-click
     login.html in Finder\n```\n⚠️ Note: Opening as `file://` may cause CORS issues.
     Use HTTP server for full functionality.\n\n### Production Deployment\n\nIn production,
     serve these files with:\n- **Nginx** - Standard web server\n- **Apache** - Traditional
@@ -59,12 +59,13 @@ data:
     + NATS K/V cache\n2. **Subsequent requests:** Gateway checks NATS K/V directly
     (sub-millisecond)\n3. **Cache miss:** Gateway calls `auth0_validate_session` →
     refreshes NATS K/V cache\n\nThis provides fast session lookups while keeping Postgres
-    as the source of truth.\n\n## Testing Flow\n\n### Local Development\n1. **Start
-    Gateway**: `cd crates/gateway && cargo run --release`\n2. **Start UI server**:
-    `cd ../e2e/fixtures/gateway_ui && python3 -m http.server 8090`\n3. **Open browser**:
+    as the source of truth.\n\n## Testing Flow\n\n### Local Development\n0. **Prerequisite**:
+    Clone `noetl/gateway` as a sibling directory (`../gateway`).\n1. **Start
+    Gateway**: `cd ../gateway && cargo run --release`\n2. **Start UI server**:
+    `cd tests/fixtures/gateway_ui && python3 -m http.server 8090`\n3. **Open browser**:
     `http://localhost:8090/login.html`\n4. **Login**: Use Auth0 token or test session
     token\n\n### Kind Kubernetes Cluster\n1. **Deploy to Kind**: See documentation/docs/development/kind_kubernetes.md\n2.
-    **Start UI server**: `cd ../e2e/fixtures/gateway_ui && python3 -m http.server 8090`\n3.
+    **Start UI server**: `cd tests/fixtures/gateway_ui && python3 -m http.server 8090`\n3.
     **Open browser**: `http://localhost:8090/login.html?env=kind`\n4. **Gateway endpoint**:
     `http://localhost:30080` (via NodePort)\n\n### GKE Production\n1. **Deploy to
     GKE**: See documentation for GKE deployment\n2. **Open browser**: `https://your-domain.com/login.html`\n3.

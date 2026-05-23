@@ -21,6 +21,11 @@ data:
   NOETL_DISABLE_METRICS: "true"
   NOETL_VICTORIALOGS_URL: "http://vmlogs-single-server.vmlogs.svc.cluster.local:9428"
   NOETL_LOG_FORMAT: ""
+  # Mirror execution/core events to the event outbox for local projector validation.
+  NOETL_EVENT_MIRROR_ENABLED: "true"
+  NOETL_EVENT_NATS_STREAM: "NOETL_EVENTS"
+  NOETL_EVENT_NATS_SUBJECT_PREFIX: "noetl.events"
+  NOETL_EVENT_NATS_SHARD_COUNT: "1"
   # NATS Configuration for command publishing
   NATS_URL: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
   NATS_USER: "noetl"
@@ -38,15 +43,10 @@ data:
   NOETL_SERVER: "uvicorn"
   NOETL_SERVER_WORKERS: "1"
   NOETL_SERVER_RELOAD: "false"
-  NOETL_BATCH_ACCEPT_WORKERS: "4"
   NOETL_AUTO_RECREATE_RUNTIME: "true"
   NOETL_HEARTBEAT_RETRY_AFTER: "3"
   NOETL_RUNTIME_SWEEP_INTERVAL: "15"
-  NOETL_RUNTIME_OFFLINE_SECONDS: "180"
-  NOETL_COMMAND_CLAIM_LEASE_SECONDS: "180"
-  NOETL_COMMAND_WORKER_HEARTBEAT_STALE_SECONDS: "90"
-  NOETL_COMMAND_CLAIM_HEALTHY_WORKER_HARD_TIMEOUT_SECONDS: "3600"
-  NOETL_COMMAND_REAPER_WORKER_STALE_SECONDS: "180"
+  NOETL_RUNTIME_OFFLINE_SECONDS: "60"
   NOETL_SERVER_METRICS_INTERVAL: "60"
   # Database Configuration (SERVER ONLY - not accessible to workers)
   # Note: POSTGRES_USER/POSTGRES_DB removed - those are application-level and defined in playbook credentials
@@ -57,21 +57,18 @@ data:
   NOETL_SCHEMA: "noetl"
   NOETL_DB_STARTUP_TIMEOUT: "180"
   NOETL_DB_RETRY_INTERVAL: "5"
-  NOETL_POSTGRES_POOL_MIN_SIZE: "4"
-  NOETL_POSTGRES_POOL_MAX_SIZE: "64"
-  NOETL_POSTGRES_POOL_MAX_WAITING: "512"
-  # Result Storage Configuration (output_select pattern)
+  # Result Storage Configuration (RisingWave-aligned, phase 1)
   # Threshold for inline vs external storage (64KB default)
   NOETL_INLINE_MAX_BYTES: "65536"
   # Preview size for large results
   NOETL_PREVIEW_MAX_BYTES: "1024"
-  # Default storage tier: kv, object, s3, gcs
+  # Default storage tier: memory, kv, disk, s3, gcs
   NOETL_DEFAULT_STORAGE_TIER: "kv"
-  # Durable cloud spill tier for disk-backed large results.
-  NOETL_STORAGE_CLOUD_TIER: "gcs"
-  # S3-compatible object-store configuration (SeaweedFS by default, RustFS opt-in)
+  # Cloud tier for DISK async spill ('s3' covers S3-compatible endpoints, or 'gcs').
+  NOETL_STORAGE_CLOUD_TIER: "s3"
   NOETL_S3_ENDPOINT: "http://object-store.object-store.svc.cluster.local:9000"
-  AWS_ACCESS_KEY_ID: "noetl-access"
-  AWS_SECRET_ACCESS_KEY: "noetl-secret"
   NOETL_S3_BUCKET: "noetl"
   NOETL_S3_REGION: "us-east-1"
+  # Default dev credentials. Replace with a Secret in prod.
+  AWS_ACCESS_KEY_ID: "noetl-access"
+  AWS_SECRET_ACCESS_KEY: "noetl-secret"

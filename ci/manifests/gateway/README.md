@@ -7,13 +7,13 @@ Kubernetes manifests for deploying the NoETL Gateway (Rust API + Static UI) to k
 ### Gateway API (Rust)
 - **Deployment**: `deployment.yaml` - Rust gateway service
 - **Service**: `service.yaml` - NodePort on 30090 (localhost:8090)
-- **Image**: `noetl-gateway:latest` (built from crates/gateway/Dockerfile)
+- **Image**: `noetl-gateway:latest` (built from ../gateway/Dockerfile)
 
 ### Gateway UI (Nginx)
 - **Deployment**: `deployment-ui.yaml` - Nginx serving static files
 - **Service**: `service-ui.yaml` - NodePort on 30080 (localhost:8080)
 - **ConfigMap**: `configmap-ui.yaml` - Nginx configuration
-- **ConfigMap**: `configmap-ui-files.yaml` - UI files (HTML/JS/CSS) from ../e2e/fixtures/gateway_ui/
+- **ConfigMap**: `configmap-ui-files.yaml` - UI files (HTML/JS/CSS) from tests/fixtures/gateway_ui/
 - **Script**: `regenerate-ui-configmap.sh` - Regenerate UI ConfigMap from source files
 
 ## Architecture
@@ -28,7 +28,7 @@ Kubernetes manifests for deploying the NoETL Gateway (Rust API + Static UI) to k
 |  Gateway UI Pod (Nginx)                             |
 |  - Namespace: gateway                               |
 |  - NodePort: 30080 -> localhost:8080                |
-|  - Serves: /mnt/gateway-ui/* (../e2e/fixtures/)      |
+|  - Serves: /mnt/gateway-ui/* (tests/fixtures/)      |
 +----------------+------------------------------------+
                  | JavaScript fetch()
                  v
@@ -51,22 +51,22 @@ Kubernetes manifests for deploying the NoETL Gateway (Rust API + Static UI) to k
 
 ```bash
 # Build and deploy everything
-noetl run automation/infrastructure/gateway.yaml --set action=deploy-all
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=deploy-all
 
 # Or step by step:
-noetl run automation/infrastructure/gateway.yaml --set action=build-image    # Build Gateway Docker image
-noetl run automation/infrastructure/gateway.yaml --set action=deploy         # Deploy Gateway API
-noetl run automation/infrastructure/gateway.yaml --set action=deploy-ui      # Deploy Gateway UI
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=build-image    # Build Gateway Docker image
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=deploy         # Deploy Gateway API
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=deploy-ui      # Deploy Gateway UI
 
 # Check status
-noetl run automation/infrastructure/gateway.yaml --set action=status
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=status
 
 # View logs
-noetl run automation/infrastructure/gateway.yaml --set action=logs
-noetl run automation/infrastructure/gateway.yaml --set action=logs-ui
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=logs
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=logs-ui
 
 # Test endpoints
-noetl run automation/infrastructure/gateway.yaml --set action=test
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=test
 ```
 
 ## Access URLs
@@ -89,7 +89,7 @@ noetl run automation/infrastructure/gateway.yaml --set action=test
 
 ## File Mounting
 
-UI files are stored in a ConfigMap generated from `../e2e/fixtures/gateway_ui/`:
+UI files are stored in a ConfigMap generated from `tests/fixtures/gateway_ui/`:
 
 ```bash
 # Regenerate ConfigMap after editing UI files
@@ -104,7 +104,7 @@ kubectl rollout restart deployment/gateway-ui -n gateway
 
 ## Updating UI Files
 
-When you edit files in `../e2e/fixtures/gateway_ui/`:
+When you edit files in `tests/fixtures/gateway_ui/`:
 
 1. **Regenerate ConfigMap manifest:**
    ```bash
@@ -139,23 +139,23 @@ Gateway API deployment:
 
 **Edit UI files:**
 ```bash
-# Edit ../e2e/fixtures/gateway_ui/*.html, *.js, *.css
+# Edit tests/fixtures/gateway_ui/*.html, *.js, *.css
 # Restart UI pod to reload
-noetl run automation/infrastructure/gateway.yaml --set action=restart
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=restart
 ```
 
 **Edit Gateway code:**
 ```bash
-# Edit crates/gateway/src/**/*.rs
+# Edit ../gateway/src/**/*.rs
 # Rebuild and redeploy
-noetl run automation/infrastructure/gateway.yaml --set action=redeploy
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=redeploy
 ```
 
 ## Troubleshooting
 
 **Gateway not starting:**
 ```bash
-noetl run automation/infrastructure/gateway.yaml --set action=logs
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=logs
 # Check NoETL server is running
 kubectl get pods -n noetl
 ```
@@ -165,7 +165,7 @@ kubectl get pods -n noetl
 # Check mount
 kubectl exec -n gateway deployment/gateway-ui -- ls -la /usr/share/nginx/html
 # Restart UI
-noetl run automation/infrastructure/gateway.yaml --set action=restart
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=restart
 ```
 
 **CORS errors:**
@@ -183,5 +183,5 @@ lsof -i :8090
 
 ```bash
 # Remove Gateway completely
-noetl run automation/infrastructure/gateway.yaml --set action=remove
+noetl run ../ops/automation/infrastructure/gateway.yaml --set action=remove
 ```

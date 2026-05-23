@@ -235,22 +235,22 @@ workflow:
               exit 1
             fi
 
-            kubectl apply -f "$NOETL_REPO/ci/manifests/noetl/namespace/"
+            kubectl apply -f "ci/manifests/noetl/namespace/"
 
-            kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/namespace/namespace.yaml"
+            kubectl apply -f "ci/manifests/postgres/namespace/namespace.yaml"
             kubectl create configmap postgres-schema-ddl --namespace postgres \
               --from-file=schema_ddl.sql.norun="$SCHEMA_DDL" \
               --dry-run=client -o yaml | kubectl apply -f -
-            kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/config-files.yaml"
-            kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/configmap.yaml"
-            kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/secret.yaml"
-            kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/persistent-volume.yaml"
-            kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/service.yaml"
-            kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/service-external.yaml"
-            kubectl apply -f "$NOETL_REPO/ci/manifests/postgres/deployment.yaml"
+            kubectl apply -f "ci/manifests/postgres/config-files.yaml"
+            kubectl apply -f "ci/manifests/postgres/configmap.yaml"
+            kubectl apply -f "ci/manifests/postgres/secret.yaml"
+            kubectl apply -f "ci/manifests/postgres/persistent-volume.yaml"
+            kubectl apply -f "ci/manifests/postgres/service.yaml"
+            kubectl apply -f "ci/manifests/postgres/service-external.yaml"
+            kubectl apply -f "ci/manifests/postgres/deployment.yaml"
 
-            kubectl apply -f "$NOETL_REPO/ci/manifests/nats/namespace.yaml"
-            kubectl apply -f "$NOETL_REPO/ci/manifests/nats/nats.yaml"
+            kubectl apply -f "ci/manifests/nats/namespace.yaml"
+            kubectl apply -f "ci/manifests/nats/nats.yaml"
 
             if is_truthy "$FORCE_TEST_SERVER_BUILD" || ! podman image inspect local/test-server:latest >/dev/null 2>&1; then
               echo "Building local test-server from $TEST_SERVER_REPO"
@@ -261,8 +261,8 @@ workflow:
               echo "Using existing local/test-server:latest (set force_test_server_build=true to refresh)"
             fi
             kind_load_image local/test-server:latest
-            kubectl apply -f "$NOETL_REPO/ci/manifests/test-server/namespace.yaml"
-            kubectl apply -f "$NOETL_REPO/ci/manifests/test-server/deployment.yaml"
+            kubectl apply -f "ci/manifests/test-server/namespace.yaml"
+            kubectl apply -f "ci/manifests/test-server/deployment.yaml"
             kubectl set image deployment/paginated-api -n test-server api=localhost/local/test-server:latest
             kubectl rollout restart deployment/paginated-api -n test-server
 
@@ -387,9 +387,9 @@ workflow:
               echo "       Or provide --set image_tag=<tag> for a registry image deploy."
               exit 1
             fi
-            kubectl apply -f "$NOETL_REPO/ci/manifests/noetl/namespace/"
+            kubectl apply -f "ci/manifests/noetl/namespace/"
             IMAGE="$(resolve_deploy_image "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG")"
-            for manifest in "$NOETL_REPO"/ci/manifests/noetl/*.yaml; do
+            for manifest in ci/manifests/noetl/*.yaml; do
               if [ -f "$manifest" ]; then
                 sed \
                   -e "s|image_name:image_tag|$IMAGE|g" \
