@@ -7,6 +7,7 @@ metadata:
   labels:
     app: noetl-worker
     component: worker
+    managed-by: helm
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -17,11 +18,13 @@ spec:
   minReplicaCount: {{ .Values.worker.autoscaling.minReplicas }}
   maxReplicaCount: {{ .Values.worker.autoscaling.maxReplicas }}
   triggers:
-    - type: prometheus
+    - type: nats-jetstream
       metadata:
-        serverAddress: {{ .Values.worker.autoscaling.keda.serverAddress | quote }}
-        metricName: {{ .Values.worker.autoscaling.keda.metricName | quote }}
-        query: {{ .Values.worker.autoscaling.keda.query | quote }}
-        threshold: {{ .Values.worker.autoscaling.keda.threshold | quote }}
-        activationTargetQueryValue: {{ .Values.worker.autoscaling.keda.activationTargetQueryValue | quote }}
+        natsServerMonitoringEndpoint: {{ .Values.worker.autoscaling.keda.nats.monitoringEndpoint | quote }}
+        account: {{ .Values.worker.autoscaling.keda.nats.account | quote }}
+        stream: {{ .Values.worker.autoscaling.keda.nats.stream | quote }}
+        consumer: {{ .Values.worker.autoscaling.keda.nats.consumer | quote }}
+        lagThreshold: {{ .Values.worker.autoscaling.keda.nats.lagThreshold | quote }}
+        activationLagThreshold: {{ .Values.worker.autoscaling.keda.nats.activationLagThreshold | quote }}
+        useHttps: {{ .Values.worker.autoscaling.keda.nats.useHttps | quote }}
 {{- end }}

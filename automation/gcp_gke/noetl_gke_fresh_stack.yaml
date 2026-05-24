@@ -138,14 +138,14 @@ workload:
 
   # NoETL settings
   noetl_worker_replicas: 1
-  # GKE provisions an external KEDA ScaledObject from
-  # ci/manifests/keda/scaledobject-worker-cpu-01.yaml. The chart's built-in
-  # CPU HPA conflicts with KEDA on the same Deployment, so it is disabled by
-  # default for this profile. Set true only when explicitly opting out of
-  # external KEDA.
-  noetl_worker_autoscaling_enabled: false
+  # GKE workers scale via the Helm-NATS-fed KEDA ScaledObject rendered by
+  # automation/helm/noetl/templates/worker-keda-scaledobject.yaml. Both flags
+  # must agree: autoscaling.enabled gates the whole autoscaling block, and
+  # keda.enabled selects the NATS trigger path over the chart CPU HPA.
+  noetl_worker_autoscaling_enabled: true
+  noetl_worker_autoscaling_keda_enabled: true
   noetl_worker_autoscaling_min_replicas: 1
-  noetl_worker_autoscaling_max_replicas: 8
+  noetl_worker_autoscaling_max_replicas: 20
   noetl_worker_autoscaling_target_cpu: 70
   noetl_worker_autoscaling_target_memory: ""
   noetl_server_rollout_max_surge: 0
@@ -164,8 +164,8 @@ workload:
   #
   # Connection budget per database:
   #   noetl db    : server pool max=8  (1 server pod x 8) <= pgbouncer 1x8=8 cap
-  #   demo_noetl  : worker stays at one replica by default; external KEDA owns
-  #                 worker scaling for PFT-sized cursor fanout.
+  #   demo_noetl  : chart-rendered KEDA scales workers for PFT-sized cursor
+  #                 fanout.
   #                 Worker pool max=2 and DB-command concurrency=2 keep
   #                 client pressure aligned with the PgBouncer backend cap
   #                 instead of stampeding Cloud SQL.
@@ -1479,6 +1479,7 @@ workflow:
             --set image.tag={{ workload.noetl_image_tag }} \
             --set worker.replicas={{ workload.noetl_worker_replicas }} \
             --set worker.autoscaling.enabled={{ workload.noetl_worker_autoscaling_enabled }} \
+            --set worker.autoscaling.keda.enabled={{ workload.noetl_worker_autoscaling_keda_enabled }} \
             --set worker.autoscaling.minReplicas={{ workload.noetl_worker_autoscaling_min_replicas }} \
             --set worker.autoscaling.maxReplicas={{ workload.noetl_worker_autoscaling_max_replicas }} \
             --set worker.autoscaling.targetCPUUtilizationPercentage={{ workload.noetl_worker_autoscaling_target_cpu }} \
