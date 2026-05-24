@@ -29,18 +29,21 @@ worker:
   autoscaling:
     enabled: false
     minReplicas: 1
-    maxReplicas: 8
+    maxReplicas: 20
     targetCPUUtilizationPercentage: 70
     targetMemoryUtilizationPercentage: null
     keda:
       enabled: false
-      pollingInterval: 30
-      cooldownPeriod: 300
-      metricName: noetl_frame_backlog_total
-      activationTargetQueryValue: "0"
-      threshold: "1"
-      query: 'sum(noetl_frame_backlog_total{stage_kind="all",status="all"})'
-      serverAddress: "http://vmselect-vmstack-victoria-metrics-k8s-stack.monitoring.svc.cluster.local:8481/select/0/prometheus"
+      pollingInterval: 10
+      cooldownPeriod: 30
+      nats:
+        account: "$G"
+        monitoringEndpoint: nats-headless.nats.svc.cluster.local:8222
+        stream: NOETL_COMMANDS
+        consumer: noetl_worker_pool
+        lagThreshold: "10"
+        activationLagThreshold: "1"
+        useHttps: "false"
     behavior:
       scaleUp:
         stabilizationWindowSeconds: 0
