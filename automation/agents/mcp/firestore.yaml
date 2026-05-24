@@ -329,6 +329,39 @@ workflow:
             doc = _plain_doc(payload)
             return _ok("set_doc", {"path": doc["path"], "document": doc}, f"set_doc {doc['path']}")
 
+        def _batch_set_docs(args):
+            items = _as_list(args.get("items") or args.get("docs"))
+            if not items:
+                return _error("batch_set_docs", "items is required and must be a non-empty list")
+            results = []
+            errors = []
+            for index, item in enumerate(items):
+                item = _as_dict(item)
+                path = _clean_path(item.get("path"))
+                doc = item.get("doc", item.get("data"))
+                if not path:
+                    errors.append({"index": index, "path": path, "error": "path is required"})
+                    continue
+                if not isinstance(doc, dict):
+                    errors.append({"index": index, "path": path, "error": "doc is required and must be an object"})
+                    continue
+                result = _set_doc({"path": path, "data": doc, "merge": bool(item.get("merge", False))})
+                payload = _as_dict(result.get("data"))
+                if result.get("isError"):
+                    errors.append({"index": index, "path": path, "error": payload.get("error") or result.get("summary")})
+                else:
+                    results.append({"index": index, "path": payload.get("path", path), "document": payload.get("document")})
+            data = {
+                "count": len(items),
+                "succeeded": len(results),
+                "failed": len(errors),
+                "results": results,
+                "errors": errors,
+            }
+            if errors:
+                return _error("batch_set_docs", "one or more batch set_doc operations failed", errors, 207)
+            return _ok("batch_set_docs", data, f"batch_set_docs {len(results)}/{len(items)}")
+
         def _get_doc(args):
             path = _clean_path(args.get("path"))
             if not path:
@@ -340,6 +373,46 @@ workflow:
                 return _error("get_doc", "Firestore get_doc failed", json.dumps(payload)[:700], status_code)
             doc = _plain_doc(payload)
             return _ok("get_doc", {"found": True, "path": doc["path"], "document": doc}, f"get_doc {doc['path']}")
+
+        def _batch_get_docs(args):
+            items = _as_list(args.get("items") or args.get("paths"))
+            if not items:
+                return _error("batch_get_docs", "items is required and must be a non-empty list")
+            by_path = {}
+            results = []
+            errors = []
+            for index, item in enumerate(items):
+                if isinstance(item, str):
+                    path = _clean_path(item)
+                else:
+                    path = _clean_path(_as_dict(item).get("path"))
+                if not path:
+                    errors.append({"index": index, "path": path, "error": "path is required"})
+                    continue
+                result = _get_doc({"path": path})
+                payload = _as_dict(result.get("data"))
+                if result.get("isError"):
+                    errors.append({"index": index, "path": path, "error": payload.get("error") or result.get("summary")})
+                else:
+                    item_result = {
+                        "index": index,
+                        "path": path,
+                        "found": bool(payload.get("found")),
+                        "document": payload.get("document"),
+                    }
+                    results.append(item_result)
+                    by_path[path] = item_result
+            data = {
+                "count": len(items),
+                "succeeded": len(results),
+                "failed": len(errors),
+                "results": results,
+                "by_path": by_path,
+                "errors": errors,
+            }
+            if errors:
+                return _error("batch_get_docs", "one or more batch get_doc operations failed", errors, 207)
+            return _ok("batch_get_docs", data, f"batch_get_docs {len(results)}/{len(items)}")
 
         def _query_collection(args):
             collection_path = _clean_path(args.get("collection_path"))
@@ -424,6 +497,45 @@ workflow:
             except Exception as exc:
                 return _error("append_event", "Firestore append_event failed", exc)
 
+        def _batch_append_events(args):
+            items = _as_list(args.get("items") or args.get("events"))
+            if not items:
+                return _error("batch_append_events", "items is required and must be a non-empty list")
+            results = []
+            errors = []
+            for index, item in enumerate(items):
+                item = _as_dict(item)
+                thread_path = _clean_path(item.get("thread_path"))
+                event = _as_dict(item.get("event"))
+                if not thread_path:
+                    errors.append({"index": index, "thread_path": thread_path, "error": "thread_path is required"})
+                    continue
+                if not event:
+                    errors.append({"index": index, "thread_path": thread_path, "error": "event is required and must be an object"})
+                    continue
+                result = _append_event({"thread_path": thread_path, "event": event})
+                payload = _as_dict(result.get("data"))
+                if result.get("isError"):
+                    errors.append({"index": index, "thread_path": thread_path, "error": payload.get("error") or result.get("summary")})
+                else:
+                    results.append({
+                        "index": index,
+                        "thread_path": payload.get("thread_path", thread_path),
+                        "path": payload.get("path"),
+                        "seq": payload.get("seq"),
+                        "event": payload.get("event"),
+                    })
+            data = {
+                "count": len(items),
+                "succeeded": len(results),
+                "failed": len(errors),
+                "results": results,
+                "errors": errors,
+            }
+            if errors:
+                return _error("batch_append_events", "one or more batch append_event operations failed", errors, 207)
+            return _ok("batch_append_events", data, f"batch_append_events {len(results)}/{len(items)}")
+
         def _replay_events(args):
             thread_path = _clean_path(args.get("thread_path"))
             if not thread_path:
@@ -464,10 +576,53 @@ workflow:
                     },
                 },
                 {
+                    "name": "batch_set_docs",
+                    "title": "Batch set Firestore documents",
+                    "description": "Create or update multiple Firestore documents in one MCP invocation. Each item is {path, doc, merge?}.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["items"],
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["path", "doc"],
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "doc": {"type": "object"},
+                                        "merge": {"type": "boolean", "default": False},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                {
                     "name": "get_doc",
                     "title": "Get Firestore document",
                     "description": "Fetch a Firestore document. Missing documents return found=false without failing the MCP call.",
                     "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
+                },
+                {
+                    "name": "batch_get_docs",
+                    "title": "Batch get Firestore documents",
+                    "description": "Fetch multiple Firestore documents in one MCP invocation. Missing documents return found=false per item.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["items"],
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "oneOf": [
+                                        {"type": "string"},
+                                        {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
+                                    ]
+                                },
+                            },
+                        },
+                    },
                 },
                 {
                     "name": "query_collection",
@@ -504,6 +659,28 @@ workflow:
                     },
                 },
                 {
+                    "name": "batch_append_events",
+                    "title": "Batch append events",
+                    "description": "Append multiple events in one MCP invocation. Each item is {thread_path, event}; each event keeps append_event redaction and seq semantics.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["items"],
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["thread_path", "event"],
+                                    "properties": {
+                                        "thread_path": {"type": "string"},
+                                        "event": {"type": "object"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                {
                     "name": "replay_events",
                     "title": "Replay events",
                     "description": "Replay events from a thread in seq order, with optional seq range and type filter.",
@@ -526,10 +703,13 @@ workflow:
             tool_args = _as_dict(args.get("arguments")) if "arguments" in args else args
             dispatch = {
                 "set_doc": _set_doc,
+                "batch_set_docs": _batch_set_docs,
                 "get_doc": _get_doc,
+                "batch_get_docs": _batch_get_docs,
                 "query_collection": _query_collection,
                 "delete_doc": _delete_doc,
                 "append_event": _append_event,
+                "batch_append_events": _batch_append_events,
                 "replay_events": _replay_events,
             }
             if tool not in dispatch:
@@ -567,13 +747,16 @@ workflow:
             "_structured_query": _structured_query,
             "_run_query": _run_query,
             "_set_doc": _set_doc,
+            "_batch_set_docs": _batch_set_docs,
             "_get_doc": _get_doc,
+            "_batch_get_docs": _batch_get_docs,
             "_query_collection": _query_collection,
             "_delete_doc": _delete_doc,
             "_redact": _redact,
             "_begin_transaction": _begin_transaction,
             "_commit_event": _commit_event,
             "_append_event": _append_event,
+            "_batch_append_events": _batch_append_events,
             "_replay_events": _replay_events,
             "_tools_list": _tools_list,
             "_tools_call": _tools_call,
