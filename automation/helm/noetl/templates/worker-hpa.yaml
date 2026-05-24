@@ -1,4 +1,14 @@
-{{- if and .Values.worker.autoscaling.enabled (not .Values.worker.autoscaling.keda.enabled) }}
+{{- /*
+  Defensive value resolution mirroring worker-keda-scaledobject.yaml,
+  so `helm upgrade --reuse-values` does not crash if the live release
+  predates the worker.autoscaling.keda block. The two templates are
+  mutually exclusive: keda.enabled=true selects the ScaledObject, and
+  any other state selects this CPU/memory HPA when autoscaling.enabled
+  is true.
+*/ -}}
+{{- $autoscaling := .Values.worker.autoscaling | default dict -}}
+{{- $keda := $autoscaling.keda | default dict -}}
+{{- if and ($autoscaling.enabled | default false) (not ($keda.enabled | default false)) }}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -12,26 +22,26 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: noetl-worker
-  minReplicas: {{ .Values.worker.autoscaling.minReplicas }}
-  maxReplicas: {{ .Values.worker.autoscaling.maxReplicas }}
+  minReplicas: {{ $autoscaling.minReplicas | default 1 }}
+  maxReplicas: {{ $autoscaling.maxReplicas | default 20 }}
   metrics:
-    {{- if .Values.worker.autoscaling.targetCPUUtilizationPercentage }}
+    {{- if $autoscaling.targetCPUUtilizationPercentage }}
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: {{ .Values.worker.autoscaling.targetCPUUtilizationPercentage }}
+          averageUtilization: {{ $autoscaling.targetCPUUtilizationPercentage }}
     {{- end }}
-    {{- if .Values.worker.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- if $autoscaling.targetMemoryUtilizationPercentage }}
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: {{ .Values.worker.autoscaling.targetMemoryUtilizationPercentage }}
+          averageUtilization: {{ $autoscaling.targetMemoryUtilizationPercentage }}
     {{- end }}
-  {{- with .Values.worker.autoscaling.behavior }}
+  {{- with $autoscaling.behavior }}
   behavior:
 {{- toYaml . | nindent 4 }}
   {{- end }}

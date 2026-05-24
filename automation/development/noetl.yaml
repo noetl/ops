@@ -197,7 +197,49 @@ workflow:
             fi
           }
 
+          # This playbook is the kind-cluster install path only. The GKE
+          # install path lives under automation/gcp_gke/ and uses the
+          # Helm chart at automation/helm/noetl/. See
+          # https://github.com/noetl/ops/wiki/automation-gcp-gke.
+          looks_like_managed_kubernetes() {
+            # Match the well-known prefixes the major managed-Kubernetes
+            # providers stamp into kubeconfig contexts. Conservative on
+            # purpose — false positives here are a friendly redirect to
+            # the right install path, not a data-loss event.
+            case "${1:-}" in
+              gke_*|arn:aws:eks:*|*.aks*|aks-*|do-*-k8s-*|*-doks-*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          ensure_kind_profile() {
+            # Refuse to run kind-shaped build/load/deploy actions when the
+            # operator points at a managed-Kubernetes cluster, whether by
+            # overriding expected_kube_context or by leaving the live
+            # context pointing at one.
+            local override="${EXPECTED_CONTEXT:-}"
+            local current="$(kubectl config current-context 2>/dev/null || true)"
+
+            if looks_like_managed_kubernetes "$override"; then
+              echo "ERROR: expected_kube_context='$override' looks like a managed-Kubernetes cluster."
+              echo "       This playbook is the kind-cluster install path only."
+              echo "       For GKE, use automation/gcp_gke/noetl_gke_fresh_stack.yaml."
+              echo "       See https://github.com/noetl/ops/wiki/automation-gcp-gke."
+              exit 1
+            fi
+
+            if [ -n "$current" ] && looks_like_managed_kubernetes "$current"; then
+              echo "ERROR: Active kubectl context '$current' looks like a managed-Kubernetes cluster."
+              echo "       This playbook is the kind-cluster install path only."
+              echo "       For GKE, use automation/gcp_gke/noetl_gke_fresh_stack.yaml."
+              echo "       See https://github.com/noetl/ops/wiki/automation-gcp-gke."
+              echo "       Switch contexts first: kubectl config use-context $override"
+              exit 1
+            fi
+          }
+
           ensure_kind_context() {
+            ensure_kind_profile
             CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
             if [ -z "$CURRENT_CONTEXT" ]; then
               echo "ERROR: No active kubectl context found."
@@ -397,6 +439,7 @@ workflow:
           }
 
           load() {
+            ensure_kind_profile
             ensure_podman_running
             if [ ! -f .noetl_last_build_tag.txt ]; then
               FALLBACK_TAG="$(resolve_latest_local_tag)"
@@ -526,6 +569,10 @@ workflow:
             help|*)
               echo "Usage:"
               echo "  noetl run automation/development/noetl.yaml --runtime local --set action=<action>"
+              echo ""
+              echo "Profile: kind-cluster install path only."
+              echo "For GKE see automation/gcp_gke/noetl_gke_fresh_stack.yaml or"
+              echo "https://github.com/noetl/ops/wiki/automation-gcp-gke."
               echo ""
               echo "Actions: build, load, deploy, redeploy, status, reset"
               echo "Optional: --set noetl_repo_dir=../noetl"

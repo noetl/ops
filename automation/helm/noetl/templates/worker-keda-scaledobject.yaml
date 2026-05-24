@@ -1,4 +1,19 @@
-{{- if and .Values.worker.autoscaling.enabled .Values.worker.autoscaling.keda.enabled }}
+{{- /*
+  Defensive value resolution so `helm upgrade --reuse-values` does not
+  crash on this template when the live release was rendered with a
+  prior chart version that did not yet have the worker.autoscaling.keda
+  block. The chart's documented defaults live in values.yaml; the
+  fallbacks here mirror them so a release upgraded with --reuse-values
+  still produces the GKE-shaped ScaledObject correctly.
+
+  See https://github.com/noetl/ops/wiki/automation-gcp-gke for the
+  install/upgrade path and the --reuse-values gotcha that motivates
+  this pattern.
+*/ -}}
+{{- $autoscaling := .Values.worker.autoscaling | default dict -}}
+{{- $keda := $autoscaling.keda | default dict -}}
+{{- $nats := $keda.nats | default dict -}}
+{{- if and ($autoscaling.enabled | default false) ($keda.enabled | default false) }}
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -13,18 +28,18 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: noetl-worker
-  pollingInterval: {{ .Values.worker.autoscaling.keda.pollingInterval }}
-  cooldownPeriod: {{ .Values.worker.autoscaling.keda.cooldownPeriod }}
-  minReplicaCount: {{ .Values.worker.autoscaling.minReplicas }}
-  maxReplicaCount: {{ .Values.worker.autoscaling.maxReplicas }}
+  pollingInterval: {{ $keda.pollingInterval | default 10 }}
+  cooldownPeriod: {{ $keda.cooldownPeriod | default 30 }}
+  minReplicaCount: {{ $autoscaling.minReplicas | default 1 }}
+  maxReplicaCount: {{ $autoscaling.maxReplicas | default 20 }}
   triggers:
     - type: nats-jetstream
       metadata:
-        natsServerMonitoringEndpoint: {{ .Values.worker.autoscaling.keda.nats.monitoringEndpoint | quote }}
-        account: {{ .Values.worker.autoscaling.keda.nats.account | quote }}
-        stream: {{ .Values.worker.autoscaling.keda.nats.stream | quote }}
-        consumer: {{ .Values.worker.autoscaling.keda.nats.consumer | quote }}
-        lagThreshold: {{ .Values.worker.autoscaling.keda.nats.lagThreshold | quote }}
-        activationLagThreshold: {{ .Values.worker.autoscaling.keda.nats.activationLagThreshold | quote }}
-        useHttps: {{ .Values.worker.autoscaling.keda.nats.useHttps | quote }}
+        natsServerMonitoringEndpoint: {{ $nats.monitoringEndpoint | default "nats-headless.nats.svc.cluster.local:8222" | quote }}
+        account: {{ $nats.account | default "$G" | quote }}
+        stream: {{ $nats.stream | default "NOETL_COMMANDS" | quote }}
+        consumer: {{ $nats.consumer | default "noetl_worker_pool" | quote }}
+        lagThreshold: {{ $nats.lagThreshold | default "10" | quote }}
+        activationLagThreshold: {{ $nats.activationLagThreshold | default "1" | quote }}
+        useHttps: {{ $nats.useHttps | default "false" | quote }}
 {{- end }}
