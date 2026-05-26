@@ -182,6 +182,15 @@ workload:
   noetl_worker_postgres_pool_timeout_seconds: 60
   noetl_worker_max_inflight_commands: 6
   noetl_worker_max_inflight_db_commands: 2
+  # Inline-trivial-children execution mode for this cluster. The chart
+  # default is ``off``; this cluster has completed Round B Phase D
+  # validation (5x speedup on vertex-ai-stub, cancel cascade emits
+  # PLAYBOOK_CANCELLED, child execution_id bigint-safe, keychain
+  # redaction preserved). See
+  # https://github.com/noetl/noetl/wiki/inline_runner#phase-d-evidence
+  # for the live latency table and the four-PR cascade that landed
+  # before this rollout.
+  noetl_inline_trivial_children: "enforce"
   noetl_worker_nats_max_deliver: 1000
   noetl_worker_nats_max_ack_pending: 64
   noetl_tempstore_max_ref_cache_entries: 50000
@@ -1509,6 +1518,7 @@ workflow:
             --set config.worker.NOETL_POSTGRES_POOL_TIMEOUT_SECONDS={{ workload.noetl_worker_postgres_pool_timeout_seconds }} \
             --set config.worker.NOETL_WORKER_MAX_INFLIGHT_COMMANDS={{ workload.noetl_worker_max_inflight_commands }} \
             --set config.worker.NOETL_WORKER_MAX_INFLIGHT_DB_COMMANDS={{ workload.noetl_worker_max_inflight_db_commands }} \
+            --set config.worker.NOETL_INLINE_TRIVIAL_CHILDREN={{ workload.noetl_inline_trivial_children }} \
             --set config.server.NOETL_TEMPSTORE_MAX_REF_CACHE_ENTRIES={{ workload.noetl_tempstore_max_ref_cache_entries }} \
             --set config.server.NOETL_TEMPSTORE_MAX_MEMORY_CACHE_ENTRIES={{ workload.noetl_tempstore_max_memory_cache_entries }} \
             --set config.worker.NOETL_TEMPSTORE_MAX_REF_CACHE_ENTRIES={{ workload.noetl_tempstore_max_ref_cache_entries }} \
@@ -1532,7 +1542,8 @@ workflow:
             NOETL_POSTGRES_POOL_MAX_WAITING- \
             NOETL_POSTGRES_POOL_TIMEOUT_SECONDS- \
             NOETL_WORKER_MAX_INFLIGHT_COMMANDS- \
-            NOETL_WORKER_MAX_INFLIGHT_DB_COMMANDS- || true
+            NOETL_WORKER_MAX_INFLIGHT_DB_COMMANDS- \
+            NOETL_INLINE_TRIVIAL_CHILDREN- || true
 
           echo "Forcing NoETL rollout restart to refresh image and ConfigMap-derived runtime settings."
           kubectl rollout restart deployment/noetl-server -n noetl

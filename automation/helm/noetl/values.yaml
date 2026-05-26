@@ -304,6 +304,23 @@ config:
     NOETL_COMMAND_HEARTBEAT_MAX_RETRIES: "2"
     NOETL_CURSOR_FRAME_EVENT_TIMEOUT_SECONDS: "30"
     NOETL_CURSOR_FRAME_EVENT_MAX_RETRIES: "3"
+    # Inline-trivial-children execution mode (Round A detector / Round B
+    # runner; see https://github.com/noetl/noetl/wiki/inline_execution and
+    # https://github.com/noetl/noetl/wiki/inline_runner). Three values:
+    #   - off (default): no detector call; zero overhead.
+    #   - dry_run: detector runs + attaches meta.inline_decision to events;
+    #              dispatch path unchanged (HTTP+NATS for every child).
+    #   - enforce: detector-approved children run inline in the worker
+    #              process, skipping the /api/execute + NATS round-trip
+    #              (~5x faster on the validated firestore/vertex-ai-stub
+    #              shape). Detector-declined children still go through
+    #              dispatch — the detector is the safety net.
+    # Default ``off`` because operators should validate Phase D
+    # (latency, cancel cascade, payload parity) on their cluster before
+    # flipping to enforce. Override per-cluster via Helm --set or a
+    # values overlay (see gcp_gke/noetl_gke_fresh_stack.yaml for the
+    # demo cluster's enforce override).
+    NOETL_INLINE_TRIVIAL_CHILDREN: "off"
     # Result storage configuration (tiered hot/warm/cold cache, phase 1).
     NOETL_INLINE_MAX_BYTES: "65536"
     NOETL_PREVIEW_MAX_BYTES: "1024"
