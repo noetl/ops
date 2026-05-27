@@ -242,6 +242,22 @@ config:
     NOETL_COMMAND_REAPER_WORKER_STALE_SECONDS: "180"
     NOETL_COMMAND_REAPER_HEALTHY_HARD_TIMEOUT_SECONDS: "300"
     NOETL_SERVER_METRICS_INTERVAL: "60"
+    # Enable the transactional outbox + NATS event mirror.  Without
+    # this flag every event append skips the outbox and the
+    # NATSEventPublisher never publishes anything on
+    # ``noetl.events.{tenant}.{org}.{exec_id}.{shard}``.  The gateway's
+    # ``playbook_state_listener`` subscribes to that subject; with the
+    # flag off it receives zero ``playbook.completed`` messages and the
+    # travel SPA hangs at ``Muno is planning…`` indefinitely.  Mirror
+    # the value to ``config.worker`` below — both producers feed the
+    # same outbox.
+    #
+    # See ``noetl/server/api/broker/service.py:_is_event_mirror_enabled``,
+    # ``noetl/core/event_store/postgres.py``, and the corresponding
+    # static manifest in ``ci/manifests/noetl/configmap-server.yaml:25``
+    # which already had it on.  The chart was missing this entry, so
+    # Helm-deployed clusters silently ran with the publisher disabled.
+    NOETL_EVENT_MIRROR_ENABLED: "true"
     POSTGRES_HOST: "postgres.postgres.svc.cluster.local"
     POSTGRES_PORT: "5432"
     NOETL_POSTGRES_DB: "noetl"
@@ -304,6 +320,11 @@ config:
     NOETL_COMMAND_HEARTBEAT_MAX_RETRIES: "2"
     NOETL_CURSOR_FRAME_EVENT_TIMEOUT_SECONDS: "30"
     NOETL_CURSOR_FRAME_EVENT_MAX_RETRIES: "3"
+    # Enable the transactional outbox + NATS event mirror on the
+    # worker.  Mirrors the same-named entry under ``config.server``
+    # above — see that block's comment for why the gateway needs
+    # NATS-published events on ``noetl.events.{tenant}.{org}.{exec_id}.{shard}``.
+    NOETL_EVENT_MIRROR_ENABLED: "true"
     # Inline-trivial-children execution mode (Round A detector / Round B
     # runner; see https://github.com/noetl/noetl/wiki/inline_execution and
     # https://github.com/noetl/noetl/wiki/inline_runner). Three values:
