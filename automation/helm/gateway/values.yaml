@@ -29,7 +29,22 @@ env:
   rustLog: "info,gateway=debug"
   corsAllowedOrigins: "http://localhost:8080,http://localhost:8090,http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173,https://mestumre.dev,https://travel.mestumre.dev,https://gateway.mestumre.dev"
   natsUrl: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
-  natsUpdatesSubjectPrefix: "playbooks.executions."
+  # NATS subject prefix the gateway's playbook_state listener
+  # subscribes to (``{prefix}>``).  Must match the noetl event publisher's
+  # ``NOETL_EVENT_NATS_SUBJECT_PREFIX`` (``noetl.events`` by default),
+  # plus a trailing dot.  The publisher emits subjects of the form
+  # ``noetl.events.{tenant}.{org}.{exec_id}.{shard}`` — see
+  # ``noetl/core/messaging/nats_client.py::subject_for_event``.
+  #
+  # The legacy ``"playbooks.executions."`` prefix did not match any
+  # subject the noetl publisher emits — the gateway silently received
+  # zero ``playbook.completed`` messages and the travel SPA hung at
+  # ``Muno is planning…`` indefinitely (see
+  # gateway PR #12 + ai-meta handoff
+  # 2026-05-27-itinerary-planner-spa-hang).  Gateway image must be
+  # rebuilt with PR #12 alongside this value flip so the corrected
+  # subject tail is parsed into the execution id correctly.
+  natsUpdatesSubjectPrefix: "noetl.events."
   authPlaybookTimeoutSecs: "12"
   publicUrl: ""
   # Set to "true" to bypass auth validation (for testing only)
