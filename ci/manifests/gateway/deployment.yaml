@@ -35,8 +35,16 @@ spec:
         # NATS messaging
         - name: NATS_URL
           value: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
+        # Must match ``NOETL_EVENT_NATS_SUBJECT_PREFIX`` on the noetl
+        # server/worker (``noetl.events`` by default) plus a trailing
+        # dot.  The publisher emits subjects
+        # ``noetl.events.{tenant}.{org}.{exec_id}.{shard}`` — see
+        # ``noetl/core/messaging/nats_client.py::subject_for_event``.
+        # The legacy ``"playbooks.executions."`` prefix matched no real
+        # subject and silently broke the gateway's playbook_state SSE
+        # path.  Pair this with gateway PR #12.
         - name: NATS_UPDATES_SUBJECT_PREFIX
-          value: "playbooks.executions."
+          value: "noetl.events."
         - name: NATS_CALLBACK_SUBJECT_PREFIX
           value: "noetl.callbacks"
         # CORS
