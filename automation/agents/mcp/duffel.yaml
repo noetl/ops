@@ -48,7 +48,18 @@ keychain:
   # credential with the live-environment value.  See ai-meta
   # ``handoffs/archive/2026-05-27-itinerary-planner-empty-widget/``
   # for the production diagnostic that motivated the change.
+  #
+  # ``kind: credential_ref`` tells the keychain processor in
+  # noetl/server/keychain_processor.py:_process_credential_ref to
+  # fetch the credential from ``noetl.credential`` by name, take
+  # the ``data`` payload verbatim, and cache it in ``noetl.keychain``
+  # so worker templates ``{{ keychain.duffel_token.token }}``
+  # resolve to the actual token value.  Without ``kind`` the
+  # processor logs "Skipping invalid entry" and the resolved
+  # value stays empty — see noetl/ai-meta#24 for the diagnostic
+  # that surfaced this requirement.
   - name: duffel_token
+    kind: credential_ref
 
 workflow:
   - step: duffel_dispatch
