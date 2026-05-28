@@ -20,11 +20,7 @@ metadata:
     scopes: [/mcp/duffel]
 
 workload:
-  gcp_auth: google_oauth
   duffel_env: test
-  duffel_test_token_path: projects/1014428265962/secrets/duffel-api-test/versions/1
-  # Placeholder only. Do not provision or exercise live mode in the search-only round.
-  duffel_live_token_path: projects/1014428265962/secrets/duffel-api-live/versions/1
   duffel_api_base: https://api.duffel.com
   duffel_api_version: v2
   method: "tools/list"
@@ -32,15 +28,27 @@ workload:
   arguments: {}
 
 keychain:
-  # Keychain Jinja templates resolve workload fields via bare references.
-  # Keep `gcp_auth`, `duffel_env`, and token paths unqualified here.
+  # Look up the duffel_token credential directly from
+  # ``noetl.credential`` — the same resolution path used by
+  # ``openai_token``, ``anthropic_token``, ``amadeus_credentials``,
+  # and every other token-shaped credential in the deployment.  The
+  # credential is registered out-of-band via
+  # ``noetl register credential --file duffel_token.json`` (see
+  # ``~/projects/noetl/credentials/`` for the template), AES-
+  # encrypted by the cluster's ``NOETL_SECRET_KEY``, and the
+  # playbook resolves it via the unqualified
+  # ``{{ keychain.duffel_token.token }}`` reference in the
+  # ``duffel_dispatch`` step.
+  #
+  # This replaces the earlier ``kind: secret_manager`` /
+  # ``provider: gcp`` dispatch shape which required a fresh
+  # ``google_oauth`` Bearer + a Workload-Identity-backed GCS Secret
+  # Manager round-trip on every cache miss.  Live vs test tokens
+  # are now interchangeable here — switch by re-registering the
+  # credential with the live-environment value.  See ai-meta
+  # ``handoffs/archive/2026-05-27-itinerary-planner-empty-widget/``
+  # for the production diagnostic that motivated the change.
   - name: duffel_token
-    kind: secret_manager
-    provider: gcp
-    scope: global
-    auth: "{{ gcp_auth }}"
-    map:
-      token: "{{ duffel_live_token_path if duffel_env == 'live' else duffel_test_token_path }}"
 
 workflow:
   - step: duffel_dispatch
