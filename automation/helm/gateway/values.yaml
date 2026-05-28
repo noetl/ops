@@ -50,6 +50,29 @@ env:
   # Set to "true" to bypass auth validation (for testing only)
   authBypass: "true"
 
+  # Auth0 application metadata.  These values are surfaced verbatim
+  # by the gateway's ``GET /api/runtime/contract`` endpoint under an
+  # ``auth0`` block so the ``noetl`` CLI can bootstrap a context
+  # with one command:
+  #
+  #   noetl context init <name> --from-gateway https://gateway.example.com
+  #
+  # The gateway does NOT use these values for token validation —
+  # validation happens per-request against whichever
+  # ``auth0_domain`` the login payload carries (see
+  # ``src/auth/mod.rs::login_handler``).  These fields are
+  # informational only, telling the CLI which Auth0 application
+  # the SPA + this gateway expect operators to authenticate
+  # against.
+  #
+  # Leave the values empty when the deployment doesn't use Auth0;
+  # the runtime contract simply omits the ``auth0`` block in that
+  # case.
+  auth0Domain: "mestumre-development.us.auth0.com"
+  auth0ClientId: "Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN"
+  auth0RedirectUri: "https://travel.mestumre.dev/login"
+  auth0Audience: ""
+
 resources:
   requests:
     memory: "128Mi"
