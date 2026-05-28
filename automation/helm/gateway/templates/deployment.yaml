@@ -46,6 +46,30 @@ spec:
             - name: GATEWAY_AUTH_BYPASS
               value: {{ .Values.env.authBypass | quote }}
             {{- end }}
+            # Auth0 application metadata — informational only.
+            # Surfaced via ``GET /api/runtime/contract`` so the
+            # ``noetl`` CLI can bootstrap a context with the right
+            # client_id + redirect_uri without operators looking
+            # them up in the SPA source.  When any field is empty
+            # the runtime contract simply omits it from the
+            # ``auth0`` block (or omits the whole block when domain
+            # is unset).
+            {{- if .Values.env.auth0Domain }}
+            - name: GATEWAY_AUTH0_DOMAIN
+              value: {{ .Values.env.auth0Domain | quote }}
+            {{- end }}
+            {{- if .Values.env.auth0ClientId }}
+            - name: GATEWAY_AUTH0_CLIENT_ID
+              value: {{ .Values.env.auth0ClientId | quote }}
+            {{- end }}
+            {{- if .Values.env.auth0RedirectUri }}
+            - name: GATEWAY_AUTH0_REDIRECT_URI
+              value: {{ .Values.env.auth0RedirectUri | quote }}
+            {{- end }}
+            {{- if .Values.env.auth0Audience }}
+            - name: GATEWAY_AUTH0_AUDIENCE
+              value: {{ .Values.env.auth0Audience | quote }}
+            {{- end }}
           resources:
 {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
