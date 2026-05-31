@@ -1,0 +1,37 @@
+# Minimal playbook for end-to-end kind validation of the Rust
+# noetl-worker (5.1.0).  Two shell steps — both run via the
+# `noetl-tools` shell adapter that the Rust worker dispatches
+# through (per cli/executor's tools_bridge), so the Rust worker
+# can actually execute them.
+#
+# What we're validating after this lands:
+#   1. Worker registers + heartbeats.
+#   2. Worker claims a command from NATS JetStream.
+#   3. Worker dispatches the shell tool successfully.
+#   4. Every emitted event carries the post-EE-3 wire shape:
+#        - event_type / step / status / created_at at top level
+#        - event_id (app-side snowflake)
+#        - worker_id (top-level field)
+#        - meta.attempts (per-command retry counter)
+#   5. Python broker (post-EE-4) deserializes the new shape via
+#      the validation aliases and persists rows in noetl.event
+#      with all fields populated.
+#   6. The NATS lag gauges populate visibly on /metrics.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: rust_worker_validation
+  path: tests/fixtures/rust_worker_validation
+
+workflow:
+  - step: greet
+    tool:
+      kind: shell
+      command: 'echo "hello from rust worker $(hostname) at $(date -u +%FT%TZ)"'
+    next:
+      arcs:
+        - step: count
+  - step: count
+    tool:
+      kind: shell
+      command: 'echo "count=42"'

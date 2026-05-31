@@ -1,0 +1,130 @@
+# Local kind validation manifest for the Rust noetl-worker (5.1.0).
+#
+# Deploys a SINGLE Rust worker pod alongside the existing Python
+# worker pool (`worker-cpu-01`).  Both pools claim from the same
+# NATS stream + consumer (`NOETL_COMMANDS` / `noetl_worker_pool`) so
+# whichever pulls a command first wins — exactly the Appendix H §
+# R-3.x design.
+#
+# Image: `noetl-worker:dev` (built locally with podman from
+# noetl/worker@2821149, the v5.1.0 head).  imagePullPolicy: Never so
+# kind uses the loaded image, not GHCR.
+#
+# Per agents/rules/deployment-validation.md — every container-image
+# change validates here before GKE.  This manifest is the validation
+# rig for noetl-worker 3.0.0+ (post PR-EE-3 + snowflake event_id +
+# meta.attempts + NATS consumer-lag metric).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-worker-rust
+  namespace: noetl
+  labels:
+    app: noetl-worker-rust
+    component: worker
+    runtime: rust
+    worker-pool: worker-rust-pool
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: noetl-worker-rust
+      worker-pool: worker-rust-pool
+  template:
+    metadata:
+      labels:
+        app: noetl-worker-rust
+        component: worker
+        runtime: rust
+        worker-pool: worker-rust-pool
+      annotations:
+        # Make the metrics port scrapable by KEDA + Prometheus
+        # without an explicit Service.
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: noetl-worker
+      initContainers:
+        - name: wait-for-api
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "until curl -sf http://noetl.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL API...'; sleep 3; done"
+      containers:
+        - name: worker
+          # Podman tags images with the `localhost/` prefix by
+          # default; containerd inside the kind node is strict about
+          # the registry portion, so we reference the full local
+          # name.
+          image: localhost/noetl-worker:dev
+          imagePullPolicy: Never
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            # Pool name distinguishes Rust heartbeats from the
+            # Python pool's heartbeats so register/deregister
+            # don't collide.
+            - name: WORKER_POOL_NAME
+              value: worker-rust-pool
+            # Unique worker_id per pod — used for the snowflake
+            # generator's node_id hash + the structured-log
+            # correlation field per observability.md Principle 4.
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Same NATS stream + consumer as the Python pool —
+            # Rust + Python workers compete for messages, KEDA
+            # scales the union.  Per Appendix H § R-3.x.
+            - name: NATS_URL
+              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
+            - name: NATS_STREAM
+              value: NOETL_COMMANDS
+            - name: NATS_CONSUMER
+              value: noetl_worker_pool
+            - name: NOETL_SERVER_URL
+              value: http://noetl.noetl.svc.cluster.local:8082
+            - name: WORKER_HEARTBEAT_INTERVAL
+              value: "15"
+            - name: WORKER_MAX_CONCURRENT
+              value: "4"
+            - name: WORKER_METRICS_BIND
+              value: "0.0.0.0:9090"
+            # Default 5s; override for validation so the lag
+            # gauges populate visibly fast.
+            - name: WORKER_NATS_LAG_POLL_INTERVAL
+              value: "5"
+            # Verbose tracing for the validation run.
+            - name: RUST_LOG
+              value: "info,noetl_worker=debug,noetl_executor=debug"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+# Headless service so Prometheus / KEDA can scrape every pod's
+# /metrics endpoint directly.  Mirrors `noetl-worker-metrics`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-worker-rust-metrics
+  namespace: noetl
+  labels:
+    app: noetl-worker-rust
+spec:
+  clusterIP: None
+  selector:
+    app: noetl-worker-rust
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
