@@ -1,0 +1,92 @@
+# End-to-end kind validation for the Rust noetl-worker R-2.x paths
+# (5.6.0).  Builds on rust-worker-validation.yaml (the 5.1.0 EE-3
+# smoke test) but exercises the over-budget `call.done` payload
+# branches that R-2.1 + R-2.2 + the credential scrubber introduced:
+#
+#   1. **Inline path** — small DuckDB query under the 100 KB budget;
+#      `result.context` rides the event log as-is.  No shm, no
+#      durable PUT.  Locks in that the scrubber doesn't break the
+#      inline shape.
+#
+#   2. **Over-budget tabular path** — 6 000-row DuckDB rowset with
+#      typed columns (Int64 / Utf8 / Float64 / Boolean).  The result
+#      JSON is ~150 KB so it overflows the inline budget; the worker
+#      should stage Arrow IPC stream bytes in the shm cache + PUT
+#      the JSON to `/api/result/{execution_id}` for cross-node
+#      consumers.  Expected `call.done.payload.result.reference`
+#      shape:
+#        - `kind: "result_ref"`
+#        - `ref: "noetl://execution/<eid>/result/big_select/<id>"`
+#        - `meta.bytes` > 100 000
+#        - `ipc.media_type: "application/vnd.apache.arrow.stream"`
+#        - `ipc.row_count: 6000`
+#        - `ipc.schema_digest: "arrow"`
+#
+#   3. **Credential scrub** — both the small + large query include
+#      `password` and `api_key` columns whose values mention obvious
+#      credential prefixes (`sk-ant-...`).  After the worker emits,
+#      `noetl.event` must show those values redacted to `[REDACTED]`
+#      in `payload.result.context` for the inline query, and the
+#      durable result-store fetch must return the redacted rows for
+#      the over-budget query.
+#
+# Verification queries live in `validate-rust-worker-r2.sql`
+# alongside this playbook.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: rust_worker_r2_validation
+  path: tests/fixtures/rust_worker_r2_validation
+
+workflow:
+  # ---------------------------------------------------------------------
+  # Step 1 — small in-budget query.  Verifies the inline path +
+  # credential scrub on a non-tabular-shape (the result fits comfortably
+  # under 100 KB so it never hits the encoder).
+  # ---------------------------------------------------------------------
+  - step: small_select
+    tool:
+      kind: duckdb
+      query: |
+        SELECT
+          i AS id,
+          'user_' || i AS username,
+          'hunter_' || i AS password,
+          'sk-ant-aaaaaaaaaaaaaaaaaaaaaaaaaaaa' AS api_key
+        FROM generate_series(1, 5) AS s(i)
+      as_objects: true
+    next:
+      arcs:
+        - step: big_select
+
+  # ---------------------------------------------------------------------
+  # Step 2 — over-budget tabular query.  6000 rows × 4 columns with
+  # the same credential columns produces a JSON payload > 100 KB.
+  # Exercises:
+  #   - R-2.1 cross-node durable PUT (`/api/result/{execution_id}`).
+  #   - R-2.1 colocated shm cache stage via `noetl-arrow-cache`.
+  #   - R-2.2 Arrow IPC encoding (`media_type = arrow.stream`).
+  #   - The producer-side credential scrubber (each row's password
+  #     + api_key must come out as `[REDACTED]`).
+  # ---------------------------------------------------------------------
+  - step: big_select
+    tool:
+      kind: duckdb
+      query: |
+        SELECT
+          i AS id,
+          'user_' || lpad(i::VARCHAR, 6, '0') AS username,
+          'hunter_' || lpad(i::VARCHAR, 6, '0') AS password,
+          'sk-ant-' || repeat('x', 40) AS api_key,
+          (i * 1.5)::DOUBLE AS score,
+          (i % 2 = 0) AS active
+        FROM generate_series(1, 6000) AS s(i)
+      as_objects: true
+    next:
+      arcs:
+        - step: done
+
+  - step: done
+    tool:
+      kind: shell
+      command: 'echo "rust-worker R-2.x validation complete"'
