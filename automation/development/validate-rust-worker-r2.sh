@@ -49,18 +49,31 @@ fi
 echo "Execution ID: $EXECUTION_ID"
 
 echo
-echo "==> Waiting for execution to complete (max 60s)"
-for i in $(seq 1 60); do
-    STATUS=$(curl -sf "$SERVER/api/executions/$EXECUTION_ID/status" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || true)
-    echo "[$i] status=$STATUS"
-    if [[ "$STATUS" == "COMPLETED" || "$STATUS" == "FAILED" || "$STATUS" == "CANCELED" ]]; then
+echo "==> Waiting for execution to complete (max 120s)"
+# The status endpoint returns `{completed: bool, failed: bool, current_step, ...}`
+# rather than a single status string — poll those booleans + the
+# `completion_inferred` heuristic for terminal state.
+for i in $(seq 1 120); do
+    RAW=$(curl -sf "$SERVER/api/executions/$EXECUTION_ID/status" 2>/dev/null || echo "{}")
+    SUMMARY=$(echo "$RAW" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('completed=? failed=? step=?')
+    sys.exit(0)
+print(f\"completed={d.get('completed')} failed={d.get('failed')} step={d.get('current_step','?')}\")
+" 2>/dev/null)
+    echo "[$i] $SUMMARY"
+    if echo "$SUMMARY" | grep -q "completed=True"; then
+        break
+    fi
+    if echo "$SUMMARY" | grep -q "failed=True"; then
+        echo "WARN: execution failed"
         break
     fi
     sleep 1
 done
-if [[ "$STATUS" != "COMPLETED" ]]; then
-    echo "WARN: execution status is $STATUS (expected COMPLETED) — running probes anyway for diagnostics"
-fi
 
 echo
 echo "==> Copying SQL into postgres pod"
