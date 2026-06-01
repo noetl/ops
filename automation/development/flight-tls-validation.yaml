@@ -1,0 +1,78 @@
+# End-to-end kind validation for the R-2.3 Phase C2 trust boundary:
+# server TLS (C2.1) + client TLS (C2.2) + bearer-token middleware
+# (C2.3) + mTLS (C2.4) — all four knobs on, talking through the
+# `result_fetch` tool kind to the noetl-server's Arrow Flight
+# endpoint.
+#
+# Pairs with `validate-flight-tls.sh` (the runner) +
+# `validate-flight-tls.sql` (post-run probes), and depends on
+# `generate-flight-tls.sh` having already turned on the trust
+# boundary (the runner invokes that for you).
+#
+# Mirrors `result-fetch-validation.yaml` (the no-auth baseline) so
+# the SQL probes can compare the two side-by-side.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: flight_tls_validation
+  path: tests/fixtures/flight_tls_validation
+
+workflow:
+  # ---------------------------------------------------------------------
+  # producer — same over-budget DuckDB query the no-auth rig uses.
+  # The Rust worker spills > 100 KB tabular output to the durable
+  # result store + emits a `result.reference.ref` that fetch steps
+  # consume.  No auth knobs on this step — the producer is local to
+  # the worker, no Flight call.
+  # ---------------------------------------------------------------------
+  - step: producer
+    tool:
+      kind: duckdb
+      query: |
+        SELECT
+          i AS id,
+          'user_' || lpad(i::VARCHAR, 6, '0') AS username,
+          'hunter_' || lpad(i::VARCHAR, 6, '0') AS password,
+          'sk-ant-' || repeat('x', 40) AS api_key,
+          (i * 1.5)::DOUBLE AS score,
+          (i % 2 = 0) AS active
+        FROM generate_series(1, 6000) AS s(i)
+      as_objects: true
+    next:
+      arcs:
+        - step: fetch_via_flight_secure
+
+  # ---------------------------------------------------------------------
+  # fetch_via_flight_secure — full TLS + mTLS + bearer auth path.
+  # The worker:
+  #   - trusts the server cert via `tls_ca_path` (the server CA
+  #     mounted under /etc/noetl/flight/server-ca.crt by the
+  #     generate script);
+  #   - presents a client cert + key via `client_cert_path` +
+  #     `client_key_path` (also under /etc/noetl/flight);
+  #   - sends the bearer token via `bearer_token` (a keychain alias
+  #     resolved from `NOETL_FLIGHT_BEARER_TOKEN` in the worker
+  #     ExecutionContext, which the deployment patch loaded from
+  #     the noetl-flight-client Secret).
+  #
+  # `flight_endpoint` is explicit so we hit the in-cluster DNS the
+  # server cert SAN was issued for.
+  # ---------------------------------------------------------------------
+  - step: fetch_via_flight_secure
+    tool:
+      kind: result_fetch
+      ref: "{{ producer.reference.ref }}"
+      prefer: flight
+      flight_endpoint: "https://noetl.noetl.svc.cluster.local:8083"
+      tls_ca_path: /etc/noetl/flight/server-ca.crt
+      client_cert_path: /etc/noetl/flight/client.crt
+      client_key_path: /etc/noetl/flight/client.key
+      bearer_token: NOETL_FLIGHT_BEARER_TOKEN
+    next:
+      arcs:
+        - step: done
+
+  - step: done
+    tool:
+      kind: shell
+      command: 'echo "flight TLS+mTLS+bearer validation complete"'
