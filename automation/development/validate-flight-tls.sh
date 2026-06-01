@@ -71,8 +71,38 @@ echo "==> Turning on Flight TLS + bearer + mTLS via $GENERATE_SCRIPT"
 bash "$GENERATE_SCRIPT"
 
 echo
-echo "==> Registering playbook"
-PLAYBOOK_CONTENT=$(python3 -c "import json,sys; print(json.dumps({'content': open(sys.argv[1]).read(), 'resource_type': 'Playbook'}))" "$PLAYBOOK_FILE")
+echo "==> Waiting for noetl-server /api/health to settle after rollout"
+for i in $(seq 1 30); do
+    if curl -sf "$SERVER/api/health" >/dev/null 2>&1; then
+        echo "    healthy after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+echo
+echo "==> Registering playbook (injecting bearer token from noetl-flight-bearer Secret)"
+# The playbook's `bearer_token` field is a keychain alias by
+# convention.  The worker's ExecutionContext.secrets map isn't
+# currently populated from envFrom Secrets at startup (that's a
+# noetl-worker code gap tracked separately), so the alias falls
+# through as a literal and the server rejects with
+# `Unauthenticated`.  Until the alias-resolution path lands,
+# substitute the literal token into the playbook at registration
+# time.  The generated token only exists in the cluster catalog +
+# this kind run, never in the repo (per safety.md).
+ACTUAL_TOKEN=$(kubectl --context kind-noetl -n noetl get secret noetl-flight-bearer \
+    -o jsonpath='{.data.NOETL_FLIGHT_BEARER_TOKENS}' | base64 -d)
+if [[ -z "$ACTUAL_TOKEN" ]]; then
+    echo "FATAL: couldn't read bearer token from noetl-flight-bearer Secret"
+    exit 1
+fi
+RENDERED_PLAYBOOK=$(mktemp -t flight-tls-validation-rendered.XXXXXX.yaml)
+trap 'rm -f "$RENDERED_PLAYBOOK"' RETURN
+# Replace the keychain alias placeholder with the literal token.
+sed "s|bearer_token: NOETL_FLIGHT_BEARER_TOKEN|bearer_token: \"$ACTUAL_TOKEN\"|" \
+    "$PLAYBOOK_FILE" > "$RENDERED_PLAYBOOK"
+PLAYBOOK_CONTENT=$(python3 -c "import json,sys; print(json.dumps({'content': open(sys.argv[1]).read(), 'resource_type': 'Playbook'}))" "$RENDERED_PLAYBOOK")
 REGISTER_RESPONSE=$(curl -sf -X POST "$SERVER/api/catalog/register" \
     -H "Content-Type: application/json" \
     --data-binary "$PLAYBOOK_CONTENT")
@@ -85,6 +115,10 @@ fi
 
 echo
 echo "==> Executing"
+# Brief settle for catalog propagation across the server's
+# event-log + projector tiers — without this the first execute
+# call after a fresh registration can race and return 4xx.
+sleep 3
 EXEC_RESPONSE=$(curl -sf -X POST "$SERVER/api/execute" \
     -H "Content-Type: application/json" \
     -d "{\"path\": \"tests/fixtures/flight_tls_validation\", \"version\": $VERSION}")

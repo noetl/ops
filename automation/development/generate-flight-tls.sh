@@ -40,18 +40,75 @@ remove_tls() {
     kubectl --context "$CONTEXT" -n "$NAMESPACE" delete secret \
         noetl-flight-tls noetl-flight-bearer noetl-flight-client \
         --ignore-not-found
-    # Strip the auth env vars + volume mounts via JSON-patch.  When
-    # the patch path doesn't exist (deployment never patched) the
-    # `--ignore-not-found` style of `kubectl patch` is unsupported,
-    # so we tolerate failures (deployment is already clean).
+
+    # Name-based revert: look up the array indices of our additions
+    # via jq (rather than hard-coded indices that depend on order),
+    # then emit a JSON-patch removing each one.  Indices are computed
+    # in **descending order** within each list because each remove
+    # shifts subsequent indices down.
     for dep in noetl-server noetl-worker-rust; do
+        # Names we added per deployment.
+        case "$dep" in
+            noetl-server)
+                env_names='NOETL_FLIGHT_TLS_CERT NOETL_FLIGHT_TLS_KEY NOETL_FLIGHT_CLIENT_CA'
+                envfrom_name='noetl-flight-bearer'
+                mount_name='flight-tls'
+                volume_name='flight-tls'
+                ;;
+            noetl-worker-rust)
+                env_names=''
+                envfrom_name='noetl-flight-client'
+                mount_name='flight-client'
+                volume_name='flight-client'
+                ;;
+        esac
+
+        # Pipe the deployment JSON to python so the JSON content
+        # itself doesn't get inlined into the heredoc (which is
+        # fragile with embedded quotes / multi-line strings).
+        # Variables flow via env, not shell substitution.
+        OPS=$(kubectl --context "$CONTEXT" -n "$NAMESPACE" \
+                get deployment "$dep" -o json 2>/dev/null \
+            | EN="$env_names" EF="$envfrom_name" \
+              MN="$mount_name" VN="$volume_name" \
+              python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+spec = d["spec"]["template"]["spec"]
+c = spec["containers"][0]
+ops = []
+env_list = c.get("env", [])
+for nm in os.environ.get("EN", "").split():
+    for i, e in enumerate(env_list):
+        if e.get("name") == nm:
+            ops.append((i, f"/spec/template/spec/containers/0/env/{i}"))
+            break
+for i, e in enumerate(c.get("envFrom", [])):
+    if e.get("secretRef", {}).get("name") == os.environ.get("EF"):
+        ops.append((i, f"/spec/template/spec/containers/0/envFrom/{i}"))
+        break
+for i, m in enumerate(c.get("volumeMounts", [])):
+    if m.get("name") == os.environ.get("MN"):
+        ops.append((i, f"/spec/template/spec/containers/0/volumeMounts/{i}"))
+        break
+for i, v in enumerate(spec.get("volumes", [])):
+    if v.get("name") == os.environ.get("VN"):
+        ops.append((i, f"/spec/template/spec/volumes/{i}"))
+        break
+sorted_ops = sorted(ops, key=lambda x: -x[0])
+print(json.dumps([{"op": "remove", "path": p} for _, p in sorted_ops]))
+') || {
+            echo "    $dep: not present (ok)"
+            continue
+        }
+
+        if [[ -z "$OPS" || "$OPS" == "[]" ]]; then
+            echo "    $dep: already unpatched (ok)"
+            continue
+        fi
         kubectl --context "$CONTEXT" -n "$NAMESPACE" patch deployment "$dep" \
-            --type=json \
-            -p '[
-                {"op":"remove","path":"/spec/template/spec/containers/0/envFrom/2"},
-                {"op":"remove","path":"/spec/template/spec/containers/0/volumeMounts/2"},
-                {"op":"remove","path":"/spec/template/spec/volumes/2"}
-            ]' 2>/dev/null || echo "    $dep: already unpatched (ok)"
+            --type=json -p "$OPS" >/dev/null
+        echo "    $dep: reverted"
     done
     echo "==> Done.  Deployments roll automatically on the next image refresh."
     exit 0
@@ -140,43 +197,50 @@ kubectl --context "$CONTEXT" -n "$NAMESPACE" create secret generic noetl-flight-
 
 echo "==> Patching deployments to mount the certs + read the env"
 
-# Strategic-merge patch on the server deployment — adds an envFrom
-# pointing at the bearer Secret, env entries for the cert paths
-# (the configmap doesn't carry them by default), a volumeMount, and
-# the corresponding volume.
-SERVER_PATCH=$(cat <<'EOF'
-spec:
-  template:
-    spec:
-      containers:
-        - name: noetl-server
-          env:
-            - name: NOETL_FLIGHT_TLS_CERT
-              value: /etc/noetl/flight/server.crt
-            - name: NOETL_FLIGHT_TLS_KEY
-              value: /etc/noetl/flight/server.key
-            - name: NOETL_FLIGHT_CLIENT_CA
-              value: /etc/noetl/flight/client-ca.crt
-          envFrom:
-            - secretRef:
-                name: noetl-flight-bearer
-          volumeMounts:
-            - name: flight-tls
-              mountPath: /etc/noetl/flight
-              readOnly: true
-      volumes:
-        - name: flight-tls
-          secret:
-            secretName: noetl-flight-tls
-EOF
-)
-kubectl --context "$CONTEXT" -n "$NAMESPACE" patch deployment noetl-server \
-    --type=strategic --patch "$SERVER_PATCH"
+# JSON-patch (RFC 6902) instead of strategic-merge — strategic-merge
+# on `envFrom` and `volumes` without a patchMergeKey REPLACES the
+# entire list, which would drop the existing configmap + Secret
+# refs the base manifest depends on (`noetl-server-config`,
+# `noetl-secret`, `noetl-data` PVC, etc.).  JSON-patch `add` at
+# `/-` appends without touching siblings.
+SERVER_PATCH='[
+  {"op":"add","path":"/spec/template/spec/containers/0/envFrom/-","value":{"secretRef":{"name":"noetl-flight-bearer"}}},
+  {"op":"add","path":"/spec/template/spec/containers/0/env","value":[]},
+  {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_FLIGHT_TLS_CERT","value":"/etc/noetl/flight/server.crt"}},
+  {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_FLIGHT_TLS_KEY","value":"/etc/noetl/flight/server.key"}},
+  {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_FLIGHT_CLIENT_CA","value":"/etc/noetl/flight/client-ca.crt"}},
+  {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"flight-tls","mountPath":"/etc/noetl/flight","readOnly":true}},
+  {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"flight-tls","secret":{"secretName":"noetl-flight-tls"}}}
+]'
+# Some deployments may already have `env: []` set; if the second
+# JSON-patch op fails because the key already exists, fall back to
+# appending without the create-array op.  We try both orderings.
+if ! kubectl --context "$CONTEXT" -n "$NAMESPACE" patch deployment noetl-server \
+        --type=json -p "$SERVER_PATCH" 2>/dev/null; then
+    # Fallback: env array already exists; skip the create-array op.
+    SERVER_PATCH_FALLBACK='[
+      {"op":"add","path":"/spec/template/spec/containers/0/envFrom/-","value":{"secretRef":{"name":"noetl-flight-bearer"}}},
+      {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_FLIGHT_TLS_CERT","value":"/etc/noetl/flight/server.crt"}},
+      {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_FLIGHT_TLS_KEY","value":"/etc/noetl/flight/server.key"}},
+      {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_FLIGHT_CLIENT_CA","value":"/etc/noetl/flight/client-ca.crt"}},
+      {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"flight-tls","mountPath":"/etc/noetl/flight","readOnly":true}},
+      {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"flight-tls","secret":{"secretName":"noetl-flight-tls"}}}
+    ]'
+    kubectl --context "$CONTEXT" -n "$NAMESPACE" patch deployment noetl-server \
+        --type=json -p "$SERVER_PATCH_FALLBACK"
+fi
 
-# Worker patch — the worker's auth knobs flow through the
-# `result_fetch` tool config; the deployment only needs to mount the
-# client cert + key + server CA + bearer token.  The validation
-# playbook (C2.6) references these paths from the playbook config.
+# Worker patch — strategic-merge.  The worker's `envFrom` is
+# empty in the base manifest (no configmap to preserve), so
+# strategic-merge replacement is safe — unlike the noetl-server
+# case where the base envFrom carries `noetl-server-config` +
+# `noetl-secret` that we MUST keep.  Volumes + volumeMounts merge
+# by name on strategic-merge so the existing entries stay.
+#
+# Strategic-merge is used here instead of JSON-patch because the
+# kind cluster's admission stack (KEDA + others) intermittently
+# rejects JSON-patch on the worker-rust deployment with a generic
+# 422.  Strategic-merge passes the same validation cleanly.
 WORKER_PATCH=$(cat <<'EOF'
 spec:
   template:
