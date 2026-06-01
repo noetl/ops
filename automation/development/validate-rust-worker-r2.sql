@@ -1,11 +1,12 @@
 -- Post-run validation queries for the Rust worker R-2.x kind
--- validation (5.6.0).  Verifies the over-budget call.done payload
+-- validation rig.  Verifies the over-budget call.done payload
 -- shape + the producer-side credential scrub.  Run after invoking
 -- `rust-worker-r2-validation.yaml`.
 --
--- Usage:
+-- Usage (invoked by the runner; not typically run by hand):
 --   kubectl --context kind-noetl -n postgres exec postgres-685d4bb64b-l76dn -- \
---     psql -U noetl -d noetl -f /tmp/validate-rust-worker-r2.sql
+--     psql -U noetl -d noetl -v exec_id=<execution_id> \
+--     -f /tmp/validate-rust-worker-r2.sql
 --
 -- For the actual data-fetch step (resolve the ResultRef back to its
 -- bytes), see the matching curl recipe in the validate-rust-worker-r2.sh
@@ -17,6 +18,12 @@
 -- object).  The probes below access the call.done result via the
 -- `result` column at the row level, then drill into `result.context`
 -- / `result.reference` jsonb sub-objects (NOT `payload.result.*`).
+--
+-- NOTE on event filtering: `worker_id` only lands on `command.claimed`
+-- events in the current schema — `call.done` rows have `worker_id`
+-- NULL.  Probes filter by `execution_id = :exec_id` instead; the .sh
+-- runner already pins to the Rust worker via `PIN_RUST_WORKER=1`, so
+-- the execution_id is sufficient on its own.
 
 -- =============================================================
 -- 1. Inline path (small_select)
@@ -38,7 +45,7 @@ SELECT
     result#>'{context,data,rows,0,api_key}' AS first_row_api_key,
     result#>'{context,data,rows,0,username}' AS first_row_username
 FROM noetl.event
-WHERE worker_id LIKE 'noetl-worker-rust-%'
+WHERE execution_id = :exec_id
   AND node_name = 'small_select'
   AND event_type = 'call.done'
 ORDER BY event_id DESC
@@ -73,7 +80,7 @@ SELECT
     result#>>'{reference,ipc,schema_digest}' AS ipc_schema_digest,
     result#>>'{reference,ipc,shm_name}' AS ipc_shm_name
 FROM noetl.event
-WHERE worker_id LIKE 'noetl-worker-rust-%'
+WHERE execution_id = :exec_id
   AND node_name = 'big_select'
   AND event_type = 'call.done'
 ORDER BY event_id DESC
@@ -113,14 +120,7 @@ SELECT
     preview->'rows'->0->>'api_key'  AS preview_first_api_key,
     preview->'rows'->0->>'username' AS preview_first_username
 FROM noetl.result_ref
-WHERE execution_id IN (
-    SELECT execution_id
-    FROM noetl.event
-    WHERE worker_id LIKE 'noetl-worker-rust-%'
-      AND node_name = 'big_select'
-      AND event_type = 'call.done'
-    ORDER BY event_id DESC LIMIT 1
-)
+WHERE execution_id = :exec_id
   AND name = 'big_select'
 ORDER BY created_at DESC
 LIMIT 1;
@@ -145,7 +145,7 @@ SELECT
     COUNT(*) FILTER (WHERE result ? 'context')   AS with_inline_context,
     COUNT(*) FILTER (WHERE result ? 'reference') AS with_reference
 FROM noetl.event
-WHERE worker_id LIKE 'noetl-worker-rust-%'
+WHERE execution_id = :exec_id
   AND node_name IN ('small_select', 'big_select', 'done')
 GROUP BY node_name, event_type
 ORDER BY node_name, event_type;
