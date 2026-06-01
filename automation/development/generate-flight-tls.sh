@@ -241,12 +241,24 @@ fi
 # kind cluster's admission stack (KEDA + others) intermittently
 # rejects JSON-patch on the worker-rust deployment with a generic
 # 422.  Strategic-merge passes the same validation cleanly.
+#
+# `NOETL_KEYCHAIN_ENV_VARS` (noetl/worker#35) tells the worker's
+# `CommandExecutor::new` to lift the named env vars into the
+# per-executor keychain map, so playbook fields like
+# `result_fetch.bearer_token: NOETL_FLIGHT_BEARER_TOKEN` resolve
+# via `ctx.get_secret(alias)` against the envFrom-mounted Secret
+# value.  Without this, the playbook would see the literal alias
+# string instead of the token — that's the gap the rig's previous
+# sed workaround papered over.
 WORKER_PATCH=$(cat <<'EOF'
 spec:
   template:
     spec:
       containers:
         - name: worker
+          env:
+            - name: NOETL_KEYCHAIN_ENV_VARS
+              value: NOETL_FLIGHT_BEARER_TOKEN
           envFrom:
             - secretRef:
                 name: noetl-flight-client
