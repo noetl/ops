@@ -12,5 +12,12 @@ spec:
       targetPort: 8082
       protocol: TCP
       name: noetl
+    # R-2.3 Phase A: Arrow Flight gRPC endpoint.  In-cluster
+    # consumers (the Rust worker, Python tools) reach it via
+    # `grpc://noetl.noetl.svc.cluster.local:8083`.
+    - port: 8083
+      targetPort: 8083
+      protocol: TCP
+      name: flight-grpc
   selector:
     app: noetl-server

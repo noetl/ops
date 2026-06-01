@@ -22,6 +22,15 @@ spec:
           imagePullPolicy: Never
           ports:
             - containerPort: 8082
+              name: http
+            # R-2.3 Phase A: Arrow Flight gRPC endpoint serving the
+            # same data as `/api/result/resolve` but as an Arrow IPC
+            # stream over gRPC.  Set NOETL_FLIGHT_DISABLED=1 to turn
+            # the spawn off; NOETL_FLIGHT_LOCATION overrides the
+            # bind address.  See the noetl wiki page
+            # `arrow-flight-result-fetch` for the protocol contract.
+            - containerPort: 8083
+              name: flight-grpc
           envFrom:
             - configMapRef:
                 name: noetl-server-config
