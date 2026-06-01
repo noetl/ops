@@ -81,28 +81,17 @@ for i in $(seq 1 30); do
 done
 
 echo
-echo "==> Registering playbook (injecting bearer token from noetl-flight-bearer Secret)"
-# The playbook's `bearer_token` field is a keychain alias by
-# convention.  The worker's ExecutionContext.secrets map isn't
-# currently populated from envFrom Secrets at startup (that's a
-# noetl-worker code gap tracked separately), so the alias falls
-# through as a literal and the server rejects with
-# `Unauthenticated`.  Until the alias-resolution path lands,
-# substitute the literal token into the playbook at registration
-# time.  The generated token only exists in the cluster catalog +
-# this kind run, never in the repo (per safety.md).
-ACTUAL_TOKEN=$(kubectl --context kind-noetl -n noetl get secret noetl-flight-bearer \
-    -o jsonpath='{.data.NOETL_FLIGHT_BEARER_TOKENS}' | base64 -d)
-if [[ -z "$ACTUAL_TOKEN" ]]; then
-    echo "FATAL: couldn't read bearer token from noetl-flight-bearer Secret"
-    exit 1
-fi
-RENDERED_PLAYBOOK=$(mktemp -t flight-tls-validation-rendered.XXXXXX.yaml)
-trap 'rm -f "$RENDERED_PLAYBOOK"' RETURN
-# Replace the keychain alias placeholder with the literal token.
-sed "s|bearer_token: NOETL_FLIGHT_BEARER_TOKEN|bearer_token: \"$ACTUAL_TOKEN\"|" \
-    "$PLAYBOOK_FILE" > "$RENDERED_PLAYBOOK"
-PLAYBOOK_CONTENT=$(python3 -c "import json,sys; print(json.dumps({'content': open(sys.argv[1]).read(), 'resource_type': 'Playbook'}))" "$RENDERED_PLAYBOOK")
+echo "==> Registering playbook"
+# noetl/worker#35 lifts `NOETL_FLIGHT_BEARER_TOKEN` from the
+# worker's envFrom Secret into `ExecutionContext.secrets` at
+# startup, so the playbook's
+# `bearer_token: NOETL_FLIGHT_BEARER_TOKEN` keychain alias
+# resolves directly via `ctx.get_secret` — no client-side
+# substitution needed.  (Earlier revisions of this script
+# sed-injected the literal token before registration; that
+# workaround came out once worker 5.7.0 shipped the allow-list
+# loader.)
+PLAYBOOK_CONTENT=$(python3 -c "import json,sys; print(json.dumps({'content': open(sys.argv[1]).read(), 'resource_type': 'Playbook'}))" "$PLAYBOOK_FILE")
 REGISTER_RESPONSE=$(curl -sf -X POST "$SERVER/api/catalog/register" \
     -H "Content-Type: application/json" \
     --data-binary "$PLAYBOOK_CONTENT")
