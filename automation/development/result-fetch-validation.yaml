@@ -1,0 +1,97 @@
+# End-to-end kind validation for the `result_fetch` tool kind
+# (noetl-tools 2.11.0+ via noetl-worker 5.7.0+).  Pairs with the
+# R-2.x worker rig in `rust-worker-r2-validation.yaml` —
+# demonstrates the playbook-facing surface that consumes the
+# data-plane primitives that rig already validated.
+#
+# Per `agents/rules/execution-model.md`, fetch policy (when /
+# whether / which backend) lives in the playbook step.  The tool
+# is the surface authors invoke.
+#
+# What this validates:
+#
+#   1. `producer` step generates > 100 KB of tabular data via
+#      DuckDB.  Worker emits `call.done` with a
+#      `result.reference.ref = noetl://execution/<eid>/result/producer/<id>`
+#      because the payload exceeds the inline budget (R-2.1).
+#
+#   2. `fetch_via_flight` step uses the `result_fetch` tool kind
+#      with `prefer: flight` to materialise the rows back through
+#      the noetl-server's Arrow Flight `do_get` endpoint
+#      (R-2.3 Phase A + Phase B client).
+#
+#   3. `fetch_via_http` step does the same with `prefer: http` to
+#      exercise the HTTP `/api/result/resolve` fallback path.
+#
+#   4. Both fetch steps' outputs have `[REDACTED]` in the password
+#      column — the producer-side credential scrub (R-2.1 / worker
+#      5.6.0) flows through to the read side.
+#
+# Verification: see validate-result-fetch.sql alongside this file
+# for the SQL probes.  The runner script
+# (validate-result-fetch.sh) drives register + execute + check.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: result_fetch_validation
+  path: tests/fixtures/result_fetch_validation
+
+workflow:
+  # ---------------------------------------------------------------------
+  # producer — DuckDB SELECT producing ~150 KB of typed rows.
+  # Exceeds the inline budget so the worker spills the bytes to
+  # the durable result store + emits a `result.reference.ref`.
+  # ---------------------------------------------------------------------
+  - step: producer
+    tool:
+      kind: duckdb
+      query: |
+        SELECT
+          i AS id,
+          'user_' || lpad(i::VARCHAR, 6, '0') AS username,
+          'hunter_' || lpad(i::VARCHAR, 6, '0') AS password,
+          'sk-ant-' || repeat('x', 40) AS api_key,
+          (i * 1.5)::DOUBLE AS score,
+          (i % 2 = 0) AS active
+        FROM generate_series(1, 6000) AS s(i)
+      as_objects: true
+    next:
+      arcs:
+        - step: fetch_via_flight
+
+  # ---------------------------------------------------------------------
+  # fetch_via_flight — explicit playbook step exercising the
+  # `result_fetch` tool's Flight path.  `prefer: flight` is the
+  # default so this leg covers the gRPC route.  The `flight_endpoint`
+  # config is intentionally omitted so the tool derives the URL
+  # from `ctx.server_url` (swap 8082 → 8083) — same convention the
+  # K8s manifests + kind extraPortMappings ship.
+  # ---------------------------------------------------------------------
+  - step: fetch_via_flight
+    tool:
+      kind: result_fetch
+      ref: "{{ producer.reference.ref }}"
+      prefer: flight
+    next:
+      arcs:
+        - step: fetch_via_http
+
+  # ---------------------------------------------------------------------
+  # fetch_via_http — same playbook surface, different backend.
+  # `prefer: http` skips Flight entirely + goes straight to
+  # `/api/result/resolve`.  Useful when the deployment doesn't
+  # expose Flight or for non-tabular refs the caller knows about.
+  # ---------------------------------------------------------------------
+  - step: fetch_via_http
+    tool:
+      kind: result_fetch
+      ref: "{{ producer.reference.ref }}"
+      prefer: http
+    next:
+      arcs:
+        - step: done
+
+  - step: done
+    tool:
+      kind: shell
+      command: 'echo "result_fetch validation complete"'
