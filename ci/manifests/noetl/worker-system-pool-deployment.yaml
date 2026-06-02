@@ -1,0 +1,146 @@
+# System worker pool — privileged Rust worker pool that runs
+# platform-internal NoETL playbooks (system/outbox_publisher,
+# system/projector, system/auth, ...).
+#
+# Per noetl/ai-meta#46 Phase 1.b.  Reuses the existing
+# ``ghcr.io/noetl/worker`` image (no new compiled binary) with a
+# distinct NATS consumer (``noetl_worker_pool_system``) and filter
+# subject (``noetl.commands.system.>``).  Phase 2 of #46 lands the
+# first system playbook (``system/outbox_publisher``); until then this
+# pool sits idle on the consumer.
+#
+# Data-access-boundary rule applies — system playbooks call the server
+# at ``/api/internal/*`` instead of touching ``noetl.*`` directly.
+# This pod mounts ``NOETL_INTERNAL_API_TOKEN`` from a K8s Secret so
+# the playbooks' ``tool: http`` calls can authenticate.  The token's
+# Secret is created out-of-band (see
+# ``automation/development/system-pool-secrets.sh`` or equivalent
+# kubectl create secret command in the README) and is NOT committed
+# here.
+#
+# Per agents/rules/deployment-validation.md — kind validation rig
+# in ``automation/development/validate-internal-api.sh`` covers the
+# server side; Phase 1.b validation just confirms the pool deploys
+# and idles correctly on the consumer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-worker-system-pool
+  namespace: noetl
+  labels:
+    app: noetl-worker-system-pool
+    component: system-worker
+    runtime: rust
+    worker-pool: worker-system-pool
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: noetl-worker-system-pool
+      worker-pool: worker-system-pool
+  template:
+    metadata:
+      labels:
+        app: noetl-worker-system-pool
+        component: system-worker
+        runtime: rust
+        worker-pool: worker-system-pool
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9090"
+    spec:
+      # Distinct ServiceAccount from the user-pool worker.  RBAC
+      # differs: this SA needs no direct DB access (system playbooks
+      # call the server API per data-access-boundary), but it does
+      # need to read the catalog (for system/* playbooks) and read
+      # its own Secret (for NOETL_INTERNAL_API_TOKEN).  Defined in
+      # serviceaccount-worker-system-pool.yaml.
+      serviceAccountName: noetl-worker-system-pool
+      initContainers:
+        - name: wait-for-api
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "until curl -sf http://noetl.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL API...'; sleep 3; done"
+      containers:
+        - name: worker
+          image: localhost/noetl-worker:dev
+          imagePullPolicy: Never
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: WORKER_POOL_NAME
+              value: worker-system-pool
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NATS_URL
+              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
+            - name: NATS_STREAM
+              value: NOETL_COMMANDS
+            # System pool's dedicated NATS consumer.  Server routes
+            # ``system_*`` tool-kind commands here via
+            # ``POOL_FILTER_MAP`` (Phase 2 of #46 will land that
+            # routing extension; for now this consumer just exists).
+            - name: NATS_CONSUMER
+              value: noetl_worker_pool_system
+            - name: NATS_FILTER_SUBJECT
+              value: noetl.commands.system.>
+            - name: NOETL_SERVER_URL
+              value: http://noetl.noetl.svc.cluster.local:8082
+            - name: WORKER_HEARTBEAT_INTERVAL
+              value: "15"
+            # System playbooks are typically low-frequency; lower
+            # concurrency than the user pool's default.
+            - name: WORKER_MAX_CONCURRENT
+              value: "2"
+            - name: WORKER_METRICS_BIND
+              value: "0.0.0.0:9090"
+            - name: WORKER_NATS_LAG_POLL_INTERVAL
+              value: "5"
+            # Bearer token for the system playbooks' ``tool: http``
+            # calls to ``/api/internal/*``.  Mounted from a K8s
+            # Secret named ``noetl-internal-api-token`` (see
+            # secret-internal-api-token.yaml stub + README for the
+            # ``kubectl create secret`` recipe — the live token is
+            # not committed).
+            - name: NOETL_INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: noetl-internal-api-token
+                  key: token
+            - name: RUST_LOG
+              value: "info,noetl_worker=debug,noetl_executor=debug"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"  # +128Mi vs user pool — system playbooks
+              # eventually include WASM module cache per #46 Phase 4
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+---
+# Headless service so Prometheus + KEDA can scrape every pod's
+# /metrics endpoint directly.  Mirrors `noetl-worker-rust-metrics`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-worker-system-pool-metrics
+  namespace: noetl
+  labels:
+    app: noetl-worker-system-pool
+spec:
+  clusterIP: None
+  selector:
+    app: noetl-worker-system-pool
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
