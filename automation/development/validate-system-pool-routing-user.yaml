@@ -1,0 +1,26 @@
+# Phase 2.a.2 routing validation fixture — user-namespace playbook
+#
+# Control fixture for the routing test.  Sits under
+# `tests/fixtures/...` (not `system/`), so its commands should route
+# to the shared pool (`noetl.commands.shared.<eid>`).  Same single
+# python step as the system fixture so the only routing input that
+# differs is the catalog path.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: routing_test
+  path: tests/fixtures/routing_test
+  description: Phase 2.a.2 path-based routing fixture (user namespace)
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workflow:
+  - step: start
+    desc: Single python step — should route to shared pool
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "ok", "from": "tests/fixtures/routing_test"}
