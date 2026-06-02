@@ -1,0 +1,28 @@
+# Phase 2.a.2 routing validation fixture — system playbook
+#
+# Minimal single-step playbook under the `system/` namespace.  Used by
+# `validate-system-pool-routing.sh` to verify path-based routing sends
+# this playbook's commands to `noetl.commands.system.<eid>`.
+#
+# No HTTP / auth — keeps the fixture independent of the bearer-token
+# wiring (Phase 2.a.3) so this test stays focused on the routing
+# decision alone.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: routing_test
+  path: system/routing_test
+  description: Phase 2.a.2 path-based routing fixture (system namespace)
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workflow:
+  - step: start
+    desc: Single python step — should route to system pool
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "ok", "from": "system/routing_test"}
