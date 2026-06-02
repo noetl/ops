@@ -33,6 +33,19 @@ data:
   NATS_STREAM: "NOETL_COMMANDS"
   NATS_CONSUMER: "noetl_worker_pool"
   NATS_SUBJECT: "noetl.commands"
+  # Per noetl/ai-meta#42 PR-5 — the cutover flag.  When true the
+  # server publishes command notifications to
+  # `noetl.commands.<pool>.<execution_id>` instead of bare
+  # `noetl.commands`, where `<pool>` is derived from the playbook
+  # step's `tool.kind` via `POOL_FILTER_MAP` (today: `agent` →
+  # `python`, everything else → `shared`).  Workers in both pools
+  # already subscribe to the right consumers per PR-2b / PR-3 /
+  # PR-4b.  Flipping this on completes the routing roll-out: the
+  # Rust pool stops seeing Python-only tool kinds; the Python pool
+  # continues to drain shared + Python-only segments via its
+  # multi-subscriber loop.  PR-6 cleans up the legacy
+  # `noetl_worker_pool` durable once verification soak completes.
+  NOETL_COMMAND_ROUTING_ENABLED: "true"
   # Keychain cache refresh threshold (15 minutes - prevents expiration during long loops)
   NOETL_KEYCHAIN_REFRESH_THRESHOLD: "900"
   # Server Runtime Configuration
