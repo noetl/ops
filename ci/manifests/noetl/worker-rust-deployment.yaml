@@ -78,15 +78,29 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # Same NATS stream + consumer as the Python pool —
-            # Rust + Python workers compete for messages, KEDA
-            # scales the union.  Per Appendix H § R-3.x.
+            # Per noetl/ai-meta#42 PR-2b/PR-3/PR-4b: the Rust pool
+            # subscribes to the *shared* segment of the per-pool
+            # routing scheme.  The consumer name has a `_shared`
+            # suffix; the consumer-side filter pins it to commands
+            # published under `noetl.commands.shared.>`.  Until
+            # PR-5's flag flip, the server is still publishing to
+            # the bare subject so this consumer is empty; after
+            # cutover it drains shared-segment commands.  The
+            # Python pool's deployment continues to read the legacy
+            # `NATS_CONSUMER=noetl_worker_pool` from the ConfigMap
+            # and uses its multi-subscriber loop (PR-2b) to also
+            # bind `*_shared` and `*_python` consumers.
             - name: NATS_URL
               value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
             - name: NATS_STREAM
               value: NOETL_COMMANDS
             - name: NATS_CONSUMER
-              value: noetl_worker_pool
+              value: noetl_worker_pool_shared
+            # Restricts the Rust pool to the shared-segment branch
+            # of the routing scheme.  See noetl/ai-meta#42 PR-3 for
+            # the worker-side env contract.
+            - name: NATS_FILTER_SUBJECT
+              value: noetl.commands.shared.>
             - name: NOETL_SERVER_URL
               value: http://noetl.noetl.svc.cluster.local:8082
             - name: WORKER_HEARTBEAT_INTERVAL
