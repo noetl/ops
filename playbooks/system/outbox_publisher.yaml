@@ -93,13 +93,17 @@ workload:
   server_url: "http://noetl.noetl.svc.cluster.local:8082"
 
   # Bearer-token credential alias.  Resolved at dispatch time by the
-  # worker's keychain.  See noetl/ai-meta#50 (Phase 2.a.3) for the
-  # auth-wiring decision: the system pool's NOETL_INTERNAL_API_TOKEN
-  # env will be lifted into the keychain as alias
-  # `internal_api_token` via the worker's keychain-env-allowlist
-  # (mirror of the existing pattern in
-  # repos/worker/src/.../load_keychain_env_allowlist).
-  api_token_alias: internal_api_token
+  # worker's keychain (the existing pattern in
+  # repos/worker/src/executor/command.rs::load_keychain_env_allowlist):
+  # the system pool's deployment manifest adds
+  # ``NOETL_INTERNAL_API_TOKEN`` to the ``NOETL_KEYCHAIN_ENV_VARS``
+  # comma-separated list, the worker lifts it into ``ctx.secrets``
+  # verbatim under that env-var name, and ``auth.credential`` below
+  # resolves it via ``ctx.get_secret(...)``.
+  #
+  # See noetl/ai-meta#50 (Phase 2.a.3) for the deployment-env
+  # update that wires this through.
+  api_token_alias: NOETL_INTERNAL_API_TOKEN
 
 workflow:
   - step: start
@@ -123,7 +127,13 @@ workflow:
       url: "{{ server_url }}/api/internal/outbox/claim"
       headers:
         Content-Type: "application/json"
-        Authorization: "Bearer {{ secret(api_token_alias) }}"
+      # AuthResolver looks up ``credential`` in ``ctx.secrets`` and
+      # sets ``Authorization: Bearer <token>`` automatically.  The
+      # alias matches the env-var name lifted by the worker via
+      # ``NOETL_KEYCHAIN_ENV_VARS``.
+      auth:
+        type: bearer
+        credential: "{{ api_token_alias }}"
       body:
         limit: "{{ batch_size }}"
     next:
@@ -170,7 +180,9 @@ workflow:
       url: "{{ server_url }}/api/internal/outbox/mark-published"
       headers:
         Content-Type: "application/json"
-        Authorization: "Bearer {{ secret(api_token_alias) }}"
+      auth:
+        type: bearer
+        credential: "{{ api_token_alias }}"
       body:
         # All rows we claimed — the publish_batch step's iterator
         # guarantees they're all sent before this step.  Per-row
