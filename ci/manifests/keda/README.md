@@ -4,18 +4,30 @@ This directory holds the KEDA `ScaledObject` manifests that scale the
 two worker Deployments based on NATS JetStream consumer lag:
 
 - **`scaledobject-worker-cpu-01.yaml`** — Python `noetl-worker`
-  deployment.  The original scaler from the v2-spec Phase 4 round.
+  deployment.  **Three triggers** (one per pool segment: legacy,
+  shared, python) after noetl/ai-meta#42 PR-4 to handle per-pool
+  command routing for tool kinds the Rust worker can't dispatch
+  (today: `agent`; tomorrow: `container` per #43).  KEDA's HPA
+  reconciler picks the `MAX` desired-replicas across triggers, so
+  the pool scales on whichever consumer has the largest backlog.
 - **`scaledobject-worker-rust-pool.yaml`** — Rust `noetl-worker-rust`
-  deployment.  Added 2026-06-02 alongside R-3 Phase B-4 dual-scaling.
+  deployment.  Single trigger on the `noetl_worker_pool_shared`
+  consumer (Rust workers only subscribe to the shared segment per
+  PR-2b/PR-3).
 
-Both scalers point at the **same** NATS stream + consumer
-(`NOETL_COMMANDS` / `noetl_worker_pool`), because both deployments
-claim from the same shared consumer.  NATS dispatches each pending
-message to whichever pool's pod sends the next pull request, so the
-two pools naturally share load without any per-pool subject filter.
-KEDA scales each Deployment independently against the same lag metric
-— total active pods will be roughly 2× a single-pool config but total
-throughput stays the same because the consumer is shared.
+The Python pool's three consumers map to the three subject branches
+the Python worker subscribes to:
+
+| Consumer | Filter subject | Notes |
+|---|---|---|
+| `noetl_worker_pool` | _none_ (wide-open) | Legacy single-consumer; receives publishes on the bare subject (today's behaviour, kept active until PR-6 cleanup once the cutover soak completes). |
+| `noetl_worker_pool_shared` | `noetl.commands.shared.>` | Receives commands routed to the shared segment after PR-5 cutover. |
+| `noetl_worker_pool_python` | `noetl.commands.python.>` | Receives commands routed to the Python-only segment (currently: `agent` kind). |
+
+The Rust pool's single consumer (`noetl_worker_pool_shared`) is the
+same JetStream durable as the Python pool's second trigger — both
+pools claim from it competitively, NATS dispatches each pending
+message to whichever pod sends the next pull request first.
 
 The generator that produced both YAMLs lives at
 [`noetl/core/runtime/keda.py`](https://github.com/noetl/noetl/blob/main/noetl/core/runtime/keda.py)
