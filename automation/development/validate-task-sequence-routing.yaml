@@ -1,0 +1,42 @@
+# Phase #47 routing validation fixture — task_sequence playbook
+#
+# Single step whose `tool:` is a list of two named tasks.  The presence
+# of a list (vs a single tool dict) is what makes the engine emit a
+# command with `tool_kind=task_sequence` and the step name suffixed
+# `:task_sequence`.
+#
+# After `task_sequence` is added to `POOL_FILTER_MAP` in
+# `noetl/core/runtime/pool_routing.py`, this playbook's command must
+# route to the python pool segment (NATS subject
+# `noetl.commands.python.<eid>`) and the Python worker's
+# `TaskSequenceExecutor` must claim + dispatch it.
+#
+# Used by `validate-task-sequence-routing.sh`.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: task_sequence_routing_test
+  path: tests/fixtures/task_sequence_routing
+  description: |
+    Phase #47 routing fixture — single task_sequence step with two
+    python tasks.  No external systems; safe to register/run anywhere.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workflow:
+  - step: pipe
+    desc: Two-task sequence — first computes a value, second consumes it
+    tool:
+      - name: produce
+        kind: python
+        input: {}
+        code: |
+          result = {"status": "ok", "value": 42}
+      - name: consume
+        kind: python
+        input:
+          incoming: "{{ _prev.value | default(0) }}"
+        code: |
+          result = {"status": "ok", "doubled": int(incoming) * 2}
