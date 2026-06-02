@@ -115,6 +115,21 @@ spec:
                 secretKeyRef:
                   name: noetl-internal-api-token
                   key: token
+            # Tell the worker's keychain-env-allowlist to lift the
+            # bearer token into ``ctx.secrets`` under the verbatim
+            # env-var name.  System playbooks' ``tool: http`` blocks
+            # then reference it via:
+            #
+            #   auth:
+            #     type: bearer
+            #     credential: NOETL_INTERNAL_API_TOKEN
+            #
+            # The pattern lives in
+            # ``repos/worker/src/executor/command.rs``
+            # (``load_keychain_env_allowlist``).  Tracks
+            # noetl/ai-meta#50 Phase 2.a.3.
+            - name: NOETL_KEYCHAIN_ENV_VARS
+              value: NOETL_INTERNAL_API_TOKEN
             - name: RUST_LOG
               value: "info,noetl_worker=debug,noetl_executor=debug"
           resources:
