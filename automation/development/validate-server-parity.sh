@@ -137,5 +137,50 @@ probe "status"        GET  /api/status        || true
 probe "credentials"   GET  /api/credentials   || true
 probe "dashboard/stats" GET /api/dashboard/stats || true
 
+# ---------------------------------------------------------------------------
+# Round 2 — endpoints with path params (need live execution_id +
+# playbook path).  Auto-discover from the live DB so the harness
+# remains self-contained.  Skips silently when no data is present.
+# ---------------------------------------------------------------------------
+
+POSTGRES_POD=${POSTGRES_POD:-postgres-685d4bb64b-l76dn}
+discover() {
+    # Returns the latest completed execution_id whose catalog path is
+    # also surfaced.  Skips if the kind cluster's psql isn't reachable
+    # (e.g. running this harness in CI).
+    kubectl --context kind-noetl -n postgres exec "$POSTGRES_POD" -- \
+        psql -U noetl -d noetl -At -c "$1" 2>/dev/null | head -1
+}
+
+LIVE_EID=$(discover "SELECT execution_id::text FROM noetl.event WHERE event_type='playbook.initialized' ORDER BY event_id DESC LIMIT 1;")
+LIVE_PATH=$(discover "SELECT path FROM noetl.catalog ORDER BY catalog_id DESC LIMIT 1;")
+LIVE_EVENT_ID=$(discover "SELECT event_id::text FROM noetl.event WHERE result IS NOT NULL ORDER BY event_id DESC LIMIT 1;")
+
+printf '\n%s discovery: execution_id=%s playbook=%s event_id=%s\n' \
+    "$(cyan '==>')" "${LIVE_EID:-<none>}" "${LIVE_PATH:-<none>}" "${LIVE_EVENT_ID:-<none>}"
+
+if [[ -n "$LIVE_EID" ]]; then
+    probe "executions"                  GET  /api/executions                                    || true
+    probe "executions/{id}"              GET  /api/executions/$LIVE_EID                          || true
+    probe "executions/{id}/status"       GET  /api/executions/$LIVE_EID/status                   || true
+    probe "vars/{execution_id}"          GET  /api/vars/$LIVE_EID                                || true
+fi
+
+if [[ -n "$LIVE_EVENT_ID" ]]; then
+    probe "commands/{event_id}"          GET  /api/commands/$LIVE_EVENT_ID                       || true
+fi
+
+# Catalog read path — uses POST for list (intentional) and GET for
+# resource/ui_schema.
+probe "catalog/list (POST)"          POST /api/catalog/list                                  '{"kind":"Playbook","limit":5}' || true
+
+if [[ -n "$LIVE_PATH" ]]; then
+    probe "catalog/{path}/ui_schema"    GET  "/api/catalog/${LIVE_PATH}/ui_schema"              || true
+fi
+
+# Pool routing + runtime contract endpoints — heavily used by gateway / SPA.
+probe "runtime/contract"             GET  /api/runtime/contract                              || true
+probe "runtimes"                     GET  /api/runtimes                                      || true
+
 echo
 echo "==> Done.  Drifts above are documented for triage."
