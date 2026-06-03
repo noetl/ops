@@ -93,13 +93,17 @@ workload:
   server_url: "http://noetl.noetl.svc.cluster.local:8082"
 
   # Bearer-token credential alias.  Resolved at dispatch time by the
-  # worker's keychain.  See noetl/ai-meta#50 (Phase 2.a.3) for the
-  # auth-wiring decision: the system pool's NOETL_INTERNAL_API_TOKEN
-  # env will be lifted into the keychain as alias
-  # `internal_api_token` via the worker's keychain-env-allowlist
-  # (mirror of the existing pattern in
-  # repos/worker/src/.../load_keychain_env_allowlist).
-  api_token_alias: internal_api_token
+  # worker's `AuthResolver.resolve_bearer` against the keychain
+  # entry of the same name.  Phase 2.a.3 (noetl/ai-meta#50)
+  # added ``NOETL_KEYCHAIN_ENV_VARS=NOETL_INTERNAL_API_TOKEN`` to the
+  # system pool's deployment manifest, so on worker startup
+  # ``load_keychain_env_allowlist()`` lifts the bearer token from
+  # the pod env into ``ctx.secrets["NOETL_INTERNAL_API_TOKEN"]``
+  # under the verbatim env-var name.  Each ``tool: http`` step
+  # below references this alias via the standard NoETL
+  # ``auth: { type: bearer, credential: ... }`` block — the
+  # AuthResolver then emits ``Authorization: Bearer <token>``.
+  api_token_alias: NOETL_INTERNAL_API_TOKEN
 
 workflow:
   - step: start
@@ -123,7 +127,9 @@ workflow:
       url: "{{ server_url }}/api/internal/outbox/claim"
       headers:
         Content-Type: "application/json"
-        Authorization: "Bearer {{ secret(api_token_alias) }}"
+      auth:
+        type: bearer
+        credential: "{{ api_token_alias }}"
       body:
         limit: "{{ batch_size }}"
     next:
@@ -170,7 +176,9 @@ workflow:
       url: "{{ server_url }}/api/internal/outbox/mark-published"
       headers:
         Content-Type: "application/json"
-        Authorization: "Bearer {{ secret(api_token_alias) }}"
+      auth:
+        type: bearer
+        credential: "{{ api_token_alias }}"
       body:
         # All rows we claimed — the publish_batch step's iterator
         # guarantees they're all sent before this step.  Per-row
