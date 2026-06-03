@@ -56,7 +56,8 @@ NORMALIZE_JQ='
         "idle_connections",
         "queries_total",
         "queries_active",
-        "version"
+        "version",
+        "generated_at"
       ] | index($k) | not))
     else .
     end
