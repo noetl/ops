@@ -1,0 +1,131 @@
+# noetl-server-rust — Rust control plane (noetl/server crate v2.1.1+)
+#
+# Deployed alongside the Python noetl-server for strangler-fig
+# parity validation (Phase C of noetl/ai-meta#49).  Listens on
+# port 8082 internally; the headless Service exposes it under a
+# distinct DNS name so the Python server can keep its existing
+# Service unchanged.
+#
+# This deployment exists for kind validation only — production
+# rollout requires the sharding work in #49 Phase F.
+#
+# Generated from repos/server/Dockerfile (multi-stage cargo-chef
+# build).  Image rebuilt locally for arm64 because the GHCR
+# ``ghcr.io/noetl/server:2.1.1`` published manifest is amd64-only
+# today.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-server-rust
+  namespace: noetl
+  labels:
+    app: noetl-server-rust
+    component: server
+    runtime: rust
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: noetl-server-rust
+  template:
+    metadata:
+      labels:
+        app: noetl-server-rust
+        component: server
+        runtime: rust
+    spec:
+      containers:
+        - name: noetl-server
+          image: localhost/noetl-server-rust:dev
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8082
+              name: http
+          env:
+            - name: NOETL_HOST
+              value: "0.0.0.0"
+            - name: NOETL_PORT
+              value: "8082"
+            - name: RUST_LOG
+              value: "info,noetl_server=debug,sqlx=warn"
+            # Database — reuse the existing Postgres service.  These
+            # match the Python server's noetl-secret + configmap-
+            # server values; only env-var NAMES differ
+            # (POSTGRES_* on Rust vs NOETL_PG_* on Python).
+            - name: POSTGRES_HOST
+              value: "postgres.postgres.svc.cluster.local"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: "noetl"
+            - name: POSTGRES_PASSWORD
+              value: "noetl"
+            - name: POSTGRES_DATABASE
+              value: "noetl"
+            - name: NOETL_SCHEMA
+              value: "noetl"
+            # NATS connection — same broker the Python server uses.
+            - name: NOETL_NATS_URL
+              value: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
+            # Internal-API bearer token — mounted from the same
+            # K8s Secret the system worker pool reads.  Worker's
+            # NOETL_KEYCHAIN_ENV_VARS allow-list lifts this into
+            # ctx.secrets at dispatch time; server's
+            # require_internal_api_token extractor compares the
+            # request's `Authorization: Bearer <token>` against
+            # this env var with constant-time equality.
+            - name: NOETL_INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: noetl-internal-api-token
+                  key: token
+            # Encryption key for credential store (same key the
+            # Python server uses so credentials written by either
+            # decode on the other).
+            - name: NOETL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: noetl-secret
+                  key: NOETL_ENCRYPTION_KEY
+                  optional: true
+          resources:
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8082
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-server-rust
+  namespace: noetl
+  labels:
+    app: noetl-server-rust
+spec:
+  selector:
+    app: noetl-server-rust
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+      protocol: TCP
+  type: ClusterIP
