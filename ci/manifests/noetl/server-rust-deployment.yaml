@@ -68,6 +68,12 @@ spec:
             # NATS connection — same broker the Python server uses.
             - name: NOETL_NATS_URL
               value: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
+            # Publicly-reachable URL embedded in NATS command
+            # notifications so workers know where to call back
+            # for command details + result POSTs.  Required by
+            # /api/execute's NATS publish (noetl/server#26).
+            - name: NOETL_PUBLIC_SERVER_URL
+              value: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
             # Internal-API bearer token — mounted from the same
             # K8s Secret the system worker pool reads.  Worker's
             # NOETL_KEYCHAIN_ENV_VARS allow-list lifts this into
