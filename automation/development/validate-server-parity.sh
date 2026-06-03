@@ -180,7 +180,9 @@ fi
 
 # Pool routing + runtime contract endpoints — heavily used by gateway / SPA.
 probe "runtime/contract"             GET  /api/runtime/contract                              || true
-probe "runtimes"                     GET  /api/runtimes                                      || true
+# /api/runtimes was a Rust-side innovation removed in noetl/server#19 for
+# Phase A parity; both servers now 404 here so the probe is moot.  Re-add
+# when the Python backport lands.
 
 echo
 echo "==> Done.  Drifts above are documented for triage."
