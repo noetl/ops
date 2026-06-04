@@ -74,6 +74,30 @@ spec:
             # /api/execute's NATS publish (noetl/server#26).
             - name: NOETL_PUBLIC_SERVER_URL
               value: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
+            # 10-bit machine id for the application-side snowflake
+            # generator added in Phase F R1.5 of noetl/ai-meta#49
+            # (server v2.10.1+; see noetl/server#42 + #43).  Each
+            # replica MUST set a distinct value (0–1023) to avoid
+            # snowflake id collisions producing duplicate event /
+            # execution / command IDs.
+            #
+            # Single-replica deployment (current): "1" is fine.
+            # When scaling beyond 1 replica:
+            #   - StatefulSet pattern: derive from pod ordinal via
+            #     fieldRef on metadata.labels['apps.kubernetes.io/pod-index']
+            #     piped through an initContainer that emits the
+            #     integer to a shared file → exposed back as an env.
+            #   - Deployment pattern: set per-replica via Helm
+            #     values (replicaIndex) or via the K8s
+            #     replica-controller's ordinal.
+            #   - Fallback: leave unset; the binary derives a 10-
+            #     bit id from HOSTNAME via FNV-1a.  Hash collisions
+            #     in the 1024-bucket space are rare for small fleets.
+            #
+            # See https://github.com/noetl/server/wiki/deployment-specification#snowflake-id-generation
+            # for the layout + collision-risk discussion.
+            - name: NOETL_SERVER_MACHINE_ID
+              value: "1"
             # Internal-API bearer token — mounted from the same
             # K8s Secret the system worker pool reads.  Worker's
             # NOETL_KEYCHAIN_ENV_VARS allow-list lifts this into
