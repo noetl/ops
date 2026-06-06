@@ -50,7 +50,7 @@ keychain:
   # conditional simple and validate both modes before relying on a new
   # environment switch.
   - name: amadeus_credentials
-    kind: secret_manager
+    kind: secrets
     provider: gcp
     scope: global
     auth: "{{ gcp_auth }}"
