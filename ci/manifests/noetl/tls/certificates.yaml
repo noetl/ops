@@ -1,0 +1,105 @@
+# cert-manager TLS chain for the Rust noetl-server + noetl-worker mTLS
+# transport (Secrets Wallet Phase 4c, noetl/ai-meta#61).
+#
+# Bootstrap: a self-signed Issuer mints a long-lived in-cluster CA; a
+# CA Issuer then signs the two leaf certs.  cert-manager materializes
+# the `noetl-server-tls` + `noetl-worker-tls` Secrets (keys tls.crt /
+# tls.key / ca.crt) that the mTLS overlay mounts — so the stack comes
+# up mTLS with NO manual openssl / `kubectl create secret`.
+#
+# Requires cert-manager in the cluster.  See README.md for the install
+# step + the apply/validate runbook.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: noetl-selfsigned-issuer
+  namespace: noetl
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: noetl-ca
+  namespace: noetl
+spec:
+  isCA: true
+  commonName: noetl-ca
+  secretName: noetl-ca-tls
+  duration: 87600h # 10y — the in-cluster root
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+  issuerRef:
+    name: noetl-selfsigned-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: noetl-ca-issuer
+  namespace: noetl
+spec:
+  ca:
+    secretName: noetl-ca-tls
+---
+# Server leaf — the noetl-server-rust TLS listener identity.
+# SANs cover the in-cluster Service DNS + localhost (port-forward).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: noetl-server-tls
+  namespace: noetl
+spec:
+  secretName: noetl-server-tls
+  duration: 8760h # 1y
+  renewBefore: 720h # 30d
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  dnsNames:
+    - noetl-server-rust.noetl.svc
+    - noetl-server-rust.noetl.svc.cluster.local
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+  issuerRef:
+    name: noetl-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
+# Worker leaf — the noetl-worker-rust mTLS client identity.
+# clientAuth EKU; the server's WebPkiClientVerifier only checks the
+# chain to the CA, so the worker SAN is informational.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: noetl-worker-tls
+  namespace: noetl
+spec:
+  secretName: noetl-worker-tls
+  duration: 8760h # 1y
+  renewBefore: 720h # 30d
+  commonName: noetl-worker-rust
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+  usages:
+    - client auth
+    - digital signature
+    - key encipherment
+  dnsNames:
+    - noetl-worker-rust.noetl.svc
+  issuerRef:
+    name: noetl-ca-issuer
+    kind: Issuer
+    group: cert-manager.io

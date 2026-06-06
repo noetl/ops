@@ -1,0 +1,44 @@
+# mTLS overlay patch for noetl-worker-rust (Secrets Wallet Phase 4c).
+# Mounts the cert-manager-issued `noetl-worker-tls` Secret and makes the
+# worker's control-plane client present a client cert (worker#56 env
+# contract). The `wait-for-api` init container is rewritten to curl the
+# server's mTLS endpoint WITH the client cert — a plain-HTTP curl can't
+# complete against an mTLS server and would block the pod in Init.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-worker-rust
+  namespace: noetl
+spec:
+  template:
+    spec:
+      volumes:
+        - name: tls
+          secret:
+            secretName: noetl-worker-tls
+      initContainers:
+        - name: wait-for-api
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          command:
+            - sh
+            - -c
+            - "until curl -sf --cacert /tls/ca.crt --cert /tls/tls.crt --key /tls/tls.key https://noetl-server-rust.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL mTLS API...'; sleep 3; done"
+      containers:
+        - name: worker
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          env:
+            - name: NOETL_TLS_CLIENT_CERT
+              value: /tls/tls.crt
+            - name: NOETL_TLS_CLIENT_KEY
+              value: /tls/tls.key
+            - name: NOETL_TLS_CA
+              value: /tls/ca.crt
+            # Point the worker at the Rust server's mTLS endpoint.
+            - name: NOETL_SERVER_URL
+              value: https://noetl-server-rust.noetl.svc.cluster.local:8082
