@@ -86,7 +86,7 @@ keychain:
   #      today; entries are simply present-or-absent. Provider switching
   #      belongs in normal workflow code, not in keychain predicates.
   - name: openai_token
-    kind: secret_manager
+    kind: secrets
     provider: gcp
     scope: global
     auth: "{{ gcp_auth }}"
@@ -94,7 +94,7 @@ keychain:
       api_key: "{{ openai_secret_path }}"
 
   - name: anthropic_token
-    kind: secret_manager
+    kind: secrets
     provider: gcp
     scope: global
     auth: "{{ gcp_auth }}"
@@ -102,7 +102,7 @@ keychain:
       api_key: "{{ anthropic_secret_path }}"
 
   - name: amadeus_credentials
-    kind: secret_manager
+    kind: secrets
     provider: gcp
     scope: global
     auth: "{{ gcp_auth }}"
