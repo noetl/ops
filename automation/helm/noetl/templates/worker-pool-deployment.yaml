@@ -30,10 +30,24 @@ spec:
         - name: wait-for-api
           image: curlimages/curl:8.7.1
           imagePullPolicy: IfNotPresent
+{{- if .Values.tls.enabled }}
+          # Phase 4 mTLS: plain-HTTP curl can't complete against an mTLS
+          # listener (the cert-less handshake is rejected before /api/health
+          # is evaluated).  Curl with the mounted client cert.
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          command:
+            - sh
+            - -c
+            - "until curl -sf --cacert /tls/ca.crt --cert /tls/tls.crt --key /tls/tls.key https://noetl-server.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.service.port }}/api/health; do echo 'Waiting for NoETL mTLS API...'; sleep 3; done"
+{{- else }}
           command:
             - sh
             - -c
             - "until curl -sf http://noetl.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.service.port }}/api/health; do echo 'Waiting for NoETL API...'; sleep 3; done"
+{{- end }}
       containers:
         - name: worker-pool
           image: "{{ .Values.workerPool.image.repository }}:{{ .Values.workerPool.image.tag }}"
@@ -46,10 +60,30 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+{{- if .Values.tls.enabled }}
+            # Secrets Wallet Phase 4b (noetl/ai-meta#61) — values-gated mTLS
+            # client.  The Rust noetl-worker consumes this env (worker
+            # v5.12.0+) to present a client cert + verify the server.
+            - name: NOETL_TLS_CLIENT_CERT
+              value: /tls/tls.crt
+            - name: NOETL_TLS_CLIENT_KEY
+              value: /tls/tls.key
+            - name: NOETL_TLS_CA
+              value: /tls/ca.crt
+            # Override the configmap's plain-HTTP server URL so registration
+            # + claims + event posts speak https from the start.
+            - name: NOETL_SERVER_URL
+              value: https://noetl-server.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.service.port }}
+{{- end }}
           volumeMounts:
 {{- if .Values.persistence.data.enabled }}
             - name: noetl-data
               mountPath: /opt/noetl/data
+{{- end }}
+{{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /tls
+              readOnly: true
 {{- end }}
           resources:
 {{- toYaml .Values.workerPool.resources | nindent 12 }}
@@ -68,5 +102,10 @@ spec:
         - name: noetl-data
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.data.name }}
+{{- end }}
+{{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.certManager.worker.secretName }}
 {{- end }}
 {{- end }}

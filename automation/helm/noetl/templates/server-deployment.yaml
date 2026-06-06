@@ -28,6 +28,23 @@ spec:
                 name: noetl-server-config
             - secretRef:
                 name: noetl-secret
+{{- if .Values.tls.enabled }}
+          # Secrets Wallet Phase 4 (noetl/ai-meta#61) — values-gated mTLS.
+          # The Rust noetl-server consumes this env contract (server v2.30.0+);
+          # under a Python image these env vars are no-ops.
+          env:
+            - name: NOETL_TLS_CERT
+              value: /tls/tls.crt
+            - name: NOETL_TLS_KEY
+              value: /tls/tls.key
+{{- if .Values.tls.mtls.enabled }}
+            - name: NOETL_TLS_CLIENT_CA
+              value: /tls/ca.crt
+{{- end }}
+            # Workers route lifecycle events back here over the same scheme.
+            - name: NOETL_PUBLIC_SERVER_URL
+              value: https://noetl-server.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.service.port }}
+{{- end }}
           volumeMounts:
 {{- if .Values.persistence.data.enabled }}
             - name: noetl-data
@@ -37,14 +54,41 @@ spec:
             - name: noetl-logs
               mountPath: /opt/noetl/logs
 {{- end }}
+{{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+{{- end }}
           command: ["python"]
           args: ["-m", "noetl.server", "--host", "0.0.0.0", "--port", "{{ .Values.service.port }}"]
           resources:
 {{- toYaml .Values.server.resources | nindent 12 }}
+{{- if and .Values.tls.enabled .Values.tls.mtls.enabled }}
+          # mTLS rejects the K8s probe's certless TLS handshake, so a TCP
+          # port-open check is the pragmatic probe form (a separate non-mTLS
+          # health port is the production-grade alternative).
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+{{- else }}
           livenessProbe:
             httpGet:
               path: /api/health
               port: {{ .Values.service.port }}
+{{- if .Values.tls.enabled }}
+              scheme: HTTPS
+{{- end }}
             initialDelaySeconds: 120
             periodSeconds: 10
             timeoutSeconds: 5
@@ -53,10 +97,14 @@ spec:
             httpGet:
               path: /api/health
               port: {{ .Values.service.port }}
+{{- if .Values.tls.enabled }}
+              scheme: HTTPS
+{{- end }}
             initialDelaySeconds: 60
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 12
+{{- end }}
       volumes:
 {{- if .Values.persistence.data.enabled }}
         - name: noetl-data
@@ -67,4 +115,9 @@ spec:
         - name: noetl-logs
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.logs.name }}
+{{- end }}
+{{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.certManager.server.secretName }}
 {{- end }}
