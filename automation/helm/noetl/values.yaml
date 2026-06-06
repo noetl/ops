@@ -158,6 +158,79 @@ ingress:
     enabled: true
     name: noetl-managed-cert
 
+# ---------------------------------------------------------------------------
+# Control-plane TLS / mTLS (Secrets Wallet Phase 4, noetl/ai-meta#61).
+#
+# Disabled by default — when `enabled: false` the chart renders identical to
+# pre-Phase-4 (no Certificate templates, no mTLS env, httpGet probes).  When
+# the operator flips `enabled: true`:
+#   * `tls-certificates.yaml` issues a server cert (serverAuth, SAN = the
+#     in-cluster Service DNS) + a worker-pool cert (clientAuth) via the
+#     referenced cert-manager Issuer.
+#   * The server deployment mounts the server Secret and gets `NOETL_TLS_CERT`
+#     / `NOETL_TLS_KEY` / `NOETL_TLS_CLIENT_CA` (when `mtls.enabled: true`).
+#     Probes switch to `tcpSocket` — an httpGet probe can't present a client
+#     cert under mTLS.
+#   * The worker pool mounts the worker Secret and gets
+#     `NOETL_TLS_CLIENT_CERT` / `NOETL_TLS_CLIENT_KEY` / `NOETL_TLS_CA`, plus
+#     an `https://` `NOETL_SERVER_URL`.  Its `wait-for-api` init container is
+#     rewritten to curl the mTLS endpoint WITH the client cert.
+#
+# The env contract above is the Rust noetl-server / noetl-worker contract
+# (`noetl/server` v2.30.0+, `noetl/worker` v5.12.0+).  Under a Python-image
+# server / worker the env vars are no-ops — Python ignores unknown env, so
+# setting `tls.enabled: true` on a Python-stack deployment is a misconfig the
+# operator catches at probe time (the listener is still plain HTTP, the
+# server cert is unused).  Helm-managed cutover to the Rust binaries is a
+# separate concern.
+#
+# The kind reference for the same shape lives at
+# `ci/manifests/noetl/tls/` (Phase 4c, ops#163).
+tls:
+  enabled: false
+  # When true, the server requires + verifies client certs (`mtls=true`).
+  # When false, the server serves HTTPS but accepts any client (server-only
+  # TLS — useful when a service mesh sidecar handles client identity).
+  mtls:
+    enabled: true
+  certManager:
+    # When false, the chart skips creating Certificate / Issuer resources and
+    # assumes the operator has materialised the Secrets named below by some
+    # other means (a Kubernetes Secret committed via SealedSecrets, an
+    # external-secrets operator, etc.).
+    enabled: true
+    issuerRef:
+      # The cert-manager Issuer that signs the server + worker leaf certs.
+      # On kind use the in-cluster `noetl-ca-issuer` from
+      # `ci/manifests/noetl/tls/certificates.yaml` (set `bootstrap.enabled:
+      # true` below to have the chart issue it).  On GKE point this at a
+      # `ClusterIssuer` backed by GCP Certificate Authority Service or a
+      # SPIRE/SPIFFE federation.
+      name: noetl-ca-issuer
+      kind: Issuer  # or ClusterIssuer
+    # When `bootstrap.enabled: true` the chart provisions a self-signed CA
+    # Issuer + CA Certificate + the CA Issuer that signs the leaf certs.
+    # For non-prod / smoke tests — production points `issuerRef` at an
+    # external issuer (GCP CAS / SPIRE) and leaves this off.
+    bootstrap:
+      enabled: false
+      caCertificateName: noetl-ca
+      caSecretName: noetl-ca-tls
+      caDuration: 87600h   # 10y
+    server:
+      # Name of the Secret cert-manager materialises with the server cert.
+      secretName: noetl-server-tls
+      # Subject alt names included on the server cert.  When empty the
+      # chart uses `noetl-server.<namespace>.svc[.cluster.local]` + the
+      # in-cluster Service short name + `localhost` (port-forward).
+      dnsNames: []
+      duration: 8760h      # 1y
+      renewBefore: 720h    # 30d
+    worker:
+      secretName: noetl-worker-tls
+      duration: 8760h
+      renewBefore: 720h
+
 persistence:
   data:
     enabled: true

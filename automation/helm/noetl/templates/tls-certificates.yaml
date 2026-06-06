@@ -1,0 +1,106 @@
+{{- /*
+  cert-manager TLS chain for the Rust noetl-server + noetl-worker mTLS
+  transport (Secrets Wallet Phase 4 GKE flip, noetl/ai-meta#61).  Mirrors the
+  kind reference at `ci/manifests/noetl/tls/certificates.yaml`.
+
+  Three modes:
+    * `tls.enabled: false`                            → renders nothing.
+    * `tls.enabled + tls.certManager.enabled`         → leaf Certificates only;
+      operator supplies the Issuer externally.
+    * `+ tls.certManager.bootstrap.enabled`           → also provision a
+      self-signed CA Issuer + CA Certificate + CA Issuer (non-prod / kind).
+*/}}
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+{{- $tls := .Values.tls }}
+{{- $cm := $tls.certManager }}
+{{- $ns := .Values.namespace }}
+{{- $svc := "noetl-server" }}
+{{- $defaultDns := list (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) $svc "localhost" }}
+{{- $serverDns := default $defaultDns $cm.server.dnsNames }}
+{{- if $cm.bootstrap.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: noetl-selfsigned-issuer
+  namespace: {{ $ns }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $cm.bootstrap.caCertificateName }}
+  namespace: {{ $ns }}
+spec:
+  isCA: true
+  commonName: noetl-ca
+  secretName: {{ $cm.bootstrap.caSecretName }}
+  duration: {{ $cm.bootstrap.caDuration }}
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+  issuerRef:
+    name: noetl-selfsigned-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: noetl-ca-issuer
+  namespace: {{ $ns }}
+spec:
+  ca:
+    secretName: {{ $cm.bootstrap.caSecretName }}
+---
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $cm.server.secretName }}
+  namespace: {{ $ns }}
+spec:
+  secretName: {{ $cm.server.secretName }}
+  duration: {{ $cm.server.duration }}
+  renewBefore: {{ $cm.server.renewBefore }}
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  dnsNames:
+{{- range $serverDns }}
+    - {{ . }}
+{{- end }}
+  issuerRef:
+    name: {{ $cm.issuerRef.name }}
+    kind: {{ $cm.issuerRef.kind }}
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $cm.worker.secretName }}
+  namespace: {{ $ns }}
+spec:
+  secretName: {{ $cm.worker.secretName }}
+  duration: {{ $cm.worker.duration }}
+  renewBefore: {{ $cm.worker.renewBefore }}
+  commonName: noetl-worker
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+  usages:
+    - client auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: {{ $cm.issuerRef.name }}
+    kind: {{ $cm.issuerRef.kind }}
+    group: cert-manager.io
+{{- end }}
