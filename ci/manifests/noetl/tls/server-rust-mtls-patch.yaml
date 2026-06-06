@@ -1,0 +1,45 @@
+# mTLS overlay patch for noetl-server-rust (Secrets Wallet Phase 4c).
+# Mounts the cert-manager-issued `noetl-server-tls` Secret and turns on
+# the server's TLS/mTLS listener (server#103 env contract). Probes swap
+# to tcpSocket — an httpGet probe can't present a client cert, so mTLS
+# would fail it (a non-mTLS health port is the production alternative).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-server-rust
+  namespace: noetl
+spec:
+  template:
+    spec:
+      volumes:
+        - name: tls
+          secret:
+            secretName: noetl-server-tls
+      containers:
+        - name: noetl-server
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          env:
+            - name: NOETL_TLS_CERT
+              value: /tls/tls.crt
+            - name: NOETL_TLS_KEY
+              value: /tls/tls.key
+            - name: NOETL_TLS_CLIENT_CA
+              value: /tls/ca.crt
+            # Callback URL embedded in NATS notifications must be https
+            # now so workers route lifecycle events back over mTLS.
+            - name: NOETL_PUBLIC_SERVER_URL
+              value: https://noetl-server-rust.noetl.svc.cluster.local:8082
+          # httpGet → tcpSocket: null deletes the httpGet handler in a
+          # strategic-merge patch; the other probe fields (delays,
+          # thresholds) are kept from the base manifest.
+          livenessProbe:
+            httpGet: null
+            tcpSocket:
+              port: 8082
+          readinessProbe:
+            httpGet: null
+            tcpSocket:
+              port: 8082
