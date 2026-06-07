@@ -1,0 +1,105 @@
+# noetl-k8s-watcher Deployment.
+#
+# Single-replica per cluster — the watcher is idempotent
+# (server's Round-2 endpoint dedupes by event_id), so a second
+# replica during a rolling restart is harmless, but only one is
+# needed for steady-state.
+#
+# Container image is stock alpine + kubectl + jq + curl baked in.
+# The watcher script ships via the noetl-k8s-watcher-script
+# ConfigMap and is mounted at /opt/watcher/watcher.sh.  A real
+# Rust binary is a clean follow-up once the contract proves out.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-k8s-watcher
+  namespace: noetl
+  labels:
+    app: noetl-k8s-watcher
+    component: k8s-watcher
+spec:
+  replicas: 1
+  strategy:
+    # Recreate so we never have two watchers racing on the same
+    # event; the brief downtime during a rollout is fine — the
+    # server's Round-2 endpoint is idempotent on retry.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: noetl-k8s-watcher
+  template:
+    metadata:
+      labels:
+        app: noetl-k8s-watcher
+        component: k8s-watcher
+    spec:
+      serviceAccountName: noetl-k8s-watcher
+      initContainers:
+        # Wait for noetl-server to come up before we start the
+        # watch loop — same pattern other components use.
+        - name: wait-for-api
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - >
+              until curl -sf
+              http://noetl.noetl.svc.cluster.local:8082/api/health;
+              do echo 'Waiting for NoETL API...'; sleep 3; done
+      containers:
+        - name: watcher
+          # Lightweight image with kubectl + jq + curl pre-installed.
+          # `bitnami/kubectl` ships kubectl + a small busybox shell;
+          # we add jq + curl via the install step in the command.
+          # For round 1 the script is the contract; the image is
+          # interchangeable.
+          image: bitnami/kubectl:1.30.3
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              # Install jq + curl if not present (bitnami image
+              # has neither pre-installed).  Round-1 MVP shape;
+              # the follow-up Rust binary skips this entirely.
+              if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+                if command -v apt-get >/dev/null 2>&1; then
+                  apt-get update -qq && apt-get install -y --no-install-recommends jq curl >/dev/null
+                elif command -v apk >/dev/null 2>&1; then
+                  apk add --no-cache jq curl >/dev/null
+                fi
+              fi
+              exec sh /opt/watcher/watcher.sh
+          envFrom:
+            - configMapRef:
+                name: noetl-k8s-watcher-config
+          env:
+            # Bearer token for /api/internal/* calls.  Reuses the
+            # same Secret the system worker pool mounts.
+            - name: NOETL_INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: noetl-internal-api-token
+                  key: token
+          volumeMounts:
+            - name: watcher-script
+              mountPath: /opt/watcher
+              readOnly: true
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          # Liveness via the watcher's own log heartbeat would
+          # require an exporter; the watch loop reconnects on
+          # stream EOF, so the pod stays healthy as long as the
+          # container is running.  No probe for round 1.
+      volumes:
+        - name: watcher-script
+          configMap:
+            name: noetl-k8s-watcher-script
+            defaultMode: 0o555

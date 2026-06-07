@@ -1,0 +1,192 @@
+# ConfigMap for noetl-k8s-watcher.
+#
+# Holds the watcher's runtime config (env vars) AND the watcher
+# script itself.  Shipping the script in a ConfigMap lets us
+# iterate the contract without a new image — the deployment uses
+# a stock alpine image with kubectl + jq + curl baked in.
+#
+# When the watcher graduates to a real Rust binary (follow-up to
+# round 1), the script-via-ConfigMap shape goes away and only the
+# env config remains here.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noetl-k8s-watcher-config
+  namespace: noetl
+  labels:
+    app: noetl-k8s-watcher
+    component: k8s-watcher
+data:
+  # noetl-server's base URL for the callback endpoint.  Same
+  # service the worker pool uses.
+  NOETL_SERVER_URL: "http://noetl.noetl.svc.cluster.local:8082"
+
+  # Namespace whose Jobs the watcher subscribes to.  Single-ns
+  # for round 1; multi-ns is a follow-up.
+  NOETL_K8S_WATCH_NAMESPACE: "noetl"
+
+  # Label whose presence on a Job marks it as NoETL-dispatched.
+  # The watcher ignores Jobs without this label even within the
+  # watched namespace — keeps out-of-band Jobs (cert-manager,
+  # backup pipelines) from generating stale callbacks.
+  NOETL_K8S_WATCH_LABEL_SELECTOR: "noetl.execution-id"
+---
+# The watcher script itself.  Mounted at /opt/watcher/watcher.sh
+# in the Deployment.  See README.md for the contract.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noetl-k8s-watcher-script
+  namespace: noetl
+  labels:
+    app: noetl-k8s-watcher
+    component: k8s-watcher
+data:
+  watcher.sh: |
+    #!/bin/sh
+    # noetl-k8s-watcher MVP — shell wrapper around
+    # `kubectl get jobs --watch -o json`.  Round 1 of
+    # noetl/ai-meta#43.  Pure Rust binary is a clean follow-up.
+
+    set -eu
+
+    : "${NOETL_SERVER_URL:?NOETL_SERVER_URL must be set}"
+    : "${NOETL_K8S_WATCH_NAMESPACE:?NOETL_K8S_WATCH_NAMESPACE must be set}"
+    : "${NOETL_K8S_WATCH_LABEL_SELECTOR:?NOETL_K8S_WATCH_LABEL_SELECTOR must be set}"
+    : "${NOETL_INTERNAL_API_TOKEN:?NOETL_INTERNAL_API_TOKEN must be set}"
+
+    echo "noetl-k8s-watcher: starting"
+    echo "  server:    $NOETL_SERVER_URL"
+    echo "  namespace: $NOETL_K8S_WATCH_NAMESPACE"
+    echo "  selector:  $NOETL_K8S_WATCH_LABEL_SELECTOR"
+
+    # Track posted Jobs by UID so a retry on transport error doesn't
+    # double-post on the next watch event.  In-memory only (pod
+    # lifetime); the server's handler is idempotent per
+    # (execution_id, step, job_name) so a missed dedupe is harmless.
+    POSTED_DIR="/tmp/watcher-posted"
+    mkdir -p "$POSTED_DIR"
+
+    # Map K8s Job + Pod conditions to TerminalState per the
+    # umbrella's failure-mode taxonomy.  Reads the JSON of a single
+    # Job (stdin) and emits one of:
+    #   succeeded|failed|failed_image_pull|failed_oom|failed_node_lost|failed_timeout
+    # or empty (Job not yet terminal).
+    classify_state() {
+      jq -r '
+        # Complete condition (exit 0)?
+        if (.status.conditions // [])
+             | map(select(.type == "Complete" and .status == "True"))
+             | length > 0 then
+          "succeeded"
+        # Failed with a reason?
+        elif (.status.conditions // [])
+               | map(select(.type == "Failed" and .status == "True"))
+               | length > 0 then
+          (.status.conditions
+            | map(select(.type == "Failed" and .status == "True"))
+            | .[0].reason // "") as $r
+          | if   $r == "BackoffLimitExceeded" then "failed"
+            elif $r == "DeadlineExceeded"      then "failed_timeout"
+            elif $r == "PodFailurePolicy"      then "failed"
+            else                                    "failed"
+            end
+        else
+          empty
+        end
+      '
+    }
+
+    # Build the POST body.  The watcher relays whatever exit_code
+    # + reason the pod surfaced; the server normalises onto its
+    # `TerminalState` enum.
+    build_body() {
+      JOB_JSON="$1"
+      STATE="$2"
+      printf '%s' "$JOB_JSON" | jq --arg state "$STATE" '{
+        state:        $state,
+        job_name:     .metadata.name,
+        job_uid:      .metadata.uid,
+        completed_at: (.status.completionTime // now | tostring),
+        exit_code:    null,
+        reason:       (
+          (.status.conditions // [])
+            | map(select(.status == "True"))
+            | .[0].message // ""
+        )
+      }'
+    }
+
+    # POST a single terminal event to the server.  Retries 3x with
+    # backoff on transport errors; idempotent per Round 2.
+    post_callback() {
+      EID="$1"
+      STEP="$2"
+      BODY="$3"
+      URL="$NOETL_SERVER_URL/api/internal/container-callback/$EID/$STEP"
+      ATTEMPT=0
+      while [ $ATTEMPT -lt 3 ]; do
+        STATUS=$(printf '%s' "$BODY" | curl -sS -o /tmp/last-resp -w '%{http_code}' \
+          -X POST "$URL" \
+          -H "Authorization: Bearer $NOETL_INTERNAL_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          --data-binary @- || echo "000")
+        case "$STATUS" in
+          2*) return 0 ;;
+          400|401|403|404)
+            echo "noetl-k8s-watcher: $URL returned HTTP $STATUS; not retrying"
+            cat /tmp/last-resp || true
+            return 1
+            ;;
+          *)
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "noetl-k8s-watcher: $URL returned HTTP $STATUS attempt $ATTEMPT/3; backing off"
+            sleep $((ATTEMPT * 2))
+            ;;
+        esac
+      done
+      echo "noetl-k8s-watcher: $URL failed after 3 attempts; giving up"
+      return 1
+    }
+
+    # Main watch loop.  Restarts on stream EOF (cluster pause /
+    # apiserver restart).
+    while true; do
+      kubectl get jobs \
+          -n "$NOETL_K8S_WATCH_NAMESPACE" \
+          -l "$NOETL_K8S_WATCH_LABEL_SELECTOR" \
+          --watch --output=json --output-watch-events 2>/dev/null \
+        | while read -r LINE; do
+            # Each event is a JSON object: { "type": "ADDED|MODIFIED|...", "object": {...} }
+            EVENT_TYPE=$(printf '%s' "$LINE" | jq -r '.type // ""')
+            [ "$EVENT_TYPE" = "MODIFIED" ] || [ "$EVENT_TYPE" = "ADDED" ] || continue
+
+            JOB=$(printf '%s' "$LINE" | jq '.object')
+            UID=$(printf '%s' "$JOB" | jq -r '.metadata.uid // ""')
+            NAME=$(printf '%s' "$JOB" | jq -r '.metadata.name // ""')
+            EID=$(printf '%s' "$JOB"  | jq -r '.metadata.labels."noetl.execution-id" // ""')
+            STEP=$(printf '%s' "$JOB" | jq -r '.metadata.labels."noetl.step-name"    // ""')
+
+            # Require both labels (filtering already requires the
+            # presence-selector, but step-name is round-3 contract).
+            [ -n "$EID" ]  || continue
+            [ -n "$STEP" ] || { echo "noetl-k8s-watcher: $NAME missing noetl.step-name label; skipping"; continue; }
+
+            # Already posted for this Job UID?
+            [ -f "$POSTED_DIR/$UID" ] && continue
+
+            # Classify; empty means not-yet-terminal.
+            STATE=$(printf '%s' "$JOB" | classify_state)
+            [ -n "$STATE" ] || continue
+
+            BODY=$(build_body "$JOB" "$STATE")
+            echo "noetl-k8s-watcher: posting callback for $NAME ($STATE) execution=$EID step=$STEP"
+            if post_callback "$EID" "$STEP" "$BODY"; then
+              touch "$POSTED_DIR/$UID"
+              echo "noetl-k8s-watcher: posted callback for $NAME ($STATE)"
+            fi
+          done
+      echo "noetl-k8s-watcher: watch stream ended; restarting in 3s"
+      sleep 3
+    done

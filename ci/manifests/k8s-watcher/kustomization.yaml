@@ -1,0 +1,23 @@
+# Kustomization entrypoint for the noetl-k8s-watcher manifests.
+#
+# Apply with:
+#
+#     kubectl apply -k ci/manifests/k8s-watcher/
+#
+# Order matters: rbac first (so the SA exists before the
+# Deployment binds to it), then configmap (Deployment mounts the
+# script ConfigMap), then deployment.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: noetl
+
+resources:
+  - rbac.yaml
+  - configmap.yaml
+  - deployment.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: noetl
+  app.kubernetes.io/component: k8s-watcher
+  app.kubernetes.io/name: noetl-k8s-watcher

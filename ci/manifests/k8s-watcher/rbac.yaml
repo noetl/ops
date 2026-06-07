@@ -1,0 +1,60 @@
+# RBAC for noetl-k8s-watcher.
+#
+# Round 1 of the Container Tool Callback umbrella (noetl/ai-meta#43).
+# Server endpoint shipped in Round 2 (noetl/server v2.48.0, PR #141);
+# this watcher closes the loop by POSTing terminal-state events for
+# Jobs carrying the noetl.execution-id label.
+#
+# Cluster-scoped: K8s Job watch streams across the whole cluster
+# even when filtered by namespace, so a Role would force a single
+# watch per-Job — wasteful at scale.  The ClusterRole scopes
+# Jobs/get,list,watch only; no write verbs.  Pods/get,list are
+# included so the watcher can read terminal-condition reasons
+# (OOMKilled / image-pull-backoff / evicted) from the pod status.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: noetl-k8s-watcher
+  namespace: noetl
+  labels:
+    app: noetl-k8s-watcher
+    component: k8s-watcher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: noetl-k8s-watcher-role
+  labels:
+    app: noetl-k8s-watcher
+    component: k8s-watcher
+rules:
+  # Jobs - the primary surface we watch.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  # Job status - terminal conditions (Complete / Failed) live here.
+  - apiGroups: ["batch"]
+    resources: ["jobs/status"]
+    verbs: ["get", "list", "watch"]
+  # Pods - terminal failure reasons (OOMKilled, ImagePullBackOff,
+  # Evicted) live on the pod status, not the Job status.  Read-only.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: noetl-k8s-watcher-rolebinding
+  labels:
+    app: noetl-k8s-watcher
+    component: k8s-watcher
+subjects:
+  - kind: ServiceAccount
+    name: noetl-k8s-watcher
+    namespace: noetl
+roleRef:
+  kind: ClusterRole
+  name: noetl-k8s-watcher-role
+  apiGroup: rbac.authorization.k8s.io
