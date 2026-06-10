@@ -3,7 +3,7 @@
 # Holds the watcher's runtime config (env vars) AND the watcher
 # script itself.  Shipping the script in a ConfigMap lets us
 # iterate the contract without a new image — the deployment uses
-# a stock alpine image with kubectl + jq + curl baked in.
+# the alpine/k8s image, which has kubectl + jq + curl baked in.
 #
 # When the watcher graduates to a real Rust binary (follow-up to
 # round 1), the script-via-ConfigMap shape goes away and only the
@@ -68,11 +68,14 @@ data:
     POSTED_DIR="/tmp/watcher-posted"
     mkdir -p "$POSTED_DIR"
 
-    # Map K8s Job + Pod conditions to TerminalState per the
-    # umbrella's failure-mode taxonomy.  Reads the JSON of a single
-    # Job (stdin) and emits one of:
-    #   succeeded|failed|failed_image_pull|failed_oom|failed_node_lost|failed_timeout
-    # or empty (Job not yet terminal).
+    # Map a K8s Job's conditions to TerminalState.  Reads the JSON
+    # of a single Job (stdin) and emits one of:
+    #   succeeded|failed|failed_timeout
+    # or empty (Job not yet terminal).  Job-level conditions can't
+    # express OOMKilled / image-pull failures — those live on the
+    # backing Pod's status and are resolved by classify_pod_failure
+    # below, which refines a generic `failed` into the specific
+    # variant from the umbrella's failure-mode taxonomy.
     classify_state() {
       jq -r '
         # Complete condition (exit 0)?
@@ -98,17 +101,56 @@ data:
       '
     }
 
+    # Refine a generic Job failure into the specific TerminalState
+    # variant that only the backing Pod's status carries:
+    #   OOMKilled                        -> failed_oom
+    #   ImagePullBackOff / ErrImagePull  -> failed_image_pull
+    # Echoes the refined state, or empty when no pod-level reason
+    # applies (caller keeps the Job-level `failed`).  RBAC grants
+    # pods/get,list,watch (see rbac.yaml).  Checks both the live
+    # `state` and `lastState` so an already-reaped restart is still
+    # seen, across regular and init containers.
+    classify_pod_failure() {
+      JOB_NAME="$1"
+      PODS_JSON=$(kubectl get pods \
+          -n "$NOETL_K8S_WATCH_NAMESPACE" \
+          -l "job-name=$JOB_NAME" \
+          --output=json 2>/dev/null) || return 0
+      printf '%s' "$PODS_JSON" | jq -r '
+        [ .items[]?
+          | (.status.containerStatuses // []) + (.status.initContainerStatuses // [])
+          | .[]?
+        ] as $cs
+        | if   ([ $cs[]
+                  | select(.state.terminated.reason == "OOMKilled"
+                        or .lastState.terminated.reason == "OOMKilled") ] | length) > 0 then
+            "failed_oom"
+          elif ([ $cs[]
+                  | select(.state.waiting.reason == "ImagePullBackOff"
+                        or .state.waiting.reason == "ErrImagePull") ] | length) > 0 then
+            "failed_image_pull"
+          else
+            empty
+          end
+      '
+    }
+
     # Build the POST body.  The watcher relays whatever exit_code
     # + reason the pod surfaced; the server normalises onto its
     # `TerminalState` enum.
     build_body() {
       JOB_JSON="$1"
       STATE="$2"
+      # `completed_at` must be RFC3339 (the server parses it as a
+      # chrono DateTime<Utc>).  A *failed* Job has no
+      # `.status.completionTime`, so fall back to `now | todate`
+      # (RFC3339) — NOT bare `now`, which is a numeric Unix epoch and
+      # makes the server reject the body with HTTP 422.
       printf '%s' "$JOB_JSON" | jq --arg state "$STATE" '{
         state:        $state,
         job_name:     .metadata.name,
         job_uid:      .metadata.uid,
-        completed_at: (.status.completionTime // now | tostring),
+        completed_at: (.status.completionTime // (now | todate)),
         exit_code:    null,
         reason:       (
           (.status.conditions // [])
@@ -179,6 +221,17 @@ data:
             # Classify; empty means not-yet-terminal.
             STATE=$(printf '%s' "$JOB" | classify_state)
             [ -n "$STATE" ] || continue
+
+            # Refine a generic Job failure into the specific
+            # pod-level variant (OOMKilled -> failed_oom,
+            # image-pull -> failed_image_pull) when the Pod status
+            # carries one.  Success / timeout are already precise.
+            case "$STATE" in
+              failed)
+                REFINED=$(classify_pod_failure "$NAME")
+                [ -n "$REFINED" ] && STATE="$REFINED"
+                ;;
+            esac
 
             BODY=$(build_body "$JOB" "$STATE")
             echo "noetl-k8s-watcher: posting callback for $NAME ($STATE) execution=$EID step=$STEP"
