@@ -1,0 +1,87 @@
+# Continuous subscription runtime (RFC Mode B) — noetl/ai-meta#90 Phase 2.
+#
+# A long-lived run-mode of the SAME `localhost/noetl-worker:dev` image
+# (WORKER_MODE=subscription).  It holds a `kind: Subscription`'s message
+# source open and turns each received message into one
+# `POST /api/execute` on the subscription's dedicated pool segment.  It
+# is an ingress producer — it does NOT execute playbook logic and never
+# touches `noetl.*` tables (data-access-boundary): the per-message work
+# runs on `noetl-worker-rust-subscription-pool`.
+#
+# The runtime is parameterised by NOETL_SUBSCRIPTION_PATH — the catalog
+# path of the `kind: Subscription` to activate.  The source connection
+# (NATS/Pub/Sub/Kafka) is resolved from the subscription's own Wallet
+# credential via the server API, NOT from pod env (no business-logic
+# secret in env, per execution-model.md).  Set NOETL_SUBSCRIPTION_PATH
+# to the registered subscription before applying.
+#
+# One runtime pod per subscription (replicas: 1 — a pull runtime must
+# hold the subscription; KEDA scales the *execution* pool, not the
+# runtime, which stays at min 1).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-subscription-runtime
+  namespace: noetl
+  labels:
+    app: noetl-subscription-runtime
+    component: subscription-runtime
+    runtime: rust
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: noetl-subscription-runtime
+  template:
+    metadata:
+      labels:
+        app: noetl-subscription-runtime
+        component: subscription-runtime
+        runtime: rust
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: noetl-worker
+      initContainers:
+        - name: wait-for-api
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "until curl -sf http://noetl.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL API...'; sleep 3; done"
+      containers:
+        - name: subscription-runtime
+          image: localhost/noetl-worker:dev
+          imagePullPolicy: Never
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            # Mode B: the continuous subscription runtime.
+            - name: WORKER_MODE
+              value: subscription
+            # The kind: Subscription catalog path to activate.  Override
+            # per subscription (kubectl set env / kustomize patch).
+            - name: NOETL_SUBSCRIPTION_PATH
+              value: subscriptions/iot_sensor_stream
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NOETL_SERVER_URL
+              value: http://noetl.noetl.svc.cluster.local:8082
+            - name: WORKER_METRICS_BIND
+              value: "0.0.0.0:9090"
+            - name: RUST_LOG
+              value: "info,noetl_worker=debug"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
