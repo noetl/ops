@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pubsub
+  labels:
+    app.kubernetes.io/part-of: noetl-e2e
+    noetl.io/purpose: subscription-tool-e2e

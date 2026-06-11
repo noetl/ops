@@ -81,16 +81,16 @@ workflow:
         mode: exclusive
       arcs:
         - step: process_batch
-          when: "{{ drain_orders.output.count > 0 }}"
+          when: "{{ drain_orders.count > 0 }}"
         - step: empty
-          when: "{{ drain_orders.output.count == 0 }}"
+          when: "{{ drain_orders.count == 0 }}"
 
   - step: process_batch
     desc: "Fan out over each drained message"
     tool:
       kind: python
       input:
-        # `drain_orders.output.messages` is the normalized batch: each
+        # `drain_orders.messages` is the normalized batch: each
         # message has `id`, `data`, `headers`, `attributes`, `metadata`.
         message: "{{ item.data }}"
         message_id: "{{ item.id }}"
@@ -102,7 +102,7 @@ workflow:
             "payload": input_data.get("message"),
         }
       iterator:
-        items: "{{ drain_orders.output.messages }}"
+        items: "{{ drain_orders.messages }}"
         item: message
     next:
       spec:
@@ -128,9 +128,9 @@ workflow:
     tool:
       kind: python
       input:
-        drained: "{{ drain_orders.output.count if drain_orders.output else 0 }}"
-        acked: "{{ drain_orders.output.acked if drain_orders.output else false }}"
-        source: "{{ drain_orders.output.source if drain_orders.output else 'nats' }}"
+        drained: "{{ drain_orders.count | default(0) }}"
+        acked: "{{ drain_orders.acked | default(false) }}"
+        source: "{{ drain_orders.source | default('nats') }}"
       code: |
         result = {
             "status": "complete",

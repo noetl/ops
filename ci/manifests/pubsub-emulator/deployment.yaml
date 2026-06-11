@@ -1,0 +1,84 @@
+# Google Pub/Sub emulator for the NoETL `subscription` tool E2E
+# (noetl/ai-meta#90 Phase 1 — Pub/Sub pull backend live-validation).
+#
+# The emulator ships in the gcloud SDK `:emulators` image and speaks the
+# real Pub/Sub REST surface (topics:create / subscriptions:create /
+# topics:publish / subscriptions:pull / subscriptions:acknowledge) with NO
+# auth.  The `subscription` tool's Pub/Sub backend
+# (noetl-tools src/tools/source/pubsub.rs) treats any plaintext http://
+# endpoint as an emulator and skips the Authorization header, so a worker
+# pointed at this Service reaches it with a `pubsub`-typed credential whose
+# `endpoint` is `pubsub-emulator.pubsub.svc.cluster.local:8085`.
+#
+# Topics + subscriptions live in the emulator's memory only and are lost on
+# restart — the E2E runner creates them (and publishes) at test time over a
+# `kubectl port-forward`, mirroring how the NATS rig creates its stream +
+# durable consumer before draining.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pubsub-emulator
+  namespace: pubsub
+  labels:
+    app: pubsub-emulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pubsub-emulator
+  template:
+    metadata:
+      labels:
+        app: pubsub-emulator
+    spec:
+      containers:
+        - name: emulator
+          image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+          imagePullPolicy: IfNotPresent
+          # `--host-port=0.0.0.0:8085` binds all interfaces so the Service
+          # reaches it; `--project` fixes the project segment the E2E
+          # subscription resource path uses (projects/noetl-e2e/...).
+          command: ["/bin/bash", "-c"]
+          args:
+            - >-
+              gcloud beta emulators pubsub start
+              --host-port=0.0.0.0:8085
+              --project=noetl-e2e
+          ports:
+            - containerPort: 8085
+              name: pubsub
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 8085
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8085
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 768Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pubsub-emulator
+  namespace: pubsub
+  labels:
+    app: pubsub-emulator
+spec:
+  type: ClusterIP
+  selector:
+    app: pubsub-emulator
+  ports:
+    - port: 8085
+      targetPort: 8085
+      protocol: TCP
+      name: pubsub
