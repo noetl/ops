@@ -1,0 +1,125 @@
+# Single-broker KRaft-mode Apache Kafka for the NoETL `subscription` tool
+# E2E (noetl/ai-meta#90 Phase 1 — Kafka poll backend live-validation).
+#
+# Image: the maintained official `apache/kafka` image (Docker Hub).  The
+# retired `bitnami/kafka` legacy images are deliberately NOT used.  KRaft
+# combined mode (broker + controller in one process) — no ZooKeeper.
+#
+# Advertised listener is the in-cluster Service DNS
+# (`kafka.kafka.svc.cluster.local:9092`) so the NoETL worker (in the
+# `noetl` namespace) connects, fetches metadata, and reaches the broker
+# back at a resolvable address.  The E2E runner creates the topic and
+# produces messages by `kubectl exec`-ing the broker's bundled
+# `kafka-topics.sh` / `kafka-console-producer.sh` against
+# `localhost:9092`, so no host-reachable advertised listener is needed.
+#
+# The `subscription` tool's Kafka backend (noetl-tools
+# src/tools/source/kafka.rs) is plaintext-only in Phase 1, so only a
+# PLAINTEXT listener is configured.  Storage is ephemeral (emptyDir) —
+# this is a throwaway E2E broker, not a durable queue.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: kafka
+  labels:
+    app: kafka
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9092
+              name: client
+              protocol: TCP
+            - containerPort: 9093
+              name: controller
+              protocol: TCP
+          env:
+            # --- KRaft single-node combined (broker + controller) ---
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@localhost:9093"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            # Clients receive this address from metadata — must be resolvable
+            # from the worker pod (cross-namespace cluster DNS).
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://kafka.kafka.svc.cluster.local:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+            # --- single-node replication knobs (no quorum to satisfy) ---
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_NUM_PARTITIONS
+              value: "1"
+            # Fixed valid (base64 16-byte UUID) cluster id so KRaft storage
+            # formats deterministically — generated via `kafka-storage.sh
+            # random-uuid`.
+            - name: CLUSTER_ID
+              value: "H1v1HgVIRvWOk2HkqKEo8w"
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1536Mi
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: kafka
+  labels:
+    app: kafka
+spec:
+  type: ClusterIP
+  selector:
+    app: kafka
+  ports:
+    - port: 9092
+      targetPort: 9092
+      protocol: TCP
+      name: client
