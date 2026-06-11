@@ -1,0 +1,140 @@
+# Bounded subscription drain — example playbook
+#
+# Demonstrates Phase 1 of the subscription/listener RFC
+# (noetl/ai-meta#90): the atomic `tool: subscription` with
+# `operation: poll`.  It performs ONE bounded drain of a message source
+# (here NATS JetStream), returns the batch as the step output, and fans
+# the downstream step out over the drained messages.
+#
+# This is the "scheduled bounded drain" (RFC Mode A) pattern: each
+# invocation drains up to `batch` messages and exits — it never holds a
+# worker slot waiting for the next message.  Drive it on a cadence the
+# same way `system/outbox_publisher` is driven (one execution per
+# invocation), e.g.:
+#
+#   curl -X POST {server}/api/execute \
+#     -d '{"path": "examples/subscription_drain"}'
+#
+# Per agents/rules/no-default-connection.md the NATS connection is named
+# explicitly via `auth:` — the alias must resolve to a credential JSON
+# carrying at least `{"url": "nats://host:4222"}`.  The durable pull
+# consumer named below MUST already exist on the stream; the
+# subscription poll does not create or alter consumer configurations
+# (same contract as the `nats` tool's `js_consume`).
+
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: subscription_drain
+  path: examples/subscription_drain
+  description: |
+    Bounded NATS JetStream subscription drain — fetch up to `batch`
+    messages, ack them, and fan out over the batch.  Phase 1 example
+    for the subscription/listener tool (noetl/ai-meta#90).
+
+workload:
+  # NATS credential alias.  Resolved at dispatch time against the
+  # keychain / credential store; must carry {"url": "nats://..."}.
+  nats_auth: nats_local
+
+  # JetStream stream + durable pull consumer to drain.  The consumer
+  # must already exist on the stream.
+  stream: ORDERS
+  consumer: orders-drain
+
+  # Bounded-drain knobs.  `batch` is capped at 1000 and `timeout_ms`
+  # at 5000 by the tool, honoring the worker-slot contract.
+  batch: 50
+  timeout_ms: 3000
+
+workflow:
+  - step: start
+    desc: "Subscription drain invocation entry"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "started"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: drain_orders
+
+  - step: drain_orders
+    desc: "Bounded drain of the ORDERS stream via the subscription tool"
+    tool:
+      kind: subscription
+      source: nats
+      operation: poll
+      auth: "{{ nats_auth }}"
+      stream: "{{ stream }}"
+      consumer: "{{ consumer }}"
+      batch: "{{ batch }}"
+      timeout_ms: "{{ timeout_ms }}"
+      # on_success acks every fetched message before returning; use
+      # `manual` to leave them pending for redelivery on the next drain.
+      ack: on_success
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: process_batch
+          when: "{{ drain_orders.output.count > 0 }}"
+        - step: empty
+          when: "{{ drain_orders.output.count == 0 }}"
+
+  - step: process_batch
+    desc: "Fan out over each drained message"
+    tool:
+      kind: python
+      input:
+        # `drain_orders.output.messages` is the normalized batch: each
+        # message has `id`, `data`, `headers`, `attributes`, `metadata`.
+        message: "{{ item.data }}"
+        message_id: "{{ item.id }}"
+      code: |
+        # Per-message processing goes here.  This example just echoes the
+        # message id + payload so the drain is observable in the event log.
+        result = {
+            "processed_id": input_data.get("message_id"),
+            "payload": input_data.get("message"),
+        }
+      iterator:
+        items: "{{ drain_orders.output.messages }}"
+        item: message
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: empty
+    desc: "Nothing to drain this invocation"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "empty", "drained": 0}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Subscription drain iteration complete"
+    tool:
+      kind: python
+      input:
+        drained: "{{ drain_orders.output.count if drain_orders.output else 0 }}"
+        acked: "{{ drain_orders.output.acked if drain_orders.output else false }}"
+        source: "{{ drain_orders.output.source if drain_orders.output else 'nats' }}"
+      code: |
+        result = {
+            "status": "complete",
+            "drained": input_data.get("drained", 0),
+            "acked": input_data.get("acked", False),
+            "source": input_data.get("source"),
+        }
