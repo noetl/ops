@@ -1,0 +1,55 @@
+# Declarative Cloud Run (Knative) spec for the out-of-cluster subscription
+# runtime (noetl/ai-meta#90 Phase 5).  An alternative to deploy.sh's imperative
+# `gcloud run deploy`; apply with:
+#
+#   gcloud run services replace service.yaml --project <PROJECT> --region us-central1
+#
+# Replace the ${...} placeholders first (envsubst or hand-edit).  The image is
+# the SAME noetl-worker binary as the in-cluster pool, in WORKER_MODE=subscription.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: noetl-subscription-runtime
+  labels:
+    component: subscription-runtime
+    runtime: rust
+spec:
+  template:
+    metadata:
+      annotations:
+        # A pull listener is a singleton that must hold the subscription
+        # continuously: pin one always-allocated instance.
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "1"
+        # Keep CPU allocated between requests so the background poll loop runs.
+        run.googleapis.com/cpu-throttling: "false"
+    spec:
+      serviceAccountName: ${SA_EMAIL}   # e.g. noetl-subscription-runtime@${PROJECT}.iam.gserviceaccount.com
+      containerConcurrency: 1
+      containers:
+        - image: ${IMAGE}   # ${REGION}-docker.pkg.dev/${PROJECT}/noetl/noetl-worker:phase5
+          ports:
+            # Cloud Run sets $PORT to this; the worker's metrics server binds it
+            # (/healthz + /metrics) so the startup probe passes.
+            - containerPort: 8080
+          env:
+            - name: WORKER_MODE
+              value: subscription
+            - name: NOETL_SUBSCRIPTION_PATH
+              value: ${SUBSCRIPTION_PATH}   # e.g. subscriptions/cloudrun_demo
+            - name: NOETL_SERVER_URL
+              value: ${NOETL_SERVER_URL}    # HTTPS-reachable server or tunnel
+            - name: WORKER_METRICS_BIND
+              value: "0.0.0.0:8080"
+            # GCS spool bucket for the store-and-forward buffer (gcs backend).
+            - name: NOETL_SPOOL_BUCKET
+              value: ${SPOOL_BUCKET}
+            # Optional: service-account bearer token for the control plane.
+            # - name: NOETL_INTERNAL_API_TOKEN
+            #   valueFrom: { secretKeyRef: { name: noetl-internal-api-token, key: token } }
+            - name: RUST_LOG
+              value: "info,noetl_worker=debug"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 256Mi
