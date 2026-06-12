@@ -68,6 +68,15 @@ spec:
             - name: metrics
               containerPort: 9090
               protocol: TCP
+          # Platform NATS connection (URL + creds) for the store-and-forward
+          # spool's nats_object backend + circuit-state KV (noetl/ai-meta#90
+          # Phase 4).  A runtime credential, env-injected per
+          # execution-model.md — distinct from the subscription's own SOURCE
+          # credential, which is resolved from the server by alias.  The
+          # explicit `env:` below overrides any colliding key.
+          envFrom:
+            - configMapRef:
+                name: noetl-worker-config
           env:
             # Mode B: the continuous subscription runtime.
             - name: WORKER_MODE
