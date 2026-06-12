@@ -32,6 +32,17 @@ spec:
         # NoETL backend
         - name: NOETL_BASE_URL
           value: "http://noetl.noetl.svc.cluster.local:8082"
+        # Push-ingress service-account token (noetl/ai-meta#90 Phase 3).
+        # The gateway presents this on every call to the server's
+        # ``GET /api/internal/ingress/{listener}`` config endpoint; it must
+        # match the server's ``NOETL_INTERNAL_API_TOKEN`` (same Secret the
+        # system worker pool mounts).  When unset, the ``/ingress/{listener}``
+        # routes return 503 — no permissive default for the forward surface.
+        - name: NOETL_INTERNAL_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: noetl-internal-api-token
+              key: token
         # NATS messaging
         - name: NATS_URL
           value: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
