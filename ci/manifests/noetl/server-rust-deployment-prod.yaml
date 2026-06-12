@@ -1,0 +1,185 @@
+# noetl-server-rust — PRODUCTION Deployment + Service (GKE noetl-demo-19700101)
+# =============================================================================
+# Phase F R5 of noetl/ai-meta#49 — the Rust control plane ("noetl-control-plane"
+# binary) cutover candidate for the production GKE stack.
+#
+# This is the PRODUCTION-shaped manifest (distinct from the kind-only
+# `server-rust-deployment.yaml` in this directory, which uses a local
+# `localhost/...:dev` image with `imagePullPolicy: Never`).
+#
+# *** DO NOT `kubectl apply` THIS BLINDLY. ***  It is the artifact the
+# operator applies during the cutover, AFTER provisioning two prod secrets.
+# Follow `repos/ops/runbooks/noetl-server-rust-cutover.md` step by step.
+# Applying the Deployment is non-traffic-affecting on its own (it creates a
+# parallel `noetl-server-rust` Deployment + Service); production traffic only
+# moves when the `noetl` Service selector is flipped — a separate, explicit
+# operator step in the runbook.
+#
+# Image: built by `automation/gcp_gke/assets/server/cloudbuild.yaml` from
+# noetl/server commit 4644c49 (v3.5.0 + the `time =0.3.47` build-fix pin;
+# base release commit 7b217d8 won't build — see runbook).  Pinned below by the
+# immutable @sha256 digest printed by that build (NOT a mutable tag) so a
+# re-pushed tag can never silently change what prod runs.
+#
+# Prereqs the operator MUST satisfy before this Deployment will become Ready
+# (the runbook walks each one):
+#   1. Secret `noetl-secret` MUST contain key `NOETL_ENCRYPTION_KEY`
+#      (base64-encoded 32-byte key).  The Rust server FAILS CLOSED without it
+#      (no insecure default — noetl/ai-meta#61).  See the runbook's
+#      "Credential encryption decision" section: prod Python stores
+#      credentials as PLAINTEXT JSON (no-op `encrypt_json`), so there is NO
+#      Python key to match — existing credentials must be RE-ENTERED under the
+#      Rust AES-GCM scheme after cutover.
+#   2. Secret `noetl-internal-api-token` (key `token`) MUST exist — referenced
+#      non-optionally below; absent → pod CreateContainerConfigError.
+#   3. pgbouncer pool_mode MUST be `session` for sqlx prepared statements to
+#      work (see POSTGRES_HOST note below).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-server-rust
+  namespace: noetl
+  labels:
+    app: noetl-server-rust
+    component: server
+    runtime: rust
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: noetl-server-rust
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: noetl-server-rust
+        component: server
+        runtime: rust
+    spec:
+      containers:
+        - name: noetl-server
+          # Pinned by immutable digest (Cloud Build 00a26c26, 2026-06-12) so a
+          # re-pushed tag can never silently change what prod runs.  The
+          # :4644c49 / :v3.5.0 tags resolve to this same digest and are shown
+          # for human traceability.
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/server-rust@sha256:78cce8f3790bcc74c7e94d15a4486c67be868757621b00d1da6fa6c8a6b929fa
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8082
+              name: http
+          env:
+            - name: NOETL_HOST
+              value: "0.0.0.0"
+            - name: NOETL_PORT
+              value: "8082"
+            - name: RUST_LOG
+              value: "info,noetl_server=info,sqlx=warn"
+            # --- Database -----------------------------------------------------
+            # Prod has NO direct postgres Service — only `pgbouncer`.  sqlx
+            # (the Rust server's driver) uses prepared statements, which BREAK
+            # under pgbouncer transaction/statement pooling
+            # ("prepared statement already exists").  pool_mode MUST be
+            # `session` here, OR front the Rust server with a session-mode
+            # endpoint.  Verify before cutover (runbook "pgbouncer" check).
+            - name: POSTGRES_HOST
+              value: "pgbouncer.postgres.svc.cluster.local"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: "noetl"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: noetl-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DATABASE
+              value: "noetl"
+            - name: NOETL_SCHEMA
+              value: "noetl"
+            # --- NATS ---------------------------------------------------------
+            # Matches the prod broker used by the Python server + gateway
+            # (configmap noetl-server-config NATS_URL).  Inline-credential
+            # format is what the Rust client expects (resolves prereq 3a).
+            - name: NOETL_NATS_URL
+              value: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
+            # Callback URL embedded in NATS command notifications.  Points at
+            # the Rust Service DNS — valid both during canary (before the
+            # `noetl` selector flip) and after cutover.
+            - name: NOETL_PUBLIC_SERVER_URL
+              value: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
+            # 10-bit snowflake machine id.  Set to a value DISTINCT from the
+            # Python server's so the two can run concurrently during canary
+            # without minting colliding execution/command/event IDs.
+            - name: NOETL_SERVER_MACHINE_ID
+              value: "2"
+            # --- Internal-API bearer token (REQUIRED) -------------------------
+            # Gate for /api/internal/* (system worker pool).  Secret must be
+            # created before apply (runbook step 2b); referenced non-optionally
+            # so a missing secret fails loudly rather than silently disabling
+            # the gate.
+            - name: NOETL_INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: noetl-internal-api-token
+                  key: token
+            # --- Credential encryption key (REQUIRED, fail-closed) ------------
+            # NOT `optional: true` (unlike the kind manifest).  The Rust server
+            # refuses to start without a real key (noetl/ai-meta#61); making it
+            # required here surfaces a missing key as a clear CreateContainer
+            # error at apply time instead of a CrashLoop with a buried log.
+            - name: NOETL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: noetl-secret
+                  key: NOETL_ENCRYPTION_KEY
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          # /api/health returns DB + NATS connectivity, so readiness gates the
+          # pod on both being live — exactly the canary signal we want.
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8082
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+---
+# Parallel Service so the Rust server is reachable for canary checks under its
+# own DNS BEFORE any cutover.  The production `noetl` Service (selector
+# app=noetl-server) is NOT touched by this manifest — the cutover flips that
+# selector in a separate, explicit operator step (runbook "Flip").
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-server-rust
+  namespace: noetl
+  labels:
+    app: noetl-server-rust
+spec:
+  selector:
+    app: noetl-server-rust
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+      protocol: TCP
+  type: ClusterIP
