@@ -1,0 +1,113 @@
+# Dedicated subscription/IoT execution pool — noetl/ai-meta#90 Phase 2.
+#
+# A second Rust worker pool that consumes ONLY the `subscription`
+# command segment (`noetl.commands.subscription.>`).  The continuous
+# subscription runtime (see `subscription-runtime-deployment.yaml`)
+# turns each source message into a `POST /api/execute` carrying
+# `execution_pool: subscription`, so the server publishes those
+# commands to `noetl.commands.subscription.<eid>` (the new pool-segment
+# routing in noetl-server v3.2.0).  This pool drains them, isolated
+# from `noetl-worker-rust` (the shared pool, filter
+# `noetl.commands.shared.>`) — a subscription firehose scales this pool
+# without ever touching the shared command stream (RFC requirement 2 + 4).
+#
+# Same `localhost/noetl-worker:dev` image as the shared pool; only the
+# consumer + filter subject + pool name differ.  imagePullPolicy: Never
+# so kind uses the loaded image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-worker-rust-subscription-pool
+  namespace: noetl
+  labels:
+    app: noetl-worker-rust-subscription-pool
+    component: worker
+    runtime: rust
+    worker-pool: worker-subscription-pool
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: noetl-worker-rust-subscription-pool
+      worker-pool: worker-subscription-pool
+  template:
+    metadata:
+      labels:
+        app: noetl-worker-rust-subscription-pool
+        component: worker
+        runtime: rust
+        worker-pool: worker-subscription-pool
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: noetl-worker
+      initContainers:
+        - name: wait-for-api
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "until curl -sf http://noetl.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL API...'; sleep 3; done"
+      containers:
+        - name: worker
+          image: localhost/noetl-worker:dev
+          imagePullPolicy: Never
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: WORKER_POOL_NAME
+              value: worker-subscription-pool
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NATS_URL
+              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
+            - name: NATS_STREAM
+              value: NOETL_COMMANDS
+            # Dedicated consumer + filter for the subscription segment.
+            - name: NATS_CONSUMER
+              value: noetl_worker_pool_subscription
+            - name: NATS_FILTER_SUBJECT
+              value: noetl.commands.subscription.>
+            - name: NOETL_SERVER_URL
+              value: http://noetl.noetl.svc.cluster.local:8082
+            - name: WORKER_HEARTBEAT_INTERVAL
+              value: "15"
+            - name: WORKER_MAX_CONCURRENT
+              value: "8"
+            - name: WORKER_METRICS_BIND
+              value: "0.0.0.0:9090"
+            - name: WORKER_NATS_LAG_POLL_INTERVAL
+              value: "5"
+            - name: RUST_LOG
+              value: "info,noetl_worker=debug,noetl_executor=debug"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-worker-rust-subscription-pool-metrics
+  namespace: noetl
+  labels:
+    app: noetl-worker-rust-subscription-pool
+spec:
+  clusterIP: None
+  selector:
+    app: noetl-worker-rust-subscription-pool
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
