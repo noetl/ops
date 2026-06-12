@@ -1,0 +1,94 @@
+# Scale-hardened kind: Subscription — example
+#
+# Demonstrates Phase 7 of the subscription/listener RFC
+# (noetl/ai-meta#90): the three scale-hardening safety valves on a
+# continuous (Mode B) subscription runtime.
+#
+#   1. Batch dispatch (dispatch.batch_dispatch / batch_max) — when the
+#      runtime drains a backlog it dispatches via POST /api/execute/batch
+#      (one HTTP round-trip for the whole batch) instead of one request
+#      per message.  Each batch item still carries its own
+#      directive-resolved playbook / pool / trace, so per-message event
+#      traceability is intact — a batch is N independent executions.
+#
+#   2. Opt-in dedup window (dedup.enabled / window_secs) — exactly-once
+#      for a low-volume critical stream (RFC §10 OQ1).  The runtime stamps
+#      a dedup key (the idempotency_key header directive → message_id) on
+#      every /api/execute, and the server collapses a duplicate delivery
+#      (same key within the window) to a SINGLE execution + a
+#      subscription.message.deduplicated event.  Off by default — a DB
+#      write per message is too costly at IoT scale.
+#
+#   3. Per-subscription rate limit / backpressure (limits) — caps the
+#      runtime's fetch side so one firehose can't starve the shared
+#      control plane or a dedicated pool.  When the dispatch-rate budget
+#      is exhausted the runtime STOPS FETCHING (it does not ack-then-drop)
+#      so the unfetched messages stay in the source (the durable buffer)
+#      and are redelivered later — no loss.  A subscription.rate_limited
+#      event marks the engagement.
+#
+# Per agents/rules/no-default-connection.md the source connection is
+# named explicitly via `auth:` and resolved from the server by alias —
+# never a pod env var.
+
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: subscription_scale_hardened
+  path: examples/subscription_scale_hardened
+  description: |
+    A continuous NATS subscription with all three Phase-7 scale-hardening
+    valves enabled: batch dispatch, opt-in dedup window, and a
+    per-subscription rate limit.
+
+spec:
+  source: nats
+  mode: pull
+  activation: continuous
+  # Source credential alias — resolved from the server, never pod env.
+  auth: nats_local
+  stream: ORDERS
+  consumer: orders-drain
+
+  runtime:
+    target: dedicated-pool
+    pool: subscription
+    batch: 500
+    timeout_ms: 3000
+
+  dispatch:
+    playbook: domain/process_order
+    payload_from: message.json
+    execution_pool: subscription
+    # (1) Batch dispatch — drain → POST /api/execute/batch in chunks of
+    # batch_max instead of one /api/execute per message.
+    batch_dispatch: true
+    batch_max: 200
+
+  # (2) Opt-in exactly-once dedup window.  Default off; on here because
+  # this is a critical order stream where a duplicate must not double-book.
+  dedup:
+    enabled: true
+    window_secs: 600
+
+  # (3) Per-subscription rate limit / backpressure.  Cap outstanding work
+  # (max_in_flight) and the dispatch rate (max_dispatch_per_sec); over the
+  # cap the runtime throttles fetching so the source keeps the backlog.
+  limits:
+    max_in_flight: 1000
+    max_dispatch_per_sec: 200
+
+  headers:
+    normalize: true
+    directives:
+      # The idempotency key feeds the dedup window (the header wins over
+      # message_id, RFC §10 OQ8).
+      - header: x-idempotency-key
+        controls: idempotency_key
+      # Header-driven pool override stays allowlist-constrained.
+      - header: x-noetl-pool
+        controls: dispatch.execution_pool
+        allowed: ["subscription", "priority"]
+    trace:
+      propagate: w3c
