@@ -29,6 +29,14 @@ metadata:
     runtime: rust
 spec:
   replicas: 1
+  # Recreate (not RollingUpdate): a subscription is a singleton long-lived
+  # resource.  The old runtime pod must fully terminate — running its
+  # drain → deactivate on SIGTERM — BEFORE a new pod starts and re-registers +
+  # activates.  A rolling update would briefly run two pods managing the same
+  # subscription, and the terminating one's deactivate would race the new
+  # one's activate (noetl/ai-meta#90 Phase 2).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: noetl-subscription-runtime
