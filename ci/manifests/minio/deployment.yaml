@@ -1,0 +1,135 @@
+# MinIO — S3-compatible object store for the NoETL subscription spool
+# `s3` backend live-validation (noetl/ai-meta#94) and the cross-restart
+# drain proof (noetl/ai-meta#93).
+#
+# MinIO speaks the real S3 REST surface (PutObject / ListObjectsV2 /
+# GetObject / DeleteObject) with AWS SigV4 auth.  The spool `s3` backend
+# (noetl-tools src/spool/backend.rs) hand-rolls SigV4 over reqwest, so a
+# worker pointed at this Service reaches it with an `aws`-typed keychain
+# credential whose `endpoint` is `http://minio.minio.svc.cluster.local:9000`,
+# `region` is `us-east-1`, and access/secret keys are the dev root creds
+# below.
+#
+# The data volume is an `emptyDir`: spooled objects survive a *pod restart*
+# only if the pod is restarted in place (e.g. `kubectl rollout restart`
+# reuses the node-local emptyDir until the pod is deleted).  For the
+# cross-restart drain proof we kill the *subscription worker* pod (not
+# MinIO), so the MinIO-side spool persists across the worker restart.  A PVC
+# can replace the emptyDir if MinIO itself must survive a delete.
+#
+# Dev-only throwaway credentials (minioadmin/minioadmin) — this is a local
+# test emulator, never a production store; no real secret is committed,
+# matching the no-auth pubsub-emulator + plaintext kafka rigs in sibling
+# manifest dirs.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: minio
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: "minioadmin"
+            - name: MINIO_ROOT_PASSWORD
+              value: "minioadmin"
+          ports:
+            - containerPort: 9000
+              name: s3
+              protocol: TCP
+            - containerPort: 9001
+              name: console
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: minio
+  labels:
+    app: minio
+spec:
+  type: ClusterIP
+  selector:
+    app: minio
+  ports:
+    - port: 9000
+      targetPort: 9000
+      protocol: TCP
+      name: s3
+    - port: 9001
+      targetPort: 9001
+      protocol: TCP
+      name: console
+---
+# One-shot bucket creator: waits for MinIO, then `mc mb` the spool bucket.
+# Re-runnable (`mc mb --ignore-existing`).  Mirrors how the E2E rig
+# provisions NATS streams / Pub-Sub topics before draining.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-make-bucket
+  namespace: minio
+  labels:
+    app: minio
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app: minio-make-bucket
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              until mc alias set local http://minio.minio.svc.cluster.local:9000 minioadmin minioadmin;
+              do echo "waiting for minio..."; sleep 3; done &&
+              mc mb --ignore-existing local/noetl-spool &&
+              echo "bucket noetl-spool ready"
