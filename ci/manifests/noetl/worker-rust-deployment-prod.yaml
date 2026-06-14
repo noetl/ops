@@ -52,8 +52,10 @@ spec:
       containers:
         - name: noetl-worker
           # Pinned by digest after the Cloud Build (filled in once built).
-          # tags :v5.20.0 / :7b8a09a resolve to this digest (linux/amd64).
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:b808bc604d59af7cda93154631de8692be2a7799d54f9bf5b232e9706dc8dea9
+          # tags :v5.20.1 / :9ce4d6d resolve to this digest (linux/amd64).
+          # 9ce4d6d = noetl/worker#81 (nats_url credential field-map fix that
+          # unblocked auth0_login's NATS kv_put — noetl/ai-meta#49 Phase F R5).
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:61278cb62c412d1d477a44fbf2f10b2261d9df6338c4d4e1de80e8538f524658
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9090
