@@ -48,7 +48,7 @@ kubectl --context $PROD -n noetl get deploy,svc,pods
 
 Expect: `noetl-server` Deployment 1/1 (image `noetl:coalesce-*`, cmd
 `["python"]`), `noetl-worker` 3/3, Service `noetl` (selector
-`app=noetl-server`, ports 8082 + 8083). Routing: the `gateway` LoadBalancer
+`app=noetl-server`, port `8082/TCP` only). Routing: the `gateway` LoadBalancer
 (ns `gateway`, ext IP `34.46.180.136`) → env
 `NOETL_BASE_URL=http://noetl.noetl.svc.cluster.local:8082` → the `noetl`
 Service. The "flip" repoints that Service's selector.
@@ -102,39 +102,32 @@ runs.
 fine and health is green, but the FIRST playbook that uses a stored credential
 fails. Test a credential-using playbook during canary (step 5) before flipping.
 
-### Decision B — pgbouncer pool mode (sqlx compatibility)
+### Decision B — pgbouncer transaction-mode pooling (sqlx compatibility) — RESOLVED
 
-Prod has **no direct postgres Service** — only `pgbouncer.postgres.svc`. The
-Rust server's sqlx driver uses **prepared statements**, which break under
-pgbouncer **transaction**/**statement** pooling
-(`prepared statement "sqlx_s_1" already exists`).
+Prod has **no direct postgres Service**. The DB is **Cloud SQL**
+(`noetl-demo-19700101:us-central1:noetl-shared-pg`) reached through
+`pgbouncer.postgres.svc` running **`pool_mode=transaction`** (in front of a
+`cloud-sql-proxy` sidecar). Confirmed live 2026-06-12.
 
-**Verify pool mode is `session`:**
+sqlx's default named prepared-statement cache breaks under transaction pooling
+(`prepared statement "sqlx_s_N" does not exist`). **Handled:** the Rust server
+gained `NOETL_PG_STATEMENT_CACHE_CAPACITY` ([noetl/server#191](https://github.com/noetl/server/pull/191)),
+and `server-rust-deployment-prod.yaml` sets it to `0` — sqlx then uses one-shot
+unnamed statements that are safe behind transaction pooling. The Rust server
+stays behind pgbouncer exactly like Python; **no pgbouncer change needed.**
 
-```bash
-# via the pgbouncer admin console (creds from the pgbouncer secret/config):
-kubectl --context $PROD -n postgres exec deploy/pgbouncer -- \
-  psql -p 5432 -U <pgbouncer_admin> pgbouncer -c "SHOW CONFIG;" 2>/dev/null | grep -i pool_mode
-# or inspect the mounted pgbouncer.ini / config secret.
-```
+Operator check (optional — confirm the env made it into the running pod after
+step 4): `kubectl -n noetl exec deploy/noetl-server-rust -- env | grep STATEMENT_CACHE`
+→ `NOETL_PG_STATEMENT_CACHE_CAPACITY=0`. The real proof is the canary
+(step 5): a query-heavy playbook completing without `prepared statement` errors.
 
-- `pool_mode = session` → OK, proceed.
-- `pool_mode = transaction` or `statement` → **do not cut over** until you
-  either (a) point the Rust server at a session-mode endpoint (add a
-  session-mode pgbouncer or a direct postgres Service and update
-  `POSTGRES_HOST` in the manifest), or (b) confirm the server build disables
-  the sqlx statement cache. Re-validate on a canary first.
+### Decision C — Arrow Flight gRPC (port 8083) — N/A in prod
 
-### Decision C — Arrow Flight gRPC (port 8083)
-
-The `noetl` Service also exposes **port 8083 (Arrow Flight gRPC)**, selecting
-`app=noetl-server`. The Rust deployment serves **only 8082**. After a selector
-flip, port 8083 loses its backend.
-
-**Verify no prod consumer depends on `noetl:8083`** (in-cluster workers/tools
-reaching `grpc://noetl.noetl.svc.cluster.local:8083`). If something does, that
-consumer breaks on flip — resolve before cutting over (the Rust server does not
-implement Flight at this commit).
+The kind manifest's `noetl` Service exposes port 8083 (Arrow Flight gRPC), but
+the **prod `noetl` Service exposes only `8082/TCP`** — there is no 8083 port in
+prod, no Flight refs in any prod workload, and no `:8083` connections to the
+server pod (verified 2026-06-12). Nothing depends on it; the selector flip is
+safe. No action required.
 
 ---
 
@@ -142,8 +135,10 @@ implement Flight at this commit).
 
 - [ ] **A** — Credential strategy chosen; stored-credential inventory captured;
       a fresh `NOETL_ENCRYPTION_KEY` generated and set in `noetl-secret`.
-- [ ] **B** — pgbouncer `pool_mode = session` confirmed (or a session-mode path wired).
-- [ ] **C** — No prod consumer depends on `noetl:8083` Flight (or it's been handled).
+- [ ] **B** — RESOLVED: prod pgbouncer is transaction-mode; manifest sets
+      `NOETL_PG_STATEMENT_CACHE_CAPACITY=0`. Confirm a query-heavy canary
+      playbook runs clean (step 5).
+- [ ] **C** — N/A: prod `noetl` Service has no 8083/Flight port. No action.
 - [ ] `noetl-internal-api-token` secret exists (step 2b).
 - [ ] Rust Deployment applied and pod **Ready** (step 4); `/api/health` shows
       `database: connected` **and** `nats: connected`.
