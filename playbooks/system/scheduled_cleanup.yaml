@@ -1,0 +1,85 @@
+# noetl scheduled-cleanup — system playbook
+#
+# Retention/cleanup for the platform's transient `noetl.*` tables, running
+# on the **system worker pool** (noetl/ai-meta#96).  Replaces the Python-era
+# `system/scheduled_cleanup` notion for the Rust stack.
+#
+# Per `agents/rules/data-access-boundary.md`: the playbook NEVER touches
+# `noetl.*` tables with `tool: postgres`.  It calls the server's
+# `POST /api/internal/cleanup/purge` endpoint, which runs the DELETEs under
+# the server's policy + observability and returns per-table purge counts.
+#
+# What gets purged (conservative by design — see the server endpoint):
+#   - terminal `noetl.command` rows older than `command_retention_days`
+#   - dead `noetl.runtime` worker_pool registrations older than
+#     `runtime_stale_minutes`
+#   - `noetl.event` rows older than `event_retention_days` — OPT-IN only;
+#     `0` (the default) never touches the append-only source of truth.
+#
+# Routing: the `system/` path prefix makes the server publish this
+# playbook's commands to `noetl.commands.system.<execution_id>`
+# (`repos/server/src/handlers/execute.rs`), which only the system worker
+# pool consumes (filter `noetl.commands.system.>`).
+#
+# Triggering: a K8s CronJob POSTs `/api/execute path=system/scheduled_cleanup`
+# on a cadence (see `repos/ops/ci/manifests/noetl/cronjob-scheduled-cleanup.yaml`).
+# Each invocation runs one purge pass and exits.
+#
+# Auth: the http step references the bearer alias `NOETL_INTERNAL_API_TOKEN`,
+# which the system pool's worker lifts from its pod env into `ctx.secrets`
+# via `NOETL_KEYCHAIN_ENV_VARS=NOETL_INTERNAL_API_TOKEN` on startup.
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: scheduled_cleanup
+  path: system/scheduled_cleanup
+  description: |
+    System playbook that purges transient noetl.* rows (terminal commands,
+    dead worker registrations, and opt-in old events) via the server's
+    /api/internal/cleanup/purge endpoint.  Runs on the system worker pool.
+
+workload:
+  # NoETL server URL.  The system pool's pod also has this in env, but the
+  # playbook reads it from the workload so it stays portable.
+  server_url: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
+
+  # Bearer-token credential alias — lifted from pod env into ctx.secrets by
+  # NOETL_KEYCHAIN_ENV_VARS on the system pool worker.
+  api_token_alias: NOETL_INTERNAL_API_TOKEN
+
+  # Retention policy (forwarded verbatim to the server endpoint).
+  command_retention_days: 7
+  runtime_stale_minutes: 60
+  # Event log is the append-only source of truth — 0 = never purge it.
+  # Set to a large value (e.g. 365) deliberately to enable event retention.
+  event_retention_days: 0
+
+workflow:
+  - step: start
+    desc: "Purge transient noetl.* rows via the server internal cleanup endpoint"
+    tool:
+      kind: http
+      method: POST
+      url: "{{ server_url }}/api/internal/cleanup/purge"
+      headers:
+        Content-Type: "application/json"
+      auth:
+        type: bearer
+        credential: "{{ api_token_alias }}"
+      body:
+        command_retention_days: "{{ command_retention_days }}"
+        runtime_stale_minutes: "{{ runtime_stale_minutes }}"
+        event_retention_days: "{{ event_retention_days }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Cleanup invocation complete"
+    tool:
+      kind: python
+      code: |
+        result = {"status": "complete"}
