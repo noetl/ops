@@ -1,23 +1,26 @@
-# noetl-worker-system-pool — DEV/kind Rust system worker pool.
-# noetl/ai-meta#96.
+# noetl-worker-system-pool — PRODUCTION Rust system worker pool
+# (GKE noetl-demo-19700101).  noetl/ai-meta#96.
 # =============================================================================
 # Privileged worker pool that runs platform-internal `system/*` playbooks.
 # First job: `system/scheduled_cleanup` (retention/purge of transient noetl.*
 # rows via POST /api/internal/cleanup/purge).
 #
-# Dev/kind variant: local worker image + the flat `NOETL_COMMANDS` stream the
-# kind cluster uses + the Rust server Service.  The prod variant
-# (`worker-system-pool-deployment-prod.yaml`) pins the prod registry image and
-# the dedicated `NOETL_COMMANDS_RUST` stream.
+# This is the PROD variant of `worker-system-pool-deployment.yaml` (which is
+# dev-shaped: localhost image, NOETL_COMMANDS stream, Python server URL).
+# Prod differences mirror `worker-rust-deployment-prod.yaml`:
+#   - prod Artifact Registry image, pinned by digest (same noetl-worker-rust
+#     image as the shared pool — the worker binary is identical; only the
+#     consumer/filter differ),
+#   - NATS_STREAM = NOETL_COMMANDS_RUST (the dedicated Rust-stack stream that
+#     owns `noetl.commands.>`, so it includes `noetl.commands.system.>`),
+#   - NOETL_SERVER_URL = the Rust server Service.
 #
 # Per data-access-boundary.md the system playbooks call /api/internal/* — this
-# pod mounts NOETL_INTERNAL_API_TOKEN from the K8s Secret and lifts it into
-# ctx.secrets via NOETL_KEYCHAIN_ENV_VARS so the playbooks' `tool: http` bearer
-# auth resolves.  Requires `serviceaccount-worker-system-pool.yaml` first.
+# pod mounts NOETL_INTERNAL_API_TOKEN from the K8s Secret `noetl-internal-api-token`
+# (already present in prod) and lifts it into ctx.secrets via
+# NOETL_KEYCHAIN_ENV_VARS so the playbooks' `tool: http` bearer auth resolves.
 #
-# The Python-era outbox-publisher/projector system playbooks are gone — the
-# Rust server publishes commands directly to NATS and writes events inline,
-# so the transactional outbox is unused.
+# Requires `serviceaccount-worker-system-pool.yaml` applied first.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -58,8 +61,11 @@ spec:
             - "until curl -sf http://noetl-server-rust.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL Rust server...'; sleep 3; done"
       containers:
         - name: noetl-worker
-          image: localhost/noetl-worker:dev
-          imagePullPolicy: Never
+          # Same prod image as the shared Rust worker pool (worker@9ce4d6d,
+          # v5.20.1).  The binary is identical; only the NATS consumer +
+          # filter subject differ.  Pinned by digest.
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:61278cb62c412d1d477a44fbf2f10b2261d9df6338c4d4e1de80e8538f524658
+          imagePullPolicy: IfNotPresent
           ports:
             - name: metrics
               containerPort: 9090
@@ -73,10 +79,11 @@ spec:
                   fieldPath: metadata.name
             - name: NATS_URL
               value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
-            # kind uses the flat NOETL_COMMANDS stream (subjects
-            # noetl.commands.>), so it captures noetl.commands.system.>.
+            # Dedicated Rust-stack stream (subjects noetl.commands.>), same as
+            # the shared Rust worker pool.  Includes noetl.commands.system.>.
             - name: NATS_STREAM
-              value: NOETL_COMMANDS
+              value: NOETL_COMMANDS_RUST
+            # Distinct durable consumer for the system segment.
             - name: NATS_CONSUMER
               value: noetl_worker_system_rust
             - name: NATS_FILTER_SUBJECT
@@ -85,21 +92,27 @@ spec:
               value: http://noetl-server-rust.noetl.svc.cluster.local:8082
             - name: WORKER_HEARTBEAT_INTERVAL
               value: "15"
+            # System playbooks are low-frequency; keep concurrency low.
             - name: WORKER_MAX_CONCURRENT
               value: "2"
             - name: WORKER_METRICS_BIND
               value: "0.0.0.0:9090"
             - name: WORKER_NATS_LAG_POLL_INTERVAL
               value: "5"
+            # Bearer token for the system playbooks' tool: http calls to
+            # /api/internal/*.  Secret already present in prod.
             - name: NOETL_INTERNAL_API_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: noetl-internal-api-token
                   key: token
+            # Lift the token into ctx.secrets under the verbatim env-var name
+            # so `auth: { type: bearer, credential: NOETL_INTERNAL_API_TOKEN }`
+            # resolves in the system playbooks.
             - name: NOETL_KEYCHAIN_ENV_VARS
               value: NOETL_INTERNAL_API_TOKEN
             - name: RUST_LOG
-              value: "info,noetl_worker=debug,noetl_executor=debug"
+              value: "info,noetl_worker=info,noetl_executor=info"
           resources:
             requests:
               cpu: "100m"
@@ -107,6 +120,18 @@ spec:
             limits:
               cpu: "1"
               memory: "512Mi"
+          livenessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 6
+          readinessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
 ---
 apiVersion: v1
 kind: Service

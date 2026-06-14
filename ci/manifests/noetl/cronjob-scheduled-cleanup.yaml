@@ -1,0 +1,63 @@
+# CronJob — triggers system/scheduled_cleanup on a cadence.
+# noetl/ai-meta#96.
+# =============================================================================
+# Fires the retention/cleanup system playbook by POSTing to the Rust server's
+# /api/execute.  The server routes the `system/` path to
+# noetl.commands.system.<eid>, which only the system worker pool consumes; the
+# pool runs the playbook's http step against /api/internal/cleanup/purge.
+#
+# The CronJob only TRIGGERS the execution — it carries no DB access and no
+# internal token.  /api/execute is reachable on the cluster network; the
+# privileged purge work happens inside the system pool under the internal-API
+# token, per data-access-boundary.md.
+#
+# Schedule: hourly.  Each run purges terminal commands (>7d) + dead worker
+# registrations (>60m); event-log retention stays off by default (set
+# event_retention_days in the playbook workload to enable).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: noetl-scheduled-cleanup
+  namespace: noetl
+  labels:
+    app: noetl-scheduled-cleanup
+    component: system-cron
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            app: noetl-scheduled-cleanup
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: trigger
+              image: curlimages/curl:8.7.1
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  echo "Triggering system/scheduled_cleanup ..."
+                  curl -fsS -X POST \
+                    http://noetl-server-rust.noetl.svc.cluster.local:8082/api/execute \
+                    -H 'Content-Type: application/json' \
+                    -d '{"path": "system/scheduled_cleanup"}'
+                  echo
+                  echo "Triggered."
+              resources:
+                requests:
+                  cpu: "10m"
+                  memory: "32Mi"
+                limits:
+                  cpu: "100m"
+                  memory: "64Mi"
