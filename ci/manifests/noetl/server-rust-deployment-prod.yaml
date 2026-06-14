@@ -93,11 +93,18 @@ spec:
               value: "5432"
             - name: POSTGRES_USER
               value: "noetl"
+            # The CLIENT password pgbouncer expects for user `noetl` is the
+            # value Python authenticates with — stored under the `NOETL_PASSWORD`
+            # key of `noetl-secret` (the separate `POSTGRES_PASSWORD` key is a
+            # different value and makes pgbouncer SASL-auth fail).  The Rust
+            # server reads it from the POSTGRES_PASSWORD *env var* (envy prefix),
+            # so the env name stays POSTGRES_PASSWORD but the secret key is
+            # NOETL_PASSWORD.
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: noetl-secret
-                  key: POSTGRES_PASSWORD
+                  key: NOETL_PASSWORD
             - name: POSTGRES_DATABASE
               value: "noetl"
             - name: NOETL_SCHEMA
