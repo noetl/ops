@@ -13,8 +13,14 @@
 #   - terminal `noetl.command` rows older than `command_retention_days`
 #   - dead `noetl.runtime` worker_pool registrations older than
 #     `runtime_stale_minutes`
-#   - `noetl.event` rows older than `event_retention_days` — OPT-IN only;
-#     `0` (the default) never touches the append-only source of truth.
+#   - old `noetl.event` PARTITIONS older than `event_retention_days` — OPT-IN
+#     only; `0` (the default) never touches the append-only source of truth.
+#     The event log is range-partitioned by execution_id, so retention DROPs
+#     whole old partitions (instant, no DELETE scan/vacuum) rather than deleting
+#     rows.  PREREQUISITE: the server's app DB role must OWN the noetl.event
+#     partitions (DROP needs ownership; `ALTER TABLE noetl.event_* OWNER TO
+#     <app user>`).  Without it the cleanup logs a clear WARN and drops nothing
+#     (command/runtime retention is unaffected).
 #
 # Routing: the `system/` path prefix makes the server publish this
 # playbook's commands to `noetl.commands.system.<execution_id>`
@@ -51,7 +57,9 @@ workload:
   # Retention policy (forwarded verbatim to the server endpoint).
   command_retention_days: 7
   runtime_stale_minutes: 60
-  # Event log is the append-only source of truth — 0 = never purge it.
+  # Event log is the append-only source of truth — 0 = never touch it.  When
+  # > 0, retention DROPs whole event partitions older than this many days
+  # (needs the app DB role to own the noetl.event partitions — see header).
   # Set to a large value (e.g. 365) deliberately to enable event retention.
   event_retention_days: 0
 
