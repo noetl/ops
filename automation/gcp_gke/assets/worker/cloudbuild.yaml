@@ -1,0 +1,11 @@
+# Cloud Build — noetl/worker (Rust "noetl-worker"). Prod amd64 image for the
+# GKE noetl-demo-19700101 full-Rust-stack cutover (noetl/ai-meta#49).
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile, -t, "${_SHA}", -t, "${_VER}", .]
+images: ["${_SHA}", "${_VER}"]
+substitutions:
+  _SHA: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust:7b8a09a
+  _VER: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust:v5.20.0
+options: { substitutionOption: ALLOW_LOOSE, machineType: E2_HIGHCPU_8 }
+timeout: 7200s

@@ -15,6 +15,25 @@ apply the Deployment, flip the Service selector, or scale Python down.
 > Service selector (step 6). Everything before that is additive and safe.
 > Rollback is one command (step 8) and takes seconds.
 
+> 🛑 **ATTEMPT 1 (2026-06-13) FAILED — a server-only flip is NOT viable.**
+> Flipping the `noetl` Service to the Rust server while keeping the **Python
+> workers** breaks execution: the Rust server publishes commands to the
+> hierarchical subject `noetl.commands.{pool}.{execution_id}`
+> (`repos/server/src/handlers/execute.rs:1137`), but prod's NATS stream + the
+> Python workers use the flat `noetl.commands` → `POST /api/execute` returns
+> `500 NATS publish ack failed: no stream found for given subject`. The Rust
+> **worker** is what consumes the hierarchical subjects.
+> **The cutover must be the FULL Rust stack — Rust server + Rust worker, with
+> Python server AND workers scaled to 0** (the kind-validated config). The
+> single-step "flip the selector" below is necessary but not sufficient; it
+> must be paired with deploying the Rust worker pool, provisioning a NATS
+> stream that captures `noetl.commands.>`, and scaling the Python workers down.
+> See [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) postmortem
+> 2026-06-13 for the full sequence. Also: Rust stores encrypted credentials as
+> a JSON envelope (`{...}`), so `left(data_encrypted,1)='{'` does NOT prove a
+> credential is plaintext — verify by reading `data` back through the serving
+> server.
+
 ---
 
 ## 0. What's already prepped (by the prep session)
