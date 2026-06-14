@@ -1,0 +1,53 @@
+# noetl-gui (NOETL dashboard SPA) — PRODUCTION (GKE noetl-demo-19700101)
+# Phase F R5 follow-up of noetl/ai-meta#49 — front-end for the Rust control
+# plane.  Runtime-configured (docker/env.sh writes env-config.js); points at
+# the gateway (gateway.mestumre.dev).  Served via the Cloudflare tunnel at
+# https://mestumre.dev (route: mestumre.dev -> gui.gateway.svc:80).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gui
+  namespace: gateway
+  labels: { app: gui, component: frontend }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: gui }
+  template:
+    metadata:
+      labels: { app: gui, component: frontend }
+    spec:
+      containers:
+        - name: nginx
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-gui@sha256:8ad29db9ef39b621849866659e2baba6fda000460dc13f5da2b0665e23b185e6
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 8080, name: http }
+          env:
+            - { name: VITE_API_MODE, value: "gateway" }
+            - { name: VITE_GATEWAY_URL, value: "https://gateway.mestumre.dev" }
+            - { name: VITE_API_BASE_URL, value: "https://gateway.mestumre.dev" }
+            - { name: VITE_AUTH0_DOMAIN, value: "mestumre-development.us.auth0.com" }
+            - { name: VITE_AUTH0_CLIENT_ID, value: "Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN" }
+            - { name: VITE_AUTH0_REDIRECT_URI, value: "https://mestumre.dev" }
+            - { name: VITE_APP_VERSION, value: "1.11.1" }
+          resources:
+            requests: { memory: "32Mi", cpu: "50m" }
+            limits: { memory: "128Mi", cpu: "200m" }
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gui
+  namespace: gateway
+  labels: { app: gui }
+spec:
+  type: ClusterIP
+  selector: { app: gui }
+  ports:
+    - { name: http, port: 80, targetPort: 8080, protocol: TCP }
