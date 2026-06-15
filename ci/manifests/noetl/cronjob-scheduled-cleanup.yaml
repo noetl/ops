@@ -12,8 +12,12 @@
 # token, per data-access-boundary.md.
 #
 # Schedule: hourly.  Each run purges terminal commands (>7d) + dead worker
-# registrations (>60m); event-log retention stays off by default (set
-# event_retention_days in the playbook workload to enable).
+# registrations (>60m), and DROPs event partitions older than 365d
+# (event_retention_days=365 in the payload).  Drop-based event retention needs
+# the app DB role to own the noetl.event partitions — run
+# `sql/event-partition-ownership.sql` once as a superuser; until then the
+# cleanup logs a WARN and drops nothing (a 365d window drops nothing on a
+# cluster younger than a year anyway, so enabling it now is safe + forward-ready).
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -51,7 +55,7 @@ spec:
                   curl -fsS -X POST \
                     http://noetl-server-rust.noetl.svc.cluster.local:8082/api/execute \
                     -H 'Content-Type: application/json' \
-                    -d '{"path": "system/scheduled_cleanup"}'
+                    -d '{"path": "system/scheduled_cleanup", "payload": {"event_retention_days": 365}}'
                   echo
                   echo "Triggered."
               resources:
