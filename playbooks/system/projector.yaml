@@ -1,0 +1,191 @@
+# noetl projector — system playbook (CQRS read-model)
+#
+# Phase 2b of the CQRS event-log split (noetl/ai-meta#103).  Drains a bounded
+# batch from the `noetl_events` JetStream stream (filled by the server's
+# event-log tailer, phase 2a), extracts the distinct `execution_id`s that
+# changed, and asks the server to advance each one's `projection_snapshot` via
+# `POST /api/internal/projection/advance` — the read model the orchestrator
+# reads.  The server folds via the block-b bounded-rebuild machinery; the
+# playbook never touches `noetl.*` directly (data-access-boundary.md).
+#
+# Run model: this is the "scheduled bounded drain" (RFC Mode A) — each
+# invocation drains up to `batch` messages and exits, never holding a worker
+# slot waiting for the next message (execution-model.md callback rule).  Drive
+# it on a cadence the same way `system/scheduled_cleanup` is driven — a K8s
+# CronJob POSTs `/api/execute path=system/projector` (see
+# `repos/ops/ci/manifests/noetl/cronjob-projector.yaml`).  For production
+# keep-up, scale the cadence / KEDA on the `noetl_projector` consumer's pending
+# count so projection lag stays bounded.
+#
+# Prerequisites:
+#   - The server runs with `NOETL_EVENT_STREAM_ENABLED=true` (the tailer fills
+#     the stream + ensures the durable `noetl_projector` pull consumer).
+#   - To actually transfer snapshot ownership, the server also runs with
+#     `NOETL_PROJECTOR_OWNS_SNAPSHOT=true` (the orchestrator then stops
+#     self-writing the snapshot and reads what this playbook advances).  With
+#     it off, this playbook still advances the snapshot harmlessly (idempotent,
+#     monotonic) — useful for shadow-validating the pipeline before cutover.
+#
+# Routing: the `system/` path prefix makes the server publish this playbook's
+# commands to `noetl.commands.system.<execution_id>`, consumed only by the
+# system worker pool.
+#
+# Auth:
+#   - NATS connection: `nats_auth` alias (no-default-connection.md) — must
+#     resolve to a credential JSON carrying at least `{"url": "nats://..."}`.
+#   - Internal API: bearer alias `NOETL_INTERNAL_API_TOKEN`, lifted from the
+#     system pool worker's pod env into `ctx.secrets` via
+#     `NOETL_KEYCHAIN_ENV_VARS=NOETL_INTERNAL_API_TOKEN`.
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: projector
+  path: system/projector
+  description: |
+    System playbook that folds the noetl_events JetStream stream into the
+    orchestrator read model: drain a bounded batch, extract the changed
+    execution_ids, and advance each one's projection_snapshot via the server's
+    /api/internal/projection/advance endpoint.  Runs on the system worker pool.
+
+workload:
+  # NoETL server URL (also in the system pool pod env; read from workload so the
+  # playbook stays portable).
+  server_url: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
+
+  # Bearer-token credential alias for the internal API.
+  api_token_alias: NOETL_INTERNAL_API_TOKEN
+
+  # NATS credential alias — must carry {"url": "nats://..."}.
+  nats_auth: nats_system
+
+  # JetStream stream + durable pull consumer the server ensures (phase 2a).
+  stream: noetl_events
+  consumer: noetl_projector
+
+  # Bounded-drain knobs.  `batch` is capped at 1000 and `timeout_ms` at 5000 by
+  # the tool, honoring the worker-slot contract.
+  batch: 500
+  timeout_ms: 3000
+
+workflow:
+  - step: start
+    desc: "Projector invocation entry"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "started"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: drain_events
+
+  - step: drain_events
+    desc: "Bounded drain of the noetl_events stream"
+    tool:
+      kind: subscription
+      source: nats
+      operation: poll
+      auth: "{{ nats_auth }}"
+      stream: "{{ stream }}"
+      consumer: "{{ consumer }}"
+      batch: "{{ batch }}"
+      timeout_ms: "{{ timeout_ms }}"
+      # Ack the batch on success — the snapshot is idempotently rebuildable from
+      # noetl.event during dual-write, so a rare lost ack only delays a
+      # snapshot advance (the next event re-triggers it); it never corrupts.
+      ack: on_success
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: extract_execution_ids
+          when: "{{ drain_events.count > 0 }}"
+        - step: empty
+          when: "{{ drain_events.count == 0 }}"
+
+  - step: extract_execution_ids
+    desc: "Collect the distinct execution_ids that changed in this batch"
+    tool:
+      kind: python
+      input:
+        messages: "{{ drain_events.messages }}"
+      code: |
+        import json
+
+        seen = []
+        seen_set = set()
+        for msg in input_data.get("messages", []) or []:
+            data = msg.get("data") if isinstance(msg, dict) else None
+            # The tailer publishes the full event row as JSON; `data` may arrive
+            # already decoded (dict) or as a JSON string/bytes — handle both.
+            if isinstance(data, (str, bytes, bytearray)):
+                try:
+                    data = json.loads(data)
+                except Exception:
+                    data = None
+            if not isinstance(data, dict):
+                continue
+            eid = data.get("execution_id")
+            if eid is None:
+                continue
+            try:
+                eid = int(eid)
+            except (TypeError, ValueError):
+                continue
+            if eid not in seen_set:
+                seen_set.add(eid)
+                seen.append(eid)
+
+        result = {"execution_ids": seen, "count": len(seen)}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: advance_snapshots
+          when: "{{ extract_execution_ids.count > 0 }}"
+        - step: empty
+          when: "{{ extract_execution_ids.count == 0 }}"
+
+  - step: advance_snapshots
+    desc: "Advance projection_snapshot for each changed execution"
+    tool:
+      kind: http
+      method: POST
+      url: "{{ server_url }}/api/internal/projection/advance"
+      headers:
+        Content-Type: "application/json"
+      auth:
+        type: bearer
+        credential: "{{ api_token_alias }}"
+      body:
+        execution_ids: "{{ extract_execution_ids.execution_ids }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: empty
+    desc: "Nothing to project this invocation"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "empty", "advanced": 0}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Projector invocation complete"
+    tool:
+      kind: python
+      input:
+        drained: "{{ drain_events.count | default(0) }}"
+      code: |
+        result = {"status": "complete", "drained": input_data.get("drained", 0)}
