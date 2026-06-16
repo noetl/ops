@@ -1,0 +1,84 @@
+# CronJob — drives system/projector (CQRS read-model).
+# noetl/ai-meta#103 phase 2b.
+# =============================================================================
+# Fires the projector system playbook by POSTing to the Rust server's
+# /api/execute.  The server routes the `system/` path to
+# noetl.commands.system.<eid>, which only the system worker pool consumes; the
+# pool runs the playbook (drain noetl_events → advance projection_snapshot via
+# /api/internal/projection/advance), per data-access-boundary.md.
+#
+# The CronJob only TRIGGERS executions — it carries no DB access and no internal
+# token.  The privileged work happens inside the system pool under the
+# internal-API token.
+#
+# Cadence: each `noetl_events` drain is bounded (batch ≤1000, exits — it never
+# holds a worker slot).  K8s cron granularity is 1 minute, which is far too
+# coarse to keep up with a real event rate, so each run LOOPS the trigger for
+# ~55s (one bounded drain per iteration) and `concurrencyPolicy: Forbid` keeps
+# runs from overlapping — giving roughly continuous draining.
+#
+# Production keep-up: prefer scaling on the `noetl_projector` consumer's pending
+# count.  A KEDA NATS-JetStream ScaledObject on that consumer (mirroring
+# `keda/scaledobject-worker-system-pool.yaml`) lets the system pool fan out when
+# projection lag grows, instead of relying on this single looping trigger.  This
+# CronJob is the floor that guarantees progress even with KEDA at zero.
+#
+# Prerequisite: the server runs with NOETL_EVENT_STREAM_ENABLED=true (fills the
+# stream + ensures the noetl_projector consumer).  To transfer snapshot
+# ownership, also NOETL_PROJECTOR_OWNS_SNAPSHOT=true; with it off the projector
+# still advances the snapshot harmlessly (shadow validation).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: noetl-projector
+  namespace: noetl
+  labels:
+    app: noetl-projector
+    component: system-cron
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 30
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # Bound the run just past the looping window so a stuck trigger can't
+      # outlive its minute and block the next (Forbid) run.
+      activeDeadlineSeconds: 70
+      template:
+        metadata:
+          labels:
+            app: noetl-projector
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: trigger
+              image: curlimages/curl:8.7.1
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  # Loop bounded drains for ~55s; the next CronJob minute
+                  # continues.  Each POST kicks one bounded projector run.
+                  end=$(( $(date +%s) + 55 ))
+                  n=0
+                  while [ "$(date +%s)" -lt "$end" ]; do
+                    curl -fsS -X POST \
+                      http://noetl-server-rust.noetl.svc.cluster.local:8082/api/execute \
+                      -H 'Content-Type: application/json' \
+                      -d '{"path": "system/projector"}' >/dev/null || true
+                    n=$(( n + 1 ))
+                    sleep 1
+                  done
+                  echo "Triggered system/projector ${n}x this minute."
+              resources:
+                requests:
+                  cpu: "10m"
+                  memory: "32Mi"
+                limits:
+                  cpu: "100m"
+                  memory: "64Mi"
