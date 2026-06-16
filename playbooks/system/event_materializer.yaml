@@ -1,0 +1,162 @@
+# noetl event-materializer — system playbook (CQRS write-path cutover)
+#
+# Phase 2d-1 of the CQRS event-log split (noetl/ai-meta#103).  Drains a bounded
+# batch from the `noetl_events` JetStream stream and batch-writes the events into
+# `noetl.event` via the server's `POST /api/internal/events/project` endpoint —
+# materializing the durable event log from the stream instead of the synchronous
+# per-event INSERT.  The playbook never touches `noetl.*` directly
+# (data-access-boundary.md).
+#
+# Shadow phase: in 2d-1 the server STILL writes `noetl.event` synchronously, so
+# this runs ALONGSIDE that.  `events/project` is idempotent (`ON CONFLICT DO
+# NOTHING`, returns a `duplicates` count), so the double-write is safe — during
+# shadow, `duplicates` ≈ batch size confirms the materializer reproduces exactly
+# what the synchronous path already wrote.  At the 2d-3 cutover the synchronous
+# INSERT is dropped and this becomes the sole `noetl.event` writer.
+#
+# It drains its OWN durable consumer (`noetl_materializer`), independent of the
+# projector's `noetl_projector`, so the two fold the same stream in parallel.
+#
+# Run model + routing + auth: identical to `system/projector` — Mode A bounded
+# drain, one pass per invocation, driven by a CronJob; `system/` path → system
+# worker pool; internal API via the `NOETL_INTERNAL_API_TOKEN` bearer alias;
+# NATS via the `nats_system` credential alias (explicit `user`/`password` fields,
+# not URL-embedded — see system/projector).
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: event_materializer
+  path: system/event_materializer
+  description: |
+    System playbook that materializes noetl.event from the noetl_events
+    JetStream stream: drain a bounded batch, map each message to an event
+    envelope, and batch-write via the server's /api/internal/events/project
+    endpoint.  Runs on the system worker pool.
+
+workload:
+  server_url: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
+  api_token_alias: NOETL_INTERNAL_API_TOKEN
+  nats_auth: nats_system
+  stream: noetl_events
+  consumer: noetl_materializer
+  batch: 500
+  timeout_ms: 3000
+
+workflow:
+  - step: start
+    desc: "Materializer invocation entry"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "started"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: drain_events
+
+  - step: drain_events
+    desc: "Bounded drain of the noetl_events stream (materializer consumer)"
+    tool:
+      kind: subscription
+      source: nats
+      operation: poll
+      auth: "{{ nats_auth }}"
+      stream: "{{ stream }}"
+      consumer: "{{ consumer }}"
+      batch: "{{ batch }}"
+      timeout_ms: "{{ timeout_ms }}"
+      ack: on_success
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: build_envelopes
+          when: "{{ drain_events.count > 0 }}"
+        - step: empty
+          when: "{{ drain_events.count == 0 }}"
+
+  - step: build_envelopes
+    desc: "Map each drained event JSON to an events/project envelope"
+    tool:
+      kind: python
+      input:
+        messages: "{{ drain_events.messages }}"
+      code: |
+        import json
+
+        # Fields the events/project EventEnvelope reads directly; everything
+        # else (catalog_id, current_index, …) round-trips via its `extra`
+        # flatten when we pass the row through untouched.
+        events = []
+        for msg in input_data.get("messages", []) or []:
+            data = msg.get("data") if isinstance(msg, dict) else None
+            if isinstance(data, (str, bytes, bytearray)):
+                try:
+                    data = json.loads(data)
+                except Exception:
+                    data = None
+            if not isinstance(data, dict):
+                continue
+            if data.get("event_id") is None:
+                continue
+            ev = dict(data)
+            # The envelope's typed field is `timestamp`; the stream row carries
+            # `created_at`.  Map it so the materialized row keeps its original
+            # time instead of defaulting to now().
+            if "created_at" in ev and "timestamp" not in ev:
+                ev["timestamp"] = ev.pop("created_at")
+            events.append(ev)
+
+        result = {"events": events, "count": len(events)}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: materialize
+          when: "{{ build_envelopes.count > 0 }}"
+        - step: empty
+          when: "{{ build_envelopes.count == 0 }}"
+
+  - step: materialize
+    desc: "Batch-write the events into noetl.event via the server endpoint"
+    tool:
+      kind: http
+      method: POST
+      url: "{{ server_url }}/api/internal/events/project"
+      headers:
+        Content-Type: "application/json"
+      auth:
+        type: bearer
+        credential: "{{ api_token_alias }}"
+      body:
+        events: "{{ build_envelopes.events }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: empty
+    desc: "Nothing to materialize this invocation"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "empty", "materialized": 0}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Materializer invocation complete"
+    tool:
+      kind: python
+      input:
+        drained: "{{ drain_events.count | default(0) }}"
+      code: |
+        result = {"status": "complete", "drained": input_data.get("drained", 0)}
