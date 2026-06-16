@@ -56,7 +56,11 @@ workload:
   # Bearer-token credential alias for the internal API.
   api_token_alias: NOETL_INTERNAL_API_TOKEN
 
-  # NATS credential alias — must carry {"url": "nats://..."}.
+  # NATS credential alias.  The `tool: nats` / `tool: subscription` backend reads
+  # `url` + separate `user` / `password` / `token` fields from the credential —
+  # it does NOT parse user:pass embedded in the URL.  So register e.g.
+  #   {"url":"nats://nats.nats.svc.cluster.local:4222","user":"noetl","password":"..."}
+  # (a URL-embedded `nats://user:pass@host` yields an authorization violation).
   nats_auth: nats_system
 
   # JetStream stream + durable pull consumer the server ensures (phase 2a).
