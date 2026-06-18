@@ -113,13 +113,28 @@ spec:
               value: NOETL_INTERNAL_API_TOKEN
             - name: RUST_LOG
               value: "info,noetl_worker=info,noetl_executor=info"
+            # Arrow IPC shared-memory cache budget (noetl-arrow-cache).
+            # Pinned here next to the /dev/shm sizeLimit below so the two
+            # stay coherent: sizeLimit (320Mi) MUST exceed this budget
+            # (256Mi) or the worker SIGBUSes (exit 135) when the cache
+            # fills past the tmpfs.  worker.rs:91 / arrow-cache cache.rs:12.
+            - name: NOETL_IPC_CACHE_BUDGET_BYTES
+              value: "268435456" # 256 MiB
+          volumeMounts:
+            # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
+            # container-runtime default /dev/shm is a 64 MiB tmpfs; the
+            # cache writes shm regions up to NOETL_IPC_CACHE_BUDGET_BYTES
+            # and overruns 64 MiB, page-faulting into SIGBUS (exit 135).
+            - name: dshm
+              mountPath: /dev/shm
           resources:
             requests:
               cpu: "100m"
               memory: "128Mi"
             limits:
               cpu: "1"
-              memory: "512Mi"
+              # 320Mi (/dev/shm tmpfs, charged to the cgroup) + worker RSS.
+              memory: "768Mi"
           livenessProbe:
             tcpSocket:
               port: 9090
@@ -132,6 +147,15 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 6
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            # >= NOETL_IPC_CACHE_BUDGET_BYTES (256Mi) + 64Mi headroom for
+            # tmpfs page rounding / fragmentation.  tmpfs usage counts
+            # against the container memory limit above (768Mi), which
+            # covers this plus the worker RSS.
+            sizeLimit: 320Mi
 ---
 apiVersion: v1
 kind: Service
