@@ -1,0 +1,44 @@
+# Scrape the worker pools' /metrics endpoints.
+#
+# The worker deployments expose Prometheus metrics on the named `metrics`
+# port (9090) behind headless `*-metrics` Services, but until now nothing
+# selected them — only the server (noetl-scrape) and postgres-exporter had
+# VMServiceScrapes, so worker metrics never reached VictoriaMetrics.
+#
+# This is required for the CQRS materializer-lag guardrail
+# (noetl/ai-meta#103): the lag gauge
+# (noetl_worker_nats_consumer_pending{consumer="noetl_materializer"}) and the
+# materializer counters (noetl_worker_materializer_*) live on the system-pool
+# worker, so the alert rules in vmrule-materializer-lag.yaml are blind unless
+# this scrape exists. Covers every worker pool's metrics Service so the broader
+# worker observability surface (dispatch, command-consumer lag, subscription)
+# is captured too.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: noetl-worker-scrape
+  namespace: noetl
+spec:
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - noetl-worker-system-pool
+          - noetl-worker-rust
+          - noetl-worker-rust-subscription-pool
+          - noetl-worker
+  namespaceSelector:
+    matchNames:
+      - noetl
+  relabelConfigs:
+    - sourceLabels: [__meta_kubernetes_service_name]
+      targetLabel: service
+    - sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod

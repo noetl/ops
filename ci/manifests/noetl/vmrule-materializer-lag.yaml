@@ -1,0 +1,195 @@
+# Materializer-lag alerting — the operator gate for the CQRS
+# NOETL_EVENT_INGEST_PUBLISH_ONLY flip (noetl/ai-meta#103).
+#
+# Under the gate the server writes ZERO noetl.event rows and PUBLISHES
+# every event to the noetl_events JetStream stream; the worker-side
+# materializer loop (system pool, NOETL_MATERIALIZER_ENABLED) is the
+# SOLE writer — it drains the stream and POSTs /api/internal/events/project,
+# acking each batch only after a durable insert.  If that loop falls
+# behind or dies, published events pile up un-materialized and the event
+# log silently stops advancing.  These rules are the early-warning +
+# page surface for exactly that condition, so the flip stays one revert
+# (NOETL_EVENT_INGEST_PUBLISH_ONLY=false) away from safe.
+#
+# Signals (cheapest, earliest first):
+#   1. Backlog gauge — noetl_worker_nats_consumer_pending +
+#      noetl_worker_nats_consumer_ack_pending for the
+#      {stream=noetl_events, consumer=noetl_materializer} pair.  The lag
+#      poller (worker/src/nats/lag_poller.rs) reports it on an INDEPENDENT
+#      task, so a stalled/dead materializer loop — which cannot report its
+#      own lag — still surfaces as a climbing gauge.  This works in shadow
+#      mode (gate off) AND under the gate, so it doubles as the pre-flip
+#      green-baseline check (backlog ~0).
+#   2. Stall-under-gate — server publishing (noetl_event_ingest_published_total
+#      moves only when the gate is ON) while the materializer acks nothing
+#      (noetl_worker_materializer_acked_total flat).  Self-scoped to the
+#      gate, because publishes only happen under the gate.
+#   3. Project errors — events/project POSTs failing (batches redeliver,
+#      no loss, but the sink is unhealthy).
+#   4. Absent-under-gate — publishing under the gate but no materializer
+#      metrics scraped at all (the worker isn't running).
+#
+# Scrape path: the system-pool worker exposes /metrics on :9090 with
+# prometheus.io/scrape annotations (worker-system-pool-deployment.yaml);
+# the server exposes noetl_event_ingest_published_total via the
+# noetl-scrape VMServiceScrape.  VMAlert selects this VMRule
+# (vmstack-values.yaml vmalert.spec.selectAllByDefault: true).
+#
+# Thresholds are prod steady-state bounds.  Tune per cluster: a healthy
+# materializer (batch=200, idle_sleep=500ms) keeps the backlog at ~0; a
+# sustained backlog above one batch means it is not keeping up.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: noetl-materializer-lag
+  namespace: noetl
+  labels:
+    app: noetl
+    component: materializer
+    # The flip guardrail for noetl/ai-meta#103.
+    noetl.io/flip-guardrail: publish-only
+spec:
+  groups:
+    - name: noetl-materializer-lag
+      interval: 15s
+      rules:
+        # Recording rule: total un-materialized backlog for the
+        # materializer consumer, deduped across system-pool pods (each
+        # pod's poller reports the same consumer-level value).
+        - record: noetl:materializer_backlog
+          expr: |
+            max(
+              noetl_worker_nats_consumer_pending{stream="noetl_events", consumer="noetl_materializer"}
+              + noetl_worker_nats_consumer_ack_pending{stream="noetl_events", consumer="noetl_materializer"}
+            )
+
+        # WARNING — the materializer is falling behind.  Sustained backlog
+        # above one drain batch for 10m.  Healthy steady state is ~0.
+        - alert: MaterializerBacklogWarning
+          expr: noetl:materializer_backlog > 200
+          for: 10m
+          labels:
+            severity: warning
+            component: materializer
+            noetl.io/flip-guardrail: publish-only
+          annotations:
+            summary: "CQRS materializer falling behind ({{ $value }} events un-materialized)"
+            description: >-
+              The noetl_events/noetl_materializer backlog has been above 200
+              for 10m. Under NOETL_EVENT_INGEST_PUBLISH_ONLY the materializer
+              is the sole noetl.event writer, so this backlog is events that
+              have been published but not yet written to the log. Check the
+              system-pool worker (noetl_worker_materializer_* counters) and
+              the /api/internal/events/project path.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-cqrs-publish-only-flip.md#materializerbacklogwarning"
+
+        # CRITICAL / page — backlog is large.  Either a sustained outage or
+        # a runaway under the gate.  If the gate is ON, this is data not
+        # reaching the log: execute the revert.
+        - alert: MaterializerBacklogCritical
+          expr: noetl:materializer_backlog > 2000
+          for: 5m
+          labels:
+            severity: critical
+            component: materializer
+            noetl.io/flip-guardrail: publish-only
+          annotations:
+            summary: "CQRS materializer backlog critical ({{ $value }} events un-materialized)"
+            description: >-
+              The noetl_events/noetl_materializer backlog has been above 2000
+              for 5m. Under the PUBLISH_ONLY gate the event log is not keeping
+              up with publishes. Execute the one-command revert
+              (NOETL_EVENT_INGEST_PUBLISH_ONLY=false on noetl-server) so the
+              server resumes synchronous INSERTs while the materializer drains
+              the backlog. See the runbook.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-cqrs-publish-only-flip.md#materializerbacklogcritical"
+
+        # CRITICAL / page — backlog is growing unbounded even below the
+        # absolute critical threshold.  Catches a slow leak the static
+        # thresholds would miss until it is large.
+        - alert: MaterializerBacklogGrowing
+          expr: noetl:materializer_backlog > 200 and deriv(noetl:materializer_backlog[10m]) > 0
+          for: 15m
+          labels:
+            severity: critical
+            component: materializer
+            noetl.io/flip-guardrail: publish-only
+          annotations:
+            summary: "CQRS materializer backlog growing unbounded ({{ $value }} and rising)"
+            description: >-
+              The materializer backlog has been monotonically increasing for
+              15m and is above 200. The materializer is draining slower than
+              the server publishes. Under the gate this trends toward the log
+              never catching up — investigate, and revert if the gate is ON.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-cqrs-publish-only-flip.md#materializerbackloggrowing"
+
+        # CRITICAL / page — the dangerous one.  Server is PUBLISHING (the
+        # published counter only moves when the gate is ON) but the
+        # materializer has acked NOTHING for 5m.  The sole writer is stalled
+        # or stuck mid-batch: events are flowing in and nothing is coming out.
+        - alert: MaterializerStalledUnderGate
+          expr: |
+            (sum(rate(noetl_event_ingest_published_total[5m])) > 0)
+            and on()
+            (sum(rate(noetl_worker_materializer_acked_total[5m])) == 0)
+          for: 5m
+          labels:
+            severity: critical
+            component: materializer
+            noetl.io/flip-guardrail: publish-only
+          annotations:
+            summary: "CQRS materializer STALLED while the gate is publishing"
+            description: >-
+              noetl_event_ingest_published_total is advancing (the
+              PUBLISH_ONLY gate is ON and active) but
+              noetl_worker_materializer_acked_total has been flat for 5m — the
+              sole event-log writer is not making progress. Events are being
+              published and not materialized. Execute the revert
+              (NOETL_EVENT_INGEST_PUBLISH_ONLY=false) immediately, then
+              diagnose the materializer.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-cqrs-publish-only-flip.md#materializerstalledundergate"
+
+        # WARNING — the events/project sink is erroring.  Batches are NOT
+        # acked and redeliver (no loss by design), but the sink is unhealthy.
+        - alert: MaterializerProjectErrors
+          expr: sum(rate(noetl_worker_materializer_project_errors_total[5m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: materializer
+            noetl.io/flip-guardrail: publish-only
+          annotations:
+            summary: "CQRS materializer events/project failing — batches redelivering"
+            description: >-
+              noetl_worker_materializer_project_errors_total is increasing: the
+              materializer's POST /api/internal/events/project is failing, so
+              batches stay un-acked and redeliver after the consumer ack-wait.
+              No data loss (ack-after-materialize), but materialization is
+              stalled until the server sink recovers. Check noetl-server logs
+              and DB health.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-cqrs-publish-only-flip.md#materializerprojecterrors"
+
+        # CRITICAL / page — publishing under the gate but the materializer
+        # worker is not being scraped at all (pod gone / metrics down).  The
+        # stall alert can't fire because its counter series is absent; this
+        # is the absent-metric backstop.
+        - alert: MaterializerAbsentUnderGate
+          expr: |
+            (sum(rate(noetl_event_ingest_published_total[5m])) > 0)
+            and on()
+            absent(noetl_worker_materializer_acked_total)
+          for: 5m
+          labels:
+            severity: critical
+            component: materializer
+            noetl.io/flip-guardrail: publish-only
+          annotations:
+            summary: "CQRS materializer metrics ABSENT while the gate is publishing"
+            description: >-
+              The server is publishing under the PUBLISH_ONLY gate but no
+              noetl_worker_materializer_* metrics are being scraped — the
+              system-pool materializer worker is not running or its /metrics
+              endpoint is down. The event log is not being written. Execute the
+              revert (NOETL_EVENT_INGEST_PUBLISH_ONLY=false) and restore the
+              system pool.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-cqrs-publish-only-flip.md#materializerabsentundergate"
