@@ -127,11 +127,20 @@ spec:
         # published counter only moves when the gate is ON) but the
         # materializer has acked NOTHING for 5m.  The sole writer is stalled
         # or stuck mid-batch: events are flowing in and nothing is coming out.
+        # The `noetl:materializer_backlog > 0` guard suppresses a
+        # post-burst false positive: after a backlog drains, the published
+        # rate can linger above 0 (recent events still in the 5m window)
+        # while the materializer is idle (acked rate 0 because there is
+        # nothing left to ack).  A real stall always has un-materialized
+        # backlog, so requiring backlog > 0 keeps the alert sharp without
+        # the cooldown false-fire.
         - alert: MaterializerStalledUnderGate
           expr: |
             (sum(rate(noetl_event_ingest_published_total[5m])) > 0)
             and on()
             (sum(rate(noetl_worker_materializer_acked_total[5m])) == 0)
+            and on()
+            (noetl:materializer_backlog > 0)
           for: 5m
           labels:
             severity: critical
