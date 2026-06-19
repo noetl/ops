@@ -1,41 +1,40 @@
 # noetl-server-rust — PRODUCTION Deployment + Service (GKE noetl-demo-19700101)
 # =============================================================================
-# Phase F R5 of noetl/ai-meta#49 — the Rust control plane ("noetl-control-plane"
-# binary) cutover candidate for the production GKE stack.
+# The Rust control plane ("noetl-control-plane" binary) for the production GKE
+# stack.  Originally the noetl/ai-meta#49 Python→Rust cutover candidate; that
+# cutover is DONE (prod's `noetl` Service already selects app=noetl-server-rust
+# and there is no Python deployment).  This manifest is now the ROLL-FORWARD
+# artifact for the post-#103 image (CQRS PUBLISH_ONLY gate + cancel/finalize
+# chokepoint, server v3.29.3).
 #
 # This is the PRODUCTION-shaped manifest (distinct from the kind-only
 # `server-rust-deployment.yaml` in this directory, which uses a local
 # `localhost/...:dev` image with `imagePullPolicy: Never`).
 #
-# *** DO NOT `kubectl apply` THIS BLINDLY. ***  It is the artifact the
-# operator applies during the cutover, AFTER provisioning two prod secrets.
-# Follow `repos/ops/runbooks/noetl-server-rust-cutover.md` step by step.
-# Applying the Deployment is non-traffic-affecting on its own (it creates a
-# parallel `noetl-server-rust` Deployment + Service); production traffic only
-# moves when the `noetl` Service selector is flipped — a separate, explicit
-# operator step in the runbook.
+# *** DO NOT `kubectl apply` THIS BLINDLY. ***  The Deployment name
+# `noetl-server-rust` IS the live, traffic-serving deployment, so applying this
+# ROLLS the live server (zero-downtime rolling update: maxUnavailable=0,
+# maxSurge=1).  Treat it as a normal prod server release, gated on the
+# operator.  It does NOT flip the CQRS gate — `NOETL_EVENT_INGEST_PUBLISH_ONLY`
+# is pinned `false` below.  Follow the "Production (GKE)" section of
+# `repos/ops/runbooks/noetl-cqrs-publish-only-flip.md`.
 #
 # Image: built by `automation/gcp_gke/assets/server/cloudbuild.yaml` from
-# noetl/server commit e7df366 (v3.5.0 + the `time =0.3.47` build-fix pin +
-# the NOETL_PG_STATEMENT_CACHE_CAPACITY sqlx fix; base release commit 7b217d8
-# won't build — see runbook).  Pinned below by the
-# immutable @sha256 digest printed by that build (NOT a mutable tag) so a
-# re-pushed tag can never silently change what prod runs.
+# noetl/server v3.29.3 (commit b6e5d31).  Pinned below by the immutable @sha256
+# digest (NOT a mutable tag) so a re-pushed tag can never silently change what
+# prod runs.
 #
-# Prereqs the operator MUST satisfy before this Deployment will become Ready
-# (the runbook walks each one):
-#   1. Secret `noetl-secret` MUST contain key `NOETL_ENCRYPTION_KEY`
-#      (base64-encoded 32-byte key).  The Rust server FAILS CLOSED without it
-#      (no insecure default — noetl/ai-meta#61).  See the runbook's
-#      "Credential encryption decision" section: prod Python stores
-#      credentials as PLAINTEXT JSON (no-op `encrypt_json`), so there is NO
-#      Python key to match — existing credentials must be RE-ENTERED under the
-#      Rust AES-GCM scheme after cutover.
-#   2. Secret `noetl-internal-api-token` (key `token`) MUST exist — referenced
+# Prereqs the operator MUST satisfy (ALL ALREADY PRESENT in prod as of
+# 2026-06-19 — created when the Rust cutover landed; verify before apply):
+#   1. Secret `noetl-secret` carries key `NOETL_ENCRYPTION_KEY` (base64 32-byte).
+#      The Rust server FAILS CLOSED without it (no insecure default —
+#      noetl/ai-meta#61).  Credentials were re-entered under the Rust AES-GCM
+#      scheme at cutover; this roll-forward does NOT re-touch them.
+#   2. Secret `noetl-internal-api-token` (key `token`) — referenced
 #      non-optionally below; absent → pod CreateContainerConfigError.
 #   3. Prod pgbouncer runs `pool_mode=transaction`; this manifest sets
-#      NOETL_PG_STATEMENT_CACHE_CAPACITY=0 so sqlx is safe behind it
-#      (noetl/server e7df366+).  No pgbouncer change needed.
+#      NOETL_PG_STATEMENT_CACHE_CAPACITY=0 so sqlx is safe behind it.
+#      No pgbouncer change needed.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -65,11 +64,11 @@ spec:
     spec:
       containers:
         - name: noetl-server
-          # Pinned by immutable digest (Cloud Build 94cc199e, 2026-06-13) so a
+          # Pinned by immutable digest (Cloud Build e6930f36, 2026-06-19) so a
           # re-pushed tag can never silently change what prod runs.  The
-          # :e7df366 / :v3.5.0 tags resolve to this same digest and are shown
+          # :v3.29.3 / :b6e5d31 tags resolve to this same digest and are shown
           # for human traceability.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/server-rust@sha256:c3783281b3c90572ef01538e1672125ab464e732db329f1187e1b12411964984
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/server-rust@sha256:6d2de321cd0938182c85cfaa500ac922e31f128d046e6306816f0983b40e6d1e
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8082
@@ -155,6 +154,19 @@ spec:
                 secretKeyRef:
                   name: noetl-secret
                   key: NOETL_ENCRYPTION_KEY
+            # --- CQRS write-path gate (noetl/ai-meta#103) --------------------
+            # Pinned EXPLICITLY false so this roll-forward does NOT flip the
+            # gate.  When false the server writes noetl.event synchronously
+            # (today's behavior).  The flip to "true" — server publishes to the
+            # noetl_events JetStream stream and the system-pool materializer
+            # becomes the sole writer — is a SEPARATE, staged operator action
+            # taken behind the materializer-lag alerts (GMP Rules
+            # `noetl-materializer-lag`).  See the "Production (GKE)" section of
+            # runbooks/noetl-cqrs-publish-only-flip.md.  Revert is one command:
+            # set this back to false.  Default is already false in the binary;
+            # naming it here makes the gate visible in the manifest.
+            - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
+              value: "false"
           resources:
             requests:
               cpu: "250m"
@@ -181,10 +193,11 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 12
 ---
-# Parallel Service so the Rust server is reachable for canary checks under its
-# own DNS BEFORE any cutover.  The production `noetl` Service (selector
-# app=noetl-server) is NOT touched by this manifest — the cutover flips that
-# selector in a separate, explicit operator step (runbook "Flip").
+# Dedicated `noetl-server-rust` Service (already present in prod; apply is
+# idempotent).  The production `noetl` Service ALREADY selects
+# app=noetl-server-rust (the Python→Rust cutover is done), so both this Service
+# and the `noetl` Service resolve to the same pods.  This manifest does not
+# change the `noetl` Service.
 apiVersion: v1
 kind: Service
 metadata:
