@@ -120,6 +120,18 @@ spec:
             # fills past the tmpfs.  worker.rs:91 / arrow-cache cache.rs:12.
             - name: NOETL_IPC_CACHE_BUDGET_BYTES
               value: "268435456" # 256 MiB
+            # CQRS event materializer (noetl/ai-meta#103) — ack-after-materialize
+            # sole-writer loop for noetl.event under NOETL_EVENT_INGEST_PUBLISH_ONLY.
+            # Staging order for the operator-gated flip (do BOTH, materializer first):
+            #   1. Flip this to "true" → the loop runs as a HARMLESS SHADOW while the
+            #      server still writes synchronously (events/project is idempotent,
+            #      so the drain only logs duplicates, never loss). Watch
+            #      noetl_worker_materializer_* + the consumer ack-pending lag.
+            #   2. Then flip the server's NOETL_EVENT_INGEST_PUBLISH_ONLY=true → the
+            #      server stops INSERTing and this loop becomes the sole writer.
+            # Kept "false" here so NO production default changes on apply.
+            - name: NOETL_MATERIALIZER_ENABLED
+              value: "false"
           volumeMounts:
             # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
             # container-runtime default /dev/shm is a 64 MiB tmpfs; the
