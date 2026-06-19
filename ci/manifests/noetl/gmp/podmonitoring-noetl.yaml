@@ -1,0 +1,76 @@
+# GMP PodMonitoring — production scrape for noetl worker + server /metrics.
+# =============================================================================
+# PROD-ONLY (GKE noetl-demo-19700101).  The production cluster runs **Google
+# Managed Prometheus** (namespaces gke-gmp-system / gmp-public), NOT the
+# VictoriaMetrics operator that the kind cluster uses.  The kind scrape config
+# (`ci/manifests/noetl-scrape/vmscrape*.yaml`, kind:
+# `operator.victoriametrics.com/v1beta1/VMServiceScrape`) cannot apply here —
+# the VM CRDs do not exist.  This file is the GMP-native equivalent.
+#
+# GMP does NOT honor `prometheus.io/scrape` pod annotations — it only scrapes
+# targets named by a PodMonitoring / ClusterPodMonitoring.  Before this file,
+# the noetl namespace had NO PodMonitoring, so neither the server nor the
+# worker /metrics endpoints reached Managed Prometheus.  This is the scrape
+# half of the CQRS materializer-lag guardrail (noetl/ai-meta#103): the lag
+# gauge (noetl_worker_nats_consumer_pending{consumer="noetl_materializer"}) and
+# the materializer counters (noetl_worker_materializer_*) live on the
+# system-pool worker; noetl_event_ingest_published_total lives on the server.
+# The materializer-lag Rules (rules-materializer-lag.yaml) are blind without
+# both scrapes.
+#
+# Applying this is observability-only and non-traffic-affecting.  It is safe to
+# apply BEFORE the materializer worker rolls — the new series simply appear
+# once the v5.35.0 worker (lag poller + materializer counters) is deployed.
+# Until then it captures the existing worker dispatch / command-consumer lag
+# surface, a net observability win.
+#
+# GMP auto-attaches target labels (cluster, location, namespace, pod,
+# container, job), so no relabelConfigs are needed — the materializer rules key
+# off metric labels (stream, consumer), not target relabels.
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: noetl-workers
+  namespace: noetl
+  labels:
+    app: noetl
+    component: worker
+    # The scrape half of the flip guardrail for noetl/ai-meta#103.
+    noetl.io/flip-guardrail: publish-only
+spec:
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - noetl-worker-system-pool
+          - noetl-worker-rust
+          - noetl-worker-rust-subscription-pool
+          - noetl-worker
+  endpoints:
+    - port: metrics        # named container port (9090) on every worker pool
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: noetl-server
+  namespace: noetl
+  labels:
+    app: noetl
+    component: server
+    noetl.io/flip-guardrail: publish-only
+spec:
+  selector:
+    matchLabels:
+      app: noetl-server-rust
+  endpoints:
+    # The server exposes Prometheus metrics on its HTTP port (8082) at
+    # /metrics — including noetl_event_ingest_published_total, the
+    # "gate is ON and active" signal the MaterializerStalledUnderGate /
+    # MaterializerAbsentUnderGate alerts depend on.
+    - port: http
+      path: /metrics
+      interval: 30s

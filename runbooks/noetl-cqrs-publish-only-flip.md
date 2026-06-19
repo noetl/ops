@@ -27,6 +27,84 @@ materializer-lag alerts.
 
 ---
 
+## Production (GKE) — environment specifics (READ FIRST)
+
+The body of this runbook was written against the **kind** dev cluster (a
+VictoriaMetrics stack: VMAlert / VMRule / VMServiceScrape, a vmstack
+Alertmanager). **Production differs in three load-bearing ways.** A
+read-only prep verification on `gke_noetl-demo-19700101_us-central1_noetl-cluster`
+(2026-06-19) established the live facts below — verify them again before you
+act.
+
+- **`<ctx>` = `gke_noetl-demo-19700101_us-central1_noetl-cluster`**, namespace
+  `noetl`. Routing is the `noetl` ClusterIP Service's **selector**
+  (`app=noetl-server-rust`), not an Ingress. Prod **already runs the full Rust
+  stack** — the Python→Rust cutover (noetl/ai-meta#49) is done. There is no
+  Python deployment to keep serving; the "Python stays serving" framing from
+  earlier prep briefs is obsolete.
+
+- **Monitoring is Google Managed Prometheus (GMP), NOT VictoriaMetrics.** The
+  `vmalert` / `VMRule` / `VMServiceScrape` commands in this runbook do not
+  exist on prod. The prod equivalents shipped in
+  [`ci/manifests/noetl/gmp/`](../ci/manifests/noetl/gmp/):
+  `podmonitoring-noetl.yaml` (GMP `PodMonitoring` — the worker + server scrape)
+  and `rules-materializer-lag.yaml` (GMP `Rules` — the same PromQL/thresholds
+  as the kind VMRule). Both were **applied during prep** (observability-only,
+  non-traffic-affecting). Query backlog/alerts through Cloud Monitoring
+  (Managed Prometheus) or the GMP rule-evaluator, not a VMAlert port-forward.
+  Alerts route to the **GMP managedAlertmanager** (OperatorConfig `config` in
+  `gmp-public` → secret `alertmanager`), not the vmstack Alertmanager.
+
+- **Both flip secrets already exist** (created when the Rust cutover landed,
+  ~5 days before this prep): `noetl-secret` carries `NOETL_ENCRYPTION_KEY`
+  (alongside `NOETL_PASSWORD` / `POSTGRES_PASSWORD`) and
+  `noetl-internal-api-token` carries `token`. The "create the encryption key /
+  internal-api token" operator step from the #49 cutover runbook is **done** —
+  do not recreate them. (Credential plaintext re-entry was part of that
+  cutover, not this flip; the Rust server has been serving credential-backed
+  executions since, so it is not a flip prerequisite.)
+
+### Prod prerequisite the kind runbook does NOT mention: roll the images first
+
+The materializer loop + lag poller exist only in **worker v5.35.0**; the
+publish-only gate + `noetl_event_ingest_published_total` counter exist only in
+**server v3.29.3**. Prod is still on the **pre-#103 images** — live
+`noetl-server-rust` runs `server-rust:batch-dispatch-v1` and the system pool
+runs `noetl-worker-rust:cursor-100`. **The flip is not possible until the
+images roll.** Prep pushed both target images to the prod Artifact Registry
+(digests in the prep report / Releases wiki). The roll-forward manifests are
+staged, NOT applied:
+[`ci/manifests/noetl/server-rust-deployment-prod.yaml`](../ci/manifests/noetl/server-rust-deployment-prod.yaml)
+(→ v3.29.3, `NOETL_EVENT_INGEST_PUBLISH_ONLY=false`) and
+[`ci/manifests/noetl/worker-system-pool-deployment-prod.yaml`](../ci/manifests/noetl/worker-system-pool-deployment-prod.yaml)
+(→ v5.35.0, `NOETL_MATERIALIZER_ENABLED=false`).
+
+**Operator sequence on prod (each step gated, conservative):**
+
+1. **Roll the system pool to v5.35.0** (materializer still `false`):
+   `kubectl --context <ctx> -n noetl apply -f ci/manifests/noetl/worker-system-pool-deployment-prod.yaml`.
+   This is a rolling update of one system-pool pod — low blast radius (system
+   playbooks only), brings in the lag poller so the backlog gauge starts
+   reporting. Confirm `noetl_worker_nats_consumer_*` series appear in GMP.
+2. **Roll the server to v3.29.3** (gate still `false`):
+   `kubectl --context <ctx> -n noetl apply -f ci/manifests/noetl/server-rust-deployment-prod.yaml`.
+   This rolls the **live, traffic-serving** `noetl-server-rust` deployment
+   (zero-downtime: `maxUnavailable=0`, `maxSurge=1`). Watch gateway 5xx and
+   `/api/health` (DB + NATS connected). This is traffic-touching — treat it as
+   a normal prod server release, not part of the gate flip.
+3. **Enable the materializer as a shadow** — set `NOETL_MATERIALIZER_ENABLED=true`
+   on the system pool. Server gate still `false`, so the materializer drains
+   the stream idempotently while the server still INSERTs. This is the
+   green-baseline check below (backlog ≈ 0).
+4. **Wire the pager** (Alert routing section, GMP variant below).
+5. **Then, and only then, flip the gate** (The flip section).
+
+Steps 1–2 are the new-image rollout; 3–5 are the actual staged flip the rest of
+this runbook describes. Until step 1, the materializer-lag alerts are inert
+(their series do not exist yet) — expected, not a fault.
+
+---
+
 ## Why this gate exists
 
 Under `PUBLISH_ONLY` the server writes **zero** `noetl.event` rows. Every
@@ -187,19 +265,84 @@ attempting the flip again.
 
 ## Alert routing
 
-Routing today is a blackhole catch-all (`ci/vmstack/vmstack-values.yaml`
-`alertmanager.config`) — no external receiver is wired. **Before flipping in
-production**, wire the criticals to a real pager:
+### kind (VictoriaMetrics)
 
-1. Add a receiver (Slack/PagerDuty) under `alertmanager.config.receivers`
-   (commented examples are in the values file).
-2. Add a route matching `noetl.io/flip-guardrail="publish-only"` +
-   `severity=~"critical"` to that receiver (commented example under
-   `alertmanager.config.route.routes`).
-3. Re-apply the vmstack values (`helm upgrade vmstack …`).
+Routing on kind is a blackhole catch-all (`ci/vmstack/vmstack-values.yaml`
+`alertmanager.config`) — no external receiver is wired. To exercise delivery on
+kind: add a receiver under `alertmanager.config.receivers`, a route matching
+`noetl.io/flip-guardrail="publish-only"` + `severity=~"critical"`, and
+`helm upgrade vmstack …`. With blackhole, alerts still reach `firing` and are
+visible in the VMAlert UI/API — routing only governs delivery, not evaluation.
 
-With blackhole, alerts still reach `firing` and are visible in the VMAlert
-UI/API and the dashboard — routing only governs delivery, not evaluation.
+### Production (GKE / Google Managed Prometheus) — OPERATOR-GATED
+
+Prod does NOT use the vmstack Alertmanager. The GMP managed rule-evaluator
+sends alerts to the **GMP managedAlertmanager**, configured by OperatorConfig
+`config` in namespace `gmp-public`:
+
+```yaml
+# kubectl --context <ctx> -n gmp-public get operatorconfig config -o yaml
+managedAlertmanager:
+  configSecret:
+    name: alertmanager        # secret in gmp-public
+    key: alertmanager.yaml
+```
+
+The receiver/route config lives in the `alertmanager` secret's
+`alertmanager.yaml` key. **Prep did NOT touch it** — wiring a real pager needs
+the receiver endpoint (Slack webhook / PagerDuty routing key / email), which is
+an operator secret this prep does not hold. To wire it:
+
+1. Author an `alertmanager.yaml` with your receiver. **Templated stub**
+   (replace the placeholder; pick one receiver type):
+
+   ```yaml
+   route:
+     receiver: default
+     group_by: [alertname, cluster]
+     routes:
+       # Page the criticals from the CQRS flip guardrail.
+       - matchers:
+           - 'noetl_io_flip_guardrail="publish-only"'   # GMP sanitizes the `/` and `.` in label names to `_`
+           - 'severity="critical"'
+         receiver: noetl-flip-pager
+         continue: false
+   receivers:
+     - name: default
+     - name: noetl-flip-pager
+       # --- PagerDuty (uncomment + fill) ---
+       # pagerduty_configs:
+       #   - routing_key: <PAGERDUTY_ROUTING_KEY>
+       #     severity: critical
+       # --- or Slack (uncomment + fill) ---
+       # slack_configs:
+       #   - api_url: <SLACK_WEBHOOK_URL>
+       #     channel: '#noetl-prod-alerts'
+       #     title: '{{ .CommonAnnotations.summary }}'
+       #     text: '{{ .CommonAnnotations.description }}  Runbook: {{ .CommonAnnotations.runbook_url }}'
+   ```
+
+   > Note: GMP rewrites label names with `/` or `.` to `_` in the rule
+   > pipeline, so the alert label `noetl.io/flip-guardrail` is matched as
+   > `noetl_io_flip_guardrail` in the Alertmanager route. Confirm the rewritten
+   > name on a live firing alert before relying on the matcher.
+
+2. Replace the secret (it currently exists with a default/empty config):
+
+   ```bash
+   kubectl --context <ctx> -n gmp-public create secret generic alertmanager \
+     --from-file=alertmanager.yaml=./alertmanager.yaml \
+     --dry-run=client -o yaml | kubectl --context <ctx> -n gmp-public apply -f -
+   ```
+
+   The GMP operator reloads the managed Alertmanager automatically; no
+   OperatorConfig edit is needed (it already points at this secret).
+
+Until this is wired, the criticals still **evaluate and fire** in GMP (visible
+in Cloud Monitoring / the rule-evaluator) — only delivery is missing. Treat
+pager wiring as a hard prerequisite before flipping the gate in prod: the flip
+makes materializer availability load-bearing, and an un-paged critical defeats
+the guardrail.
 
 ---
 

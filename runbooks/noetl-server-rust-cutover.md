@@ -1,5 +1,19 @@
 # Operator Runbook — Production cutover: Python `noetl-server` → Rust `noetl-server-rust`
 
+> ✅ **ALREADY EXECUTED — historical record (verified live 2026-06-19).** The
+> Python→Rust cutover this runbook describes **has happened** in prod. On
+> `gke_noetl-demo-19700101_us-central1_noetl-cluster` ns `noetl`: the `noetl`
+> Service selector is `app=noetl-server-rust`; there is **no Python
+> deployment**; `noetl-server-rust` (1/1), `noetl-worker-rust` (2/2), and
+> `noetl-worker-system-pool` (1/1) all run the Rust stack; both secrets
+> (`NOETL_ENCRYPTION_KEY` on `noetl-secret`, `noetl-internal-api-token`) are
+> present. The live images are the **pre-#103** generation
+> (`server-rust:batch-dispatch-v1`, `noetl-worker-rust:cursor-100`). The next
+> prod change is the **CQRS PUBLISH_ONLY flip** — see
+> [`noetl-cqrs-publish-only-flip.md`](noetl-cqrs-publish-only-flip.md), whose
+> "Production (GKE) — environment specifics" section is the current source of
+> truth for prod. Keep this file as the cutover audit trail; do not re-run it.
+
 **Scope:** Flip the production GKE control plane from the Python FastAPI
 `noetl-server` to the Rust `noetl/server` crate (`noetl-control-plane`),
 on cluster `gke_noetl-demo-19700101_us-central1_noetl-cluster`.
