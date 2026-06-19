@@ -537,9 +537,28 @@ alertmanager:
   # - with `useManagedConfig: true` has structure described [here](https://docs.victoriametrics.com/operator/api/#vmalertmanagerconfig).
   useManagedConfig: false
   # -- (object) VMAlertmanager configuration
+  #
+  # Routing today is a blackhole catch-all — no external receiver is wired
+  # in this cluster.  Before the NOETL_EVENT_INGEST_PUBLISH_ONLY flip
+  # (noetl/ai-meta#103) an operator MUST wire the materializer-lag alerts
+  # to a real pager: add a Slack/PagerDuty receiver (uncomment one of the
+  # examples below) and a route matching
+  # `noetl.io/flip-guardrail="publish-only"` so the critical
+  # (MaterializerBacklogCritical / MaterializerStalledUnderGate /
+  # MaterializerAbsentUnderGate) alerts page on-call.  See the runbook:
+  # runbooks/noetl-cqrs-publish-only-flip.md (section "Alert routing").
+  # The alerts still reach `firing` state and are visible in the VMAlert
+  # UI / API with blackhole; routing only governs delivery.
   config:
     route:
       receiver: "blackhole"
+      # routes:
+      #   # Page on-call for the PUBLISH_ONLY flip guardrail criticals.
+      #   - matchers:
+      #       - 'noetl.io/flip-guardrail = "publish-only"'
+      #         severity =~ "critical"
+      #     receiver: "pagerduty-noetl"  # define under receivers:
+      #     continue: true
     #   group_by: ["alertgroup", "job"]
     #   group_wait: 30s
     #   group_interval: 5m
@@ -687,7 +706,15 @@ vmalert:
   # -- VMAlert labels
   labels: {}
   # -- Create VMAlert CR
-  enabled: false
+  # Enabled so the platform's alert rules actually evaluate.  Required by
+  # the CQRS materializer-lag guardrail (noetl/ai-meta#103): the VMRule
+  # ci/manifests/noetl/vmrule-materializer-lag.yaml is the operator gate
+  # for the NOETL_EVENT_INGEST_PUBLISH_ONLY flip, and it does nothing
+  # unless VMAlert is running to evaluate it.  selectAllByDefault (below)
+  # auto-selects every VMRule in the cluster, so new rules need no extra
+  # wiring.  Notifier = the alertmanager CR (enabled above); datasource =
+  # the vmsingle the stack provisions.
+  enabled: true
 
   # -- Controls whether VMAlert should use VMAgent or VMInsert as a target for remotewrite
   remoteWriteVMAgent: false

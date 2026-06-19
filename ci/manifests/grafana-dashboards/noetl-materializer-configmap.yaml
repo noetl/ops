@@ -1,0 +1,117 @@
+# Grafana dashboard for the CQRS materializer-lag guardrail
+# (noetl/ai-meta#103).  Auto-loaded by the Grafana sidecar via the
+# grafana_dashboard label.  Datasource "VictoriaMetrics" matches the
+# other NoETL dashboards.  Panels mirror the alert signals in
+# ci/manifests/noetl/vmrule-materializer-lag.yaml so an operator can see
+# the same numbers the alerts evaluate — the pre-flip green-baseline
+# check (backlog ~0) and the during/after-flip health.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noetl-materializer-dashboard
+  namespace: vmstack
+  labels:
+    grafana_dashboard: "1"
+    grafana_folder: "NoETL"
+data:
+  noetl-materializer-dashboard.json: |
+    {
+      "title": "NoETL CQRS Materializer (PUBLISH_ONLY guardrail)",
+      "uid": "noetl-materializer-lag",
+      "timezone": "browser",
+      "schemaVersion": 36,
+      "version": 1,
+      "refresh": "15s",
+      "tags": ["noetl", "cqrs", "materializer", "flip-guardrail"],
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Materializer backlog (un-materialized events)",
+          "description": "noetl:materializer_backlog = pending + ack_pending on the noetl_events/noetl_materializer consumer. Green ~0 = healthy / safe-to-flip baseline.",
+          "gridPos": { "h": 7, "w": 8, "x": 0, "y": 0 },
+          "datasource": "VictoriaMetrics",
+          "targets": [
+            { "expr": "noetl:materializer_backlog", "legendFormat": "backlog" }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "orientation": "horizontal"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 200 },
+                  { "color": "red", "value": 2000 }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "type": "stat",
+          "title": "Gate active? (server publishing rate)",
+          "description": "rate(noetl_event_ingest_published_total). Non-zero = NOETL_EVENT_INGEST_PUBLISH_ONLY is ON and events are flowing to the stream.",
+          "gridPos": { "h": 7, "w": 8, "x": 8, "y": 0 },
+          "datasource": "VictoriaMetrics",
+          "targets": [
+            { "expr": "sum(rate(noetl_event_ingest_published_total[5m]))", "legendFormat": "published/s" }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "orientation": "horizontal"
+          }
+        },
+        {
+          "type": "stat",
+          "title": "events/project errors (redeliveries)",
+          "description": "rate(noetl_worker_materializer_project_errors_total). Non-zero = batches are redelivering (no loss; sink unhealthy).",
+          "gridPos": { "h": 7, "w": 8, "x": 16, "y": 0 },
+          "datasource": "VictoriaMetrics",
+          "targets": [
+            { "expr": "sum(rate(noetl_worker_materializer_project_errors_total[5m]))", "legendFormat": "errors/s" }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "orientation": "horizontal"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 0.001 }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "type": "timeseries",
+          "title": "Consumer backlog over time (pending + ack_pending)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+          "datasource": "VictoriaMetrics",
+          "targets": [
+            { "expr": "max(noetl_worker_nats_consumer_pending{stream=\"noetl_events\", consumer=\"noetl_materializer\"})", "legendFormat": "pending (undelivered)" },
+            { "expr": "max(noetl_worker_nats_consumer_ack_pending{stream=\"noetl_events\", consumer=\"noetl_materializer\"})", "legendFormat": "ack_pending (in-flight)" },
+            { "expr": "noetl:materializer_backlog", "legendFormat": "total backlog" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Throughput: published vs projected vs acked",
+          "description": "Healthy: published == projected == acked (each event published once, materialized once, acked once). Published flat + projected/acked rising = draining a backlog. Published rising + acked flat = STALLED.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+          "datasource": "VictoriaMetrics",
+          "targets": [
+            { "expr": "sum(rate(noetl_event_ingest_published_total[1m]))", "legendFormat": "published/s (server)" },
+            { "expr": "sum(rate(noetl_worker_materializer_projected_total[1m]))", "legendFormat": "projected/s (worker)" },
+            { "expr": "sum(rate(noetl_worker_materializer_acked_total[1m]))", "legendFormat": "acked/s (worker)" },
+            { "expr": "sum(rate(noetl_worker_materializer_duplicates_total[1m]))", "legendFormat": "duplicates/s (redeliver)" }
+          ]
+        }
+      ]
+    }
