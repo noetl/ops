@@ -167,6 +167,22 @@ spec:
             # naming it here makes the gate visible in the manifest.
             - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
               value: "false"
+            # RFC noetl/ai-meta#115 Phase 6 — how the execution-lifecycle hot path
+            # reads noetl.event.  Pinned EXPLICITLY "event_scan" so this roll-
+            # forward does NOT change read behavior.  The flip to "audit_only" —
+            # the hot-path readers (get_catalog_id, inherit_parent_trace, the
+            # subscription dedup-audit + container-callback catalog/existence
+            # reads) are served from the in-memory execute-time ExecDescriptor and
+            # noetl.event becomes audit-only (still written by the materializer,
+            # read by operator/status/replay APIs, never scanned by the lifecycle)
+            # — is a SEPARATE, staged operator action taken WITH
+            # NOETL_STATE_BUILDER=offserver so the drive + ingest/callback paths
+            # are both scan-free.  Cold-descriptor reads fall back to the scan, so
+            # correctness never regresses.  Revert is one command: set back to
+            # "event_scan".  Default is already "event_scan" in the binary; naming
+            # it here makes the read-path mode visible in the manifest.
+            - name: NOETL_EVENT_READ_PATH
+              value: "event_scan"
           resources:
             requests:
               cpu: "250m"
