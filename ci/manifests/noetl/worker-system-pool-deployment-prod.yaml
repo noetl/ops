@@ -135,6 +135,23 @@ spec:
             # Kept "false" here so NO production default changes on apply.
             - name: NOETL_MATERIALIZER_ENABLED
               value: "false"
+            # Off-server state builder (noetl/ai-meta#115 Phase 4).  Where the
+            # orchestrator drive's WorkflowState is CONSTRUCTED:
+            #   server     (default) — the server builds it in-process and ships
+            #                it to the worker plug-in (run_state). PROD BEHAVIOR.
+            #   offserver  — this system-pool worker builds the drive state from
+            #                the noetl_events WAL spine (durable consumer
+            #                `noetl_state_builder`, wasm run/from_events entry),
+            #                with the server-built state as the incomplete-chain
+            #                fallback — state construction runs off the server.
+            # Kept "server" here so NO production default changes on apply; an
+            # operator-gated flip (after the kind off-server parity rig + a
+            # builder-backlog alert) is the path to enabling it, like the
+            # materializer flip above.
+            - name: NOETL_STATE_BUILDER
+              value: "server"
+            - name: NOETL_STATE_BUILDER_CONSUMER
+              value: "noetl_state_builder"
           volumeMounts:
             # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
             # container-runtime default /dev/shm is a 64 MiB tmpfs; the
