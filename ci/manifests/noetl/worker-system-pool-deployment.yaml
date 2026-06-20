@@ -132,6 +132,30 @@ spec:
             # harmless shadow double-write (duplicates, never loss).
             - name: NOETL_MATERIALIZER_ENABLED
               value: "true"
+            # Off-server state builder (noetl/ai-meta#115 Phase 4).  Where the
+            # orchestrator drive's WorkflowState is CONSTRUCTED:
+            #   server     (default) — the server builds state in-process and
+            #                ships it to the worker plug-in (run_state).
+            #   offserver  — this system-pool worker drains the noetl_events WAL
+            #                into a pool-side chain index (durable consumer
+            #                `noetl_state_builder`) and builds the drive state
+            #                from the WAL spine via the wasm `run`/from_events
+            #                entry — state construction runs HERE, off the server,
+            #                with zero noetl.event reads.  The server-built state
+            #                rides along as the fallback the worker uses only when
+            #                its WAL chain is incomplete (lag/cold), so progress +
+            #                correctness never regress below the server-built path.
+            # Default `server` (prod unchanged); the kind off-server parity rig
+            # (e2e kind_validate_state_builder_offserver.sh) flips this to
+            # `offserver` for its run.  Mirrors NOETL_MATERIALIZER_ENABLED — the
+            # builder is a first-class system-pool loop, not a separate Deployment.
+            - name: NOETL_STATE_BUILDER
+              value: "server"
+            # Durable consumer name for the authoritative (offserver) WAL drain —
+            # makes the builder's backlog observable (KEDA/VMAlert), like the
+            # materializer's noetl_materializer consumer.
+            - name: NOETL_STATE_BUILDER_CONSUMER
+              value: "noetl_state_builder"
           volumeMounts:
             # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
             # container-runtime default /dev/shm is a 64 MiB tmpfs; the
