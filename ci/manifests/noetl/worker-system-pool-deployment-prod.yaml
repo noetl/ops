@@ -61,13 +61,14 @@ spec:
             - "until curl -sf http://noetl-server-rust.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL Rust server...'; sleep 3; done"
       containers:
         - name: noetl-worker
-          # worker v5.35.0 (commit b910341) — the post-#103 image carrying the
-          # materializer loop + the JetStream lag poller's materializer-consumer
-          # tracking (the CQRS flip guardrail's lag gauge).  Same binary as the
-          # shared Rust worker pool; only the NATS consumer + filter subject
-          # differ.  Pinned by immutable digest (Cloud Build b238027b,
-          # 2026-06-19); the :v5.35.0 / :b910341 tags resolve to it.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:9912b032473b20893a1f06c1ae0c13f9a0120c3a73ee6c616407622c990eac94
+          # worker v5.40.2 (commit 48b0bde) — carries the materializer loop + the
+          # JetStream lag poller's materializer-consumer tracking (the CQRS flip
+          # guardrail's lag gauge) PLUS the off-server state builder with #117
+          # spine causal-order + #119 WAL-index restart-rehydration.  Same binary
+          # as the shared Rust worker pool; only the NATS consumer + filter
+          # subject differ.  Pinned by immutable digest (AR push
+          # 2026-06-20T15:20:02Z); the :v5.40.2 / :48b0bde tags resolve to it.
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:41713265e171f0c9d2370b89498a49349f696c19d09cc28f99e2634991858774
           imagePullPolicy: IfNotPresent
           ports:
             - name: metrics

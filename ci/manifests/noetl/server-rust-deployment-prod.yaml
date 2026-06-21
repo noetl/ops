@@ -4,8 +4,19 @@
 # stack.  Originally the noetl/ai-meta#49 Python→Rust cutover candidate; that
 # cutover is DONE (prod's `noetl` Service already selects app=noetl-server-rust
 # and there is no Python deployment).  This manifest is now the ROLL-FORWARD
-# artifact for the post-#103 image (CQRS PUBLISH_ONLY gate + cancel/finalize
-# chokepoint, server v3.29.3).
+# artifact for the post-#115/#116/#117/#118/#119 image (CQRS PUBLISH_ONLY gate +
+# cancel/finalize chokepoint + one-level prev_event_id event chain + off-server
+# state builder + FinalizedGuard + WAL-index restart-rehydration, server v3.39.1).
+#
+# PREREQUISITE (one-time, owner-applied) for this image: the v3.39.1 write path
+# binds `prev_event_id` on every noetl.event / noetl.command INSERT.  The runtime
+# `noetl` role is NOT the table owner (owner=postgres), so the server's startup
+# `ensure_columns` best-effort ADD COLUMN is swallowed with a harmless
+# "event-chain DDL skipped (server role likely not table owner)" WARN — that line
+# PERSISTS by design even after the columns exist (Postgres checks ownership
+# before the IF-NOT-EXISTS skip).  The columns + idx_event_prev_event_id were
+# provisioned ONCE by the DB owner (`postgres`) on 2026-06-20; see
+# runbooks/noetl-cqrs-publish-only-flip.md "prev_event_id migration" record.
 #
 # This is the PRODUCTION-shaped manifest (distinct from the kind-only
 # `server-rust-deployment.yaml` in this directory, which uses a local
@@ -20,7 +31,7 @@
 # `repos/ops/runbooks/noetl-cqrs-publish-only-flip.md`.
 #
 # Image: built by `automation/gcp_gke/assets/server/cloudbuild.yaml` from
-# noetl/server v3.29.3 (commit b6e5d31).  Pinned below by the immutable @sha256
+# noetl/server v3.39.1 (commit c5f8cb2).  Pinned below by the immutable @sha256
 # digest (NOT a mutable tag) so a re-pushed tag can never silently change what
 # prod runs.
 #
@@ -64,11 +75,11 @@ spec:
     spec:
       containers:
         - name: noetl-server
-          # Pinned by immutable digest (Cloud Build e6930f36, 2026-06-19) so a
+          # Pinned by immutable digest (AR push 2026-06-20T14:57:59Z) so a
           # re-pushed tag can never silently change what prod runs.  The
-          # :v3.29.3 / :b6e5d31 tags resolve to this same digest and are shown
+          # :v3.39.1 / :c5f8cb2 tags resolve to this same digest and are shown
           # for human traceability.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/server-rust@sha256:6d2de321cd0938182c85cfaa500ac922e31f128d046e6306816f0983b40e6d1e
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/server-rust@sha256:197a6d109e7eb14fb39a6e950cee06313078c76b38fed239a4a09f28966ce672
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8082
