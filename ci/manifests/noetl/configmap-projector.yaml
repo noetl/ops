@@ -17,7 +17,10 @@ data:
   NOETL_SERVER_WORKERS: "1"
   NOETL_SERVER_RELOAD: "false"
   NATS_URL: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
-  NOETL_PROJECTOR_NATS_STREAM: "NOETL_EVENTS"
+  # JetStream event stream name — lowercase `noetl_events` (the live stream the
+  # Rust stack publishes to). The uppercase `NOETL_EVENTS` was the removed Python
+  # stack's stream and collided on subject `noetl.events.>`.
+  NOETL_PROJECTOR_NATS_STREAM: "noetl_events"
   NOETL_PROJECTOR_NATS_SUBJECT: "noetl.events.>"
   NOETL_PROJECTOR_MAX_INFLIGHT: "8"
   NOETL_PROJECTOR_NATS_MAX_ACK_PENDING: "64"

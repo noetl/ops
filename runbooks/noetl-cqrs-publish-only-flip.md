@@ -27,6 +27,104 @@ materializer-lag alerts.
 
 ---
 
+## ROLLOUT RECORD — 2026-06-20 (EXECUTED on prod GKE)
+
+The full rollout below was executed on
+`gke_noetl-demo-19700101_us-central1_noetl-cluster` ns `noetl` on
+2026-06-20. Prod was left **gate-ON** (CQRS publish-only + off-server
+state builder), healthy. The image targets are **v3.39.1 / v5.40.2**
+(NOT the v3.29.3 / v5.35.0 the "roll the images first" section below
+still names — that section predates this rollout; the sequence is the
+same, only the digests moved forward).
+
+**Pre-step — one-time owner-applied `prev_event_id` migration.** The
+v3.39.1 write path binds `prev_event_id` on every `noetl.event` /
+`noetl.command` INSERT (the gate-off path) and stamps the one-level
+chain at the emit chokepoint. The columns did not exist on prod and the
+runtime `noetl` role is **not** the table owner (`owner=postgres`;
+`noetl` is only a `cloudsqlsuperuser` member, which Cloud SQL restricts),
+so the server's startup `ensure_columns` best-effort `ADD COLUMN` is
+swallowed (`must be owner of table event`). Applied **as the DB owner**
+the operator-authorized additive, idempotent, metadata-only DDL:
+
+```sql
+ALTER TABLE noetl.event   ADD COLUMN IF NOT EXISTS prev_event_id BIGINT;
+ALTER TABLE noetl.command ADD COLUMN IF NOT EXISTS prev_event_id BIGINT;
+CREATE INDEX IF NOT EXISTS idx_event_prev_event_id ON noetl.event (execution_id, prev_event_id) WHERE prev_event_id IS NOT NULL;
+```
+
+- **Connection used:** the working `postgres` (owner) credential the
+  live `pgbouncer` deployment already carries in its `DATABASE_URLS`
+  backend route (`postgres://postgres:****@127.0.0.1:6432/noetl`),
+  reached over a `kubectl port-forward` to `svc/pgbouncer` (ns
+  `postgres`). No password was rotated, printed, or committed.
+- **Cascade:** `noetl.event` (14 partitions) + `noetl.command` (16
+  partitions) are partitioned parents; in PostgreSQL 15 the `ADD COLUMN`
+  and the non-concurrent partitioned `CREATE INDEX` recurse to every
+  partition automatically. Verified: zero table-partitions missing the
+  column; `idx_event_prev_event_id` `indisvalid=true`, 14 leaf indexes
+  attached.
+- **GSM `pg_noetl_k8s` secret — STALE.** The Google Secret Manager
+  `pg_noetl_k8s` password is drifted and fails auth; it was NOT used and
+  NOT touched. **Recommendation: the operator should rotate / realign
+  `pg_noetl_k8s` to the live owner password** so future
+  owner-privileged migrations have a managed credential path instead of
+  the pgbouncer-embedded value.
+- **The `event-chain DDL skipped` WARN PERSISTS by design** after the
+  migration — Postgres checks table ownership *before* the
+  `IF NOT EXISTS` skip, so the runtime `noetl` role's startup
+  `ensure_columns` still errors `must be owner` and is logged-and-
+  swallowed. The WARN is cosmetic; the real proof the migration worked
+  is a **gate-off event write succeeding** (the INSERT binds the column).
+
+**Rollout — images (gates at safe defaults):**
+
+1. Server → **v3.39.1** (`@sha256:197a6d10…`, tag `c5f8cb2`) via
+   `kubectl apply -f ci/manifests/noetl/server-rust-deployment-prod.yaml`.
+   Verified `/api/health` `version=3.39.1`, DB+NATS connected.
+2. Shared worker pool + system pool → **v5.40.2**
+   (`@sha256:41713265…`, tag `48b0bde`). The v3.39.1 plug-in drive routes
+   `__orchestrate__` to the **system pool**; the old `cursor-100` workers
+   cannot run the v5.40.2 orchestrate protocol (`call.error` →
+   `command.failed`, drive stalls), so the workers MUST roll with /
+   before the server. Gate-off `test/simple_python` then COMPLETED
+   end-to-end with a fully linked `prev_event_id` chain.
+3. **Materializer shadow** — `NOETL_MATERIALIZER_ENABLED=true` on the
+   system pool (gate still off). Materializer + off-server state-builder
+   drain start clean; backlog 0 (gate-off → server publishes nothing, so
+   the shadow is idle-healthy).
+
+**The flip (STAGE 2):**
+
+```bash
+kubectl --context <ctx> -n noetl set env deploy/noetl-worker-system-pool NOETL_STATE_BUILDER=offserver
+kubectl --context <ctx> -n noetl set env deploy/noetl-server-rust NOETL_EVENT_INGEST_PUBLISH_ONLY=true NOETL_STATE_BUILDER=offserver
+```
+
+Server logged `NOETL_EVENT_INGEST_PUBLISH_ONLY=ON — … materializer is the
+sole writer; the server writes zero event rows`; the system pool logged
+`off-server state-builder drain started (WAL drain, zero noetl.event
+scans … ephemeral_rebuild=true, mode=Authoritative)`.
+
+**Validation (gate-ON):** 5 tenant executions across `test/simple_python`,
+`fixtures/playbooks/hello_world`, `tests/e2e_probe` (incl. 2× concurrent)
+all COMPLETED. Per-execution chains `roots=1` / `terminals=1` /
+`dangling=0`. Aggregate: server `noetl_event_ingest_published_total` ==
+worker `noetl_worker_materializer_acked_total` (= total rows) ⇒
+**materializer sole writer**; `noetl_worker_state_builder_event_scans_total
+= 0` ⇒ **never-scan holds**; materializer backlog 0 throughout; zero pod
+restarts on a 90s soak.
+
+**Revert (one command set, on standby):**
+
+```bash
+kubectl --context <ctx> -n noetl set env deploy/noetl-server-rust NOETL_EVENT_INGEST_PUBLISH_ONLY=false NOETL_STATE_BUILDER=server
+kubectl --context <ctx> -n noetl set env deploy/noetl-worker-system-pool NOETL_STATE_BUILDER=server
+# (the materializer may stay enabled as a harmless idempotent shadow)
+```
+
+---
+
 ## Production (GKE) — environment specifics (READ FIRST)
 
 The body of this runbook was written against the **kind** dev cluster (a

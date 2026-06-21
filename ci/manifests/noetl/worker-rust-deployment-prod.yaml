@@ -36,7 +36,12 @@ metadata:
     runtime: rust
     worker-pool: worker-rust-pool
 spec:
-  replicas: 1
+  # KEDA owns the replica count at runtime (ScaledObject `noetl-worker-rust`,
+  # min 2 / max 20, nats-jetstream consumer-lag trigger).  This value is only
+  # the bootstrap floor before the HPA reconciles; set to 2 (the KEDA min +
+  # live prod capacity) so a `kubectl apply` never momentarily scales the pool
+  # down and fights the HPA.
+  replicas: 2
   selector:
     matchLabels:
       app: noetl-worker-rust
@@ -51,11 +56,12 @@ spec:
     spec:
       containers:
         - name: noetl-worker
-          # Pinned by digest after the Cloud Build (filled in once built).
-          # tags :v5.20.1 / :9ce4d6d resolve to this digest (linux/amd64).
-          # 9ce4d6d = noetl/worker#81 (nats_url credential field-map fix that
-          # unblocked auth0_login's NATS kv_put — noetl/ai-meta#49 Phase F R5).
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:61278cb62c412d1d477a44fbf2f10b2261d9df6338c4d4e1de80e8538f524658
+          # Pinned by immutable digest (AR push 2026-06-20T15:20:02Z).
+          # tags :v5.40.2 / :48b0bde resolve to this digest (linux/amd64).
+          # v5.40.2 = #117 off-server spine causal-order + #119 WAL-index
+          # restart-rehydration (noetl/ai-meta#115 Phase 4 / #107).  Same binary
+          # as the system pool; only the NATS consumer + filter subject differ.
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:41713265e171f0c9d2370b89498a49349f696c19d09cc28f99e2634991858774
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9090
