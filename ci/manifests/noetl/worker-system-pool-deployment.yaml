@@ -156,6 +156,29 @@ spec:
             # materializer's noetl_materializer consumer.
             - name: NOETL_STATE_BUILDER_CONSUMER
               value: "noetl_state_builder"
+            # Shadow result materializer (noetl/ai-meta#104 Phase B).  A SEPARATE
+            # noetl_events consumer (noetl_result_materializer) that writes the
+            # over-budget result payload to object store at the derivable §7 key —
+            # tabular -> Arrow Feather, non-tabular -> JSON — ALONGSIDE the
+            # authoritative noetl.result_store path.  SHADOW: nothing reads the
+            # Feather tier until Phase C; it never alters the authoritative result
+            # and never fails an event.  Isolated consumer so object-store latency
+            # never back-pressures the noetl.event audit fold / lag alert.
+            # Default OFF (true no-op — the loop is not spawned).  The e2e rig
+            # kind_validate_result_materializer.sh flips this on for its run.
+            - name: NOETL_RESULT_MATERIALIZER_ENABLED
+              value: "false"
+            # Single-cell seed (RFC §4.3) for the write-side URN resolution: every
+            # shard homes on this one configured cell.  The numeric shard= segment
+            # of the §7 key is still derived per-result from the stable shard hash.
+            # (The server-served multi-cell endpoint registry + miss behavior —
+            # OQ6 — is deferred to Phase C, where the read path needs it.)
+            - name: NOETL_RESULT_CELL_ENV
+              value: "dev"
+            - name: NOETL_RESULT_CELL_REGION
+              value: "local"
+            - name: NOETL_RESULT_CELL
+              value: "local-0"
           volumeMounts:
             # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
             # container-runtime default /dev/shm is a 64 MiB tmpfs; the
