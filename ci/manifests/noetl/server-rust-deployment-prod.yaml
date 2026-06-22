@@ -4,9 +4,18 @@
 # stack.  Originally the noetl/ai-meta#49 Python→Rust cutover candidate; that
 # cutover is DONE (prod's `noetl` Service already selects app=noetl-server-rust
 # and there is no Python deployment).  This manifest is now the ROLL-FORWARD
-# artifact for the post-#115/#116/#117/#118/#119 image (CQRS PUBLISH_ONLY gate +
-# cancel/finalize chokepoint + one-level prev_event_id event chain + off-server
-# state builder + FinalizedGuard + WAL-index restart-rehydration, server v3.39.1).
+# artifact for the post-#115/#116/#117/#118/#119/#121 image (CQRS PUBLISH_ONLY
+# gate + cancel/finalize chokepoint + one-level prev_event_id event chain +
+# off-server state builder + FinalizedGuard + WAL-index restart-rehydration +
+# system-exec off-server drive wedge fix, server v3.39.5).
+#
+# *** This manifest PINS THE LIVE PROD CUTOVER STATE (2026-06-21). ***  Prod was
+# cut over to the full off-server CQRS stack via `kubectl set image` / `set env`
+# (server v3.39.5, NOETL_EVENT_INGEST_PUBLISH_ONLY=true, NOETL_STATE_BUILDER=
+# offserver — the materializer on the system pool is the sole noetl.event
+# writer).  This file now describes that running state so a future `kubectl
+# apply` is a NO-OP instead of silently reverting the cutover.  The gate env
+# values below are the LIVE values, not the pre-cutover defaults.
 #
 # PREREQUISITE (one-time, owner-applied) for this image: the v3.39.1 write path
 # binds `prev_event_id` on every noetl.event / noetl.command INSERT.  The runtime
@@ -26,14 +35,15 @@
 # `noetl-server-rust` IS the live, traffic-serving deployment, so applying this
 # ROLLS the live server (zero-downtime rolling update: maxUnavailable=0,
 # maxSurge=1).  Treat it as a normal prod server release, gated on the
-# operator.  It does NOT flip the CQRS gate — `NOETL_EVENT_INGEST_PUBLISH_ONLY`
-# is pinned `false` below.  Follow the "Production (GKE)" section of
-# `repos/ops/runbooks/noetl-cqrs-publish-only-flip.md`.
+# operator.  The CQRS gate `NOETL_EVENT_INGEST_PUBLISH_ONLY` is pinned `true`
+# below to MATCH the live cutover (it is already true on the running pods), so
+# applying this does NOT change the gate — it keeps it on.  Follow the
+# "Production (GKE)" section of `repos/ops/runbooks/noetl-cqrs-publish-only-flip.md`.
 #
 # Image: built by `automation/gcp_gke/assets/server/cloudbuild.yaml` from
-# noetl/server v3.39.1 (commit c5f8cb2).  Pinned below by the immutable @sha256
-# digest (NOT a mutable tag) so a re-pushed tag can never silently change what
-# prod runs.
+# noetl/server v3.39.5 (the #121 system-exec off-server drive wedge fix).
+# Pinned below by the immutable @sha256 digest (NOT a mutable tag) so a
+# re-pushed tag can never silently change what prod runs.
 #
 # Prereqs the operator MUST satisfy (ALL ALREADY PRESENT in prod as of
 # 2026-06-19 — created when the Rust cutover landed; verify before apply):
@@ -75,11 +85,12 @@ spec:
     spec:
       containers:
         - name: noetl-server
-          # Pinned by immutable digest (AR push 2026-06-20T14:57:59Z) so a
+          # Pinned by immutable digest (AR push 2026-06-21T19:54:08Z) so a
           # re-pushed tag can never silently change what prod runs.  The
-          # :v3.39.1 / :c5f8cb2 tags resolve to this same digest and are shown
-          # for human traceability.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/server-rust@sha256:197a6d109e7eb14fb39a6e950cee06313078c76b38fed239a4a09f28966ce672
+          # :v3.39.5 tag resolves to this same digest and is shown for human
+          # traceability.  This is the LIVE prod image as of the 2026-06-21
+          # off-server cutover.
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/server-rust@sha256:feaac0c56ff08a70569dd2e0d7bf5b29486934076a67ff86f09c5c2926248179
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8082
@@ -166,18 +177,19 @@ spec:
                   name: noetl-secret
                   key: NOETL_ENCRYPTION_KEY
             # --- CQRS write-path gate (noetl/ai-meta#103) --------------------
-            # Pinned EXPLICITLY false so this roll-forward does NOT flip the
-            # gate.  When false the server writes noetl.event synchronously
-            # (today's behavior).  The flip to "true" — server publishes to the
-            # noetl_events JetStream stream and the system-pool materializer
-            # becomes the sole writer — is a SEPARATE, staged operator action
-            # taken behind the materializer-lag alerts (GMP Rules
-            # `noetl-materializer-lag`).  See the "Production (GKE)" section of
-            # runbooks/noetl-cqrs-publish-only-flip.md.  Revert is one command:
-            # set this back to false.  Default is already false in the binary;
-            # naming it here makes the gate visible in the manifest.
+            # Pinned "true" to MATCH THE LIVE PROD CUTOVER (2026-06-21).  When
+            # true the server stops INSERTing into noetl.event and instead
+            # publishes to the noetl_events JetStream stream; the system-pool
+            # materializer (NOETL_MATERIALIZER_ENABLED=true) becomes the sole
+            # noetl.event writer.  The flip was performed live behind the
+            # materializer-lag alerts (GMP Rules `noetl-materializer-lag`) and
+            # has been LEFT ON.  This manifest now records that state so apply is
+            # a no-op.  Revert is one command: set this back to "false" (and the
+            # system pool's NOETL_MATERIALIZER_ENABLED to "false").  See the
+            # "Production (GKE)" section of
+            # runbooks/noetl-cqrs-publish-only-flip.md.
             - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
-              value: "false"
+              value: "true"
             # RFC noetl/ai-meta#115 Phase 6 — how the execution-lifecycle hot path
             # reads noetl.event.  Pinned EXPLICITLY "event_scan" so this roll-
             # forward does NOT change read behavior.  The flip to "audit_only" —
@@ -194,6 +206,17 @@ spec:
             # it here makes the read-path mode visible in the manifest.
             - name: NOETL_EVENT_READ_PATH
               value: "event_scan"
+            # Off-server state builder (noetl/ai-meta#115 Phase 4 / #107).
+            # Pinned "offserver" to MATCH THE LIVE PROD CUTOVER (2026-06-21):
+            # the orchestrator drive builds its WorkflowState OFF the server
+            # from the noetl_events WAL spine instead of in-process on the
+            # server.  The server + the system-pool worker BOTH carry this flag
+            # set to "offserver" in prod (the drive plug-in runs on the system
+            # pool).  Default in the binary is "server"; naming it here records
+            # the live value so apply is a no-op.  Revert: set back to "server"
+            # on both the server and the system pool.
+            - name: NOETL_STATE_BUILDER
+              value: "offserver"
           resources:
             requests:
               cpu: "250m"

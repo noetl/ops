@@ -61,14 +61,17 @@ spec:
             - "until curl -sf http://noetl-server-rust.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL Rust server...'; sleep 3; done"
       containers:
         - name: noetl-worker
-          # worker v5.40.2 (commit 48b0bde) — carries the materializer loop + the
+          # worker v5.40.3 (commit 6dd3449) — carries the materializer loop + the
           # JetStream lag poller's materializer-consumer tracking (the CQRS flip
           # guardrail's lag gauge) PLUS the off-server state builder with #117
-          # spine causal-order + #119 WAL-index restart-rehydration.  Same binary
-          # as the shared Rust worker pool; only the NATS consumer + filter
-          # subject differ.  Pinned by immutable digest (AR push
-          # 2026-06-20T15:20:02Z); the :v5.40.2 / :48b0bde tags resolve to it.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:41713265e171f0c9d2370b89498a49349f696c19d09cc28f99e2634991858774
+          # spine causal-order + #119 WAL-index restart-rehydration.  Shipped
+          # alongside the #121 system-exec off-server drive wedge fix (server-
+          # side).  Same binary as the shared Rust worker pool; only the NATS
+          # consumer + filter subject differ.  Pinned by immutable digest (AR
+          # push 2026-06-21T16:57:05Z); the :v5.40.3 / :6dd3449 tags resolve to
+          # it.  This is the LIVE prod image as of the 2026-06-21 off-server
+          # cutover.
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:5e80493bc496c8921d6dbf54f62abd7a732cc04bfadb951d39420d396f18170a
           imagePullPolicy: IfNotPresent
           ports:
             - name: metrics
@@ -126,16 +129,16 @@ spec:
               value: "268435456" # 256 MiB
             # CQRS event materializer (noetl/ai-meta#103) — ack-after-materialize
             # sole-writer loop for noetl.event under NOETL_EVENT_INGEST_PUBLISH_ONLY.
-            # Staging order for the operator-gated flip (do BOTH, materializer first):
-            #   1. Flip this to "true" → the loop runs as a HARMLESS SHADOW while the
-            #      server still writes synchronously (events/project is idempotent,
-            #      so the drain only logs duplicates, never loss). Watch
-            #      noetl_worker_materializer_* + the consumer ack-pending lag.
-            #   2. Then flip the server's NOETL_EVENT_INGEST_PUBLISH_ONLY=true → the
-            #      server stops INSERTing and this loop becomes the sole writer.
-            # Kept "false" here so NO production default changes on apply.
+            # Pinned "true" to MATCH THE LIVE PROD CUTOVER (2026-06-21): the
+            # server runs with NOETL_EVENT_INGEST_PUBLISH_ONLY=true (it no longer
+            # INSERTs into noetl.event) and this loop is the SOLE noetl.event
+            # writer.  The flip was performed live behind the materializer-lag
+            # alerts and LEFT ON; this manifest records that state so apply is a
+            # no-op.  Revert (paired with the server's gate): set this back to
+            # "false" AND the server's NOETL_EVENT_INGEST_PUBLISH_ONLY to
+            # "false".
             - name: NOETL_MATERIALIZER_ENABLED
-              value: "false"
+              value: "true"
             # Off-server state builder (noetl/ai-meta#115 Phase 4).  Where the
             # orchestrator drive's WorkflowState is CONSTRUCTED:
             #   server     (default) — the server builds it in-process and ships
@@ -145,12 +148,13 @@ spec:
             #                `noetl_state_builder`, wasm run/from_events entry),
             #                with the server-built state as the incomplete-chain
             #                fallback — state construction runs off the server.
-            # Kept "server" here so NO production default changes on apply; an
-            # operator-gated flip (after the kind off-server parity rig + a
-            # builder-backlog alert) is the path to enabling it, like the
-            # materializer flip above.
+            # Pinned "offserver" to MATCH THE LIVE PROD CUTOVER (2026-06-21): the
+            # drive plug-in runs on this system pool and builds state off the
+            # server from the WAL.  The server carries the same flag set to
+            # "offserver".  Recorded here so apply is a no-op; revert: set back
+            # to "server" on both this pool and the server.
             - name: NOETL_STATE_BUILDER
-              value: "server"
+              value: "offserver"
             - name: NOETL_STATE_BUILDER_CONSUMER
               value: "noetl_state_builder"
           volumeMounts:
