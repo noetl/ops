@@ -56,12 +56,17 @@ spec:
     spec:
       containers:
         - name: noetl-worker
-          # Pinned by immutable digest (AR push 2026-06-20T15:20:02Z).
-          # tags :v5.40.2 / :48b0bde resolve to this digest (linux/amd64).
-          # v5.40.2 = #117 off-server spine causal-order + #119 WAL-index
-          # restart-rehydration (noetl/ai-meta#115 Phase 4 / #107).  Same binary
-          # as the system pool; only the NATS consumer + filter subject differ.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:41713265e171f0c9d2370b89498a49349f696c19d09cc28f99e2634991858774
+          # Pinned by immutable digest (AR push 2026-06-21T16:57:05Z).
+          # tags :v5.40.3 / :6dd3449 resolve to this digest (linux/amd64).
+          # v5.40.3 = the worker shipped alongside the #121 system-exec
+          # off-server drive wedge fix (server-side fix; worker is a version
+          # bump carrying #117 off-server spine causal-order + #119 WAL-index
+          # restart-rehydration).  This is the LIVE prod image as of the
+          # 2026-06-21 off-server cutover.  Same binary as the system pool; only
+          # the NATS consumer + filter subject differ.  This step-worker pool
+          # carries NO off-server flags (the drive plug-in runs on the system
+          # pool, not here).
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:5e80493bc496c8921d6dbf54f62abd7a732cc04bfadb951d39420d396f18170a
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9090
