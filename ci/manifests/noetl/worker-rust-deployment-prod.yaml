@@ -125,10 +125,23 @@ spec:
               mountPath: /dev/shm
           resources:
             requests:
-              cpu: "100m"
+              # noetl/ai-meta#127 — raised 100m -> 250m to give the busy
+              # batch worker a real guaranteed floor (matches server-rust's
+              # 250m request; still a low-request/high-limit bursting shape).
+              cpu: "250m"
               memory: "128Mi"
             limits:
-              cpu: "1"
+              # noetl/ai-meta#127 — raised 1 -> 2.  Profiling a 10k PFT batch
+              # showed the worker pegs one CPU and burns 38-47% of its time
+              # CPU-THROTTLED at the 1-CPU limit (the per-sub-task
+              # running_ctx.clone() + to_template_context() is the hot path).
+              # Lifting the limit to 2 removed the throttle and cut the run
+              # ~166-172s -> ~137.6s (~20%), zero patient loss.  The throttle
+              # ceiling is the limit, not the request; nodes are 16-CPU and
+              # ~98% idle, so the burst headroom is freely available (KEDA max
+              # 20 pods x 2 = 40 CPU still fits across the 4x ek-standard-16
+              # nodes, ~63.5 CPU allocatable).
+              cpu: "2"
               # 320Mi (/dev/shm tmpfs, charged to the cgroup) + worker RSS.
               memory: "768Mi"
           livenessProbe:

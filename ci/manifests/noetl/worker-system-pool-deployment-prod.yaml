@@ -166,10 +166,20 @@ spec:
               mountPath: /dev/shm
           resources:
             requests:
-              cpu: "100m"
+              # noetl/ai-meta#127 — raised 100m -> 250m (matches the shared
+              # Rust worker pool + server-rust).  This single pod carries the
+              # off-server orchestrate drive AND the sole-writer CQRS
+              # materializer for the whole prod system, so it pegs CPU under a
+              # large batch the same way the step workers do.
+              cpu: "250m"
               memory: "128Mi"
             limits:
-              cpu: "1"
+              # noetl/ai-meta#127 — raised 1 -> 2 alongside the shared pool.
+              # Raising the limit only lifts the burst ceiling for this single
+              # drive+materializer pod (request stays low), protecting drive +
+              # materialize throughput under load so the off-server cutover
+              # stays healthy.  Nodes are 16-CPU and ~98% idle; pure upside.
+              cpu: "2"
               # 320Mi (/dev/shm tmpfs, charged to the cgroup) + worker RSS.
               memory: "768Mi"
           livenessProbe:
