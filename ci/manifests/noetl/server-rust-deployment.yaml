@@ -119,6 +119,17 @@ spec:
                   name: noetl-secret
                   key: NOETL_ENCRYPTION_KEY
                   optional: true
+            # Result-tier GC (noetl/ai-meta#104 Phase F).  Gates the
+            # POST /api/internal/result-tier/gc sweep endpoint the
+            # system/scheduled_cleanup playbook calls.  Default OFF →
+            # the endpoint returns a disabled no-op report and deletes
+            # nothing.  When ON, the sweep is still dry-run by default
+            # (the playbook's result_tier_gc_dry_run) and NEVER deletes a
+            # live-referenced object (an object whose execution still has
+            # surviving noetl.event rows).  The e2e rig
+            # kind_validate_result_tier_gc_dr.sh flips this on for its run.
+            - name: NOETL_RESULT_TIER_GC
+              value: "false"
           resources:
             limits:
               cpu: "2"

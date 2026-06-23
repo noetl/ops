@@ -63,6 +63,25 @@ workload:
   # Set to a large value (e.g. 365) deliberately to enable event retention.
   event_retention_days: 0
 
+  # Result-tier GC (noetl/ai-meta#104 Phase F).  Sweeps the Feather/JSON result
+  # tier (object store) for provably-dead objects — an object whose execution has
+  # aged out of the event log (no surviving noetl.event row), past a grace window.
+  # DOUBLE-GATED + safe by default:
+  #   1. The server endpoint is a no-op unless NOETL_RESULT_TIER_GC is set on the
+  #      server (default off → the call returns a disabled no-op report).
+  #   2. result_tier_gc_dry_run defaults to true → the sweep LISTS dead candidates
+  #      and deletes nothing.  Set to false (with the server flag on) to reclaim.
+  # The sweep NEVER deletes a live-referenced object (the server enforces this).
+  result_tier_gc_dry_run: true
+  # Minimum object age (seconds, from the execution_id mint time) before an
+  # unreferenced object is eligible — protects an in-flight execution whose events
+  # have not yet materialized.  One day by default.
+  result_tier_gc_grace_seconds: 86400
+  # Max objects examined per sweep.
+  result_tier_gc_limit: 1000
+  # Object-key prefix to scan (the §7 object-key root).
+  result_tier_gc_prefix: "noetl/"
+
 workflow:
   - step: start
     desc: "Purge transient noetl.* rows via the server internal cleanup endpoint"
@@ -79,6 +98,28 @@ workflow:
         command_retention_days: "{{ command_retention_days }}"
         runtime_stale_minutes: "{{ runtime_stale_minutes }}"
         event_retention_days: "{{ event_retention_days }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: gc_result_tier
+
+  - step: gc_result_tier
+    desc: "Sweep the result tier for provably-dead objects (#104 Phase F; dry-run by default, server-flag-gated)"
+    tool:
+      kind: http
+      method: POST
+      url: "{{ server_url }}/api/internal/result-tier/gc"
+      headers:
+        Content-Type: "application/json"
+      auth:
+        type: bearer
+        credential: "{{ api_token_alias }}"
+      body:
+        dry_run: "{{ result_tier_gc_dry_run }}"
+        grace_seconds: "{{ result_tier_gc_grace_seconds }}"
+        limit: "{{ result_tier_gc_limit }}"
+        prefix: "{{ result_tier_gc_prefix }}"
     next:
       spec:
         mode: exclusive
