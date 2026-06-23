@@ -179,6 +179,17 @@ spec:
               value: "local"
             - name: NOETL_RESULT_CELL
               value: "local-0"
+            # Phase D minting flip (noetl/ai-meta#104 Phase D).  When ON the
+            # URN -> Feather/GCS tier is the AUTHORITATIVE result store: this flag
+            # alone makes the result materializer the authoritative tier writer
+            # (no separate NOETL_RESULT_MATERIALIZER_ENABLED needed) and, on the
+            # consume pool, makes resolve-by-URN the PRIMARY read path.  The server
+            # keeps writing noetl.result_store as the reversible dual-write
+            # fallback leg (retirement is the OQ5-gated op decision, NOT Phase D).
+            # Default OFF (true no-op).  The e2e rig
+            # kind_validate_result_mint_authoritative.sh flips this on for its run.
+            - name: NOETL_RESULT_MINT_AUTHORITATIVE
+              value: "false"
           volumeMounts:
             # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
             # container-runtime default /dev/shm is a 64 MiB tmpfs; the
