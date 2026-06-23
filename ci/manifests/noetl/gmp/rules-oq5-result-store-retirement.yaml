@@ -17,24 +17,47 @@
 # is a SEPARATE metric-gated decision, and THIS rule is that gate's monitoring
 # surface.
 #
-# The retirement gate is:
+# WHY THE GATE METRICS CHANGED (2026-06-23)
+# -----------------------------------------
+# The first cut of this gate keyed on
 #   noetl_worker_result_mint_authoritative_total{path="legacy_fallback"}
-# holding at 0 across the soak window, WHILE producers are staging in steady
-# state.  legacy_fallback increments only when resolve-by-URN found NO tier
-# object and fell back to the dual-written result_store — i.e. the one case
-# where dropping result_store would have lost the read.  Zero fallback over a
-# representative window with real tier traffic ⇒ result_store is never needed
-# as a read fallback ⇒ safe to retire (subject to the explicit drop-dual-write
-# go).
+# holding at 0.  That series is emitted ONLY when NOETL_RESULT_MINT_AUTHORITATIVE
+# is set on the pool doing the consume-side resolve.  In prod MINT is set on the
+# system pool only (ops#204) — NOT on noetl-worker-rust, which runs the
+# regular-execution consume path.  So the series is never emitted there: a GMP
+# query for noetl_worker_result_mint_authoritative_total returns NO DATA, and
+# `... > 0` is trivially false regardless of whether a fallback occurred.  The
+# gate was vacuous.  Setting MINT on worker-rust to un-vacuum it is the known
+# stray-materializer footgun (do NOT) — so the gate is repointed onto the
+# resolve + producer-stage series that ARE emitted under the prod config
+# (NOETL_RESULT_URI_RESOLVE + NOETL_RESULT_PRODUCER_STAGE on worker-rust;
+# NOETL_RESULT_PRODUCER_STAGE on the system pool's materializer).
+#
+# THE GATE (all three must hold over the soak window, with real over-budget
+# traffic):
+#   1. PRIMARY — read-side fallback rate is 0.  A resolve that found NO tier
+#      object and fell back to the dual-written result_store is the one case
+#      where dropping result_store would have lost a read.  Zero fallback over
+#      a representative window ⇒ result_store is never needed as a read
+#      fallback.  Series: noetl_worker_result_resolve_total{outcome=~"fallback_.*"}.
+#   2. DECOUPLING — the materializer skips its result_store fetch for staged
+#      objects (skip-on-exists fires) and writes 0 tier objects for them.
+#      Series: noetl_worker_result_producer_stage_total{outcome="materializer_skip_exists"}.
+#   3. PRECONDITION — producers are staging in steady state with no errors.
+#      Series: noetl_worker_result_producer_stage_total{outcome=~"staged_feather|staged_json"}
+#      growing, {outcome=~"skip_registry|error"} at 0.
 #
 # PRECONDITION (gated prod change — NOT enabled by applying this rule):
-#   1. worker v5.46.0+ deployed to the producing pool (noetl-worker-rust).
-#   2. NOETL_RESULT_PRODUCER_STAGE=true on that pool.
-# Until both hold, producer-stage series are absent and the staging-active
-# recording rule reads 0 — the soak has not started.  Applying this rule is
-# observability-only and non-traffic-affecting.
+#   1. worker v5.46.0+ deployed to BOTH noetl-worker-rust (producer) and
+#      noetl-worker-system-pool (materializer).
+#   2. NOETL_RESULT_PRODUCER_STAGE=true on BOTH pools.
+#   3. NOETL_RESULT_URI_RESOLVE=true on noetl-worker-rust.
+# Until these hold, producer-stage / skip-on-exists series are absent and the
+# staging-active recording rule reads 0 — the soak has not started.  Applying
+# this rule is observability-only and non-traffic-affecting.
 #
-# Requires the scrapes in podmonitoring-noetl.yaml so the series exist.
+# Requires the noetl-workers PodMonitoring (port metrics /metrics) so the
+# series exist for BOTH pools.
 #
 # Soak start criteria, window + time floor: noetl/ai-meta#104.
 ---
@@ -52,33 +75,58 @@ spec:
     - name: noetl-oq5-result-store-retirement
       interval: 30s
       rules:
-        # Recording rule: read-side fallback rate. The retirement gate is this
-        # holding at 0 across the soak window. Non-zero ⇒ a resolve found no
-        # tier object and fell back to result_store ⇒ retirement NOT safe.
-        - record: noetl:oq5_legacy_fallback_rate
+        # PRIMARY gate — read-side fallback rate. A resolve found no tier object
+        # and fell back to the dual-written result_store. The retirement gate is
+        # this holding at 0 across the soak window. Non-zero ⇒ result_store WAS
+        # the read fallback ⇒ retirement NOT safe; resets the soak clock.
+        - record: noetl:oq5_resolve_fallback_rate
           expr: |
-            sum(rate(noetl_worker_result_mint_authoritative_total{path="legacy_fallback"}[5m]))
+            sum(rate(noetl_worker_result_resolve_total{outcome=~"fallback_.*"}[5m]))
 
-        # Recording rule: tier-served resolve rate. The denominator that makes
-        # a 0 fallback meaningful — proves over-budget results ARE being
-        # resolved via the authoritative tier (real traffic, not silence).
+        # Denominator — tier-served resolve rate. Proves over-budget results ARE
+        # being resolved from the authoritative tier (real traffic, not silence),
+        # so a 0 fallback is meaningful.
         - record: noetl:oq5_tier_resolve_rate
           expr: |
-            sum(rate(noetl_worker_result_mint_authoritative_total{path="tier"}[5m]))
+            sum(rate(noetl_worker_result_resolve_total{outcome=~"resolved_feather|resolved_json"}[5m]))
 
-        # Recording rule: producers actually staging the tier (the soak
-        # precondition). Sum of the two success outcomes. 0 ⇒ producer-stage
-        # is off / not deployed ⇒ the soak is NOT running.
+        # DECOUPLING — materializer skip-on-exists rate. The materializer found
+        # the producer-staged object on its §7 key and skipped the result_store
+        # fetch entirely. Growing ⇒ the materializer needs NO result_store read
+        # for staged results (the prerequisite for retiring the dual-write).
+        - record: noetl:oq5_materializer_skip_rate
+          expr: |
+            sum(rate(noetl_worker_result_producer_stage_total{outcome="materializer_skip_exists"}[5m]))
+
+        # PRECONDITION — producers actually staging the tier. Sum of the two
+        # success outcomes. 0 ⇒ producer-stage off / not deployed ⇒ soak NOT
+        # running.
         - record: noetl:oq5_producer_staging_rate
           expr: |
             sum(rate(noetl_worker_result_producer_stage_total{outcome=~"staged_feather|staged_json"}[5m]))
 
+        # PRECONDITION (degraded) — producers declining to stage (registry miss
+        # / put error). The tier write falls back onto the materializer +
+        # result_store for those results.
+        - record: noetl:oq5_producer_stage_error_rate
+          expr: |
+            sum(rate(noetl_worker_result_producer_stage_total{outcome=~"skip_registry|error"}[5m]))
+
+        # Belt-and-suspenders, NO-OP under the prod config (documented above):
+        # the Phase-D mint legacy-fallback series. MINT is system-pool-only, and
+        # system playbooks rarely resolve over-budget results, so this is
+        # near-always absent/0. Kept as a secondary signal ONLY — it is NOT the
+        # gate (the gate is noetl:oq5_resolve_fallback_rate). No alert binds it.
+        - record: noetl:oq5_mint_legacy_fallback_rate
+          expr: |
+            sum(rate(noetl_worker_result_mint_authoritative_total{path="legacy_fallback"}[5m]))
+
         # CRITICAL — the gate broke. A resolve fell back to result_store while
-        # the soak was meant to be proving it never would. During the soak this
-        # fires the moment the assumption fails; it RESETS the soak clock. (If
-        # the dual-write is already dropped, this is data not found — page.)
-        - alert: OQ5LegacyFallbackDetected
-          expr: noetl:oq5_legacy_fallback_rate > 0
+        # the soak was meant to be proving it never would. Fires the moment the
+        # assumption fails and RESETS the soak clock. (If the dual-write is
+        # already dropped, this is data-not-found — page.)
+        - alert: OQ5ResolveFallbackDetected
+          expr: noetl:oq5_resolve_fallback_rate > 0
           for: 2m
           labels:
             severity: critical
@@ -87,14 +135,14 @@ spec:
           annotations:
             summary: "OQ5 retirement gate broke — result_store read fallback observed ({{ $value }}/s)"
             description: >-
-              noetl_worker_result_mint_authoritative_total{path="legacy_fallback"}
-              is advancing: a resolve-by-URN found NO tier object and fell back
-              to the dual-written noetl.result_store. The OQ5 result_store
+              noetl_worker_result_resolve_total{outcome=~"fallback_.*"} is
+              advancing: a resolve-by-URN found NO tier object and fell back to
+              the dual-written noetl.result_store. The OQ5 result_store
               retirement gate requires this to hold at 0 across the soak window.
               While the dual-write is still in place this is fail-safe (no loss),
               but it RESETS the soak clock — the tier was not authoritative for
               that resolve. Investigate the producer-stage path
-              (noetl_worker_result_producer_stage_total{outcome="skip_registry|error"})
+              (noetl_worker_result_producer_stage_total{outcome=~"skip_registry|error"})
               and the materializer before continuing the soak. Do NOT drop the
               result_store dual-write while this is firing.
             runbook_url: "https://github.com/noetl/ai-meta/issues/104"
@@ -102,10 +150,9 @@ spec:
         # WARNING — producers are declining to stage (registry miss / put
         # error), so the materializer (and result_store) is silently carrying
         # the tier write. The soak's "producers staging in steady state"
-        # precondition is degraded even if legacy_fallback is still 0.
+        # precondition is degraded even if resolve fallback is still 0.
         - alert: OQ5ProducerStageDegraded
-          expr: |
-            sum(rate(noetl_worker_result_producer_stage_total{outcome=~"skip_registry|error"}[5m])) > 0
+          expr: noetl:oq5_producer_stage_error_rate > 0
           for: 10m
           labels:
             severity: warning
@@ -114,7 +161,7 @@ spec:
           annotations:
             summary: "OQ5 producer-stage degraded — producers declining to stage ({{ $value }}/s)"
             description: >-
-              noetl_worker_result_producer_stage_total{outcome="skip_registry"|"error"}
+              noetl_worker_result_producer_stage_total{outcome=~"skip_registry|error"}
               is advancing: the producing worker could not stage the tier object
               (cell registry unavailable, or object_put failed) and the
               materializer is covering it via result_store. This does not lose
@@ -122,4 +169,29 @@ spec:
               result_store for those results — the OQ5 soak's "producers staging
               in steady state" precondition is not fully met. Hold the soak clock
               and diagnose before counting the window.
+            runbook_url: "https://github.com/noetl/ai-meta/issues/104"
+
+        # WARNING — producers are staging but the materializer is NOT skipping
+        # (no skip-on-exists). That means the materializer is still reaching
+        # result_store for objects the producer already staged — the decoupling
+        # is not in effect (e.g. NOETL_RESULT_PRODUCER_STAGE missing on the
+        # system pool, or a §7-key mismatch). for:15m absorbs producer→
+        # materializer timing skew.
+        - alert: OQ5MaterializerNotSkipping
+          expr: noetl:oq5_producer_staging_rate > 0 unless noetl:oq5_materializer_skip_rate > 0
+          for: 15m
+          labels:
+            severity: warning
+            component: result-store
+            noetl.io/soak-gate: oq5-result-store-retirement
+          annotations:
+            summary: "OQ5 materializer not skipping — still reading result_store for staged objects"
+            description: >-
+              Producers are staging the tier (noetl:oq5_producer_staging_rate >
+              0) but noetl_worker_result_producer_stage_total{outcome="materializer_skip_exists"}
+              is not advancing. The materializer is re-reading result_store for
+              objects the producer already staged — the result_store read is NOT
+              decoupled. Check NOETL_RESULT_PRODUCER_STAGE on
+              noetl-worker-system-pool and that the producer/materializer §7
+              keys match (cell env/region/shard count). Hold the soak clock.
             runbook_url: "https://github.com/noetl/ai-meta/issues/104"
