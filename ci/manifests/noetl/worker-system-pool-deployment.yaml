@@ -190,6 +190,16 @@ spec:
             # kind_validate_result_mint_authoritative.sh flips this on for its run.
             - name: NOETL_RESULT_MINT_AUTHORITATIVE
               value: "false"
+            # Result-tier DR re-derive (noetl/ai-meta#104 Phase F).  When ON the
+            # result materializer runs in VERIFY-AND-REPAIR mode: for each
+            # over-budget result it re-derives the tier object from its source and
+            # rewrites it only when the durable object is missing or byte-divergent
+            # (corrupt).  The tier is derivable from the WAL, so re-feeding a WAL
+            # event is a targeted DR repair.  Never alters the authoritative
+            # result_store source.  Default OFF (true no-op — normal write path).
+            # The e2e rig kind_validate_result_tier_gc_dr.sh flips this on.
+            - name: NOETL_RESULT_TIER_DR
+              value: "false"
           volumeMounts:
             # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
             # container-runtime default /dev/shm is a 64 MiB tmpfs; the
