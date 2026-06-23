@@ -1,0 +1,88 @@
+# OQ5 result_store-retirement soak gate (noetl/ai-meta#104) — kind VMRule.
+#
+# OQ5 Option A (worker v5.46.0, NOETL_RESULT_PRODUCER_STAGE) stages the
+# over-budget result tier object at the PRODUCER at emit time, decoupling the
+# tier write from `noetl.result_store`.  Retiring result_store (dropping the
+# dual-write) is gated on:
+#   noetl_worker_result_mint_authoritative_total{path="legacy_fallback"}
+# holding at 0 across the soak window WHILE producers stage in steady state.
+# legacy_fallback increments only when resolve-by-URN found NO tier object and
+# fell back to the dual-written result_store — the one case where dropping
+# result_store would have lost the read.  Zero fallback over a representative
+# window with real tier traffic ⇒ result_store is never the read fallback ⇒
+# safe to retire (subject to the explicit drop-dual-write go).
+#
+# Signals:
+#   1. legacy_fallback rate — THE gate. Hold at 0.
+#   2. tier-served resolve rate — the denominator; proves real over-budget
+#      traffic so a 0 fallback is meaningful (not just silence).
+#   3. producer-staging rate — the soak precondition (producer-stage on +
+#      v5.46.0 deployed). 0 ⇒ soak not running.
+#   4. producer-stage degraded — registry-miss / put-error pushing the tier
+#      write back onto the materializer + result_store.
+#
+# GMP twin: ci/manifests/noetl/gmp/rules-oq5-result-store-retirement.yaml.
+# Keep both in lockstep. Soak window + time floor + start criteria:
+# noetl/ai-meta#104.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: noetl-oq5-result-store-retirement
+  namespace: noetl
+  labels:
+    app: noetl
+    component: result-store
+    noetl.io/soak-gate: oq5-result-store-retirement
+spec:
+  groups:
+    - name: noetl-oq5-result-store-retirement
+      interval: 30s
+      rules:
+        - record: noetl:oq5_legacy_fallback_rate
+          expr: |
+            sum(rate(noetl_worker_result_mint_authoritative_total{path="legacy_fallback"}[5m]))
+
+        - record: noetl:oq5_tier_resolve_rate
+          expr: |
+            sum(rate(noetl_worker_result_mint_authoritative_total{path="tier"}[5m]))
+
+        - record: noetl:oq5_producer_staging_rate
+          expr: |
+            sum(rate(noetl_worker_result_producer_stage_total{outcome=~"staged_feather|staged_json"}[5m]))
+
+        - alert: OQ5LegacyFallbackDetected
+          expr: noetl:oq5_legacy_fallback_rate > 0
+          for: 2m
+          labels:
+            severity: critical
+            component: result-store
+            noetl.io/soak-gate: oq5-result-store-retirement
+          annotations:
+            summary: "OQ5 retirement gate broke — result_store read fallback observed ({{ $value }}/s)"
+            description: >-
+              noetl_worker_result_mint_authoritative_total{path="legacy_fallback"}
+              is advancing: a resolve-by-URN found NO tier object and fell back
+              to the dual-written noetl.result_store. The OQ5 result_store
+              retirement gate requires this to hold at 0 across the soak window.
+              While the dual-write is still in place this is fail-safe (no loss),
+              but it RESETS the soak clock. Do NOT drop the result_store
+              dual-write while this is firing.
+            runbook_url: "https://github.com/noetl/ai-meta/issues/104"
+
+        - alert: OQ5ProducerStageDegraded
+          expr: |
+            sum(rate(noetl_worker_result_producer_stage_total{outcome=~"skip_registry|error"}[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: result-store
+            noetl.io/soak-gate: oq5-result-store-retirement
+          annotations:
+            summary: "OQ5 producer-stage degraded — producers declining to stage ({{ $value }}/s)"
+            description: >-
+              The producing worker could not stage the tier object (cell
+              registry unavailable, or object_put failed) and the materializer
+              is covering it via result_store. The tier write is NOT decoupled
+              from result_store for those results — hold the soak clock and
+              diagnose.
+            runbook_url: "https://github.com/noetl/ai-meta/issues/104"
