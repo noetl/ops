@@ -58,7 +58,7 @@ spec:
           labels:
             severity: warning
             component: materializer
-            noetl.io/flip-guardrail: publish-only
+            noetl_io_flip_guardrail: publish-only
           annotations:
             summary: "CQRS materializer falling behind ({{ $value }} events un-materialized)"
             description: >-
@@ -79,7 +79,7 @@ spec:
           labels:
             severity: critical
             component: materializer
-            noetl.io/flip-guardrail: publish-only
+            noetl_io_flip_guardrail: publish-only
           annotations:
             summary: "CQRS materializer backlog critical ({{ $value }} events un-materialized)"
             description: >-
@@ -100,7 +100,7 @@ spec:
           labels:
             severity: critical
             component: materializer
-            noetl.io/flip-guardrail: publish-only
+            noetl_io_flip_guardrail: publish-only
           annotations:
             summary: "CQRS materializer backlog growing unbounded ({{ $value }} and rising)"
             description: >-
@@ -126,7 +126,7 @@ spec:
           labels:
             severity: critical
             component: materializer
-            noetl.io/flip-guardrail: publish-only
+            noetl_io_flip_guardrail: publish-only
           annotations:
             summary: "CQRS materializer STALLED while the gate is publishing"
             description: >-
@@ -147,7 +147,7 @@ spec:
           labels:
             severity: warning
             component: materializer
-            noetl.io/flip-guardrail: publish-only
+            noetl_io_flip_guardrail: publish-only
           annotations:
             summary: "CQRS materializer events/project failing — batches redelivering"
             description: >-
@@ -172,7 +172,7 @@ spec:
           labels:
             severity: critical
             component: materializer
-            noetl.io/flip-guardrail: publish-only
+            noetl_io_flip_guardrail: publish-only
           annotations:
             summary: "CQRS materializer metrics ABSENT while the gate is publishing"
             description: >-

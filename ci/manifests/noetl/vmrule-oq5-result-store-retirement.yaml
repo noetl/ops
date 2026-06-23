@@ -71,7 +71,7 @@ spec:
           labels:
             severity: critical
             component: result-store
-            noetl.io/soak-gate: oq5-result-store-retirement
+            noetl_io_soak_gate: oq5-result-store-retirement
           annotations:
             summary: "OQ5 retirement gate broke — result_store read fallback observed ({{ $value }}/s)"
             description: >-
@@ -90,7 +90,7 @@ spec:
           labels:
             severity: warning
             component: result-store
-            noetl.io/soak-gate: oq5-result-store-retirement
+            noetl_io_soak_gate: oq5-result-store-retirement
           annotations:
             summary: "OQ5 producer-stage degraded — producers declining to stage ({{ $value }}/s)"
             description: >-
@@ -107,7 +107,7 @@ spec:
           labels:
             severity: warning
             component: result-store
-            noetl.io/soak-gate: oq5-result-store-retirement
+            noetl_io_soak_gate: oq5-result-store-retirement
           annotations:
             summary: "OQ5 materializer not skipping — still reading result_store for staged objects"
             description: >-
