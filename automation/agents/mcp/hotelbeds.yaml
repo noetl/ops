@@ -226,7 +226,7 @@ workflow:
             try:
                 parsed = json.loads(raw)
             except Exception:
-                raise RuntimeError(f"secret '{secret_name}' is not valid JSON (expected {{apikey, secret}})")
+                raise RuntimeError(f"secret '{secret_name}' is not valid JSON (expected apikey/secret fields)")
             apikey = _text(parsed.get("apikey") or parsed.get("api_key") or parsed.get("key"))
             secret = _text(parsed.get("secret") or parsed.get("shared_secret"))
             if not apikey or not secret:
