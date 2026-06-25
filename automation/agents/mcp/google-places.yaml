@@ -6,20 +6,28 @@ metadata:
   description: |
     Google Places + Maps enrichment MCP playbook for the travel agent.
 
-    Pattern C hybrid auth:
-    - backend Places API calls use the worker service account via
-      Workload Identity / Application Default Credentials and send
-      Authorization: Bearer plus X-Goog-User-Project.
+    Pattern C hybrid auth (no google-auth library — noetl/ai-meta#137):
+    - backend Places API (New) calls mint an OAuth2 access token directly
+      from the GKE metadata server using the worker pod's Workload Identity
+      (GET http://metadata.google.internal/.../service-accounts/default/token
+      with Metadata-Flavor: Google) and send Authorization: Bearer plus
+      X-Goog-User-Project. This is the same token google.auth.default() reads
+      under the hood, so no Python google-auth/requests dependency is needed.
     - widget image URLs use the restricted google-maps-widget-key API
       key from Secret Manager because browsers cannot fetch Maps Static
       or Place Photos with a service-account token.
+
+    Operator prerequisite: the worker pod's KSA must be bound via GKE
+    Workload Identity to a GCP service account with Places API access and
+    roles/serviceusage.serviceUsageConsumer. Until then the backend calls
+    return a clear auth/permission error (not a missing-library error).
 
     Setup reference:
     playbooks/google-maps-platform-setup-pattern-c.md in ai-meta.
   agent: true
   exposes_as_mcp: true
   exposed_in_ui: false
-  version: "1.0"
+  version: "1.1"
   tags: [mcp, google-places, maps, travel, enrichment]
   terminal:
     visible: true
@@ -55,6 +63,10 @@ workflow:
         import urllib.request
 
         SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+        METADATA_TOKEN_URL = (
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/token"
+        )
         PLACES_SEARCH_TEXT = "https://places.googleapis.com/v1/places:searchText"
         PLACES_SEARCH_NEARBY = "https://places.googleapis.com/v1/places:searchNearby"
         DETAILS_FIELDS = ",".join([
@@ -123,16 +135,38 @@ workflow:
             }
 
         def _token():
+            # Mint an OAuth2 access token from the GKE metadata server using the
+            # worker pod's Workload Identity. No google-auth library: the metadata
+            # endpoint is exactly what google.auth.default() reads under the hood on
+            # GKE, so a direct urllib GET is the library-free equivalent and removes
+            # the `ModuleNotFoundError: No module named 'google'` failure (noetl/ai-meta#137).
+            # The token carries the bound service account's cloud-platform scope, which
+            # is what the Places API (New) accepts as a bearer for backend search calls.
+            req = urllib.request.Request(
+                METADATA_TOKEN_URL,
+                headers={"Metadata-Flavor": "Google"},
+                method="GET",
+            )
             try:
-                import google.auth
-                import google.auth.transport.requests
-            except Exception as exc:
-                raise RuntimeError(f"google-auth unavailable in worker image: {type(exc).__name__}: {exc}")
-            credentials, _ = google.auth.default(scopes=[SCOPE])
-            credentials.refresh(google.auth.transport.requests.Request())
-            if not getattr(credentials, "token", None):
-                raise RuntimeError("ADC returned no access token")
-            return credentials.token
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    "metadata token mint failed HTTP "
+                    f"{exc.code}: Workload Identity is not bound to a GCP service "
+                    f"account with Places access for this worker pod ({body})"
+                )
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    "metadata server unreachable "
+                    f"({getattr(exc, 'reason', exc)}): the worker pod has no GKE "
+                    "Workload Identity metadata endpoint (expected off-cluster, e.g. kind)"
+                )
+            token = (payload or {}).get("access_token") if isinstance(payload, dict) else None
+            if not token:
+                raise RuntimeError("metadata token endpoint returned no access_token")
+            return token
 
         def _post_google(url, payload, field_mask, project):
             req = urllib.request.Request(
@@ -390,6 +424,7 @@ workflow:
             "time": time,
             "urllib": urllib,
             "SCOPE": SCOPE,
+            "METADATA_TOKEN_URL": METADATA_TOKEN_URL,
             "PLACES_SEARCH_TEXT": PLACES_SEARCH_TEXT,
             "PLACES_SEARCH_NEARBY": PLACES_SEARCH_NEARBY,
             "DETAILS_FIELDS": DETAILS_FIELDS,
