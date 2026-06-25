@@ -4,18 +4,25 @@ metadata:
   name: hotelbeds_mcp
   path: automation/agents/mcp/hotelbeds
   description: |
-    HotelBeds (APITUDE) MCP server playbook — hotel availability search for
-    the travel ("Muno") itinerary planner. Replaces the removed Amadeus
-    hotels path (dev API dropped) with HotelBeds as the HOTELS provider.
+    HotelBeds (APITUDE) Hotel Booking API MCP server playbook — hotel
+    availability search for the travel ("Muno") itinerary planner. Replaces
+    the removed Amadeus hotels path (dev API dropped) with HotelBeds as the
+    HOTELS provider.
 
-    Auth (test environment):
-    - Every HotelBeds call carries three headers: Api-key, X-Signature,
-      Accept: application/json. The signature is
-      X-Signature = SHA256(apikey + secret + current_unix_time_seconds)
+    This is one of three independent HotelBeds APITUDE products, each with
+    its OWN apikey/secret, GSM secret, and rate limit (the SHA256 signature
+    scheme is shared): hotels (this file), activities
+    (hotelbeds-activities.yaml), transfers (hotelbeds-transfers.yaml).
+
+    Auth (test environment) — per the official HotelBeds getting-started
+    docs (https://developer.hotelbeds.com/documentation/getting-started/):
+    - Every HotelBeds call carries: Api-key, X-Signature,
+      Accept: application/json, Accept-Encoding: gzip. The signature is
+      X-Signature = SHA256(apiKey + secret + current_unix_time_seconds)
       as a lowercase hex digest, recomputed per request (the timestamp is
       part of the digest, so a stale signature is rejected).
     - The apikey + secret are NEVER hardcoded in this playbook. They live
-      in the GCP Secret Manager secret `hotelbeds-api-test` (a JSON blob
+      in the GCP Secret Manager secret `hotelbeds-hotels-test` (a JSON blob
       `{"apikey": "...", "secret": "..."}`), and the playbook reads them at
       runtime using the worker pod's GKE Workload Identity:
         1. mint an OAuth2 access token from the GKE metadata server
@@ -24,19 +31,25 @@ metadata:
         2. read the secret via the Secret Manager REST API with that token.
       This is the same library-free Workload-Identity pattern the reworked
       google-places MCP playbook uses (noetl/ai-meta#137). The keychain
-      credential reference `hotelbeds_api` (kind secret_manager, pointing at
-      the same GSM secret) is the declarative record of this dependency;
+      credential reference `hotelbeds_hotels` (kind secret_manager, pointing
+      at the same GSM secret) is the declarative record of this dependency;
       the in-playbook read above is the mechanism proven on the Rust worker.
+
+    Endpoint (per official docs): POST /hotel-api/1.0/hotels with a JSON body
+    {stay:{checkIn,checkOut}, occupancies:[{rooms,adults,children}],
+    geolocation:{latitude,longitude,radius,unit}}. Response hotels live under
+    body.hotels.hotels[].
 
     Operator prerequisites (until these land, backend calls return a clear
     auth/permission error — NOT a missing-library or parse error):
-    - GSM secret `hotelbeds-api-test` exists with the JSON value loaded.
+    - GSM secret `hotelbeds-hotels-test` exists with the JSON value loaded.
     - The worker pod's GSA `noetl-worker-mcp@noetl-demo-19700101.iam.gserviceaccount.com`
-      holds roles/secretmanager.secretAccessor on `hotelbeds-api-test`.
+      holds roles/secretmanager.secretAccessor on `hotelbeds-hotels-test`.
 
-    Rate limits (HotelBeds test): 8 requests / 4 seconds; quota 50 / 86400s.
-    This playbook issues at most one availability request per tools/call, so
-    a single planner turn stays well inside the limit. Do not loop it.
+    Rate limits (HotelBeds hotels test): 8 requests / 4 seconds; quota
+    50 / 86400s. This playbook issues at most one availability request per
+    tools/call, so a single planner turn stays well inside the limit. Do not
+    loop it.
 
     Tools: search_hotels (availability), list_destinations (debug).
   agent: true
@@ -58,7 +71,7 @@ workload:
   google_project: "noetl-demo-19700101"
   # GSM secret holding {"apikey": "...", "secret": "..."}. The value is loaded
   # out-of-band by the operator; this playbook only references the name.
-  hotelbeds_secret_name: "hotelbeds-api-test"
+  hotelbeds_secret_name: "hotelbeds-hotels-test"
   max_hotels: 10
 
 workflow:
@@ -86,6 +99,7 @@ workflow:
         max_hotels: "{{ workload.max_hotels | default(10) }}"
       code: |
         import base64
+        import gzip
         import hashlib
         import json
         import time
@@ -240,6 +254,21 @@ workflow:
             digest = hashlib.sha256(f"{apikey}{secret}{int(ts)}".encode("utf-8")).hexdigest()
             return digest, int(ts)
 
+        def _decode_body(resp_or_exc, raw_bytes):
+            # HotelBeds honours Accept-Encoding: gzip; urllib does not auto-
+            # decompress, so inflate when the response says it is gzipped.
+            encoding = ""
+            try:
+                encoding = (resp_or_exc.headers.get("Content-Encoding") or "").lower()
+            except Exception:
+                encoding = ""
+            if "gzip" in encoding:
+                try:
+                    raw_bytes = gzip.decompress(raw_bytes)
+                except Exception:
+                    pass
+            return raw_bytes.decode("utf-8", errors="replace")
+
         def _request(http_method, url, apikey, secret, payload=None, params=None):
             if params:
                 url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params, doseq=True)
@@ -248,6 +277,7 @@ workflow:
                 "Api-key": apikey,
                 "X-Signature": signature,
                 "Accept": "application/json",
+                "Accept-Encoding": "gzip",
             }
             body = None
             if payload is not None:
@@ -256,10 +286,10 @@ workflow:
             req = urllib.request.Request(url, data=body, headers=headers, method=http_method)
             try:
                 with urllib.request.urlopen(req, timeout=45) as resp:
-                    raw = resp.read().decode("utf-8")
+                    raw = _decode_body(resp, resp.read())
                     return True, resp.status, json.loads(raw or "{}")
             except urllib.error.HTTPError as exc:
-                raw = exc.read().decode("utf-8", errors="replace")
+                raw = _decode_body(exc, exc.read())
                 try:
                     parsed = json.loads(raw or "{}")
                 except Exception:
@@ -424,6 +454,7 @@ workflow:
 
         globals().update({
             "base64": base64,
+            "gzip": gzip,
             "hashlib": hashlib,
             "json": json,
             "time": time,
@@ -441,6 +472,7 @@ workflow:
             "_metadata_token": _metadata_token,
             "_secret_json": _secret_json,
             "_signature": _signature,
+            "_decode_body": _decode_body,
             "_request": _request,
             "_geo_from_args": _geo_from_args,
             "_hotel_summary": _hotel_summary,

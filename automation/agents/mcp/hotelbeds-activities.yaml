@@ -1,0 +1,457 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: hotelbeds_activities_mcp
+  path: automation/agents/mcp/hotelbeds-activities
+  description: |
+    HotelBeds (APITUDE) Activities API MCP server playbook — activity
+    availability search for the travel ("Muno") itinerary planner.
+
+    One of three independent HotelBeds APITUDE products, each with its OWN
+    apikey/secret, GSM secret, and rate limit (the SHA256 signature scheme is
+    shared): hotels (hotelbeds.yaml), activities (this file), transfers
+    (hotelbeds-transfers.yaml).
+
+    Auth (test environment) — per the official HotelBeds getting-started docs
+    (https://developer.hotelbeds.com/documentation/getting-started/):
+    - Every call carries: Api-key, X-Signature, Accept: application/json,
+      Accept-Encoding: gzip. The signature is
+      X-Signature = SHA256(apiKey + secret + current_unix_time_seconds)
+      as a lowercase hex digest, recomputed per request.
+    - The apikey + secret are NEVER hardcoded. They live in the GCP Secret
+      Manager secret `hotelbeds-activities-test` (a JSON blob
+      `{"apikey": "...", "secret": "..."}`), read at runtime via the worker
+      pod's GKE Workload Identity (mint a metadata-server OAuth token with
+      stdlib urllib — no google-auth lib — then read the secret via the
+      Secret Manager REST API). Same pattern as the google-places MCP
+      (noetl/ai-meta#137). Keychain credential reference: `hotelbeds_activities`.
+
+    Endpoint (per official docs): POST /activity-api/3.0/activities/availability
+    with a JSON body {filters:[{searchFilterItems:[{type,value}]}], from, to,
+    paxes:[{age}], language, pagination:{itemsPerPage,page}, order}. Response
+    activities live under body.activities[]; lowest prices under
+    modalities[].amountsFrom and the activity-level amountsFrom.
+
+    Operator prerequisites (until these land, calls return a clear
+    auth/permission error — NOT a missing-library or parse error):
+    - GSM secret `hotelbeds-activities-test` exists with the JSON value loaded.
+    - The worker pod's GSA `noetl-worker-mcp@noetl-demo-19700101.iam.gserviceaccount.com`
+      holds roles/secretmanager.secretAccessor on `hotelbeds-activities-test`.
+
+    Rate limits (HotelBeds activities test): 16 requests / 4 seconds; quota
+    5000 / 86400s. One availability request per tools/call.
+
+    Tools: search_activities (availability).
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  version: "1.0"
+  tags: [mcp, hotelbeds, apitude, travel, activities]
+  terminal:
+    visible: true
+    workspace: hotelbeds-activities
+    scopes: [/mcp/hotelbeds-activities]
+
+workload:
+  method: "tools/list"
+  tool: ""
+  arguments: {}
+  hotelbeds_env: test
+  hotelbeds_api_base: "https://api.test.hotelbeds.com"
+  google_project: "noetl-demo-19700101"
+  hotelbeds_secret_name: "hotelbeds-activities-test"
+  max_activities: 10
+
+workflow:
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`; routes to activities_dispatch
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: activities_dispatch
+
+  - step: activities_dispatch
+    desc: Dispatch HotelBeds Activities MCP tools (Workload-Identity GSM secret read + SHA256 signature)
+    tool:
+      kind: python
+      input:
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+        hotelbeds_env: "{{ workload.hotelbeds_env | default('test') }}"
+        hotelbeds_api_base: "{{ workload.hotelbeds_api_base | default('https://api.test.hotelbeds.com') }}"
+        google_project: "{{ workload.google_project | default('noetl-demo-19700101') }}"
+        hotelbeds_secret_name: "{{ workload.hotelbeds_secret_name | default('hotelbeds-activities-test') }}"
+        max_activities: "{{ workload.max_activities | default(10) }}"
+      code: |
+        import base64
+        import gzip
+        import hashlib
+        import json
+        import time
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        METADATA_TOKEN_URL = (
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/token"
+        )
+        AVAILABILITY_PATH = "/activity-api/3.0/activities/availability"
+
+        def _as_dict(value):
+            return value if isinstance(value, dict) else {}
+
+        def _as_list(value):
+            return value if isinstance(value, list) else []
+
+        def _cap(value, default=10, maximum=50):
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(1, min(parsed, maximum))
+
+        def _text(value, default=""):
+            value = default if value is None else value
+            return str(value).strip()
+
+        def _error(tool_name, message, detail=None, status_code=0, code=None):
+            text = message if detail is None else f"{message}: {str(detail)[:700]}"
+            payload = {"ok": False, "status": "error", "error": text[:2000], "status_code": status_code, "activities": []}
+            if code:
+                payload["code"] = code
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+                "_meta": {"backend": "hotelbeds-activities", "tool": tool_name, "hotelbeds_env": hotelbeds_env, "status_code": status_code, "error": text[:2000], "code": code},
+                "data": payload,
+                "control_data": payload,
+                "summary": text,
+                "text": text,
+            }
+
+        def _ok(tool_name, data, text=None, meta=None):
+            meta = meta if isinstance(meta, dict) else {}
+            payload = data if isinstance(data, dict) else {"value": data}
+            payload.setdefault("ok", True)
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text or f"HotelBeds activities {tool_name} ok"}],
+                "isError": False,
+                "_meta": {"backend": "hotelbeds-activities", "tool": tool_name, "hotelbeds_env": hotelbeds_env, **meta},
+                "data": payload,
+                "control_data": payload,
+                "summary": text or f"HotelBeds activities {tool_name} ok",
+                "text": text or f"HotelBeds activities {tool_name} ok",
+            }
+
+        def _metadata_token():
+            req = urllib.request.Request(
+                METADATA_TOKEN_URL,
+                headers={"Metadata-Flavor": "Google"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    "metadata token mint failed HTTP "
+                    f"{exc.code}: Workload Identity is not bound to a GCP service "
+                    f"account with Secret Manager access for this worker pod ({body})"
+                )
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    "metadata server unreachable "
+                    f"({getattr(exc, 'reason', exc)}): the worker pod has no GKE "
+                    "Workload Identity metadata endpoint (expected off-cluster, e.g. kind)"
+                )
+            token = (payload or {}).get("access_token") if isinstance(payload, dict) else None
+            if not token:
+                raise RuntimeError("metadata token endpoint returned no access_token")
+            return token
+
+        def _secret_json(project, secret_name):
+            token = _metadata_token()
+            name = f"projects/{project}/secrets/{secret_name}/versions/latest:access"
+            req = urllib.request.Request(
+                f"https://secretmanager.googleapis.com/v1/{name}",
+                headers={"Authorization": f"Bearer {token}"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    f"secret manager access HTTP {exc.code} for '{secret_name}': the "
+                    f"worker GSA lacks secretmanager.secretAccessor on this secret, or "
+                    f"the secret is not loaded yet ({body})"
+                )
+            encoded = ((payload.get("payload") or {}).get("data") or "").strip()
+            if not encoded:
+                raise RuntimeError(f"secret '{secret_name}' has no payload data")
+            raw = base64.b64decode(encoded).decode("utf-8").strip()
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                raise RuntimeError(f"secret '{secret_name}' is not valid JSON (expected apikey/secret fields)")
+            apikey = _text(parsed.get("apikey") or parsed.get("api_key") or parsed.get("key"))
+            secret = _text(parsed.get("secret") or parsed.get("shared_secret"))
+            if not apikey or not secret:
+                raise RuntimeError(f"secret '{secret_name}' JSON is missing apikey/secret fields")
+            return apikey, secret
+
+        def _signature(apikey, secret, ts=None):
+            if ts is None:
+                ts = int(time.time())
+            digest = hashlib.sha256(f"{apikey}{secret}{int(ts)}".encode("utf-8")).hexdigest()
+            return digest, int(ts)
+
+        def _decode_body(resp_or_exc, raw_bytes):
+            encoding = ""
+            try:
+                encoding = (resp_or_exc.headers.get("Content-Encoding") or "").lower()
+            except Exception:
+                encoding = ""
+            if "gzip" in encoding:
+                try:
+                    raw_bytes = gzip.decompress(raw_bytes)
+                except Exception:
+                    pass
+            return raw_bytes.decode("utf-8", errors="replace")
+
+        def _request(http_method, url, apikey, secret, payload=None, params=None):
+            if params:
+                url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params, doseq=True)
+            signature, _ts = _signature(apikey, secret)
+            headers = {
+                "Api-key": apikey,
+                "X-Signature": signature,
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+            }
+            body = None
+            if payload is not None:
+                headers["Content-Type"] = "application/json"
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers=headers, method=http_method)
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    raw = _decode_body(resp, resp.read())
+                    return True, resp.status, json.loads(raw or "{}")
+            except urllib.error.HTTPError as exc:
+                raw = _decode_body(exc, exc.read())
+                try:
+                    parsed = json.loads(raw or "{}")
+                except Exception:
+                    parsed = {"raw": raw[:2000]}
+                return False, exc.code, parsed
+            except urllib.error.URLError as exc:
+                return False, 0, {"error": str(getattr(exc, "reason", exc))}
+            except Exception as exc:
+                return False, 0, {"error": f"{type(exc).__name__}: {exc}"}
+
+        def _filters_from_args(args):
+            # Prefer explicit searchFilterItems; else build a destination filter
+            # from a destination code, or a segment/keyword filter.
+            items = _as_list(args.get("searchFilterItems"))
+            if items:
+                return [{"searchFilterItems": items}]
+            built = []
+            destination = _text(args.get("destination") or args.get("destination_code") or args.get("city_code"))
+            if destination:
+                built.append({"type": "destination", "value": destination.upper()})
+            country = _text(args.get("country") or args.get("country_code"))
+            if country:
+                built.append({"type": "country", "value": country.upper()})
+            if not built:
+                return []
+            return [{"searchFilterItems": built}]
+
+        def _paxes_from_args(args):
+            paxes = _as_list(args.get("paxes"))
+            if paxes:
+                return [p for p in paxes if isinstance(p, dict)]
+            try:
+                adults = max(1, int(args.get("adults") or 1))
+            except (TypeError, ValueError):
+                adults = 1
+            try:
+                adult_age = int(args.get("adult_age") or 30)
+            except (TypeError, ValueError):
+                adult_age = 30
+            built = [{"age": adult_age} for _ in range(adults)]
+            for age in _as_list(args.get("children_ages")):
+                try:
+                    built.append({"age": int(age)})
+                except (TypeError, ValueError):
+                    continue
+            return built
+
+        def _activity_summary(activity):
+            activity = _as_dict(activity)
+            modalities = _as_list(activity.get("modalities"))
+            amounts = _as_list(activity.get("amountsFrom"))
+            min_amount = None
+            for entry in amounts:
+                if isinstance(entry, dict) and entry.get("amount") is not None:
+                    try:
+                        value = float(entry.get("amount"))
+                    except (TypeError, ValueError):
+                        continue
+                    min_amount = value if min_amount is None else min(min_amount, value)
+            country = _as_dict(activity.get("country"))
+            return {
+                "code": activity.get("code") or activity.get("activityCode"),
+                "name": activity.get("name"),
+                "type": activity.get("type"),
+                "country_code": country.get("code"),
+                "country_name": country.get("name"),
+                "currency": activity.get("currencyName") or activity.get("currency"),
+                "amount_from": min_amount,
+                "modalities_count": len(modalities),
+                "modalities": [
+                    {"code": m.get("code"), "name": m.get("name"), "duration": m.get("duration")}
+                    for m in modalities[:5] if isinstance(m, dict)
+                ],
+                "content": _as_dict(activity.get("content")).get("description") if isinstance(activity.get("content"), dict) else None,
+            }
+
+        def _tools_list():
+            tools = [
+                {
+                    "name": "search_activities",
+                    "title": "Search activity availability",
+                    "description": "HotelBeds Activities availability for a destination + date range. Required: destination (code) or searchFilterItems, from, to. Optional: paxes/adults, language.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "destination": {"type": "string", "description": "HotelBeds destination code, e.g. BCN, PAR"},
+                            "country": {"type": "string", "description": "Country code, e.g. FR"},
+                            "searchFilterItems": {"type": "array", "description": "Raw HotelBeds filter items [{type,value}]"},
+                            "from": {"type": "string", "description": "YYYY-MM-DD"},
+                            "to": {"type": "string", "description": "YYYY-MM-DD"},
+                            "adults": {"type": "integer", "minimum": 1, "default": 1},
+                            "adult_age": {"type": "integer", "default": 30},
+                            "children_ages": {"type": "array"},
+                            "language": {"type": "string", "default": "en"},
+                        },
+                    },
+                },
+            ]
+            return _ok("tools/list", {"tools": tools, "tool_count": len(tools)}, f"HotelBeds Activities MCP — {len(tools)} tools available", {"tool_count": len(tools)})
+
+        def _search_activities(args, base, apikey, secret, limit):
+            filters = _filters_from_args(args)
+            if not filters:
+                return _error("search_activities", "a destination code, country, or searchFilterItems is required", code="validation_error")
+            date_from = _text(args.get("from") or args.get("date_from") or args.get("check_in"))
+            date_to = _text(args.get("to") or args.get("date_to") or args.get("check_out"))
+            if not date_from or not date_to:
+                return _error("search_activities", "from and to (YYYY-MM-DD) are required", code="validation_error")
+            paxes = _paxes_from_args(args)
+            language = _text(args.get("language") or "en")
+            payload = {
+                "filters": filters,
+                "from": date_from,
+                "to": date_to,
+                "paxes": paxes,
+                "language": language,
+                "pagination": {"itemsPerPage": min(limit, 50), "page": 1},
+                "order": "DEFAULT",
+            }
+            ok, status_code, body = _request("POST", base + AVAILABILITY_PATH, apikey, secret, payload=payload)
+            if not ok:
+                return _error("search_activities", f"HotelBeds activities availability failed HTTP {status_code}", body, status_code)
+            activities = _as_list(body.get("activities") if isinstance(body, dict) else [])
+            summarised = [_activity_summary(a) for a in activities[:limit] if isinstance(a, dict)]
+            currency = None
+            for activity in summarised:
+                if activity.get("currency"):
+                    currency = activity.get("currency")
+                    break
+            pagination = _as_dict(body.get("pagination") if isinstance(body, dict) else {})
+            return _ok(
+                "search_activities",
+                {
+                    "source": "hotelbeds-activities",
+                    "hotelbeds_env": hotelbeds_env,
+                    "status_code": status_code,
+                    "activities": summarised,
+                    "activities_total": len(summarised),
+                    "raw_total": pagination.get("totalItems") if isinstance(pagination.get("totalItems"), int) else len(activities),
+                    "from": date_from,
+                    "to": date_to,
+                    "meta": {"count": len(summarised), "source": "hotelbeds-activities", "currency": currency},
+                },
+                f"{len(summarised)} HotelBeds activity(ies)",
+                {"status_code": status_code, "activities_total": len(summarised)},
+            )
+
+        globals().update({
+            "base64": base64,
+            "gzip": gzip,
+            "hashlib": hashlib,
+            "json": json,
+            "time": time,
+            "urllib": urllib,
+            "METADATA_TOKEN_URL": METADATA_TOKEN_URL,
+            "AVAILABILITY_PATH": AVAILABILITY_PATH,
+            "_as_dict": _as_dict,
+            "_as_list": _as_list,
+            "_cap": _cap,
+            "_text": _text,
+            "_error": _error,
+            "_ok": _ok,
+            "_metadata_token": _metadata_token,
+            "_secret_json": _secret_json,
+            "_signature": _signature,
+            "_decode_body": _decode_body,
+            "_request": _request,
+            "_filters_from_args": _filters_from_args,
+            "_paxes_from_args": _paxes_from_args,
+            "_activity_summary": _activity_summary,
+            "_tools_list": _tools_list,
+            "_search_activities": _search_activities,
+        })
+
+        method_name = _text(method, "tools/list").lower()
+        tool_name = _text(tool).lower()
+        args = _as_dict(arguments)
+        base = _text(hotelbeds_api_base, "https://api.test.hotelbeds.com").rstrip("/")
+        project = _text(google_project, "noetl-demo-19700101")
+        secret_name = _text(hotelbeds_secret_name, "hotelbeds-activities-test")
+        limit = _cap(max_activities, default=10, maximum=50)
+
+        if method_name == "tools/list":
+            result = _tools_list()
+        elif method_name != "tools/call":
+            result = _error(method_name, f"Unknown MCP method: {method_name}")
+        elif tool_name != "search_activities":
+            result = _error(tool_name or "unknown", f"Unknown tool: {tool_name}. Run tools/list to see the catalog.")
+        else:
+            try:
+                apikey, secret = _secret_json(project, secret_name)
+            except Exception as exc:
+                result = _error(tool_name, "HotelBeds activities credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable")
+            if "result" not in locals() or result is None:
+                try:
+                    result = _search_activities(args, base, apikey, secret, limit)
+                except Exception as exc:
+                    result = _error(tool_name, "HotelBeds activities tool failed", f"{type(exc).__name__}: {exc}")
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
