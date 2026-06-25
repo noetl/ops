@@ -62,6 +62,15 @@ keychain:
     kind: credential_ref
 
 workflow:
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`; routes to duffel_dispatch
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: duffel_dispatch
+
   - step: duffel_dispatch
     desc: Dispatch Duffel MCP tools
     tool:

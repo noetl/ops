@@ -31,6 +31,15 @@ workload:
   arguments: {}
 
 workflow:
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`; routes to firestore_dispatch
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: firestore_dispatch
+
   - step: firestore_dispatch
     desc: Dispatch generic Firestore MCP tools
     tool:
