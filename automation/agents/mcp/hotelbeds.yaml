@@ -1,0 +1,490 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: hotelbeds_mcp
+  path: automation/agents/mcp/hotelbeds
+  description: |
+    HotelBeds (APITUDE) MCP server playbook — hotel availability search for
+    the travel ("Muno") itinerary planner. Replaces the removed Amadeus
+    hotels path (dev API dropped) with HotelBeds as the HOTELS provider.
+
+    Auth (test environment):
+    - Every HotelBeds call carries three headers: Api-key, X-Signature,
+      Accept: application/json. The signature is
+      X-Signature = SHA256(apikey + secret + current_unix_time_seconds)
+      as a lowercase hex digest, recomputed per request (the timestamp is
+      part of the digest, so a stale signature is rejected).
+    - The apikey + secret are NEVER hardcoded in this playbook. They live
+      in the GCP Secret Manager secret `hotelbeds-api-test` (a JSON blob
+      `{"apikey": "...", "secret": "..."}`), and the playbook reads them at
+      runtime using the worker pod's GKE Workload Identity:
+        1. mint an OAuth2 access token from the GKE metadata server
+           (GET http://metadata.google.internal/.../service-accounts/default/token
+           with Metadata-Flavor: Google) — stdlib urllib, no google-auth lib,
+        2. read the secret via the Secret Manager REST API with that token.
+      This is the same library-free Workload-Identity pattern the reworked
+      google-places MCP playbook uses (noetl/ai-meta#137). The keychain
+      credential reference `hotelbeds_api` (kind secret_manager, pointing at
+      the same GSM secret) is the declarative record of this dependency;
+      the in-playbook read above is the mechanism proven on the Rust worker.
+
+    Operator prerequisites (until these land, backend calls return a clear
+    auth/permission error — NOT a missing-library or parse error):
+    - GSM secret `hotelbeds-api-test` exists with the JSON value loaded.
+    - The worker pod's GSA `noetl-worker-mcp@noetl-demo-19700101.iam.gserviceaccount.com`
+      holds roles/secretmanager.secretAccessor on `hotelbeds-api-test`.
+
+    Rate limits (HotelBeds test): 8 requests / 4 seconds; quota 50 / 86400s.
+    This playbook issues at most one availability request per tools/call, so
+    a single planner turn stays well inside the limit. Do not loop it.
+
+    Tools: search_hotels (availability), list_destinations (debug).
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  version: "1.0"
+  tags: [mcp, hotelbeds, apitude, travel, hotels]
+  terminal:
+    visible: true
+    workspace: hotelbeds
+    scopes: [/mcp/hotelbeds]
+
+workload:
+  method: "tools/list"
+  tool: ""
+  arguments: {}
+  hotelbeds_env: test
+  hotelbeds_api_base: "https://api.test.hotelbeds.com"
+  google_project: "noetl-demo-19700101"
+  # GSM secret holding {"apikey": "...", "secret": "..."}. The value is loaded
+  # out-of-band by the operator; this playbook only references the name.
+  hotelbeds_secret_name: "hotelbeds-api-test"
+  max_hotels: 10
+
+workflow:
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`; routes to hotelbeds_dispatch
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: hotelbeds_dispatch
+
+  - step: hotelbeds_dispatch
+    desc: Dispatch HotelBeds MCP tools (Workload-Identity GSM secret read + SHA256 signature)
+    tool:
+      kind: python
+      input:
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+        hotelbeds_env: "{{ workload.hotelbeds_env | default('test') }}"
+        hotelbeds_api_base: "{{ workload.hotelbeds_api_base | default('https://api.test.hotelbeds.com') }}"
+        google_project: "{{ workload.google_project | default('noetl-demo-19700101') }}"
+        hotelbeds_secret_name: "{{ workload.hotelbeds_secret_name | default('hotelbeds-api-test') }}"
+        max_hotels: "{{ workload.max_hotels | default(10) }}"
+      code: |
+        import base64
+        import hashlib
+        import json
+        import time
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        METADATA_TOKEN_URL = (
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/token"
+        )
+        AVAILABILITY_PATH = "/hotel-api/1.0/hotels"
+        DESTINATIONS_PATH = "/hotel-api/1.0/locations/destinations"
+
+        # City -> geolocation fallback. Mirrors the planner's `_city_hint` known
+        # cities so a bare "hotels in Paris" (no coords resolved yet) still issues
+        # a geolocation availability search. lat/lng supplied by the caller take
+        # precedence; this is only the fallback when the caller has no coords.
+        CITY_GEO = {
+            "paris": {"latitude": 48.8566, "longitude": 2.3522},
+            "miami": {"latitude": 25.7617, "longitude": -80.1918},
+            "boston": {"latitude": 42.3601, "longitude": -71.0589},
+            "new york": {"latitude": 40.7128, "longitude": -74.0060},
+            "nyc": {"latitude": 40.7128, "longitude": -74.0060},
+            "london": {"latitude": 51.5074, "longitude": -0.1278},
+            "par": {"latitude": 48.8566, "longitude": 2.3522},
+            "mia": {"latitude": 25.7617, "longitude": -80.1918},
+            "bos": {"latitude": 42.3601, "longitude": -71.0589},
+            "lon": {"latitude": 51.5074, "longitude": -0.1278},
+        }
+
+        def _as_dict(value):
+            return value if isinstance(value, dict) else {}
+
+        def _as_list(value):
+            return value if isinstance(value, list) else []
+
+        def _cap(value, default=10, maximum=25):
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(1, min(parsed, maximum))
+
+        def _text(value, default=""):
+            value = default if value is None else value
+            return str(value).strip()
+
+        def _error(tool_name, message, detail=None, status_code=0, code=None):
+            text = message if detail is None else f"{message}: {str(detail)[:700]}"
+            payload = {"ok": False, "status": "error", "error": text[:2000], "status_code": status_code, "hotels": []}
+            if code:
+                payload["code"] = code
+            return {
+                # Keep the NoETL step green; MCP clients read isError plus
+                # control_data.status for the upstream/tool-level error.
+                "status": "ok",
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+                "_meta": {"backend": "hotelbeds", "tool": tool_name, "hotelbeds_env": hotelbeds_env, "status_code": status_code, "error": text[:2000], "code": code},
+                "data": payload,
+                "control_data": payload,
+                "summary": text,
+                "text": text,
+            }
+
+        def _ok(tool_name, data, text=None, meta=None):
+            meta = meta if isinstance(meta, dict) else {}
+            payload = data if isinstance(data, dict) else {"value": data}
+            payload.setdefault("ok", True)
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text or f"HotelBeds {tool_name} ok"}],
+                "isError": False,
+                "_meta": {"backend": "hotelbeds", "tool": tool_name, "hotelbeds_env": hotelbeds_env, **meta},
+                "data": payload,
+                "control_data": payload,
+                "summary": text or f"HotelBeds {tool_name} ok",
+                "text": text or f"HotelBeds {tool_name} ok",
+            }
+
+        def _metadata_token():
+            # Mint an OAuth2 access token from the GKE metadata server using the
+            # worker pod's Workload Identity. No google-auth library: this is the
+            # same endpoint google.auth.default() reads under the hood on GKE, so a
+            # direct urllib GET is the library-free equivalent (noetl/ai-meta#137).
+            req = urllib.request.Request(
+                METADATA_TOKEN_URL,
+                headers={"Metadata-Flavor": "Google"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    "metadata token mint failed HTTP "
+                    f"{exc.code}: Workload Identity is not bound to a GCP service "
+                    f"account with Secret Manager access for this worker pod ({body})"
+                )
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    "metadata server unreachable "
+                    f"({getattr(exc, 'reason', exc)}): the worker pod has no GKE "
+                    "Workload Identity metadata endpoint (expected off-cluster, e.g. kind)"
+                )
+            token = (payload or {}).get("access_token") if isinstance(payload, dict) else None
+            if not token:
+                raise RuntimeError("metadata token endpoint returned no access_token")
+            return token
+
+        def _secret_json(project, secret_name):
+            # Read the GSM secret value (the {"apikey","secret"} JSON) using the
+            # WI metadata token. Raises with a credential/permission-flavoured
+            # message so the failure mode is unambiguous on kind / pre-grant prod.
+            token = _metadata_token()
+            name = f"projects/{project}/secrets/{secret_name}/versions/latest:access"
+            req = urllib.request.Request(
+                f"https://secretmanager.googleapis.com/v1/{name}",
+                headers={"Authorization": f"Bearer {token}"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    f"secret manager access HTTP {exc.code} for '{secret_name}': the "
+                    f"worker GSA lacks secretmanager.secretAccessor on this secret, or "
+                    f"the secret is not loaded yet ({body})"
+                )
+            encoded = ((payload.get("payload") or {}).get("data") or "").strip()
+            if not encoded:
+                raise RuntimeError(f"secret '{secret_name}' has no payload data")
+            raw = base64.b64decode(encoded).decode("utf-8").strip()
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                raise RuntimeError(f"secret '{secret_name}' is not valid JSON (expected {{apikey, secret}})")
+            apikey = _text(parsed.get("apikey") or parsed.get("api_key") or parsed.get("key"))
+            secret = _text(parsed.get("secret") or parsed.get("shared_secret"))
+            if not apikey or not secret:
+                raise RuntimeError(f"secret '{secret_name}' JSON is missing apikey/secret fields")
+            return apikey, secret
+
+        def _signature(apikey, secret, ts=None):
+            # X-Signature = SHA256(apikey + secret + unix_seconds) hex digest.
+            if ts is None:
+                ts = int(time.time())
+            digest = hashlib.sha256(f"{apikey}{secret}{int(ts)}".encode("utf-8")).hexdigest()
+            return digest, int(ts)
+
+        def _request(http_method, url, apikey, secret, payload=None, params=None):
+            if params:
+                url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params, doseq=True)
+            signature, _ts = _signature(apikey, secret)
+            headers = {
+                "Api-key": apikey,
+                "X-Signature": signature,
+                "Accept": "application/json",
+            }
+            body = None
+            if payload is not None:
+                headers["Content-Type"] = "application/json"
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers=headers, method=http_method)
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return True, resp.status, json.loads(raw or "{}")
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(raw or "{}")
+                except Exception:
+                    parsed = {"raw": raw[:2000]}
+                return False, exc.code, parsed
+            except urllib.error.URLError as exc:
+                return False, 0, {"error": str(getattr(exc, "reason", exc))}
+            except Exception as exc:
+                return False, 0, {"error": f"{type(exc).__name__}: {exc}"}
+
+        def _geo_from_args(args):
+            # Caller-supplied coords win; else fall back to the city map.
+            lat = args.get("latitude") if args.get("latitude") is not None else args.get("lat")
+            lng = args.get("longitude") if args.get("longitude") is not None else args.get("lng")
+            try:
+                if lat is not None and lng is not None:
+                    return float(lat), float(lng)
+            except (TypeError, ValueError):
+                pass
+            for key in ("city", "city_code", "destination", "query"):
+                hint = _text(args.get(key)).lower()
+                if hint in CITY_GEO:
+                    geo = CITY_GEO[hint]
+                    return geo["latitude"], geo["longitude"]
+            return None, None
+
+        def _hotel_summary(hotel):
+            hotel = _as_dict(hotel)
+            rates = _as_list(hotel.get("rooms"))
+            min_rate = hotel.get("minRate")
+            currency = hotel.get("currency")
+            return {
+                "code": hotel.get("code"),
+                "name": hotel.get("name"),
+                "categoryName": hotel.get("categoryName"),
+                "categoryCode": hotel.get("categoryCode"),
+                "destinationName": hotel.get("destinationName"),
+                "zoneName": hotel.get("zoneName"),
+                "latitude": hotel.get("latitude"),
+                "longitude": hotel.get("longitude"),
+                "minRate": min_rate,
+                "maxRate": hotel.get("maxRate"),
+                "currency": currency,
+                "rooms_count": len(rates),
+                "reviews": _as_list(hotel.get("reviews")),
+                "address": hotel.get("address"),
+            }
+
+        def _tools_list():
+            tools = [
+                {
+                    "name": "search_hotels",
+                    "title": "Search hotel availability",
+                    "description": "HotelBeds availability for a city or coordinates. Required: a city/coords plus stay dates. Optional: adults, rooms, children, radius.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string", "description": "City name, e.g. Paris"},
+                            "city_code": {"type": "string", "description": "City code hint, e.g. PAR"},
+                            "latitude": {"type": "number"},
+                            "longitude": {"type": "number"},
+                            "radius": {"type": "integer", "default": 20, "description": "km radius for geolocation search"},
+                            "check_in": {"type": "string", "description": "YYYY-MM-DD"},
+                            "check_out": {"type": "string", "description": "YYYY-MM-DD"},
+                            "adults": {"type": "integer", "minimum": 1, "default": 2},
+                            "rooms": {"type": "integer", "minimum": 1, "default": 1},
+                            "children": {"type": "integer", "minimum": 0, "default": 0},
+                        },
+                    },
+                },
+                {
+                    "name": "list_destinations",
+                    "title": "List HotelBeds destinations",
+                    "description": "Debug: list HotelBeds destination codes (first page).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "countryCode": {"type": "string"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
+                        },
+                    },
+                },
+            ]
+            return _ok("tools/list", {"tools": tools, "tool_count": len(tools)}, f"HotelBeds MCP — {len(tools)} tools available", {"tool_count": len(tools)})
+
+        def _search_hotels(args, base, apikey, secret, limit):
+            lat, lng = _geo_from_args(args)
+            if lat is None or lng is None:
+                return _error(
+                    "search_hotels",
+                    "could not resolve a geolocation: supply latitude/longitude or a known city",
+                    code="validation_error",
+                )
+            check_in = _text(args.get("check_in") or args.get("checkIn"))
+            check_out = _text(args.get("check_out") or args.get("checkOut"))
+            if not check_in or not check_out:
+                return _error("search_hotels", "check_in and check_out (YYYY-MM-DD) are required", code="validation_error")
+            adults = _cap(args.get("adults"), default=2, maximum=8)
+            rooms = _cap(args.get("rooms"), default=1, maximum=4)
+            try:
+                children = max(0, int(args.get("children") or 0))
+            except (TypeError, ValueError):
+                children = 0
+            try:
+                radius = max(1, min(int(args.get("radius") or 20), 100))
+            except (TypeError, ValueError):
+                radius = 20
+            payload = {
+                "stay": {"checkIn": check_in, "checkOut": check_out},
+                "occupancies": [{"rooms": rooms, "adults": adults, "children": children}],
+                "geolocation": {"latitude": lat, "longitude": lng, "radius": radius, "unit": "km"},
+            }
+            ok, status_code, body = _request("POST", base + AVAILABILITY_PATH, apikey, secret, payload=payload)
+            if not ok:
+                return _error("search_hotels", f"HotelBeds availability failed HTTP {status_code}", body, status_code)
+            container = _as_dict(body.get("hotels") if isinstance(body, dict) else {})
+            hotels = _as_list(container.get("hotels"))
+            summarised = [_hotel_summary(hotel) for hotel in hotels[:limit] if isinstance(hotel, dict)]
+            currency = None
+            for hotel in summarised:
+                if hotel.get("currency"):
+                    currency = hotel.get("currency")
+                    break
+            return _ok(
+                "search_hotels",
+                {
+                    "source": "hotelbeds",
+                    "hotelbeds_env": hotelbeds_env,
+                    "status_code": status_code,
+                    "hotels": summarised,
+                    "hotels_total": len(summarised),
+                    "raw_total": container.get("total") if isinstance(container.get("total"), int) else len(hotels),
+                    "checkIn": check_in,
+                    "checkOut": check_out,
+                    "geolocation": payload["geolocation"],
+                    "meta": {"count": len(summarised), "source": "hotelbeds", "currency": currency},
+                },
+                f"{len(summarised)} HotelBeds hotel(s)",
+                {"status_code": status_code, "hotels_total": len(summarised)},
+            )
+
+        def _list_destinations(args, base, apikey, secret):
+            params = {
+                "fields": "all",
+                "language": "ENG",
+                "from": 1,
+                "to": _cap(args.get("limit"), default=100, maximum=100),
+                "useSecondaryLanguage": "false",
+            }
+            if _text(args.get("countryCode")):
+                params["countryCodes"] = _text(args.get("countryCode")).upper()
+            ok, status_code, body = _request("GET", base + DESTINATIONS_PATH, apikey, secret, params=params)
+            if not ok:
+                return _error("list_destinations", f"HotelBeds destinations failed HTTP {status_code}", body, status_code)
+            destinations = _as_list(body.get("destinations") if isinstance(body, dict) else [])
+            return _ok(
+                "list_destinations",
+                {"source": "hotelbeds", "status_code": status_code, "destinations": destinations, "destinations_total": len(destinations)},
+                f"{len(destinations)} HotelBeds destination(s)",
+                {"status_code": status_code, "destinations_total": len(destinations)},
+            )
+
+        globals().update({
+            "base64": base64,
+            "hashlib": hashlib,
+            "json": json,
+            "time": time,
+            "urllib": urllib,
+            "METADATA_TOKEN_URL": METADATA_TOKEN_URL,
+            "AVAILABILITY_PATH": AVAILABILITY_PATH,
+            "DESTINATIONS_PATH": DESTINATIONS_PATH,
+            "CITY_GEO": CITY_GEO,
+            "_as_dict": _as_dict,
+            "_as_list": _as_list,
+            "_cap": _cap,
+            "_text": _text,
+            "_error": _error,
+            "_ok": _ok,
+            "_metadata_token": _metadata_token,
+            "_secret_json": _secret_json,
+            "_signature": _signature,
+            "_request": _request,
+            "_geo_from_args": _geo_from_args,
+            "_hotel_summary": _hotel_summary,
+            "_tools_list": _tools_list,
+            "_search_hotels": _search_hotels,
+            "_list_destinations": _list_destinations,
+        })
+
+        method_name = _text(method, "tools/list").lower()
+        tool_name = _text(tool).lower()
+        args = _as_dict(arguments)
+        base = _text(hotelbeds_api_base, "https://api.test.hotelbeds.com").rstrip("/")
+        project = _text(google_project, "noetl-demo-19700101")
+        secret_name = _text(hotelbeds_secret_name, "hotelbeds-api-test")
+        limit = _cap(max_hotels, default=10, maximum=25)
+
+        if method_name == "tools/list":
+            result = _tools_list()
+        elif method_name != "tools/call":
+            result = _error(method_name, f"Unknown MCP method: {method_name}")
+        elif tool_name not in ("search_hotels", "list_destinations"):
+            result = _error(tool_name or "unknown", f"Unknown tool: {tool_name}. Run tools/list to see the catalog.")
+        else:
+            # Resolve the HotelBeds apikey/secret from GSM via Workload Identity.
+            # On kind (no metadata server) or pre-grant prod this raises a clear
+            # credential/permission error rather than a parse/wedge failure.
+            try:
+                apikey, secret = _secret_json(project, secret_name)
+            except Exception as exc:
+                result = _error(tool_name, "HotelBeds credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable")
+            if "result" not in locals() or result is None:
+                try:
+                    if tool_name == "search_hotels":
+                        result = _search_hotels(args, base, apikey, secret, limit)
+                    else:
+                        result = _list_destinations(args, base, apikey, secret)
+                except Exception as exc:
+                    result = _error(tool_name, "HotelBeds tool failed", f"{type(exc).__name__}: {exc}")
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
