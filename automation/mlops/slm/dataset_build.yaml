@@ -28,6 +28,17 @@ workload:
   slm_lib: repos/ops/automation/mlops/slm/lib
   # optional output dir override ("" => use the config's dataset_build.output_dir)
   out: ""
+  # optional corpus / version / limit overrides (replay run vs seed run)
+  corpus: ""
+  version: ""
+  limit: ""
+  no_teacher: ""        # set to "1" to skip the teacher ceiling layer (floor only)
+
+# The default teacher provider (vertex_gemini) mints a Workload-Identity OAuth
+# token from the GKE metadata server at call time — no keychain, no API key, no
+# Secret Manager injection here (see automation/mlops/slm/lib/slm_teacher.py).
+# A domain that selects the `openai` provider instead supplies OPENAI_API_KEY in
+# its own overlay (a keychain alias + step auth:), per no-default-connection.md.
 
 workflow:
   - step: start
@@ -49,12 +60,18 @@ workflow:
           CONFIG='{{ workload.config }}'
           LIB='{{ workload.slm_lib }}'
           OUT='{{ workload.out }}'
+          CORPUS='{{ workload.corpus }}'
+          VERSION='{{ workload.version }}'
+          LIMIT='{{ workload.limit }}'
+          NO_TEACHER='{{ workload.no_teacher }}'
           echo "SLM dataset_build :: config=${CONFIG}"
-          if [ -n "${OUT}" ]; then
-            python3 "${LIB}/slm_dataset_build.py" --config "${CONFIG}" --out "${OUT}"
-          else
-            python3 "${LIB}/slm_dataset_build.py" --config "${CONFIG}"
-          fi
+          ARGS="--config ${CONFIG}"
+          [ -n "${OUT}" ]     && ARGS="${ARGS} --out ${OUT}"
+          [ -n "${CORPUS}" ]  && ARGS="${ARGS} --corpus ${CORPUS}"
+          [ -n "${VERSION}" ] && ARGS="${ARGS} --version ${VERSION}"
+          [ -n "${LIMIT}" ]   && ARGS="${ARGS} --limit ${LIMIT}"
+          [ -n "${NO_TEACHER}" ] && ARGS="${ARGS} --no-teacher"
+          python3 "${LIB}/slm_dataset_build.py" ${ARGS}
     next:
       spec: { mode: exclusive }
       arcs:
