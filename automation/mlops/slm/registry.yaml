@@ -1,0 +1,71 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: slm_registry
+  path: automation/mlops/slm/registry
+  description: |
+    G3 registry surface for the SLM MLOps template pack
+    (noetl/ai-meta#146). The model / dataset / eval / release registry is a
+    versioned, queryable catalog index the SLM stages write to; large artifact
+    bytes (datasets, adapter weights, eval reports) live in the object store
+    (the noetl/ai-meta#104 result tier) and the registry records where they live
+    + how they were produced (metadata + lineage).
+
+    This playbook is the dogfood surface the stages call: `finetune` registers a
+    model + lineage + metrics, `dataset_build` registers a dataset, `eval`
+    registers an eval run, `package` registers a serving-ready release — all via
+    the server's `/api/internal/registry/*` + `/api/internal/objects/*` routes
+    (data-access-boundary.md: server-mediated, never direct DB / object access).
+
+    The server must run with `NOETL_REGISTRY_ENABLED=true` (additive /
+    default-off). This playbook runs the end-to-end smoke (register / list /
+    resolve / lineage / artifact put+get) as the worked example.
+
+    Tracks noetl/ai-meta#146 (platform foundation G3, umbrella #139 / Phase B
+    #141).
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # the generic engine library dir
+  slm_lib: repos/ops/automation/mlops/slm/lib
+  # NoETL server base URL (kind port-forward default; in-cluster:
+  # http://noetl-server-rust:8082)
+  server_url: "http://localhost:8082"
+  # internal service-account token (keychain alias in real use; env for local)
+  internal_token: "{{ env.NOETL_INTERNAL_API_TOKEN }}"
+
+workflow:
+  - step: start
+    desc: Entry point
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: registry_smoke
+
+  - step: registry_smoke
+    desc: Exercise register / list / resolve / lineage / artifact put+get
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          export NOETL_SERVER_URL='{{ workload.server_url }}'
+          export NOETL_INTERNAL_API_TOKEN='{{ workload.internal_token }}'
+          echo "SLM registry smoke :: server=${NOETL_SERVER_URL}"
+          python3 "${LIB}/slm_registry_smoke.py"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
