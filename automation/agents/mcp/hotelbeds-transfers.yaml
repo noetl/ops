@@ -1,0 +1,425 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: hotelbeds_transfers_mcp
+  path: automation/agents/mcp/hotelbeds-transfers
+  description: |
+    HotelBeds (APITUDE) Transfers API MCP server playbook — transfer
+    availability search for the travel ("Muno") itinerary planner.
+
+    One of three independent HotelBeds APITUDE products, each with its OWN
+    apikey/secret, GSM secret, and rate limit (the SHA256 signature scheme is
+    shared): hotels (hotelbeds.yaml), activities (hotelbeds-activities.yaml),
+    transfers (this file).
+
+    Auth (test environment) — per the official HotelBeds getting-started docs
+    (https://developer.hotelbeds.com/documentation/getting-started/):
+    - Every call carries: Api-key, X-Signature, Accept: application/json,
+      Accept-Encoding: gzip. The signature is
+      X-Signature = SHA256(apiKey + secret + current_unix_time_seconds)
+      as a lowercase hex digest, recomputed per request.
+    - The apikey + secret are NEVER hardcoded. They live in the GCP Secret
+      Manager secret `hotelbeds-transfers-test` (a JSON blob
+      `{"apikey": "...", "secret": "..."}`), read at runtime via the worker
+      pod's GKE Workload Identity (mint a metadata-server OAuth token with
+      stdlib urllib — no google-auth lib — then read the secret via the
+      Secret Manager REST API). Same pattern as the google-places MCP
+      (noetl/ai-meta#137). Keychain credential reference: `hotelbeds_transfers`.
+
+    Endpoint (per official docs): GET /transfer-api/1.0/availability/{language}/
+    from/{fromType}/{fromCode}/to/{toType}/{toCode}/{outbound}/{inbound}/
+    {adults}/{children}/{infants}. `inbound` is omitted for a one-way search.
+    fromType/toType are IATA | ATLAS | GPS | PORT | STATION. Response services
+    live under body.services[].
+
+    Operator prerequisites (until these land, calls return a clear
+    auth/permission error — NOT a missing-library or parse error):
+    - GSM secret `hotelbeds-transfers-test` exists with the JSON value loaded.
+    - The worker pod's GSA `noetl-worker-mcp@noetl-demo-19700101.iam.gserviceaccount.com`
+      holds roles/secretmanager.secretAccessor on `hotelbeds-transfers-test`.
+
+    Rate limits (HotelBeds transfers test): 8 requests / 4 seconds; quota
+    50000 / 86400s. One availability request per tools/call.
+
+    Tools: search_transfers (availability).
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  version: "1.0"
+  tags: [mcp, hotelbeds, apitude, travel, transfers]
+  terminal:
+    visible: true
+    workspace: hotelbeds-transfers
+    scopes: [/mcp/hotelbeds-transfers]
+
+workload:
+  method: "tools/list"
+  tool: ""
+  arguments: {}
+  hotelbeds_env: test
+  hotelbeds_api_base: "https://api.test.hotelbeds.com"
+  google_project: "noetl-demo-19700101"
+  hotelbeds_secret_name: "hotelbeds-transfers-test"
+  max_transfers: 10
+
+workflow:
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`; routes to transfers_dispatch
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: transfers_dispatch
+
+  - step: transfers_dispatch
+    desc: Dispatch HotelBeds Transfers MCP tools (Workload-Identity GSM secret read + SHA256 signature)
+    tool:
+      kind: python
+      input:
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+        hotelbeds_env: "{{ workload.hotelbeds_env | default('test') }}"
+        hotelbeds_api_base: "{{ workload.hotelbeds_api_base | default('https://api.test.hotelbeds.com') }}"
+        google_project: "{{ workload.google_project | default('noetl-demo-19700101') }}"
+        hotelbeds_secret_name: "{{ workload.hotelbeds_secret_name | default('hotelbeds-transfers-test') }}"
+        max_transfers: "{{ workload.max_transfers | default(10) }}"
+      code: |
+        import base64
+        import gzip
+        import hashlib
+        import json
+        import time
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        METADATA_TOKEN_URL = (
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/token"
+        )
+        AVAILABILITY_BASE = "/transfer-api/1.0/availability"
+        VALID_TYPES = ("IATA", "ATLAS", "GPS", "PORT", "STATION")
+
+        def _as_dict(value):
+            return value if isinstance(value, dict) else {}
+
+        def _as_list(value):
+            return value if isinstance(value, list) else []
+
+        def _cap(value, default=10, maximum=50):
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(1, min(parsed, maximum))
+
+        def _text(value, default=""):
+            value = default if value is None else value
+            return str(value).strip()
+
+        def _int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _error(tool_name, message, detail=None, status_code=0, code=None):
+            text = message if detail is None else f"{message}: {str(detail)[:700]}"
+            payload = {"ok": False, "status": "error", "error": text[:2000], "status_code": status_code, "transfers": []}
+            if code:
+                payload["code"] = code
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+                "_meta": {"backend": "hotelbeds-transfers", "tool": tool_name, "hotelbeds_env": hotelbeds_env, "status_code": status_code, "error": text[:2000], "code": code},
+                "data": payload,
+                "control_data": payload,
+                "summary": text,
+                "text": text,
+            }
+
+        def _ok(tool_name, data, text=None, meta=None):
+            meta = meta if isinstance(meta, dict) else {}
+            payload = data if isinstance(data, dict) else {"value": data}
+            payload.setdefault("ok", True)
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text or f"HotelBeds transfers {tool_name} ok"}],
+                "isError": False,
+                "_meta": {"backend": "hotelbeds-transfers", "tool": tool_name, "hotelbeds_env": hotelbeds_env, **meta},
+                "data": payload,
+                "control_data": payload,
+                "summary": text or f"HotelBeds transfers {tool_name} ok",
+                "text": text or f"HotelBeds transfers {tool_name} ok",
+            }
+
+        def _metadata_token():
+            req = urllib.request.Request(
+                METADATA_TOKEN_URL,
+                headers={"Metadata-Flavor": "Google"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    "metadata token mint failed HTTP "
+                    f"{exc.code}: Workload Identity is not bound to a GCP service "
+                    f"account with Secret Manager access for this worker pod ({body})"
+                )
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    "metadata server unreachable "
+                    f"({getattr(exc, 'reason', exc)}): the worker pod has no GKE "
+                    "Workload Identity metadata endpoint (expected off-cluster, e.g. kind)"
+                )
+            token = (payload or {}).get("access_token") if isinstance(payload, dict) else None
+            if not token:
+                raise RuntimeError("metadata token endpoint returned no access_token")
+            return token
+
+        def _secret_json(project, secret_name):
+            token = _metadata_token()
+            name = f"projects/{project}/secrets/{secret_name}/versions/latest:access"
+            req = urllib.request.Request(
+                f"https://secretmanager.googleapis.com/v1/{name}",
+                headers={"Authorization": f"Bearer {token}"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    f"secret manager access HTTP {exc.code} for '{secret_name}': the "
+                    f"worker GSA lacks secretmanager.secretAccessor on this secret, or "
+                    f"the secret is not loaded yet ({body})"
+                )
+            encoded = ((payload.get("payload") or {}).get("data") or "").strip()
+            if not encoded:
+                raise RuntimeError(f"secret '{secret_name}' has no payload data")
+            raw = base64.b64decode(encoded).decode("utf-8").strip()
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                raise RuntimeError(f"secret '{secret_name}' is not valid JSON (expected apikey/secret fields)")
+            apikey = _text(parsed.get("apikey") or parsed.get("api_key") or parsed.get("key"))
+            secret = _text(parsed.get("secret") or parsed.get("shared_secret"))
+            if not apikey or not secret:
+                raise RuntimeError(f"secret '{secret_name}' JSON is missing apikey/secret fields")
+            return apikey, secret
+
+        def _signature(apikey, secret, ts=None):
+            if ts is None:
+                ts = int(time.time())
+            digest = hashlib.sha256(f"{apikey}{secret}{int(ts)}".encode("utf-8")).hexdigest()
+            return digest, int(ts)
+
+        def _decode_body(resp_or_exc, raw_bytes):
+            encoding = ""
+            try:
+                encoding = (resp_or_exc.headers.get("Content-Encoding") or "").lower()
+            except Exception:
+                encoding = ""
+            if "gzip" in encoding:
+                try:
+                    raw_bytes = gzip.decompress(raw_bytes)
+                except Exception:
+                    pass
+            return raw_bytes.decode("utf-8", errors="replace")
+
+        def _request(http_method, url, apikey, secret):
+            signature, _ts = _signature(apikey, secret)
+            headers = {
+                "Api-key": apikey,
+                "X-Signature": signature,
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+            }
+            req = urllib.request.Request(url, headers=headers, method=http_method)
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    raw = _decode_body(resp, resp.read())
+                    return True, resp.status, json.loads(raw or "{}")
+            except urllib.error.HTTPError as exc:
+                raw = _decode_body(exc, exc.read())
+                try:
+                    parsed = json.loads(raw or "{}")
+                except Exception:
+                    parsed = {"raw": raw[:2000]}
+                return False, exc.code, parsed
+            except urllib.error.URLError as exc:
+                return False, 0, {"error": str(getattr(exc, "reason", exc))}
+            except Exception as exc:
+                return False, 0, {"error": f"{type(exc).__name__}: {exc}"}
+
+        def _seg(value):
+            return urllib.parse.quote(_text(value), safe="")
+
+        def _transfer_summary(service):
+            service = _as_dict(service)
+            vehicle = _as_dict(service.get("vehicle"))
+            category = _as_dict(service.get("category"))
+            price = _as_dict(service.get("price"))
+            content = _as_dict(service.get("content"))
+            return {
+                "id": service.get("id"),
+                "transferType": service.get("transferType"),
+                "vehicle_code": vehicle.get("code"),
+                "vehicle_name": vehicle.get("name"),
+                "category_code": category.get("code"),
+                "category_name": category.get("name"),
+                "total_amount": price.get("totalAmount"),
+                "currency": price.get("currencyId"),
+                "direction": service.get("direction"),
+                "rateKey": service.get("rateKey"),
+                "transfer_detail_info": content.get("transferDetailInfo") if isinstance(content, dict) else None,
+            }
+
+        def _tools_list():
+            tools = [
+                {
+                    "name": "search_transfers",
+                    "title": "Search transfer availability",
+                    "description": "HotelBeds Transfers availability between two points for a date. Required: from_type/from_code, to_type/to_code, outbound datetime. Optional: inbound, adults, children, infants, language.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["from_code", "to_code", "outbound"],
+                        "properties": {
+                            "from_type": {"type": "string", "enum": list(VALID_TYPES), "default": "IATA"},
+                            "from_code": {"type": "string", "description": "Pickup code, e.g. CDG"},
+                            "to_type": {"type": "string", "enum": list(VALID_TYPES), "default": "ATLAS"},
+                            "to_code": {"type": "string", "description": "Drop-off code (ATLAS hotel/zone code or IATA)"},
+                            "outbound": {"type": "string", "description": "Departure dateTime, e.g. 2026-07-25T10:00:00"},
+                            "inbound": {"type": "string", "description": "Return dateTime; omit for one-way"},
+                            "adults": {"type": "integer", "minimum": 1, "default": 1},
+                            "children": {"type": "integer", "minimum": 0, "default": 0},
+                            "infants": {"type": "integer", "minimum": 0, "default": 0},
+                            "language": {"type": "string", "default": "en"},
+                        },
+                    },
+                },
+            ]
+            return _ok("tools/list", {"tools": tools, "tool_count": len(tools)}, f"HotelBeds Transfers MCP — {len(tools)} tools available", {"tool_count": len(tools)})
+
+        def _search_transfers(args, base, apikey, secret, limit):
+            from_type = _text(args.get("from_type") or "IATA").upper()
+            to_type = _text(args.get("to_type") or "ATLAS").upper()
+            if from_type not in VALID_TYPES or to_type not in VALID_TYPES:
+                return _error("search_transfers", f"from_type/to_type must be one of {', '.join(VALID_TYPES)}", code="validation_error")
+            from_code = _text(args.get("from_code"))
+            to_code = _text(args.get("to_code"))
+            outbound = _text(args.get("outbound"))
+            if not from_code or not to_code or not outbound:
+                return _error("search_transfers", "from_code, to_code, and outbound are required", code="validation_error")
+            language = _text(args.get("language") or "en")
+            adults = max(1, _int(args.get("adults"), 1))
+            children = max(0, _int(args.get("children"), 0))
+            infants = max(0, _int(args.get("infants"), 0))
+            inbound = _text(args.get("inbound"))
+            # GET /transfer-api/1.0/availability/{language}/from/{fromType}/{fromCode}/
+            #     to/{toType}/{toCode}/{outbound}[/{inbound}]/{adults}/{children}/{infants}
+            segments = [
+                _seg(language),
+                "from", _seg(from_type), _seg(from_code),
+                "to", _seg(to_type), _seg(to_code),
+                _seg(outbound),
+            ]
+            if inbound:
+                segments.append(_seg(inbound))
+            segments.extend([str(adults), str(children), str(infants)])
+            url = base + AVAILABILITY_BASE + "/" + "/".join(segments)
+            ok, status_code, body = _request("GET", url, apikey, secret)
+            if not ok:
+                return _error("search_transfers", f"HotelBeds transfers availability failed HTTP {status_code}", body, status_code)
+            services = _as_list(body.get("services") if isinstance(body, dict) else [])
+            summarised = [_transfer_summary(s) for s in services[:limit] if isinstance(s, dict)]
+            currency = None
+            for transfer in summarised:
+                if transfer.get("currency"):
+                    currency = transfer.get("currency")
+                    break
+            return _ok(
+                "search_transfers",
+                {
+                    "source": "hotelbeds-transfers",
+                    "hotelbeds_env": hotelbeds_env,
+                    "status_code": status_code,
+                    "transfers": summarised,
+                    "transfers_total": len(summarised),
+                    "raw_total": len(services),
+                    "outbound": outbound,
+                    "inbound": inbound or None,
+                    "meta": {"count": len(summarised), "source": "hotelbeds-transfers", "currency": currency},
+                },
+                f"{len(summarised)} HotelBeds transfer(s)",
+                {"status_code": status_code, "transfers_total": len(summarised)},
+            )
+
+        globals().update({
+            "base64": base64,
+            "gzip": gzip,
+            "hashlib": hashlib,
+            "json": json,
+            "time": time,
+            "urllib": urllib,
+            "METADATA_TOKEN_URL": METADATA_TOKEN_URL,
+            "AVAILABILITY_BASE": AVAILABILITY_BASE,
+            "VALID_TYPES": VALID_TYPES,
+            "_as_dict": _as_dict,
+            "_as_list": _as_list,
+            "_cap": _cap,
+            "_text": _text,
+            "_int": _int,
+            "_error": _error,
+            "_ok": _ok,
+            "_metadata_token": _metadata_token,
+            "_secret_json": _secret_json,
+            "_signature": _signature,
+            "_decode_body": _decode_body,
+            "_request": _request,
+            "_seg": _seg,
+            "_transfer_summary": _transfer_summary,
+            "_tools_list": _tools_list,
+            "_search_transfers": _search_transfers,
+        })
+
+        method_name = _text(method, "tools/list").lower()
+        tool_name = _text(tool).lower()
+        args = _as_dict(arguments)
+        base = _text(hotelbeds_api_base, "https://api.test.hotelbeds.com").rstrip("/")
+        project = _text(google_project, "noetl-demo-19700101")
+        secret_name = _text(hotelbeds_secret_name, "hotelbeds-transfers-test")
+        limit = _cap(max_transfers, default=10, maximum=50)
+
+        if method_name == "tools/list":
+            result = _tools_list()
+        elif method_name != "tools/call":
+            result = _error(method_name, f"Unknown MCP method: {method_name}")
+        elif tool_name != "search_transfers":
+            result = _error(tool_name or "unknown", f"Unknown tool: {tool_name}. Run tools/list to see the catalog.")
+        else:
+            try:
+                apikey, secret = _secret_json(project, secret_name)
+            except Exception as exc:
+                result = _error(tool_name, "HotelBeds transfers credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable")
+            if "result" not in locals() or result is None:
+                try:
+                    result = _search_transfers(args, base, apikey, secret, limit)
+                except Exception as exc:
+                    result = _error(tool_name, "HotelBeds transfers tool failed", f"{type(exc).__name__}: {exc}")
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
