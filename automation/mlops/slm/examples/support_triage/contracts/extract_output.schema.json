@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://noetl.github.io/slm/examples/support_triage/extract_output.schema.json",
+  "title": "SupportTriageOutput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["category", "priority", "render_intent"],
+  "properties": {
+    "category": { "type": "string", "enum": ["billing", "technical", "account", "other"] },
+    "priority": { "type": "string", "enum": ["low", "medium", "high"] },
+    "render_intent": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "type": "string" } }
+    }
+  }
+}
