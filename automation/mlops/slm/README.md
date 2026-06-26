@@ -98,7 +98,38 @@ loop → Phase C).
 
 ## Not in Phase A (gated)
 
-`finetune` / `package` (G1 GPU-job dispatch + G2 long-async + G3 registry),
+`finetune` / `package` (G1 GPU-job dispatch + G2 long-async),
 `deploy` / `shadow_eval`, `traffic_capture` / `drift_monitor` /
 `retrain_orchestrator` (Phase C loop). The model-choice decision is **deferred
 until this baseline** informs it.
+
+## G3 registry (model / dataset / eval / release) — noetl/ai-meta#146
+
+The registry is the versioned, queryable catalog index the stages write to:
+`dataset_build` registers a dataset, `finetune` registers a model + lineage +
+metrics, `eval` registers an eval run, `package` registers a serving-ready
+release. Large artifact bytes (datasets, adapter weights, eval reports) live in
+the object store (the noetl/ai-meta#104 result tier); a registry entry records
+*where* they live (`artifact_uri`) + *how they were produced* (`metadata` +
+`lineage`).
+
+- **Client lib**: [`lib/slm_registry.py`](lib/slm_registry.py) — `put_artifact`
+  / `get_artifact` (object store), `register` / `resolve` / `list`, and the
+  store-then-register convenience `put_and_register`. Server-mediated: it calls
+  `/api/internal/registry/*` + `/api/internal/objects/*` with the internal
+  service-account token (data-access-boundary.md — never direct DB / object
+  access).
+- **URN scheme**: an entry is addressed by `registry://<kind>/<name>/<version>`
+  (or the fully-qualified `registry://<tenant>/<project>/<kind>/<name>/<version>`);
+  `<version>` is an integer or `latest`. Resolves like a result-tier `noetl://`
+  URN.
+- **Demo / smoke**: [`registry.yaml`](registry.yaml) runs
+  [`lib/slm_registry_smoke.py`](lib/slm_registry_smoke.py) — the end-to-end
+  register / list / resolve / lineage / artifact-put+get flow. The server must
+  run with `NOETL_REGISTRY_ENABLED=true` (additive / default-off).
+
+```bash
+NOETL_SERVER_URL=http://localhost:8082 \
+NOETL_INTERNAL_API_TOKEN=<token> \
+python3 repos/ops/automation/mlops/slm/lib/slm_registry_smoke.py
+```
