@@ -1,0 +1,66 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: slm_dataset_build
+  path: automation/mlops/slm/dataset_build
+  description: |
+    Generic SLM dataset_build template (MLOps-as-NoETL-playbooks).
+    Domain-agnostic: driven entirely by an org slm.config.yaml passed as
+    `config`. Loads the seed corpus, runs each turn through the configured
+    deterministic oracle (the zero-cost label floor; a teacher source is a
+    pluggable upgrade — RFC decision #6), schema-validates every label +
+    widget envelope, splits train/eval, and writes versioned train.jsonl /
+    eval.jsonl + a manifest.json (the dataset-registry stub; G3 makes it a
+    real catalog resource — noetl/ai-meta#146).
+
+    Reference instance: noetl/travel slm.config.yaml (Phase A, #140 / #64).
+    Tracks noetl/ai-meta#140.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # the org's config instance (path relative to the noetl invocation cwd, or absolute)
+  config: repos/travel/automation/mlops/slm/travel/slm.config.yaml
+  # the generic engine library dir
+  slm_lib: repos/ops/automation/mlops/slm/lib
+  # optional output dir override ("" => use the config's dataset_build.output_dir)
+  out: ""
+
+workflow:
+  - step: start
+    desc: Entry point
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: build_dataset
+
+  - step: build_dataset
+    desc: Run the generic dataset_build engine against the org config
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          CONFIG='{{ workload.config }}'
+          LIB='{{ workload.slm_lib }}'
+          OUT='{{ workload.out }}'
+          echo "SLM dataset_build :: config=${CONFIG}"
+          if [ -n "${OUT}" ]; then
+            python3 "${LIB}/slm_dataset_build.py" --config "${CONFIG}" --out "${OUT}"
+          else
+            python3 "${LIB}/slm_dataset_build.py" --config "${CONFIG}"
+          fi
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

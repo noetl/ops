@@ -1,0 +1,8 @@
+{"id": "s1", "intent_label": "billing", "event_type": "user_message", "event_payload": {"text": "I was charged twice for my subscription, need a refund"}, "slot_state": {}}
+{"id": "s2", "intent_label": "technical", "event_type": "user_message", "event_payload": {"text": "the app keeps crashing with an error on startup"}, "slot_state": {}}
+{"id": "s3", "intent_label": "account", "event_type": "user_message", "event_payload": {"text": "I can't login, my password reset email never arrives"}, "slot_state": {}}
+{"id": "s4", "intent_label": "billing", "event_type": "user_message", "event_payload": {"text": "my invoice is wrong this month"}, "slot_state": {}}
+{"id": "s5", "intent_label": "technical", "event_type": "user_message", "event_payload": {"text": "checkout is broken and fails immediately, urgent"}, "slot_state": {}}
+{"id": "s6", "intent_label": "account", "event_type": "user_message", "event_payload": {"text": "my account is locked, need access asap"}, "slot_state": {}}
+{"id": "s7", "intent_label": "other", "event_type": "user_message", "event_payload": {"text": "do you ship to Canada?"}, "slot_state": {}}
+{"id": "s8", "intent_label": "other", "event_type": "user_message", "event_payload": {"text": "just saying thanks for the great product"}, "slot_state": {}}

@@ -1,0 +1,64 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: slm_eval
+  path: automation/mlops/slm/eval
+  description: |
+    Generic SLM eval template (MLOps-as-NoETL-playbooks).
+    Domain-agnostic: driven entirely by an org slm.config.yaml passed as
+    `config`. Given the dataset's eval split + a candidate producer (Phase A:
+    the deterministic oracle, the trivial candidate that validates the harness
+    and pins the FLOOR numbers), computes the configured metrics — match-rate
+    vs the floor + the (deferred) teacher ceiling, tool/slot/render-intent
+    accuracy, widget-schema validity, vocab validity, and candidate latency —
+    gates them against the config targets, and writes eval_report.json.
+
+    Reference instance: noetl/travel slm.config.yaml (Phase A, #140 / #64).
+    Tracks noetl/ai-meta#140.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  config: repos/travel/automation/mlops/slm/travel/slm.config.yaml
+  slm_lib: repos/ops/automation/mlops/slm/lib
+  # optional dataset dir override ("" => derive from the config dataset_build block)
+  dataset: ""
+
+workflow:
+  - step: start
+    desc: Entry point
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: run_eval
+
+  - step: run_eval
+    desc: Run the generic eval engine against the org config + dataset eval split
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          CONFIG='{{ workload.config }}'
+          LIB='{{ workload.slm_lib }}'
+          DATASET='{{ workload.dataset }}'
+          echo "SLM eval :: config=${CONFIG}"
+          if [ -n "${DATASET}" ]; then
+            python3 "${LIB}/slm_eval.py" --config "${CONFIG}" --dataset "${DATASET}"
+          else
+            python3 "${LIB}/slm_eval.py" --config "${CONFIG}"
+          fi
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

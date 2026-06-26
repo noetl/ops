@@ -1,0 +1,39 @@
+# Toy second-domain config — proves the generic slm/* template pack is
+# config-only per domain (RFC §2.2 "second domain" extraction test).
+# Runs the SAME automation/mlops/slm/{dataset_build,eval} playbooks with zero
+# framework edits. A different contract shape from travel (no tools, no widgets).
+slm_domain:
+  name: support_triage
+  description: "Toy support-ticket triage — framework config-only validation fixture"
+
+  roles:
+    - id: extract
+      output_schema: contracts/extract_output.schema.json
+      deterministic_oracle:
+        kind: python_module
+        module: oracle.py
+        fn: extract
+    - id: render
+      # no output_schema / no widget_schema_dir — this domain emits no widgets
+      deterministic_oracle:
+        kind: python_module
+        module: oracle.py
+        fn: render
+
+  data:
+    seed_corpus: datasets/seed/turns.jsonl
+    split: { eval_ratio: 0.3, seed: "triage-7" }
+
+  dataset_build:
+    label_source: deterministic_oracle
+    run_fn: run_turn
+    output_dir: datasets/build
+    version: v1
+
+  eval:
+    candidate: deterministic_oracle
+    floor: deterministic_oracle
+    ceiling: teacher.primary
+    metrics:
+      - { id: extract_schema_validity, target: 1.0 }
+      - { id: render_intent_match, target: 0.98 }
