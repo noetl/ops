@@ -23,6 +23,92 @@ Vertex `responseSchema` converter, `slm_common.py` — config load, config-relat
 path resolution, JSONL IO, and a stdlib draft-07 JSON-Schema validator because the
 runtime has no `jsonschema`).
 
+## Phase B — finetune / eval(SLM) / package (noetl/ai-meta#141)
+
+Phase B adds the three stages that **train** and ship a model, built on the
+G1/G2/G3 platform foundations:
+
+| Playbook | Role |
+| :-- | :-- |
+| `finetune.yaml` | Train a SINGLE multitask LoRA (extract + render in one adapter) on the Phase-1 train split → write the adapter artifact → register a G3 model (lineage → dataset). `mode=local` runs the CPU **stub** backend (the validation path); `mode=container` dispatches the real qwen2.5-1.5b / llama-3.2-1b LoRA as a **G1** GPU k8s Job with **G2** poll-completion. |
+| `eval.yaml` (`candidate=slm`) | Pull the registered model, score it on the eval split under the SAME schema-constrained decoding the ceiling used, report validity vs the oracle floor + per-field match gaps → register a G3 eval (lineage → model). |
+| `package.yaml` | Export the model (peft: merge the adapter), write a model card with metrics, bundle, register a G3 release (lineage → model + eval). |
+
+`lib/` Phase-B engines: `slm_finetune.py` (training), `slm_infer.py` (the
+serving runner — stub retrieval + peft LoRA, both under constrained decoding),
+`slm_package.py` (release), plus `slm_registry.py` now carries a **local
+file-backed backend** (`NOETL_REGISTRY_BACKEND=local`) that mirrors the G3
+server semantics so the whole spine runs offline.
+
+### Two backends, one artifact contract
+
+The Phase-1 finding — *the lever is schema-constrained decoding, not model
+size* — is the design center. Both backends propose an output and the contract
+schemas dispose:
+
+- **`stub`** — pure-stdlib, CPU, zero heavy deps. A nearest-prototype retrieval
+  "model" over the multitask examples. This is the **tiny/dummy model** the
+  validation runs end-to-end so the orchestration (dataset → finetune →
+  registry → eval → release) is demonstrably correct without a GPU. Every
+  emitted output is schema-constrained, so widget-envelope + extract validity
+  stay 100% by construction.
+- **`peft`** — the real LoRA fine-tune via PEFT/transformers, generated under
+  JSON-schema / grammar-constrained decoding. Import-guarded (absent
+  torch/transformers/peft it raises a clear "GPU runtime not installed"), so it
+  only runs inside the G1 GPU training/serving image.
+
+### Offline CPU smoke (the reproducible validation)
+
+```bash
+# from automation/mlops/slm
+NOETL_REGISTRY_BACKEND=local \
+python3 lib/slm_pipeline_smoke.py \
+  --config /abs/path/repos/travel/automation/mlops/slm/travel/slm.config.yaml \
+  --dataset-version v1_constrained
+# asserts the dataset->model->eval->release lineage DAG + that constrained
+# decoding holds schema validity at 1.0.  Exits non-zero on any failure.
+```
+
+Or via the playbooks (`-r local`), with the same local registry backend:
+
+```bash
+export NOETL_REGISTRY_BACKEND=local NOETL_REGISTRY_LOCAL_DIR=/tmp/slm_registry
+noetl exec automation/mlops/slm/finetune.yaml -r local
+noetl exec automation/mlops/slm/eval.yaml -r local \
+  --set candidate=slm --set register=true --set dataset_version=v1_constrained
+noetl exec automation/mlops/slm/package.yaml -r local
+```
+
+The validation outcome on the travel v1_constrained dataset: the stub model
+holds **100% schema validity** (widget + extract + tool/intent vocab) — it
+matches the oracle floor's validity target — while the per-field **match** gate
+honestly FAILS (`tool_match≈0.69`, `widget_type_match≈0.50`, …) because a tiny
+retrieval model over 29 train turns is not production-quality. That failing gate
+is the signal a real LoRA must close; it is not faked to 1.0.
+
+### Real GPU training — what the operator must provision (gated)
+
+`finetune.yaml mode=container` and the `peft` backend are **gated** on infra the
+user must approve + stand up. None of it is deployed to prod by this work:
+
+1. **GPU node pool** — a GKE pool with GPUs (e.g. `nvidia-l4`), tainted
+   `nvidia.com/gpu=present:NoSchedule`, labelled
+   `cloud.google.com/gke-accelerator=nvidia-l4`, with the NVIDIA device-plugin
+   DaemonSet.
+2. **Training image** `ghcr.io/noetl/slm-trainer:<tag>` — python3 + CUDA torch +
+   transformers + peft + datasets + accelerate + the `lib/` engine at
+   `/opt/slm/lib`; base-model weights baked or runtime-pullable.
+3. **Dataset PVC** `slm-data` — pre-populated with `slm.config.yaml` + the built
+   dataset under `/data/datasets/build/<project>/<version>/`, writable for the
+   `/data/models` output.
+4. **ServiceAccount** `noetl-slm-trainer` — Workload-Identity-bound to a GSA with
+   registry + GCS write, carrying the internal-API token Secret
+   `noetl-internal-api`.
+5. **Platform flags (review-only today, NOT on prod)** — server
+   `NOETL_REGISTRY_ENABLED=true` (G3), worker `NOETL_CONTAINER_COMPLETION_POLL=true`
+   (G2), G1 container tool (tools ≥ 3.19.0) on the worker image.
+6. **Worker RBAC** — the worker SA needs `batch/jobs.create` in the Job namespace.
+
 ## Schema-constrained teacher (the Phase 1 finding)
 
 The first on-cluster ceiling run (raw `gemini-2.5-pro`, no output-schema

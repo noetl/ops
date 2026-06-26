@@ -171,10 +171,52 @@ def _compute_ceiling(examples, extract_schema, widget_dir, tool_vocab, intent_vo
 def _default_dataset_dir(dom, cfg_dir):
     db = dom.get("dataset_build", {})
     out_dir = C.resolve(cfg_dir, db.get("output_dir", "datasets/build"))
-    return os.path.join(out_dir, dom["name"], db.get("version", "v1"))
+    version = os.environ.get("SLM_DATASET_VERSION") or db.get("version", "v1")
+    return os.path.join(out_dir, dom["name"], version)
 
 
-def evaluate(config_path, dataset_dir=None, out_override=None):
+def _registry_namespace(dom):
+    ns = dom.get("improvement", {}).get("governance", {}).get("registry_namespace", "default/default")
+    t, _, p = ns.partition("/")
+    return (t or "default"), (p or dom["name"])
+
+
+def _resolve_model_artifact(dom, model_ref, tenant, project):
+    """Resolve a model to a local artifact path by pulling it from the G3
+    registry.  ``model_ref`` is a ``registry://`` URN or ``latest`` (default:
+    the newest ``<domain>_slm_multitask`` model entry).  Returns
+    ``(local_tar_path, meta)``."""
+    import tempfile
+    try:
+        import slm_registry as REG
+    except Exception as exc:
+        raise SystemExit("eval candidate=slm needs slm_registry to fetch the model artifact: %s" % exc)
+    client = REG.make_client()
+    t, p = _registry_namespace(dom)
+    tenant = tenant or t
+    project = project or p
+    model_name = "%s_slm_multitask" % dom["name"]
+    if model_ref and model_ref not in ("latest", ""):
+        entry = client.resolve(model_ref, tenant=tenant, project=project)
+    else:
+        entries = client.list(kind="model", name=model_name, tenant=tenant, project=project, limit=1)
+        entry = entries[0] if entries else None
+    if not entry:
+        raise SystemExit("no registered model found (ref=%r name=%r tenant=%s project=%s)"
+                         % (model_ref, model_name, tenant, project))
+    key = entry.get("artifact_uri")
+    if not key:
+        raise SystemExit("model entry %s has no artifact_uri" % entry.get("ref"))
+    data = client.get_artifact(key)
+    fd, tar_path = tempfile.mkstemp(suffix=".tar.gz", prefix="slm_model_")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    return tar_path, {"model_ref": entry["ref"], "model_version": entry.get("version"),
+                      "tenant": tenant, "project": project}
+
+
+def evaluate(config_path, dataset_dir=None, out_override=None, *, candidate_override=None,
+             model_ref=None, model_artifact=None, register=False, tenant=None, project=None):
     cfg, cfg_dir = C.load_config(config_path)
     dom = cfg["slm_domain"]
     name = dom["name"]
@@ -182,7 +224,7 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
         dataset_dir = _default_dataset_dir(dom, cfg_dir)
     roles = dom.get("roles", [])
     eval_cfg = dom.get("eval", {})
-    candidate = eval_cfg.get("candidate", "deterministic_oracle")
+    candidate = candidate_override or eval_cfg.get("candidate", "deterministic_oracle")
 
     extract_role = _role(roles, "extract")
     render_role = _role(roles, "render")
@@ -197,11 +239,33 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
     intent_vocab = set(getattr(oracle, "RENDER_INTENT_VOCAB", []))
     run_fn = getattr(oracle, dom.get("dataset_build", {}).get("run_fn", "run_turn"))
 
-    if candidate != "deterministic_oracle":
-        raise SystemExit(
-            "Phase A eval candidate=deterministic_oracle only; the SLM candidate "
-            "lands once finetune/serve ship (gated on G1/G2/G3)."
-        )
+    # ── pick the candidate producer ──────────────────────────────────────────
+    # deterministic_oracle → the Phase-A trivial candidate (pins the floor +
+    #   validates the harness; match-vs-floor == 1.0 by construction).
+    # slm                  → the Phase-B fine-tuned candidate: load the model
+    #   artifact (from the G3 registry or a local path) and run it under
+    #   schema-constrained decoding.  match-vs-floor now measures REAL model
+    #   quality (the oracle label is the target), and the absolute validity rates
+    #   are the headline "does the SLM match the floor's 100% schema validity"
+    #   numbers.
+    slm_meta = None
+    if candidate == "deterministic_oracle":
+        produce = run_fn
+    elif candidate == "slm":
+        import slm_infer as INFER
+        artifact = model_artifact
+        if not artifact:
+            artifact, slm_meta = _resolve_model_artifact(
+                dom, model_ref, tenant, project)
+        runner = INFER.SlmRunner(
+            artifact, extract_schema=extract_schema, widget_dir=widget_dir,
+            tool_vocab=tool_vocab, intent_vocab=intent_vocab)
+        produce = runner.run_turn
+        slm_meta = dict(slm_meta or {})
+        slm_meta.update({"backend": runner.backend, "base_model": runner.manifest.get("base_model"),
+                         "artifact": artifact if isinstance(artifact, str) else "<bytes>"})
+    else:
+        raise SystemExit("unknown eval candidate %r (expected deterministic_oracle | slm)" % candidate)
 
     eval_path = os.path.join(dataset_dir, "eval.jsonl")
     examples = C.read_jsonl(eval_path)
@@ -223,7 +287,7 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
         }
         label = exmpl["labels"]
         t0 = time.perf_counter()
-        produced = run_fn(turn)
+        produced = produce(turn)
         latencies.append((time.perf_counter() - t0) * 1000.0)
 
         cand_ex, cand_rd = produced["extract"], produced["render"]
@@ -304,10 +368,23 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
         if not ok:
             gate_failures.append("%s=%.4f < target %.4f" % (mid, val, target))
 
+    is_slm = candidate == "slm"
+    floor_note = (
+        "Candidate is the fine-tuned SLM; match-vs-floor measures REAL model "
+        "quality against the oracle labels (the target), and the absolute "
+        "validity rates answer 'does the SLM hold the floor's 100%% schema "
+        "validity'. The deterministic oracle remains the safety floor the "
+        "model must not regress below."
+        if is_slm else
+        "Candidate == deterministic oracle, so match-vs-floor == 1.0 by "
+        "construction; this is the harness sanity check. The load-bearing "
+        "Phase-A numbers are the absolute validity rates + the floor latency below."
+    )
     report = {
         "domain": name,
         "dataset_dir": dataset_dir,
         "candidate": candidate,
+        "model": slm_meta if is_slm else None,
         "eval_count": len(examples),
         "metrics": computed,
         "gated_metrics": gated,
@@ -315,7 +392,7 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
         "baseline": {
             "floor": {
                 "source": eval_cfg.get("floor", "deterministic_oracle"),
-                "note": "Candidate == deterministic oracle, so match-vs-floor == 1.0 by construction; this is the harness sanity check. The load-bearing Phase-A numbers are the absolute validity rates + the floor latency below.",
+                "note": floor_note,
                 "floor_latency_ms_p50": p50,
                 "floor_latency_ms_p95": p95,
             },
@@ -330,6 +407,8 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
         "by_render_intent": by_intent,
         "gate": {"passed": len(gate_failures) == 0, "failures": gate_failures},
         "phase": (
+            "B — fine-tuned SLM candidate vs the deterministic floor"
+            if is_slm else
             "1 — deterministic floor + teacher ceiling; floor↔ceiling gap computed"
             if ceiling is not None
             else "A — deterministic floor + harness validation; ceiling deferred"
@@ -338,6 +417,33 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
 
     out_path = out_override or os.path.join(dataset_dir, "eval_report.json")
     C.write_json(out_path, report)
+
+    # ── register the eval run into G3 (lineage → the evaluated model) ────────
+    report["registry"] = None
+    if register and is_slm:
+        try:
+            import slm_registry as REG
+            client = REG.make_client()
+            t, p = _registry_namespace(dom)
+            t = tenant or t
+            p = project or p
+            model_ref_resolved = (slm_meta or {}).get("model_ref")
+            with open(out_path, "rb") as fh:
+                report_bytes = fh.read()
+            entry = client.put_and_register(
+                "eval", "%s_slm_multitask" % name, "eval_report.json", report_bytes,
+                media_type="application/json",
+                metadata={"candidate": candidate, "metrics": computed,
+                          "gate": report["gate"], "latency_ms": report["latency_ms"],
+                          "model": slm_meta, "eval_count": len(examples)},
+                lineage=[model_ref_resolved] if model_ref_resolved else None,
+                tags=["slm", name, "eval"], tenant=t, project=p)
+            report["registry"] = {"eval_ref": entry["ref"], "version": entry["version"],
+                                  "model_ref": model_ref_resolved, "tenant": t, "project": p}
+            C.write_json(out_path, report)
+        except Exception as exc:  # registry optional — don't fail the eval
+            report["registry"] = {"error": str(exc)}
+
     return report, out_path
 
 
@@ -346,13 +452,26 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--candidate", default=None, choices=["deterministic_oracle", "slm"],
+                    help="override the config eval.candidate (slm = the fine-tuned model)")
+    ap.add_argument("--model-ref", default=None, help="registry:// URN or 'latest' (slm candidate)")
+    ap.add_argument("--model-artifact", default=None, help="local model artifact dir/.tar.gz (slm candidate)")
+    ap.add_argument("--register", action="store_true", help="register the eval run into G3")
+    ap.add_argument("--tenant", default=None)
+    ap.add_argument("--project", default=None)
     args = ap.parse_args()
-    report, out_path = evaluate(args.config, args.dataset, args.out)
+    report, out_path = evaluate(
+        args.config, args.dataset, args.out, candidate_override=args.candidate,
+        model_ref=args.model_ref, model_artifact=args.model_artifact,
+        register=args.register, tenant=args.tenant, project=args.project)
     print("=== eval complete ===")
     print("report:", out_path)
+    print("candidate:", report["candidate"], "| model:", json.dumps(report.get("model")))
     print(json.dumps(report["metrics"], indent=2))
     print("latency_ms:", json.dumps(report["latency_ms"]))
     print("gate:", json.dumps(report["gate"]))
+    if report.get("registry"):
+        print("registry:", json.dumps(report["registry"]))
     ceil = report["baseline"]["ceiling"]
     if ceil.get("status") == "computed":
         print("=== CEILING (floor↔teacher) ===")
