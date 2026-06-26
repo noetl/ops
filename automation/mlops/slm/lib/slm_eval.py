@@ -58,6 +58,116 @@ def _widget_types(render):
     return [w.get("widget_type") for w in render.get("widgets", [])]
 
 
+def _intent(extract):
+    return extract.get("render_intent", {}).get("kind")
+
+
+def _compute_ceiling(examples, extract_schema, widget_dir, tool_vocab, intent_vocab):
+    """FLOOR↔CEILING gap.
+
+    For every eval example that carries a teacher (ceiling) label alongside the
+    deterministic-oracle (floor) label, measure per-field agreement between the
+    two.  The gap = 1 - agreement is the load-bearing deliverable: it is exactly
+    the set of cases where the cheap deterministic floor diverges from the
+    high-quality teacher, i.e. what a fine-tuned SLM must learn to close.  Also
+    reports the teacher's own absolute validity (schema / vocab / widget), since
+    a noisy ceiling would cap how high the SLM can usefully aim.
+    """
+    paired = [e for e in examples if e.get("labels_teacher")]
+    n = len(paired)
+    if n == 0:
+        return None
+    agree = {
+        "tool_match": 0,
+        "arg_fidelity": 0,
+        "slot_update_match": 0,
+        "render_intent_match": 0,
+        "widget_type_match": 0,
+    }
+    t_ext_valid = t_tool_vocab_ok = t_intent_vocab_ok = 0
+    t_total_env = t_valid_env = 0
+    divergences = []
+    by_field_div = {k: 0 for k in agree}
+
+    for e in paired:
+        f_ex, f_rd = e["labels"]["extract"], e["labels"]["render"]
+        t_ex, t_rd = e["labels_teacher"]["extract"], e["labels_teacher"]["render"]
+
+        checks = {
+            "tool_match": _first_tool(f_ex) == _first_tool(t_ex),
+            "arg_fidelity": _first_args(f_ex) == _first_args(t_ex),
+            "slot_update_match": f_ex.get("slot_updates") == t_ex.get("slot_updates"),
+            "render_intent_match": _intent(f_ex) == _intent(t_ex),
+            "widget_type_match": _widget_types(f_rd) == _widget_types(t_rd),
+        }
+        for k, ok in checks.items():
+            if ok:
+                agree[k] += 1
+            else:
+                by_field_div[k] += 1
+        if not all(checks.values()):
+            divergences.append(
+                {
+                    "id": e.get("id"),
+                    "intent_label": e.get("intent_label"),
+                    "text": (e.get("input", {}).get("event_payload") or {}).get("text"),
+                    "diverged_fields": [k for k, ok in checks.items() if not ok],
+                    "floor": {
+                        "first_tool": _first_tool(f_ex),
+                        "render_intent": _intent(f_ex),
+                        "widget_types": _widget_types(f_rd),
+                    },
+                    "teacher": {
+                        "first_tool": _first_tool(t_ex),
+                        "render_intent": _intent(t_ex),
+                        "widget_types": _widget_types(t_rd),
+                    },
+                }
+            )
+
+        # teacher absolute validity
+        if extract_schema and not C.validate_against_schema(t_ex, extract_schema):
+            t_ext_valid += 1
+        tft = _first_tool(t_ex)
+        if not tft or tft in tool_vocab:
+            t_tool_vocab_ok += 1
+        if _intent(t_ex) in intent_vocab:
+            t_intent_vocab_ok += 1
+        if widget_dir:
+            for w in t_rd.get("widgets", []):
+                t_total_env += 1
+                if not C.validate_envelope(w, widget_dir):
+                    t_valid_env += 1
+
+    def rate(x):
+        return round(x / n, 4)
+
+    agreement = {k: rate(v) for k, v in agree.items()}
+    gap = {k: round(1.0 - v, 4) for k, v in agreement.items()}
+    return {
+        "source": "teacher (OpenAI) labels stored on the eval split",
+        "status": "computed",
+        "paired_examples": n,
+        "floor_vs_ceiling_agreement": agreement,
+        "floor_vs_ceiling_gap": gap,
+        "divergence_count_by_field": by_field_div,
+        "teacher_validity": {
+            "extract_schema_validity": rate(t_ext_valid),
+            "tool_vocab_validity": rate(t_tool_vocab_ok),
+            "render_intent_vocab_validity": rate(t_intent_vocab_ok),
+            "widget_schema_validity": round(t_valid_env / t_total_env, 4) if t_total_env else 1.0,
+        },
+        "divergences": divergences,
+        "note": (
+            "agreement = fraction of eval turns where the deterministic floor "
+            "and the teacher ceiling produce the same value for that field; "
+            "gap = 1 - agreement = the fraction a fine-tuned SLM must learn to "
+            "win over the floor. The divergences list enumerates the concrete "
+            "turns where they disagree."
+        ),
+    }
+
+
 def _default_dataset_dir(dom, cfg_dir):
     db = dom.get("dataset_build", {})
     out_dir = C.resolve(cfg_dir, db.get("output_dir", "datasets/build"))
@@ -95,6 +205,8 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
 
     eval_path = os.path.join(dataset_dir, "eval.jsonl")
     examples = C.read_jsonl(eval_path)
+
+    ceiling = _compute_ceiling(examples, extract_schema, widget_dir, tool_vocab, intent_vocab)
 
     tool_hits = arg_hits = slot_hits = intent_hits = wt_hits = 0
     ext_valid = 0
@@ -207,15 +319,21 @@ def evaluate(config_path, dataset_dir=None, out_override=None):
                 "floor_latency_ms_p50": p50,
                 "floor_latency_ms_p95": p95,
             },
-            "ceiling": {
+            "ceiling": ceiling
+            if ceiling is not None
+            else {
                 "source": eval_cfg.get("ceiling", "teacher.primary"),
                 "status": "deferred",
-                "reason": "No teacher (OpenAI) labels on this set yet — needs teacher-token budget (RFC decision #6). Once enabled, ceiling = candidate-vs-teacher agreement.",
+                "reason": "No teacher (OpenAI) labels on this eval split — run dataset_build with an enabled teacher block (RFC decision #6). Once present, ceiling = floor↔teacher agreement per field.",
             },
         },
         "by_render_intent": by_intent,
         "gate": {"passed": len(gate_failures) == 0, "failures": gate_failures},
-        "phase": "A — deterministic floor + harness validation; ceiling deferred",
+        "phase": (
+            "1 — deterministic floor + teacher ceiling; floor↔ceiling gap computed"
+            if ceiling is not None
+            else "A — deterministic floor + harness validation; ceiling deferred"
+        ),
     }
 
     out_path = out_override or os.path.join(dataset_dir, "eval_report.json")
@@ -235,6 +353,15 @@ def main():
     print(json.dumps(report["metrics"], indent=2))
     print("latency_ms:", json.dumps(report["latency_ms"]))
     print("gate:", json.dumps(report["gate"]))
+    ceil = report["baseline"]["ceiling"]
+    if ceil.get("status") == "computed":
+        print("=== CEILING (floor↔teacher) ===")
+        print("paired:", ceil["paired_examples"])
+        print("agreement:", json.dumps(ceil["floor_vs_ceiling_agreement"]))
+        print("gap:", json.dumps(ceil["floor_vs_ceiling_gap"]))
+        print("teacher_validity:", json.dumps(ceil["teacher_validity"]))
+    else:
+        print("ceiling:", ceil.get("status"))
 
 
 if __name__ == "__main__":
