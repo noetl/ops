@@ -1,0 +1,66 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: slm_replay
+  path: automation/mlops/slm/replay
+  description: |
+    Generic SLM event-log replay ingestion (MLOps-as-NoETL-playbooks).
+    Domain-agnostic: driven by an org slm.config.yaml `data.event_log_replay`
+    block. Pulls real executions of the consuming playbook from the NoETL
+    server HTTP API (READ-ONLY — honors data-access-boundary.md: noetl.* is
+    reached only via the server API and only with GET), extracts each turn's
+    input + the production label it emitted, redacts PII (emails / phones /
+    cards / names; ISO dates preserved), and writes a corpus JSONL in the exact
+    shape dataset_build reads. That corpus is the held-out golden eval set from
+    real traffic (RFC decision #8 / noetl/ai-meta#141).
+
+    Reference instance: noetl/travel slm.config.yaml (Phase 1, #140/#141 / #64).
+    Tracks noetl/ai-meta#141.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  config: repos/travel/automation/mlops/slm/travel/slm.config.yaml
+  slm_lib: repos/ops/automation/mlops/slm/lib
+  base_url: "http://localhost:8082"     # server API base; reads are GET-only
+  path: "muno/playbooks/itinerary-planner"
+  limit: "1000"
+  out: "repos/travel/automation/mlops/slm/travel/datasets/replay/replay_corpus.jsonl"
+
+workflow:
+  - step: start
+    desc: Entry point
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: ingest_replay
+
+  - step: ingest_replay
+    desc: Pull + redact real turns from the server event log (read-only)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          echo "SLM replay :: path={{ workload.path }} base={{ workload.base_url }}"
+          python3 "${LIB}/slm_replay.py" \
+            --base-url '{{ workload.base_url }}' \
+            --path '{{ workload.path }}' \
+            --limit '{{ workload.limit }}' \
+            --out '{{ workload.out }}' \
+            --config '{{ workload.config }}'
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

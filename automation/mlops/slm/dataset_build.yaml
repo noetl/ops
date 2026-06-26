@@ -28,6 +28,27 @@ workload:
   slm_lib: repos/ops/automation/mlops/slm/lib
   # optional output dir override ("" => use the config's dataset_build.output_dir)
   out: ""
+  # optional corpus / version / limit overrides (replay run vs seed run)
+  corpus: ""
+  version: ""
+  limit: ""
+  no_teacher: ""        # set to "1" to skip the teacher ceiling layer (floor only)
+  # teacher (ceiling) credential resolution — mirrors the planner's openai_token.
+  gcp_auth: ""
+  openai_secret_path: "projects/1014428265962/secrets/openai-api-key/versions/1"
+
+# The teacher labels (ceiling) call OpenAI; the key is resolved from the keychain
+# and injected into the build step's environment as OPENAI_API_KEY (per
+# no-default-connection.md the secret is referenced by alias, never inlined; per
+# data-access-boundary.md OpenAI is an external subsystem so the call is direct).
+keychain:
+  - name: openai_token
+    kind: secrets
+    provider: gcp
+    scope: global
+    auth: "{{ gcp_auth }}"
+    map:
+      api_key: "{{ openai_secret_path }}"
 
 workflow:
   - step: start
@@ -43,18 +64,27 @@ workflow:
     desc: Run the generic dataset_build engine against the org config
     tool:
       kind: shell
+      env:
+        # teacher key — resolved from the keychain alias, never inlined or logged
+        OPENAI_API_KEY: "{{ keychain.openai_token.api_key | default('') }}"
       cmds:
         - |
           set -euo pipefail
           CONFIG='{{ workload.config }}'
           LIB='{{ workload.slm_lib }}'
           OUT='{{ workload.out }}'
+          CORPUS='{{ workload.corpus }}'
+          VERSION='{{ workload.version }}'
+          LIMIT='{{ workload.limit }}'
+          NO_TEACHER='{{ workload.no_teacher }}'
           echo "SLM dataset_build :: config=${CONFIG}"
-          if [ -n "${OUT}" ]; then
-            python3 "${LIB}/slm_dataset_build.py" --config "${CONFIG}" --out "${OUT}"
-          else
-            python3 "${LIB}/slm_dataset_build.py" --config "${CONFIG}"
-          fi
+          ARGS="--config ${CONFIG}"
+          [ -n "${OUT}" ]     && ARGS="${ARGS} --out ${OUT}"
+          [ -n "${CORPUS}" ]  && ARGS="${ARGS} --corpus ${CORPUS}"
+          [ -n "${VERSION}" ] && ARGS="${ARGS} --version ${VERSION}"
+          [ -n "${LIMIT}" ]   && ARGS="${ARGS} --limit ${LIMIT}"
+          [ -n "${NO_TEACHER}" ] && ARGS="${ARGS} --no-teacher"
+          python3 "${LIB}/slm_dataset_build.py" ${ARGS}
     next:
       spec: { mode: exclusive }
       arcs:
