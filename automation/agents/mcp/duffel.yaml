@@ -9,10 +9,39 @@ metadata:
     Order creation is test-environment only and uses Duffel wallet balance
     payments. Live orders, seat maps, card payments, and payment collection
     are out of scope for this playbook version.
+
+    Auth (test environment) — the Duffel API bearer is NEVER hardcoded here.
+    It lives in the GCP Secret Manager secret `duffel-api-test` (the operator
+    uploaded the full credential file
+    `{"name":"duffel_token","type":"secret_manager","data":{"token":"duffel_test_…"},...}`
+    so the bearer is at `.data.token` inside the payload), and the playbook
+    reads it at runtime using the worker pod's GKE Workload Identity:
+      1. mint an OAuth2 access token from the GKE metadata server
+         (GET http://metadata.google.internal/.../service-accounts/default/token
+         with Metadata-Flavor: Google) — stdlib urllib, no google-auth lib,
+      2. read the secret via the Secret Manager REST API with that token,
+      3. base64-decode the payload, json-parse it, and extract `.data.token`.
+    This is the same library-free Workload-Identity pattern the HotelBeds
+    (hotelbeds*.yaml) and google-places MCP playbooks use (noetl/ai-meta#137).
+
+    This REPLACES the earlier `kind: secrets` / `provider: gcp` keychain
+    *wallet* shape (and the older `kind: credential_ref` shape). On the
+    current prod Rust runtime the `keychain.<alias>.<field>` template
+    namespace is NOT populated from those entries, so the bearer rendered
+    empty → `Authorization: Bearer ` → Duffel 401
+    `invalid_authorization_header`. The in-python read above is the mechanism
+    proven on the Rust worker; see noetl/ai-meta#137 and the wallet-resolution
+    platform-gap note.
+
+    Operator prerequisites (until these land, backend calls return a clear
+    auth/permission error — NOT a missing-library or parse error):
+    - GSM secret `duffel-api-test` exists with the credential JSON loaded.
+    - The worker pod's GSA `noetl-worker-mcp@noetl-demo-19700101.iam.gserviceaccount.com`
+      holds roles/secretmanager.secretAccessor on `duffel-api-test`.
   agent: true
   exposes_as_mcp: true
   exposed_in_ui: false
-  version: "1.0"
+  version: "1.2"
   tags: [mcp, duffel, travel, flights, ai-os]
   terminal:
     visible: true
@@ -23,47 +52,29 @@ workload:
   duffel_env: test
   duffel_api_base: https://api.duffel.com
   duffel_api_version: v2
+  google_project: "noetl-demo-19700101"
+  # GSM secret holding the Duffel credential file (bearer at `.data.token`).
+  # The value is loaded out-of-band by the operator; this playbook only
+  # references the name. Rotation is a plain
+  # `gcloud secrets versions add duffel-api-test --data-file=…` with no
+  # NoETL-side re-registration (the read is pinned to versions/latest).
+  duffel_secret_name: "duffel-api-test"
   method: "tools/list"
   tool: ""
   arguments: {}
 
-keychain:
-  # Look up the duffel_token credential directly from
-  # ``noetl.credential`` — the same resolution path used by
-  # ``openai_token``, ``anthropic_token``, ``amadeus_credentials``,
-  # and every other token-shaped credential in the deployment.  The
-  # credential is registered out-of-band via
-  # ``noetl register credential --file duffel_token.json`` (see
-  # ``~/projects/noetl/credentials/`` for the template), AES-
-  # encrypted by the cluster's ``NOETL_SECRET_KEY``, and the
-  # playbook resolves it via the unqualified
-  # ``{{ keychain.duffel_token.token }}`` reference in the
-  # ``duffel_dispatch`` step.
-  #
-  # This replaces the earlier ``kind: secret_manager`` /
-  # ``provider: gcp`` dispatch shape which required a fresh
-  # ``google_oauth`` Bearer + a Workload-Identity-backed GCS Secret
-  # Manager round-trip on every cache miss.  Live vs test tokens
-  # are now interchangeable here — switch by re-registering the
-  # credential with the live-environment value.  See ai-meta
-  # ``handoffs/archive/2026-05-27-itinerary-planner-empty-widget/``
-  # for the production diagnostic that motivated the change.
-  #
-  # ``kind: credential_ref`` tells the keychain processor in
-  # noetl/server/keychain_processor.py:_process_credential_ref to
-  # fetch the credential from ``noetl.credential`` by name, take
-  # the ``data`` payload verbatim, and cache it in ``noetl.keychain``
-  # so worker templates ``{{ keychain.duffel_token.token }}``
-  # resolve to the actual token value.  Without ``kind`` the
-  # processor logs "Skipping invalid entry" and the resolved
-  # value stays empty — see noetl/ai-meta#24 for the diagnostic
-  # that surfaced this requirement.
-  - name: duffel_token
-    kind: credential_ref
-
 workflow:
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`; routes to duffel_dispatch
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: duffel_dispatch
+
   - step: duffel_dispatch
-    desc: Dispatch Duffel MCP tools
+    desc: Dispatch Duffel MCP tools (Workload-Identity GSM secret read for the bearer)
     tool:
       kind: python
       input:
@@ -73,13 +84,103 @@ workflow:
         duffel_env: "{{ workload.duffel_env | default('test') }}"
         duffel_api_base: "{{ workload.duffel_api_base | default('https://api.duffel.com') }}"
         duffel_api_version: "{{ workload.duffel_api_version | default('v2') }}"
-        duffel_token: "{{ keychain.duffel_token.token }}"
+        google_project: "{{ workload.google_project | default('noetl-demo-19700101') }}"
+        duffel_secret_name: "{{ workload.duffel_secret_name | default('duffel-api-test') }}"
       code: |
+        import base64
         import json
         from datetime import datetime, timezone
         import urllib.error
         import urllib.parse
         import urllib.request
+
+        METADATA_TOKEN_URL = (
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/token"
+        )
+
+        def _metadata_token():
+            # Mint an OAuth2 access token from the GKE metadata server using the
+            # worker pod's Workload Identity. No google-auth library: this is the
+            # same endpoint google.auth.default() reads under the hood on GKE, so a
+            # direct urllib GET is the library-free equivalent (noetl/ai-meta#137).
+            req = urllib.request.Request(
+                METADATA_TOKEN_URL,
+                headers={"Metadata-Flavor": "Google"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    "metadata token mint failed HTTP "
+                    f"{exc.code}: Workload Identity is not bound to a GCP service "
+                    f"account with Secret Manager access for this worker pod ({body})"
+                )
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    "metadata server unreachable "
+                    f"({getattr(exc, 'reason', exc)}): the worker pod has no GKE "
+                    "Workload Identity metadata endpoint (expected off-cluster, e.g. kind)"
+                )
+            token = (payload or {}).get("access_token") if isinstance(payload, dict) else None
+            if not token:
+                raise RuntimeError("metadata token endpoint returned no access_token")
+            return token
+
+        def _extract_token(raw):
+            # The GSM secret `duffel-api-test` holds the full Duffel credential
+            # file ({"data":{"token":…}}); tolerate a bare {"token":…} object or
+            # a raw token string too, so a future `gcloud secrets versions add`
+            # in any of those shapes keeps resolving without a playbook edit.
+            # Never logged/printed.
+            s = "" if raw is None else str(raw).strip()
+            if s.startswith("{"):
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    return s
+                if isinstance(obj, dict):
+                    data = obj.get("data")
+                    if isinstance(data, dict) and data.get("token"):
+                        return str(data.get("token")).strip()
+                    if obj.get("token"):
+                        return str(obj.get("token")).strip()
+                return s
+            return s
+
+        def _secret_bearer(project, secret_name):
+            # Read the GSM secret value (the full Duffel credential file JSON)
+            # using the WI metadata token and collapse it to the bare bearer.
+            # Raises with a credential/permission-flavoured message so the
+            # failure mode is unambiguous on kind / pre-grant prod.
+            token = _metadata_token()
+            name = f"projects/{project}/secrets/{secret_name}/versions/latest:access"
+            req = urllib.request.Request(
+                f"https://secretmanager.googleapis.com/v1/{name}",
+                headers={"Authorization": f"Bearer {token}"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    f"secret manager access HTTP {exc.code} for '{secret_name}': the "
+                    f"worker GSA lacks secretmanager.secretAccessor on this secret, or "
+                    f"the secret is not loaded yet ({body})"
+                )
+            encoded = ((payload.get("payload") or {}).get("data") or "").strip()
+            if not encoded:
+                raise RuntimeError(f"secret '{secret_name}' has no payload data")
+            raw = base64.b64decode(encoded).decode("utf-8").strip()
+            bearer = _extract_token(raw)
+            if not bearer:
+                raise RuntimeError(f"secret '{secret_name}' payload had no Duffel token (.data.token)")
+            return bearer
 
         def _as_dict(value):
             return value if isinstance(value, dict) else {}
@@ -581,6 +682,11 @@ workflow:
             return _ok("list_orders", {"source": "duffel", "status_code": status_code, "orders": orders, "orders_total": len(orders), "meta": meta}, f"{len(orders)} Duffel order(s)", {"status_code": status_code, "orders_total": len(orders)})
 
         globals().update({
+            "base64": base64,
+            "METADATA_TOKEN_URL": METADATA_TOKEN_URL,
+            "_metadata_token": _metadata_token,
+            "_extract_token": _extract_token,
+            "_secret_bearer": _secret_bearer,
             "_as_dict": _as_dict,
             "_as_list": _as_list,
             "_cap": _cap,
@@ -612,29 +718,48 @@ workflow:
             "urllib": urllib,
         })
 
+        VALID_TOOLS = ("search_offers", "get_offer", "search_places", "get_airlines", "create_order", "get_order", "list_orders")
         method_name = _text(method, "tools/list").lower()
         tool_name = _text(tool).lower()
         args = _as_dict(arguments)
+        project = _text(google_project, "noetl-demo-19700101")
+        secret_name = _text(duffel_secret_name, "duffel-api-test")
+
         if method_name == "tools/list":
             result = _tools_list()
         elif method_name != "tools/call":
             result = _error(method_name, f"Unknown MCP method: {method_name}")
-        elif tool_name == "search_offers":
-            result = _search_offers(args)
-        elif tool_name == "get_offer":
-            result = _get_offer(args)
-        elif tool_name == "search_places":
-            result = _search_places(args)
-        elif tool_name == "get_airlines":
-            result = _get_airlines(args)
-        elif tool_name == "create_order":
-            result = _create_order(args)
-        elif tool_name == "get_order":
-            result = _get_order(args)
-        elif tool_name == "list_orders":
-            result = _list_orders(args)
-        else:
+        elif tool_name not in VALID_TOOLS:
             result = _error(tool_name or "unknown", f"Unknown tool: {tool_name}. Run tools/list to see the catalog.")
+        else:
+            # Resolve the Duffel bearer from GSM via Workload Identity. On kind
+            # (no metadata server) or pre-grant prod this raises a clear
+            # credential/permission error rather than a 401 from an empty bearer.
+            # Promote the resolved bearer to globals so the globally-registered
+            # _request helper reads it (the python tool execs helpers in globals).
+            try:
+                duffel_token = _secret_bearer(project, secret_name)
+                globals()["duffel_token"] = duffel_token
+            except Exception as exc:
+                result = _error(tool_name, "Duffel credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable")
+            if "result" not in locals() or result is None:
+                try:
+                    if tool_name == "search_offers":
+                        result = _search_offers(args)
+                    elif tool_name == "get_offer":
+                        result = _get_offer(args)
+                    elif tool_name == "search_places":
+                        result = _search_places(args)
+                    elif tool_name == "get_airlines":
+                        result = _get_airlines(args)
+                    elif tool_name == "create_order":
+                        result = _create_order(args)
+                    elif tool_name == "get_order":
+                        result = _get_order(args)
+                    else:
+                        result = _list_orders(args)
+                except Exception as exc:
+                    result = _error(tool_name, "Duffel tool failed", f"{type(exc).__name__}: {exc}")
     next:
       spec: { mode: exclusive }
       arcs:
