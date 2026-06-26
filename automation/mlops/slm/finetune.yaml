@@ -1,0 +1,202 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: slm_finetune
+  path: automation/mlops/slm/finetune
+  description: |
+    Generic SLM finetune stage (MLOps-as-NoETL-playbooks) — Phase B
+    (noetl/ai-meta#141).  Reads a domain's Phase-1 dataset (train split), trains
+    a SINGLE multitask LoRA (the two contract roles — extract + render — in one
+    adapter), writes the adapter as a model artifact, and registers it into the
+    G3 registry (kind=model, lineage → the dataset entry).
+
+    Two run modes — same engine (`lib/slm_finetune.py`), same artifact contract:
+
+      * mode=local     — runs the engine inline via `kind: shell` on the CPU.
+        With `--backend stub` this is the Phase-B VALIDATION path: a
+        nearest-prototype retrieval "model" with schema-constrained decoding
+        that proves the whole orchestration (dataset → finetune → registry →
+        eval → release) end-to-end with zero heavy deps and no GPU.  This is the
+        default — it's what the kind / CPU smoke runs.
+
+      * mode=container — dispatches the REAL LoRA fine-tune of
+        qwen2.5-1.5b-instruct (fallback llama-3.2-1b-instruct) as a G1
+        container/GPU k8s Job (node_selector / tolerations / GPU resources), and
+        the worker frees its slot via G2 poll-to-terminal
+        (NOETL_CONTAINER_COMPLETION_POLL) so the long run doesn't block a slot.
+        GATED on the operator provisioning a GPU node pool + a training image +
+        deploying the G1/G2/G3 flags — see the § PROD-GPU CHECKLIST at the
+        bottom.  Do NOT flip mode=container without that infra in place.
+
+    Registry writes are server-mediated (data-access-boundary.md) via
+    `lib/slm_registry.py`.  For the offline CPU smoke pass
+    NOETL_REGISTRY_BACKEND=local (file-backed mirror of the G3 semantics);
+    for the real run leave it unset (server) with NOETL_SERVER_URL +
+    NOETL_INTERNAL_API_TOKEN and a server started with
+    NOETL_REGISTRY_ENABLED=true.
+
+    Tracks noetl/ai-meta#141 (SLM platform Phase B), umbrella #139.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # ── shared ──
+  config: repos/travel/automation/mlops/slm/travel/slm.config.yaml
+  slm_lib: repos/ops/automation/mlops/slm/lib
+  mode: local                 # local | container
+  backend: stub               # stub | peft
+  dataset_version: v1_constrained
+  augment_teacher: "true"     # include the constrained-teacher repaired labels
+  base_model: ""              # "" => first config model.candidates entry
+  tenant: muno                # registry namespace (muno/slm/* cluster test tag)
+  project: travel
+
+  # ── container/GPU mode only (gated) ──
+  namespace: noetl
+  # the training image the operator builds (python + torch + transformers + peft
+  # + datasets + the slm lib) — see § PROD-GPU CHECKLIST.
+  train_image: "ghcr.io/noetl/slm-trainer:latest"
+  gpu_accelerator: "nvidia-l4"          # GKE accelerator label value
+  gpu_count: "1"
+  data_pvc: "slm-data"                  # PVC carrying the dataset + receiving the adapter
+  service_account: "noetl-slm-trainer"  # WI-bound SA with registry + GCS access
+  # in-cluster server + internal token Secret (registry writes from the Job)
+  server_url: "http://noetl-server-rust:8082"
+  internal_token_secret: "noetl-internal-api"
+  internal_token_key: "token"
+  max_steps: "200"
+  epochs: "3"
+
+workflow:
+  - step: start
+    desc: Entry point — route on mode
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: finetune_local
+          when: "{{ workload.mode == 'local' }}"
+        - step: finetune_container
+          when: "{{ workload.mode == 'container' }}"
+
+  # ── mode=local : CPU/offline engine run (the smoke path) ──────────────────
+  - step: finetune_local
+    desc: Run the finetune engine inline (CPU) — stub backend by default
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          CONFIG='{{ workload.config }}'
+          BACKEND='{{ workload.backend }}'
+          export SLM_DATASET_VERSION='{{ workload.dataset_version }}'
+          ARGS="--config ${CONFIG} --backend ${BACKEND}"
+          ARGS="${ARGS} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          [ '{{ workload.augment_teacher }}' = 'true' ] && ARGS="${ARGS} --augment-teacher"
+          [ -n '{{ workload.base_model }}' ] && ARGS="${ARGS} --base-model {{ workload.base_model }}"
+          echo "SLM finetune (local) :: backend=${BACKEND} config=${CONFIG}"
+          python3 "${LIB}/slm_finetune.py" ${ARGS}
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  # ── mode=container : GPU k8s Job + G2 poll-to-terminal (GATED) ────────────
+  # The worker dispatches this Job and returns immediately; with
+  # NOETL_CONTAINER_COMPLETION_POLL=true (G2) the worker polls the Job to a
+  # terminal state and emits the resume event WITHOUT holding a slot, so the
+  # long training run is free.  The Job itself runs the SAME engine with
+  # --backend peft and registers the model into G3 from inside the cluster.
+  - step: finetune_container
+    desc: Dispatch the real LoRA fine-tune as a GPU k8s Job (gated on GPU pool)
+    tool:
+      kind: container
+      image: "{{ workload.train_image }}"
+      namespace: "{{ workload.namespace }}"
+      service_account: "{{ workload.service_account }}"
+      command: ["python3", "/opt/slm/lib/slm_finetune.py"]
+      args:
+        - "--config"
+        - "/data/slm.config.yaml"
+        - "--backend"
+        - "peft"
+        - "--dataset"
+        - "/data/datasets/build/{{ workload.project }}/{{ workload.dataset_version }}"
+        - "--out"
+        - "/data/models/{{ workload.project }}_slm_multitask-peft"
+        - "--augment-teacher"
+        - "--max-steps"
+        - "{{ workload.max_steps }}"
+        - "--epochs"
+        - "{{ workload.epochs }}"
+        - "--tenant"
+        - "{{ workload.tenant }}"
+        - "--project"
+        - "{{ workload.project }}"
+      env:
+        - name: NOETL_SERVER_URL
+          value: "{{ workload.server_url }}"
+        - name: NOETL_REGISTRY_BACKEND
+          value: "server"
+        - name: NOETL_INTERNAL_API_TOKEN
+          value_from:
+            secret_name: "{{ workload.internal_token_secret }}"
+            secret_key: "{{ workload.internal_token_key }}"
+        - name: EXECUTION_ID
+          value: "{{ execution_id }}"
+      # G1 GPU placement: select a GPU node pool + tolerate its taint + request GPUs.
+      node_selector:
+        cloud.google.com/gke-accelerator: "{{ workload.gpu_accelerator }}"
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      resources:
+        requests: { cpu: "4", memory: "16Gi", nvidia.com/gpu: "{{ workload.gpu_count }}" }
+        limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "{{ workload.gpu_count }}" }
+      # the dataset volume (operator-provisioned PVC) holds the dataset + receives
+      # the adapter artifact.
+      volumes:
+        - name: data
+          persistent_volume_claim:
+            claim_name: "{{ workload.data_pvc }}"
+      volume_mounts:
+        - name: data
+          mount_path: /data
+      backoff_limit: 0
+      restart_policy: Never
+      timeout_seconds: 7200
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
+
+# ── PROD-GPU CHECKLIST (operator must approve + provision before mode=container) ──
+# 1. GPU node pool: a GKE node pool with GPUs (e.g. nvidia-l4), tainted
+#    `nvidia.com/gpu=present:NoSchedule`, label
+#    `cloud.google.com/gke-accelerator=nvidia-l4`, + the NVIDIA device-plugin
+#    DaemonSet installed.
+# 2. Training image `ghcr.io/noetl/slm-trainer:<tag>`: python3 + torch (CUDA) +
+#    transformers + peft + datasets + accelerate + the `lib/` engine copied to
+#    /opt/slm/lib.  Base-model weights either baked in or pullable at runtime
+#    (network egress / HF token as needed).
+# 3. Dataset PVC `slm-data`: pre-populated with slm.config.yaml + the built
+#    dataset under /data/datasets/build/<project>/<version>/; writable for the
+#    /data/models output.
+# 4. ServiceAccount `noetl-slm-trainer`: WI-bound to a GSA with registry +
+#    object-store (GCS) write access, carrying the internal-API token Secret
+#    `noetl-internal-api`.
+# 5. Platform flags (review-only today, NOT on prod): server
+#    NOETL_REGISTRY_ENABLED=true (G3); worker NOETL_CONTAINER_COMPLETION_POLL=true
+#    (G2); G1 container tool (tools>=3.19.0) on the worker image.
+# 6. Worker RBAC: the worker SA needs batch/jobs.create in `namespace`.

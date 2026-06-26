@@ -1,0 +1,69 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: slm_package
+  path: automation/mlops/slm/package
+  description: |
+    Generic SLM package stage (MLOps-as-NoETL-playbooks) — Phase B
+    (noetl/ai-meta#141).  Turns a trained + evaluated model into a
+    serving-ready RELEASE: pulls the registered model artifact + its eval run
+    from the G3 registry, (peft) merges/exports the LoRA adapter, writes a model
+    card (markdown, metrics included), bundles model + card + eval report, and
+    registers a G3 release entry (kind=release, lineage → [model, eval]).
+
+    Engine: `lib/slm_package.py`.  Registry writes are server-mediated
+    (data-access-boundary.md) via `lib/slm_registry.py`.  For the offline CPU
+    smoke pass NOETL_REGISTRY_BACKEND=local; for the real run leave it unset
+    (server) with NOETL_SERVER_URL + NOETL_INTERNAL_API_TOKEN against a server
+    with NOETL_REGISTRY_ENABLED=true.
+
+    Tracks noetl/ai-meta#141, umbrella #139.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  config: repos/travel/automation/mlops/slm/travel/slm.config.yaml
+  slm_lib: repos/ops/automation/mlops/slm/lib
+  model_ref: latest           # registry:// URN or 'latest'
+  eval_ref: latest            # registry:// URN or 'latest'
+  out: ""                     # "" => engine uses a tempdir; set to keep the bundle
+  tenant: muno
+  project: travel
+
+workflow:
+  - step: start
+    desc: Entry point
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: package_release
+
+  - step: package_release
+    desc: Export model + model card + register the G3 release
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          CONFIG='{{ workload.config }}'
+          ARGS="--config ${CONFIG}"
+          ARGS="${ARGS} --model-ref {{ workload.model_ref }} --eval-ref {{ workload.eval_ref }}"
+          ARGS="${ARGS} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          [ -n '{{ workload.out }}' ] && ARGS="${ARGS} --out {{ workload.out }}"
+          echo "SLM package :: model_ref={{ workload.model_ref }} eval_ref={{ workload.eval_ref }}"
+          python3 "${LIB}/slm_package.py" ${ARGS}
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

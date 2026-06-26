@@ -26,6 +26,7 @@ The server must run with ``NOETL_REGISTRY_ENABLED=true`` for the registry routes
 to exist (additive / default-off — noetl/ai-meta#146).
 """
 
+import hashlib
 import json
 import os
 import urllib.error
@@ -168,3 +169,179 @@ class RegistryClient:
             media_type=media_type, metadata=metadata, lineage=lineage, tags=tags,
             tenant=tenant, project=project,
         )
+
+
+# ── local file-backed backend (offline smoke / dev) ─────────────────────────
+
+DEFAULT_TENANT = "default"
+DEFAULT_PROJECT = "default"
+
+
+def _build_ref(tenant, project, kind, name, version):
+    """Fully-qualified URN, mirrors the server's ``build_ref``."""
+    return "registry://%s/%s/%s/%s/%s" % (tenant, project, kind, name, version)
+
+
+def _parse_ref(ref):
+    """Parse a ``registry://`` URN, accepting the short
+    (``registry://<kind>/<name>/<version>``) and fully-qualified
+    (``registry://<tenant>/<project>/<kind>/<name>/<version>``) shapes. Returns
+    ``(tenant, project, kind, name, version_or_None)`` (None == ``latest``)."""
+    if not ref.startswith("registry://"):
+        raise RegistryError("not a registry ref: %r" % ref)
+    parts = ref[len("registry://"):].split("/")
+    if len(parts) == 3:
+        kind, name, ver = parts
+        tenant, project = DEFAULT_TENANT, DEFAULT_PROJECT
+    elif len(parts) == 5:
+        tenant, project, kind, name, ver = parts
+    else:
+        raise RegistryError("malformed registry ref: %r" % ref)
+    version = None if ver in ("latest", "") else int(ver)
+    return tenant, project, kind, name, version
+
+
+class LocalRegistryClient:
+    """A file-backed mirror of the G3 server's registry semantics for offline /
+    CPU smokes (``NOETL_REGISTRY_BACKEND=local``).  Same URN scheme, same
+    monotonic version assignment, same digest-addressed artifact keys, same
+    response dict shape — so the identical stage code runs against either backend
+    and the only thing that changes for the production run is
+    ``NOETL_REGISTRY_BACKEND=server`` + ``NOETL_SERVER_URL``.
+
+    State lives under ``root`` (``NOETL_REGISTRY_LOCAL_DIR`` or
+    ``~/.noetl/slm_registry``):  ``index.jsonl`` is the append-only entry log;
+    ``objects/<key>`` holds artifact bytes.
+    """
+
+    def __init__(self, root=None):
+        self.root = root or os.environ.get("NOETL_REGISTRY_LOCAL_DIR") \
+            or os.path.join(os.path.expanduser("~"), ".noetl", "slm_registry")
+        self.index_path = os.path.join(self.root, "index.jsonl")
+        self.objects_dir = os.path.join(self.root, "objects")
+        os.makedirs(self.objects_dir, exist_ok=True)
+
+    # -- index IO -------------------------------------------------------------
+
+    def _read_index(self):
+        rows = []
+        if os.path.isfile(self.index_path):
+            with open(self.index_path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        rows.append(json.loads(line))
+        return rows
+
+    def _append_index(self, entry):
+        with open(self.index_path, "a") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+
+    # -- artifacts ------------------------------------------------------------
+
+    @staticmethod
+    def artifact_key(kind, name, version, filename, tenant="default", project="default"):
+        return "noetl/registry/%s/%s/%s/%s/%s/%s" % (tenant, project, kind, name, version, filename)
+
+    def put_artifact(self, key, data, media_type="application/octet-stream"):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        dest = os.path.join(self.objects_dir, key)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        return {"key": key, "digest": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
+    def get_artifact(self, key):
+        dest = os.path.join(self.objects_dir, key)
+        if not os.path.isfile(dest):
+            raise RegistryError("get_artifact %s failed: not found" % key)
+        with open(dest, "rb") as fh:
+            return fh.read()
+
+    # -- entries --------------------------------------------------------------
+
+    def register(self, kind, name, *, artifact_uri=None, artifact_digest=None,
+                 artifact_bytes=None, media_type=None, metadata=None, lineage=None,
+                 tags=None, tenant=None, project=None):
+        if kind not in ("model", "dataset", "eval", "release"):
+            raise RegistryError("unknown registry kind %r" % kind)
+        tenant = tenant or DEFAULT_TENANT
+        project = project or DEFAULT_PROJECT
+        rows = self._read_index()
+        versions = [r["version"] for r in rows
+                    if r["tenant"] == tenant and r["project"] == project
+                    and r["kind"] == kind and r["name"] == name]
+        version = (max(versions) + 1) if versions else 1
+        entry = {
+            "ref": _build_ref(tenant, project, kind, name, version),
+            "entry_id": len(rows) + 1,
+            "tenant": tenant, "project": project, "kind": kind, "name": name,
+            "version": version, "artifact_uri": artifact_uri,
+            "artifact_digest": artifact_digest, "artifact_bytes": artifact_bytes,
+            "media_type": media_type, "metadata": metadata or {},
+            "lineage": lineage or [], "tags": tags or [],
+        }
+        self._append_index(entry)
+        return entry
+
+    def resolve(self, ref, tenant=None, project=None):
+        t, p, kind, name, version = _parse_ref(ref)
+        t = tenant or t
+        p = project or p
+        rows = [r for r in self._read_index()
+                if r["tenant"] == t and r["project"] == p
+                and r["kind"] == kind and r["name"] == name]
+        if not rows:
+            return None
+        if version is None:
+            return max(rows, key=lambda r: r["version"])
+        for r in rows:
+            if r["version"] == version:
+                return r
+        return None
+
+    def list(self, *, kind=None, name=None, tenant=None, project=None, limit=None):
+        rows = self._read_index()
+        out = []
+        for r in rows:
+            if kind and r["kind"] != kind:
+                continue
+            if name and r["name"] != name:
+                continue
+            if tenant and r["tenant"] != tenant:
+                continue
+            if project and r["project"] != project:
+                continue
+            out.append(r)
+        out.sort(key=lambda r: r["entry_id"], reverse=True)
+        if limit:
+            out = out[: int(limit)]
+        return out
+
+    def put_and_register(self, kind, name, filename, data, *, media_type="application/octet-stream",
+                         metadata=None, lineage=None, tags=None, tenant="default", project="default"):
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        digest = hashlib.sha256(raw).hexdigest()
+        key = "noetl/registry/%s/%s/%s/%s/by-digest/%s/%s" % (tenant, project, kind, name, digest, filename)
+        self.put_artifact(key, raw, media_type=media_type)
+        return self.register(
+            kind, name, artifact_uri=key, artifact_digest=digest, artifact_bytes=len(raw),
+            media_type=media_type, metadata=metadata, lineage=lineage, tags=tags,
+            tenant=tenant, project=project)
+
+
+def make_client():
+    """Factory selecting the registry backend from the environment.
+
+    - ``NOETL_REGISTRY_BACKEND=local`` → :class:`LocalRegistryClient` (offline
+      smoke; no server needed).
+    - otherwise (``server`` / unset) → the server-mediated
+      :class:`RegistryClient` (needs ``NOETL_SERVER_URL`` +
+      ``NOETL_INTERNAL_API_TOKEN`` and a server with
+      ``NOETL_REGISTRY_ENABLED=true``).
+    """
+    backend = (os.environ.get("NOETL_REGISTRY_BACKEND") or "server").strip().lower()
+    if backend == "local":
+        return LocalRegistryClient()
+    return RegistryClient()

@@ -15,7 +15,15 @@ metadata:
     gates them against the config targets, and writes eval_report.json.
 
     Reference instance: noetl/travel slm.config.yaml (Phase A, #140 / #64).
-    Tracks noetl/ai-meta#140.
+
+    Phase B (#141): set candidate=slm to score the fine-tuned model instead of
+    the deterministic oracle.  The engine pulls the registered model artifact
+    (model_ref, default 'latest') from the G3 registry, runs it under the SAME
+    schema-constrained decoding the ceiling used, reports validity vs the oracle
+    floor + per-field match gaps, and (register=true) registers an eval entry
+    (kind=eval, lineage → the model).
+
+    Tracks noetl/ai-meta#140 (Phase A) + #141 (Phase B).
 
 executor:
   profile: local
@@ -26,6 +34,13 @@ workload:
   slm_lib: repos/ops/automation/mlops/slm/lib
   # optional dataset dir override ("" => derive from the config dataset_build block)
   dataset: ""
+  dataset_version: ""         # "" => config dataset_build.version
+  # candidate: "" => config eval.candidate; "deterministic_oracle" | "slm"
+  candidate: ""
+  model_ref: latest           # (slm) registry:// URN or 'latest'
+  register: "false"           # (slm) register the eval run into G3
+  tenant: muno
+  project: travel
 
 workflow:
   - step: start
@@ -47,12 +62,14 @@ workflow:
           CONFIG='{{ workload.config }}'
           LIB='{{ workload.slm_lib }}'
           DATASET='{{ workload.dataset }}'
-          echo "SLM eval :: config=${CONFIG}"
-          if [ -n "${DATASET}" ]; then
-            python3 "${LIB}/slm_eval.py" --config "${CONFIG}" --dataset "${DATASET}"
-          else
-            python3 "${LIB}/slm_eval.py" --config "${CONFIG}"
-          fi
+          [ -n '{{ workload.dataset_version }}' ] && export SLM_DATASET_VERSION='{{ workload.dataset_version }}'
+          ARGS="--config ${CONFIG}"
+          [ -n "${DATASET}" ] && ARGS="${ARGS} --dataset ${DATASET}"
+          [ -n '{{ workload.candidate }}' ] && ARGS="${ARGS} --candidate {{ workload.candidate }}"
+          [ '{{ workload.candidate }}' = 'slm' ] && ARGS="${ARGS} --model-ref {{ workload.model_ref }} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          [ '{{ workload.register }}' = 'true' ] && ARGS="${ARGS} --register"
+          echo "SLM eval :: config=${CONFIG} candidate={{ workload.candidate }}"
+          python3 "${LIB}/slm_eval.py" ${ARGS}
     next:
       spec: { mode: exclusive }
       arcs:
