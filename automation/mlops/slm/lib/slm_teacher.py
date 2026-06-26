@@ -9,16 +9,31 @@ oracle (floor) label and a teacher (ceiling) label side by side per example,
 and lets ``slm_eval`` measure the floor↔ceiling gap per field.
 
 Why this exists: the deterministic oracle is a zero-cost *floor*.  The teacher
-(OpenAI gpt-4o / gpt-4o-mini for the travel instance) is the *ceiling* — the
-quality a fine-tuned SLM is trying to reach.  The gap between them, per field,
-is the signal that ranks candidate model sizes (RFC §10 decision 1).
+is the *ceiling* — the quality a fine-tuned SLM is trying to reach.  The gap
+between them, per field, is the signal that ranks candidate model sizes
+(RFC §10 decision 1).
 
-Transport: Python stdlib ``urllib`` only — no ``openai``/``requests`` dep, so
-the engine runs anywhere the runtime's ``python3`` runs.  The API key arrives
-through the environment (``OPENAI_API_KEY`` by default; the production
-``dataset_build`` playbook injects it from the keychain alias named in the
-config ``teachers[].credential`` via the step ``auth:`` block — the key is
-never inlined, logged, or written to any artifact).
+Pluggable teacher providers (RFC decision #6 — the teacher is a swappable
+ceiling source):
+
+  * ``vertex_gemini`` — Vertex AI ``generateContent`` (default for the travel
+    instance).  Mints a Workload-Identity OAuth token in-python from the GKE
+    metadata server with stdlib ``urllib`` — no ``google-auth`` library, no
+    API key, no Secret Manager.  The worker pod's bound service account is the
+    only credential; off-cluster (kind) the mint fails with a clear message and
+    the turn is recorded as a teacher error (the floor label still ships).
+    Primary ``gemini-2.5-pro`` with a ``gemini-2.5-flash`` fallback on a
+    primary-model failure.
+  * ``openai`` / ``openai_compatible`` — OpenAI Chat Completions wire format.
+    ``openai_compatible`` + an ``endpoint`` lets a future self-hosted teacher
+    (Gemma / Qwen behind an OpenAI-compatible server) drop in unchanged.  The
+    API key arrives through the environment (``OPENAI_API_KEY`` by default);
+    the generic ``dataset_build`` playbook no longer injects an OpenAI key, so
+    a domain that wants the OpenAI ceiling supplies it in its own overlay.
+
+Transport: Python stdlib ``urllib`` only — no ``openai`` / ``requests`` /
+``google-auth`` dep, so the engine runs anywhere the runtime's ``python3``
+runs.
 
 Usage (library): see ``slm_dataset_build`` when a teacher block is enabled.
 """
@@ -31,147 +46,64 @@ import urllib.request
 
 # ── teacher price table (USD per 1M tokens) ─────────────────────────────────
 # Estimate only, for the token-cost line in the manifest/report.  Override per
-# model via the config ``teachers[].pricing`` block when prices move.  Public
-# OpenAI list pricing at the time this Phase-1 run shipped (2026-06).
+# model via the config ``teachers[].pricing`` block when prices move.
 _DEFAULT_PRICING = {
+    # OpenAI list pricing, 2026-06.
     "gpt-4o": {"input_per_1m": 2.50, "output_per_1m": 10.00},
     "gpt-4o-mini": {"input_per_1m": 0.15, "output_per_1m": 0.60},
     "gpt-4o-2024-08-06": {"input_per_1m": 2.50, "output_per_1m": 10.00},
+    # Vertex Gemini list pricing, 2026-06 (≤200k-token context tier).
+    "gemini-2.5-pro": {"input_per_1m": 1.25, "output_per_1m": 10.00},
+    "gemini-2.5-flash": {"input_per_1m": 0.30, "output_per_1m": 2.50},
 }
 
 _OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+
+# GKE metadata server token endpoint — exactly what google.auth.default() reads
+# under the hood on GKE, so a direct urllib GET is the library-free equivalent
+# (copied from automation/agents/mcp/google-places.yaml, noetl/ai-meta#137).
+_METADATA_TOKEN_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/"
+    "instance/service-accounts/default/token"
+)
 
 
 class TeacherError(RuntimeError):
     pass
 
 
-class Teacher:
-    """One configured teacher: the two role models + their prod prompts.
+# ── provider seam ───────────────────────────────────────────────────────────
+# A provider turns (model, system_prompt, user_payload) into (parsed_json,
+# usage).  ``usage`` is normalized to {prompt_tokens, completion_tokens,
+# total_tokens, model} so the Teacher accounts cost the same way regardless of
+# which backend served the call.
 
-    Construct from the config via :func:`from_config`.  ``label_turn`` produces
-    both labels for one turn and accumulates token usage on the instance so the
-    caller can read ``teacher.usage`` after the whole corpus is labeled.
+
+def _retryable_http(code):
+    return code in (429, 500, 502, 503, 504)
+
+
+class OpenAIProvider:
+    """OpenAI Chat Completions JSON-mode transport.
+
+    Also serves ``openai_compatible`` self-hosted teachers (same wire format)
+    by passing a different ``endpoint``.
     """
 
-    def __init__(
-        self,
-        api_key,
-        extract_model,
-        render_model,
-        extract_system_prompt,
-        render_system_prompt,
-        vocab=None,
-        pricing=None,
-        endpoint=None,
-        max_retries=4,
-        timeout=90,
-        request_sleep=0.0,
-    ):
+    def __init__(self, api_key, endpoint=None, max_retries=4, timeout=90):
         if not api_key:
             raise TeacherError(
                 "teacher api key not present in the environment — set the env var "
-                "named by the config (default OPENAI_API_KEY); in production the "
-                "dataset_build step injects it from the keychain via auth:."
+                "named by the config (default OPENAI_API_KEY).  The generic "
+                "dataset_build playbook no longer injects an OpenAI key; a domain "
+                "that selects the openai provider supplies it in its own overlay."
             )
         self._api_key = api_key
-        self.extract_model = extract_model
-        self.render_model = render_model
-        self.extract_system_prompt = extract_system_prompt
-        self.render_system_prompt = render_system_prompt
-        self.vocab = vocab or {}
-        self.pricing = dict(_DEFAULT_PRICING)
-        if pricing:
-            self.pricing.update(pricing)
         self.endpoint = endpoint or _OPENAI_CHAT_URL
         self.max_retries = max_retries
         self.timeout = timeout
-        self.request_sleep = request_sleep
-        # cumulative accounting across every call this instance makes
-        self.usage = {
-            "calls": 0,
-            "errors": 0,
-            "by_model": {},  # model -> {calls, prompt_tokens, completion_tokens, total_tokens, cost_usd}
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-        }
 
-    # ── construction from the org config ────────────────────────────────────
-    @classmethod
-    def from_config(cls, cfg, cfg_dir, common, teacher_id=None):
-        """Build a Teacher from the loaded config + the ``slm_common`` module.
-
-        Returns ``None`` (with a reason printed) when no enabled teacher block
-        is present, so callers can fall back to oracle-only cleanly.
-        """
-        dom = cfg["slm_domain"]
-        teachers = dom.get("teachers", []) or []
-        chosen = None
-        for t in teachers:
-            if teacher_id and t.get("id") != teacher_id:
-                continue
-            if str(t.get("status", "disabled")).lower() in ("enabled", "active", "on"):
-                chosen = t
-                break
-        if chosen is None:
-            return None, "no enabled teacher block (teachers[].status != enabled)"
-
-        models = chosen.get("models", {})
-        extract_model = models.get("extract")
-        render_model = models.get("render")
-        if not extract_model or not render_model:
-            raise TeacherError(
-                "teacher block %r missing models.extract / models.render" % chosen.get("id")
-            )
-
-        # credential alias -> env var name.  The config value is a keychain
-        # template like "{{ openai_token }}"; the production playbook resolves it
-        # via auth: and exports the secret as the env var named in
-        # teachers[].api_key_env (default OPENAI_API_KEY).  We never read the
-        # secret from the config — only from the environment.
-        api_key_env = chosen.get("api_key_env", "OPENAI_API_KEY")
-        api_key = os.environ.get(api_key_env, "")
-
-        roles = dom.get("roles", [])
-
-        def _role(rid):
-            for r in roles:
-                if r.get("id") == rid:
-                    return r
-            return {}
-
-        extract_prompt = cls._load_prompt(_role("extract"), cfg_dir, common)
-        render_prompt = cls._load_prompt(_role("render"), cfg_dir, common)
-
-        return (
-            cls(
-                api_key=api_key,
-                extract_model=extract_model,
-                render_model=render_model,
-                extract_system_prompt=extract_prompt,
-                render_system_prompt=render_prompt,
-                vocab=dom.get("vocab", {}),
-                pricing=chosen.get("pricing"),
-                endpoint=chosen.get("endpoint"),
-                request_sleep=float(chosen.get("request_sleep_s", 0.0)),
-            ),
-            "teacher %r enabled (extract=%s, render=%s)"
-            % (chosen.get("id"), extract_model, render_model),
-        )
-
-    @staticmethod
-    def _load_prompt(role, cfg_dir, common):
-        p = common.resolve(cfg_dir, role.get("system_prompt"))
-        if p and os.path.exists(p):
-            with open(p, "r") as fh:
-                return fh.read()
-        return ""
-
-    # ── HTTP (stdlib only) ──────────────────────────────────────────────────
-    def _chat_json(self, model, system_prompt, user_payload):
-        """One JSON-mode chat completion. Returns (parsed_obj, usage_dict)."""
+    def chat_json(self, model, system_prompt, user_payload):
         body = json.dumps(
             {
                 "model": model,
@@ -193,13 +125,12 @@ class Teacher:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 content = payload["choices"][0]["message"]["content"]
-                usage = payload.get("usage", {}) or {}
+                raw_usage = payload.get("usage", {}) or {}
                 obj = json.loads(content)
-                return obj, usage
+                return obj, _normalize_openai_usage(raw_usage, model)
             except urllib.error.HTTPError as exc:
                 code = exc.code
-                # retry on rate-limit / transient server errors
-                if code in (429, 500, 502, 503, 504) and attempt < self.max_retries - 1:
+                if _retryable_http(code) and attempt < self.max_retries - 1:
                     last_err = "HTTP %d" % code
                     time.sleep(min(2 ** attempt, 20))
                     continue
@@ -216,7 +147,6 @@ class Teacher:
                     continue
                 raise TeacherError("teacher transport error: %s" % last_err)
             except (KeyError, ValueError) as exc:
-                # malformed JSON from the model — one retry then give up
                 last_err = "bad response: %s" % exc
                 if attempt < self.max_retries - 1:
                     time.sleep(1)
@@ -224,17 +154,308 @@ class Teacher:
                 raise TeacherError(last_err)
         raise TeacherError("teacher exhausted retries: %s" % last_err)
 
+
+class VertexGeminiProvider:
+    """Vertex AI ``generateContent`` JSON-mode transport with WI-metadata auth.
+
+    No ``google-auth`` library, no API key, no Secret Manager: the OAuth token
+    is minted from the GKE metadata server using the worker pod's Workload
+    Identity.  Primary ``model`` with a ``fallback_model`` retry on a
+    primary-model failure (e.g. transient resource exhaustion).
+    """
+
+    def __init__(
+        self,
+        project,
+        region="us-central1",
+        fallback_model="gemini-2.5-flash",
+        token_fn=None,
+        max_retries=4,
+        timeout=90,
+        metadata_timeout=10,
+    ):
+        if not project:
+            raise TeacherError("vertex_gemini provider requires a GCP project")
+        self.project = project
+        self.region = region
+        self.fallback_model = fallback_model
+        # token_fn overridable for offline tests; defaults to the metadata mint
+        self._token_fn = token_fn or self._mint_token
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.metadata_timeout = metadata_timeout
+
+    # ── Workload-Identity token mint (stdlib urllib, no google-auth) ─────────
+    def _mint_token(self):
+        req = urllib.request.Request(
+            _METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"}, method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.metadata_timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:300]
+            raise TeacherError(
+                "vertex WI token mint failed HTTP %d: the worker pod's Workload "
+                "Identity is not bound to a service account with Vertex AI access "
+                "(%s)" % (exc.code, body)
+            )
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise TeacherError(
+                "vertex WI token mint: metadata server unreachable (%s) — expected "
+                "off-cluster (e.g. kind); a real ceiling run needs a GKE pod with "
+                "Workload Identity bound to a Vertex-enabled service account"
+                % getattr(exc, "reason", exc)
+            )
+        token = payload.get("access_token") if isinstance(payload, dict) else None
+        if not token:
+            raise TeacherError("vertex WI token mint: metadata endpoint returned no access_token")
+        return token
+
+    def _endpoint(self, model):
+        return (
+            "https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/"
+            "publishers/google/models/%s:generateContent"
+            % (self.region, self.project, self.region, model)
+        )
+
+    def _generate(self, token, model, system_prompt, user_payload):
+        body = json.dumps(
+            {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": user_payload}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "responseMimeType": "application/json",
+                },
+            }
+        ).encode("utf-8")
+        url = self._endpoint(model)
+
+        last_err = None
+        for attempt in range(self.max_retries):
+            req = urllib.request.Request(url, data=body, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", "Bearer %s" % token)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                candidates = payload.get("candidates") or []
+                if not candidates:
+                    reason = payload.get("promptFeedback", {}).get("blockReason")
+                    raise TeacherError(
+                        "vertex %s returned no candidates (blockReason=%s)" % (model, reason)
+                    )
+                parts = candidates[0].get("content", {}).get("parts", []) or []
+                text = "".join(p.get("text", "") for p in parts)
+                obj = json.loads(text)
+                usage = _normalize_vertex_usage(payload.get("usageMetadata") or {}, model)
+                return obj, usage
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                if _retryable_http(code) and attempt < self.max_retries - 1:
+                    last_err = "HTTP %d" % code
+                    time.sleep(min(2 ** attempt, 20))
+                    continue
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8")[:200]
+                except Exception:
+                    pass
+                raise TeacherError("vertex %s HTTP %d: %s" % (model, code, detail))
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_err = str(exc)
+                if attempt < self.max_retries - 1:
+                    time.sleep(min(2 ** attempt, 20))
+                    continue
+                raise TeacherError("vertex %s transport error: %s" % (model, last_err))
+            except (KeyError, ValueError) as exc:
+                last_err = "bad response: %s" % exc
+                if attempt < self.max_retries - 1:
+                    time.sleep(1)
+                    continue
+                raise TeacherError("vertex %s %s" % (model, last_err))
+        raise TeacherError("vertex %s exhausted retries: %s" % (model, last_err))
+
+    def chat_json(self, model, system_prompt, user_payload):
+        # Mint the token ONCE per call so a Workload-Identity block surfaces its
+        # clean message directly rather than being masked by the fallback path.
+        token = self._token_fn()
+        try:
+            return self._generate(token, model, system_prompt, user_payload)
+        except TeacherError as primary_err:
+            if self.fallback_model and self.fallback_model != model:
+                try:
+                    return self._generate(token, self.fallback_model, system_prompt, user_payload)
+                except TeacherError as fb_err:
+                    raise TeacherError(
+                        "vertex primary (%s) and fallback (%s) both failed: %s | %s"
+                        % (model, self.fallback_model, primary_err, fb_err)
+                    )
+            raise
+
+
+def _normalize_openai_usage(raw, model):
+    pt = int(raw.get("prompt_tokens", 0) or 0)
+    ct = int(raw.get("completion_tokens", 0) or 0)
+    tt = int(raw.get("total_tokens", pt + ct) or (pt + ct))
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt, "model": model}
+
+
+def _normalize_vertex_usage(meta, model):
+    pt = int(meta.get("promptTokenCount", 0) or 0)
+    ct = int(meta.get("candidatesTokenCount", 0) or 0)
+    tt = int(meta.get("totalTokenCount", pt + ct) or (pt + ct))
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt, "model": model}
+
+
+# ── teacher (role logic over a provider) ────────────────────────────────────
+class Teacher:
+    """One configured teacher: the two role models + their prod prompts.
+
+    Construct from the config via :func:`from_config`.  ``label_turn`` produces
+    both labels for one turn and accumulates token usage on the instance so the
+    caller can read ``teacher.usage`` after the whole corpus is labeled.
+    """
+
+    def __init__(
+        self,
+        provider,
+        extract_model,
+        render_model,
+        extract_system_prompt,
+        render_system_prompt,
+        vocab=None,
+        pricing=None,
+        request_sleep=0.0,
+    ):
+        self._provider = provider
+        self.extract_model = extract_model
+        self.render_model = render_model
+        self.extract_system_prompt = extract_system_prompt
+        self.render_system_prompt = render_system_prompt
+        self.vocab = vocab or {}
+        self.pricing = dict(_DEFAULT_PRICING)
+        if pricing:
+            self.pricing.update(pricing)
+        self.request_sleep = request_sleep
+        # cumulative accounting across every call this instance makes
+        self.usage = {
+            "calls": 0,
+            "errors": 0,
+            "by_model": {},  # model -> {calls, prompt_tokens, completion_tokens, total_tokens, cost_usd}
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+        }
+
+    # ── construction from the org config ────────────────────────────────────
+    @classmethod
+    def from_config(cls, cfg, cfg_dir, common, teacher_id=None):
+        """Build a Teacher from the loaded config + the ``slm_common`` module.
+
+        Returns ``(None, reason)`` (with a reason string) when no enabled
+        teacher block is present, so callers can fall back to oracle-only
+        cleanly.
+        """
+        dom = cfg["slm_domain"]
+        teachers = dom.get("teachers", []) or []
+        chosen = None
+        for t in teachers:
+            if teacher_id and t.get("id") != teacher_id:
+                continue
+            if str(t.get("status", "disabled")).lower() in ("enabled", "active", "on"):
+                chosen = t
+                break
+        if chosen is None:
+            return None, "no enabled teacher block (teachers[].status != enabled)"
+
+        models = chosen.get("models", {})
+        extract_model = models.get("extract")
+        render_model = models.get("render")
+        if not extract_model or not render_model:
+            raise TeacherError(
+                "teacher block %r missing models.extract / models.render" % chosen.get("id")
+            )
+
+        provider = cls._build_provider(chosen, models)
+
+        roles = dom.get("roles", [])
+
+        def _role(rid):
+            for r in roles:
+                if r.get("id") == rid:
+                    return r
+            return {}
+
+        extract_prompt = cls._load_prompt(_role("extract"), cfg_dir, common)
+        render_prompt = cls._load_prompt(_role("render"), cfg_dir, common)
+
+        provider_kind = str(chosen.get("provider", "openai")).lower()
+        return (
+            cls(
+                provider=provider,
+                extract_model=extract_model,
+                render_model=render_model,
+                extract_system_prompt=extract_prompt,
+                render_system_prompt=render_prompt,
+                vocab=dom.get("vocab", {}),
+                pricing=chosen.get("pricing"),
+                request_sleep=float(chosen.get("request_sleep_s", 0.0)),
+            ),
+            "teacher %r enabled (provider=%s, extract=%s, render=%s)"
+            % (chosen.get("id"), provider_kind, extract_model, render_model),
+        )
+
+    @staticmethod
+    def _build_provider(chosen, models):
+        """Select the transport from ``teachers[].provider`` (default openai)."""
+        provider_kind = str(chosen.get("provider", "openai")).lower()
+        if provider_kind in ("openai", "openai_compatible"):
+            api_key_env = chosen.get("api_key_env", "OPENAI_API_KEY")
+            api_key = os.environ.get(api_key_env, "")
+            return OpenAIProvider(api_key=api_key, endpoint=chosen.get("endpoint"))
+        if provider_kind in ("vertex_gemini", "vertex", "gemini"):
+            vcfg = chosen.get("vertex", {}) or {}
+            project = vcfg.get("project") or chosen.get("project")
+            if not project:
+                raise TeacherError(
+                    "vertex_gemini teacher %r missing vertex.project" % chosen.get("id")
+                )
+            fallback = models.get("fallback") or vcfg.get("fallback_model", "gemini-2.5-flash")
+            return VertexGeminiProvider(
+                project=project,
+                region=vcfg.get("region", "us-central1"),
+                fallback_model=fallback,
+            )
+        raise TeacherError(
+            "unknown teacher provider %r (expected openai | openai_compatible | "
+            "vertex_gemini)" % provider_kind
+        )
+
+    @staticmethod
+    def _load_prompt(role, cfg_dir, common):
+        p = common.resolve(cfg_dir, role.get("system_prompt"))
+        if p and os.path.exists(p):
+            with open(p, "r") as fh:
+                return fh.read()
+        return ""
+
     def _account(self, model, usage):
+        # account under the model that actually served the call (provider may
+        # have fallen back), normalized usage carries it in usage["model"]
+        served = usage.get("model", model)
         pt = int(usage.get("prompt_tokens", 0) or 0)
         ct = int(usage.get("completion_tokens", 0) or 0)
         tt = int(usage.get("total_tokens", pt + ct) or (pt + ct))
-        price = self.pricing.get(model, {})
+        price = self.pricing.get(served, {})
         cost = (
             pt * price.get("input_per_1m", 0.0) / 1_000_000.0
             + ct * price.get("output_per_1m", 0.0) / 1_000_000.0
         )
         bm = self.usage["by_model"].setdefault(
-            model,
+            served,
             {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0},
         )
         bm["calls"] += 1
@@ -272,7 +493,7 @@ class Teacher:
             },
             sort_keys=True,
         )
-        obj, usage = self._chat_json(self.extract_model, self.extract_system_prompt, user)
+        obj, usage = self._provider.chat_json(self.extract_model, self.extract_system_prompt, user)
         self._account(self.extract_model, usage)
         # normalize to the contract keys (defensive: drop unexpected top keys)
         return {
@@ -300,7 +521,7 @@ class Teacher:
             },
             sort_keys=True,
         )
-        obj, usage = self._chat_json(self.render_model, self.render_system_prompt, user)
+        obj, usage = self._provider.chat_json(self.render_model, self.render_system_prompt, user)
         self._account(self.render_model, usage)
         return {
             "bot_message": obj.get("bot_message", "") or "",
