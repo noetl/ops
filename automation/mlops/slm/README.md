@@ -13,12 +13,48 @@ G1/G2/G3):
 
 | Playbook | Role |
 | :-- | :-- |
-| `dataset_build.yaml` | Seed corpus → labels (deterministic oracle; teacher pluggable later) → schema-validate → train/eval split → versioned JSONL + manifest (registry stub). |
+| `dataset_build.yaml` | Seed corpus → labels (deterministic oracle floor + optional schema-constrained teacher ceiling) → schema-validate → train/eval split → versioned JSONL + manifest (registry stub). `-r local` only (kind:shell against on-disk files). |
+| `dataset_build_distributed.yaml` | **Generated**, `-r distributed`-capable form of the above — packs the lib + config + schemas + seed as a base64 file tree in one `kind:python` step so it runs on a worker pod with no repos on disk. Regenerate with `build_distributed_playbook.py`. |
 | `eval.yaml` | Eval split + candidate producer → match/validity/latency metrics vs floor + (deferred) ceiling → gate vs config targets → `eval_report.json`. |
 
 `lib/` holds the generic engines (`slm_dataset_build.py`, `slm_eval.py`,
-`slm_common.py` — config load, config-relative path resolution, JSONL IO, and a
-stdlib draft-07 JSON-Schema validator because the runtime has no `jsonschema`).
+`slm_teacher.py` — the pluggable teacher providers, `slm_schema.py` — draft-07 →
+Vertex `responseSchema` converter, `slm_common.py` — config load, config-relative
+path resolution, JSONL IO, and a stdlib draft-07 JSON-Schema validator because the
+runtime has no `jsonschema`).
+
+## Schema-constrained teacher (the Phase 1 finding)
+
+The first on-cluster ceiling run (raw `gemini-2.5-pro`, no output-schema
+enforcement) scored **0% valid widget envelopes / 49% valid extractions** —
+*below* the deterministic oracle floor — because the model picked valid widget
+*types* but emitted the wrong tool-request keys (`tool_id` instead of `tool`) and
+empty payloads. The lever is **not a bigger model**; it is
+**schema-constrained decoding**. `slm_teacher.py` now hands the teacher a Vertex
+`generationConfig.responseSchema` derived from the contract schemas
+(`slm_schema.py`), so extract output and per-turn widget payloads are schema-valid
+by construction; the cheaper `gemini-2.5-flash` is the label source. The
+authoritative training target stays the deterministic oracle; the constrained
+teacher is augmentation, validated + repaired toward the oracle contract before
+inclusion (`dataset_build` `labels_teacher_repaired`).
+
+## Distributed run (`-r distributed`)
+
+```bash
+# 1. regenerate the self-contained playbook from the org config
+python3 automation/mlops/slm/build_distributed_playbook.py \
+  --config ../travel/automation/mlops/slm/travel/slm.config.yaml \
+  --out automation/mlops/slm/dataset_build_distributed.yaml \
+  --path muno/slm/dataset-build-constrained
+# 2. register it to the catalog, then run on the worker pool
+noetl exec muno/slm/dataset-build-constrained -r distributed \
+  --set version=v1_constrained            # add --set limit=N to cap teacher spend
+```
+
+The worker mints its Vertex Workload-Identity token in-python from the pod
+metadata server (no API key, no Secret Manager). The worker image has **no
+PyYAML**, so the generator packs the config as pre-parsed JSON and
+`slm_common.load_config` reads it without `yaml`.
 
 ## Run
 

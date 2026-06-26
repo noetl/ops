@@ -66,6 +66,46 @@ def _validate_labels(ex, rd, extract_schema, render_schema, widget_dir):
     }
 
 
+def _repair_render(teacher_render, oracle_render, widget_dir):
+    """Validate each teacher widget against its per-type payload schema; replace
+    any invalid envelope with the oracle's widget of the same type (positional
+    fallback when the type isn't present in the oracle render).  The oracle's
+    widgets are schema-valid by construction, so the repaired render is valid
+    wherever an oracle substitute exists.  Returns (repaired_render, stats)."""
+    if not widget_dir:
+        return teacher_render, {"repaired": 0}
+    oracle_widgets = (oracle_render or {}).get("widgets", []) or []
+    by_type = {}
+    for w in oracle_widgets:
+        if isinstance(w, dict) and w.get("widget_type"):
+            by_type.setdefault(w["widget_type"], w)
+    out_widgets = []
+    repaired = 0
+    for i, w in enumerate(teacher_render.get("widgets", []) or []):
+        errs = C.validate_envelope(w, widget_dir) if isinstance(w, dict) else ["not an object"]
+        if not errs:
+            out_widgets.append(w)
+            continue
+        # substitute: prefer the oracle widget of the same declared type, else
+        # the positional oracle widget, else keep the teacher's (still invalid).
+        wt = w.get("widget_type") if isinstance(w, dict) else None
+        sub = by_type.get(wt)
+        if sub is None and i < len(oracle_widgets):
+            sub = oracle_widgets[i]
+        if sub is not None:
+            out_widgets.append(sub)
+            repaired += 1
+        else:
+            out_widgets.append(w)
+    if not out_widgets and oracle_widgets:
+        # teacher emitted no widgets at all — fall back to the oracle render
+        out_widgets = list(oracle_widgets)
+        repaired += len(oracle_widgets)
+    return {"bot_message": teacher_render.get("bot_message", ""), "widgets": out_widgets}, {
+        "repaired": repaired
+    }
+
+
 def build(config_path, out_override=None, corpus_override=None, version_override=None,
           limit=None, use_teacher=True, teacher_id=None):
     cfg, cfg_dir = C.load_config(config_path)
@@ -128,9 +168,13 @@ def build(config_path, out_override=None, corpus_override=None, version_override
     widget_type_dist = {}
     n_ext_valid = n_rnd_valid = n_widgets_valid = n_with_widgets = 0
     total_envelopes = valid_envelopes = 0
-    # teacher-side validity
+    # teacher-side validity (pre-repair = raw constrained teacher)
     t_ext_valid = t_rnd_valid = t_widgets_valid = 0
     t_total_env = t_valid_env = 0
+    # teacher-side validity (post-repair = teacher widgets, oracle-substituted on failure)
+    t_widgets_valid_rep = 0
+    t_total_env_rep = t_valid_env_rep = 0
+    t_repaired_envelopes = 0
     n_teacher = 0
 
     for turn in turns:
@@ -182,23 +226,43 @@ def build(config_path, out_override=None, corpus_override=None, version_override
         # ── teacher (ceiling) labels, additive ──
         if teacher is not None:
             try:
-                tprod = teacher.label_turn(turn, tool_summary_fn=tool_summary_fn)
+                # pass the authoritative oracle render so the teacher's per-turn
+                # responseSchema is pinned to the contract's widget types
+                tprod = teacher.label_turn(
+                    turn, tool_summary_fn=tool_summary_fn, oracle_render=rd
+                )
                 tex, trd = tprod["extract"], tprod["render"]
+                # pre-repair validity (the raw constrained-teacher numbers)
                 tv = _validate_labels(tex, trd, extract_schema, render_schema, widget_dir)
+                # validate + repair: any teacher widget that fails its per-type
+                # payload schema falls back to the oracle's widget of the same
+                # type (task 6 — "post schema-validation/repair").  Extract is
+                # NOT repaired — it is the teacher's authoritative contribution.
+                trd_rep, rep_stats = _repair_render(trd, rd, widget_dir)
+                tvr = _validate_labels(tex, trd_rep, extract_schema, render_schema, widget_dir)
+
                 t_total_env += tv["total_envelopes"]
                 t_valid_env += tv["valid_envelopes"]
+                t_total_env_rep += tvr["total_envelopes"]
+                t_valid_env_rep += tvr["valid_envelopes"]
                 if tv["extract_schema"]:
                     t_ext_valid += 1
                 if tv["render_schema"]:
                     t_rnd_valid += 1
                 if tv["widgets"]:
                     t_widgets_valid += 1
+                if tvr["widgets"]:
+                    t_widgets_valid_rep += 1
+                t_repaired_envelopes += rep_stats["repaired"]
                 n_teacher += 1
                 example["labels_teacher"] = {"extract": tex, "render": trd}
+                example["labels_teacher_repaired"] = {"extract": tex, "render": trd_rep}
                 example["teacher_valid"] = {
                     "extract_schema": tv["extract_schema"],
                     "render_schema": tv["render_schema"],
                     "widgets": tv["widgets"],
+                    "widgets_after_repair": tvr["widgets"],
+                    "envelopes_repaired": rep_stats["repaired"],
                     "errors": tv["errors"],
                 }
             except T.TeacherError as exc:
@@ -228,6 +292,7 @@ def build(config_path, out_override=None, corpus_override=None, version_override
                 "errors": len(teacher_errors),
                 "extract_model": teacher.extract_model,
                 "render_model": teacher.render_model,
+                "constrained_decoding": getattr(teacher, "constrained", False),
                 "validity": {
                     "extract_schema_valid_rate": round(t_ext_valid / n, 4),
                     "render_schema_valid_rate": round(t_rnd_valid / n, 4),
@@ -235,6 +300,13 @@ def build(config_path, out_override=None, corpus_override=None, version_override
                     "widget_envelope_valid_rate": round(t_valid_env / t_total_env, 4) if t_total_env else 1.0,
                     "total_widget_envelopes": t_total_env,
                     "valid_widget_envelopes": t_valid_env,
+                },
+                "validity_after_repair": {
+                    "examples_all_widgets_valid_rate": round(t_widgets_valid_rep / n, 4),
+                    "widget_envelope_valid_rate": round(t_valid_env_rep / t_total_env_rep, 4) if t_total_env_rep else 1.0,
+                    "total_widget_envelopes": t_total_env_rep,
+                    "valid_widget_envelopes": t_valid_env_rep,
+                    "envelopes_repaired_from_oracle": t_repaired_envelopes,
                 },
                 "usage": teacher.usage,
                 "error_samples": teacher_errors[:5],
@@ -267,6 +339,26 @@ def build(config_path, out_override=None, corpus_override=None, version_override
         "files": {
             "train": os.path.join(ds_dir, "train.jsonl"),
             "eval": os.path.join(ds_dir, "eval.jsonl"),
+        },
+        "label_combination": {
+            # Phase 1 policy (noetl/ai-meta#140/#141): the deterministic oracle
+            # is the authoritative training target on every example (schema-valid
+            # by construction).  The constrained teacher's label is carried
+            # alongside as `labels_teacher` (raw) + `labels_teacher_repaired`
+            # (per-widget oracle substitution on payload-schema failure) so the
+            # trainer can use it as augmentation / a second view where it adds
+            # value, after schema validation.  Extract is the teacher's
+            # authoritative contribution (not repaired); render payloads are
+            # repaired toward the oracle contract.
+            "authoritative": "deterministic_oracle",
+            "teacher_role": "augmentation_after_validation_and_repair",
+            "per_example_fields": {
+                "labels": "oracle (authoritative target)",
+                "labels_teacher": "constrained teacher (raw)",
+                "labels_teacher_repaired": "constrained teacher, render payloads repaired to oracle on schema failure",
+            },
+            "examples_with_valid_teacher_extract": t_ext_valid,
+            "examples_with_valid_teacher_render_after_repair": t_widgets_valid_rep,
         },
         "registry_stub": {
             "kind": "dataset",

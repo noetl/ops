@@ -138,7 +138,7 @@ class TestVertexGeminiProvider(unittest.TestCase):
         p = T.VertexGeminiProvider(project="proj", token_fn=lambda: "tok")
         calls = []
 
-        def fake_generate(token, model, system, user):
+        def fake_generate(token, model, system, user, response_schema=None):
             calls.append(model)
             if model == "gemini-2.5-pro":
                 raise T.TeacherError("vertex gemini-2.5-pro HTTP 429: resource exhausted")
@@ -248,6 +248,115 @@ class TestFromConfigProviderSelection(unittest.TestCase):
         )
         with self.assertRaises(T.TeacherError):
             T.Teacher.from_config(cfg, ".", _FakeCommon)
+
+
+# ── schema-constrained decoding (noetl/ai-meta#140 Phase 1) ─────────────────
+import os as _os
+
+_THIS = _os.path.dirname(_os.path.abspath(__file__))
+_TRAVEL = _os.path.normpath(
+    _os.path.join(_THIS, "../../../../../travel/automation/mlops/slm/travel")
+)
+_EXTRACT_SCHEMA = _os.path.join(_TRAVEL, "contracts/extract_output.schema.json")
+_WIDGET_DIR = _os.path.normpath(
+    _os.path.join(_THIS, "../../../../../travel/playbooks/widget-contract")
+)
+_HAVE_CONTRACTS = _os.path.exists(_EXTRACT_SCHEMA) and _os.path.exists(_WIDGET_DIR)
+
+
+class TestNormalizeToolRequests(unittest.TestCase):
+    def test_maps_drift_keys_and_drops_keyless(self):
+        buggy = [
+            {"tool_id": "mcp/google-places.search_text", "arguments": {"q": 1}},
+            {"tool_name": "mcp/duffel.search_offers", "parameters": {"o": "SFO"}},
+            {"arguments": {"x": 1}},  # no tool key at all -> dropped
+            "not-a-dict",
+        ]
+        out = T._normalize_tool_requests(buggy)
+        self.assertEqual(
+            out,
+            [
+                {"tool": "mcp/google-places.search_text", "arguments": {"q": 1}},
+                {"tool": "mcp/duffel.search_offers", "arguments": {"o": "SFO"}},
+            ],
+        )
+
+
+@unittest.skipUnless(_HAVE_CONTRACTS, "travel contract schemas not on disk")
+class TestSchemaConstrainedDecoding(unittest.TestCase):
+    def test_extract_schema_passed_and_response_normalized(self):
+        captured = {}
+
+        class P:
+            def chat_json(self, model, sysp, user, response_schema=None):
+                captured["extract_schema"] = response_schema
+                # model still drifts to tool_id; normalization must repair it
+                return (
+                    {
+                        "slot_updates": {},
+                        "tool_requests": [
+                            {"tool_id": "mcp/google-places.search_text", "arguments": {}}
+                        ],
+                        "render_intent": {"kind": "show_places"},
+                    },
+                    {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "model": model},
+                )
+
+        tch = T.Teacher(
+            P(), "m", "m", "SYS", "SYS",
+            constrained=True, extract_schema_path=_EXTRACT_SCHEMA, widget_dir=_WIDGET_DIR,
+        )
+        self.assertTrue(tch.constrained)
+        ex = tch.extract({"event_type": "user_message", "event_payload": {"text": "hi"}})
+        # a responseSchema was handed to the provider
+        self.assertIsNotNone(captured["extract_schema"])
+        self.assertIn("tool_requests", captured["extract_schema"]["properties"])
+        # the drifted tool_id was normalized to the contract `tool` key
+        self.assertEqual(ex["tool_requests"], [{"tool": "mcp/google-places.search_text", "arguments": {}}])
+
+    def test_render_schema_pinned_to_oracle_widget_types(self):
+        captured = {}
+
+        class P:
+            def chat_json(self, model, sysp, user, response_schema=None):
+                captured["render_schema"] = response_schema
+                return (
+                    {"bot_message": "x", "widgets": []},
+                    {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "model": model},
+                )
+
+        tch = T.Teacher(
+            P(), "m", "m", "SYS", "SYS",
+            constrained=True, extract_schema_path=_EXTRACT_SCHEMA, widget_dir=_WIDGET_DIR,
+        )
+        oracle_render = {"widgets": [{"widget_type": "date_range_picker"}]}
+        tch.render(
+            {"slot_state": {}}, {"render_intent": {"kind": "collect_missing"}},
+            allowed_widget_types=["date_range_picker"],
+        )
+        item = captured["render_schema"]["properties"]["widgets"]["items"]
+        self.assertEqual(item["properties"]["widget_type"]["enum"], ["date_range_picker"])
+        # the per-type required payload fields are enforced by construction
+        self.assertIn("min_date", item["properties"]["payload"]["required"])
+
+    def test_constrained_off_passes_no_schema(self):
+        captured = {}
+
+        class P:
+            def chat_json(self, model, sysp, user, response_schema=None):
+                captured["schema"] = response_schema
+                return (
+                    {"slot_updates": {}, "tool_requests": [], "render_intent": {"kind": "summarize"}},
+                    {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "model": model},
+                )
+
+        tch = T.Teacher(
+            P(), "m", "m", "SYS", "SYS",
+            constrained=False, extract_schema_path=_EXTRACT_SCHEMA, widget_dir=_WIDGET_DIR,
+        )
+        self.assertFalse(tch.constrained)
+        tch.extract({"event_type": "user_message", "event_payload": {"text": "hi"}})
+        self.assertIsNone(captured["schema"])
 
 
 if __name__ == "__main__":

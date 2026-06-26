@@ -44,6 +44,11 @@ import time
 import urllib.error
 import urllib.request
 
+try:
+    import slm_schema as S  # sibling module (draft-07 -> Vertex responseSchema)
+except Exception:  # pragma: no cover - allows import in contexts without the sibling
+    S = None
+
 # ── teacher price table (USD per 1M tokens) ─────────────────────────────────
 # Estimate only, for the token-cost line in the manifest/report.  Override per
 # model via the config ``teachers[].pricing`` block when prices move.
@@ -103,12 +108,26 @@ class OpenAIProvider:
         self.max_retries = max_retries
         self.timeout = timeout
 
-    def chat_json(self, model, system_prompt, user_payload):
+    def chat_json(self, model, system_prompt, user_payload, response_schema=None):
+        # OpenAI structured outputs: a response_schema (Vertex-subset dict, which
+        # is also a valid JSON Schema) upgrades json_object to a strict
+        # json_schema response_format.  Pluggable: None keeps plain JSON mode.
+        if response_schema is not None:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "slm_contract",
+                    "strict": False,
+                    "schema": response_schema,
+                },
+            }
+        else:
+            response_format = {"type": "json_object"}
         body = json.dumps(
             {
                 "model": model,
                 "temperature": 0,
-                "response_format": {"type": "json_object"},
+                "response_format": response_format,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_payload},
@@ -219,15 +238,22 @@ class VertexGeminiProvider:
             % (self.region, self.project, self.region, model)
         )
 
-    def _generate(self, token, model, system_prompt, user_payload):
+    def _generate(self, token, model, system_prompt, user_payload, response_schema=None):
+        gen_config = {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        }
+        # Schema-constrained decoding (noetl/ai-meta#140 Phase 1): when a
+        # Vertex-subset responseSchema is supplied, the model's output is
+        # JSON-schema-valid by construction — this is the fix the ceiling-run
+        # finding implies (constrain the decoder, don't grow the model).
+        if response_schema is not None:
+            gen_config["responseSchema"] = response_schema
         body = json.dumps(
             {
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"role": "user", "parts": [{"text": user_payload}]}],
-                "generationConfig": {
-                    "temperature": 0,
-                    "responseMimeType": "application/json",
-                },
+                "generationConfig": gen_config,
             }
         ).encode("utf-8")
         url = self._endpoint(model)
@@ -277,16 +303,18 @@ class VertexGeminiProvider:
                 raise TeacherError("vertex %s %s" % (model, last_err))
         raise TeacherError("vertex %s exhausted retries: %s" % (model, last_err))
 
-    def chat_json(self, model, system_prompt, user_payload):
+    def chat_json(self, model, system_prompt, user_payload, response_schema=None):
         # Mint the token ONCE per call so a Workload-Identity block surfaces its
         # clean message directly rather than being masked by the fallback path.
         token = self._token_fn()
         try:
-            return self._generate(token, model, system_prompt, user_payload)
+            return self._generate(token, model, system_prompt, user_payload, response_schema)
         except TeacherError as primary_err:
             if self.fallback_model and self.fallback_model != model:
                 try:
-                    return self._generate(token, self.fallback_model, system_prompt, user_payload)
+                    return self._generate(
+                        token, self.fallback_model, system_prompt, user_payload, response_schema
+                    )
                 except TeacherError as fb_err:
                     raise TeacherError(
                         "vertex primary (%s) and fallback (%s) both failed: %s | %s"
@@ -328,6 +356,9 @@ class Teacher:
         vocab=None,
         pricing=None,
         request_sleep=0.0,
+        constrained=True,
+        extract_schema_path=None,
+        widget_dir=None,
     ):
         self._provider = provider
         self.extract_model = extract_model
@@ -339,6 +370,25 @@ class Teacher:
         if pricing:
             self.pricing.update(pricing)
         self.request_sleep = request_sleep
+        # ── schema-constrained decoding (noetl/ai-meta#140 Phase 1) ──
+        # When on (default) and the converter + contract schemas are available,
+        # each pass is given a Vertex-subset responseSchema so the output is
+        # schema-valid by construction.  Falls back to unconstrained JSON mode
+        # (the old behaviour) when the converter is missing or a schema can't be
+        # converted, so the engine still runs and the repair pass cleans up.
+        self.constrained = bool(constrained) and S is not None
+        self.extract_schema_path = extract_schema_path
+        self.widget_dir = widget_dir
+        self._extract_response_schema = None
+        if self.constrained and extract_schema_path:
+            try:
+                self._extract_response_schema = S.extract_response_schema(extract_schema_path)
+            except Exception as exc:  # converter failure -> envelope-free extract
+                self._extract_response_schema = None
+                self.constrained_warnings = getattr(self, "constrained_warnings", [])
+                self.constrained_warnings.append("extract schema convert failed: %s" % exc)
+        # cache of per-turn render schemas keyed by the sorted widget-type tuple
+        self._render_schema_cache = {}
         # cumulative accounting across every call this instance makes
         self.usage = {
             "calls": 0,
@@ -392,6 +442,16 @@ class Teacher:
         extract_prompt = cls._load_prompt(_role("extract"), cfg_dir, common)
         render_prompt = cls._load_prompt(_role("render"), cfg_dir, common)
 
+        # contract schema paths for constrained decoding (extract output schema
+        # + the widget-contract dir for per-type render payloads)
+        extract_schema_path = common.resolve(cfg_dir, _role("extract").get("output_schema"))
+        widget_dir = common.resolve(cfg_dir, _role("render").get("widget_schema_dir"))
+        # constrained decoding defaults ON; a teacher block may opt out with
+        # constrained_decoding: false (e.g. to measure the unconstrained ceiling).
+        constrained = str(chosen.get("constrained_decoding", "true")).lower() not in (
+            "false", "0", "off", "no"
+        )
+
         provider_kind = str(chosen.get("provider", "openai")).lower()
         return (
             cls(
@@ -403,9 +463,12 @@ class Teacher:
                 vocab=dom.get("vocab", {}),
                 pricing=chosen.get("pricing"),
                 request_sleep=float(chosen.get("request_sleep_s", 0.0)),
+                constrained=constrained,
+                extract_schema_path=extract_schema_path,
+                widget_dir=widget_dir,
             ),
-            "teacher %r enabled (provider=%s, extract=%s, render=%s)"
-            % (chosen.get("id"), provider_kind, extract_model, render_model),
+            "teacher %r enabled (provider=%s, extract=%s, render=%s, constrained=%s)"
+            % (chosen.get("id"), provider_kind, extract_model, render_model, constrained),
         )
 
     @staticmethod
@@ -493,16 +556,44 @@ class Teacher:
             },
             sort_keys=True,
         )
-        obj, usage = self._provider.chat_json(self.extract_model, self.extract_system_prompt, user)
+        schema = self._extract_response_schema if self.constrained else None
+        obj, usage = self._provider.chat_json(
+            self.extract_model, self.extract_system_prompt, user, response_schema=schema
+        )
         self._account(self.extract_model, usage)
-        # normalize to the contract keys (defensive: drop unexpected top keys)
+        # normalize to the contract keys (defensive: drop unexpected top keys),
+        # and repair tool-request shape drift — the first unconstrained ceiling
+        # run emitted `tool_id` / `tool_name` / `parameters` instead of the
+        # contract's `tool` / `arguments`, which both failed extract validation
+        # and crashed the oracle tool-summary with KeyError (noetl/ai-meta#140).
         return {
             "slot_updates": obj.get("slot_updates", {}) or {},
-            "tool_requests": obj.get("tool_requests", []) or [],
+            "tool_requests": _normalize_tool_requests(obj.get("tool_requests", []) or []),
             "render_intent": obj.get("render_intent", {"kind": "summarize"}) or {"kind": "summarize"},
         }
 
-    def render(self, turn, extraction, tool_summary=None):
+    def _render_schema_for(self, allowed_widget_types):
+        """Per-turn render responseSchema pinned to the authoritative oracle's
+        widget types (cached by the sorted type tuple).  Returns None when
+        constrained decoding is off or the per-type payload schemas can't be
+        converted (the repair pass then cleans up)."""
+        if not (self.constrained and self.widget_dir and allowed_widget_types):
+            return None
+        key = tuple(sorted(set(allowed_widget_types)))
+        if key in self._render_schema_cache:
+            return self._render_schema_cache[key]
+        try:
+            schema = S.render_response_schema(self.widget_dir, list(allowed_widget_types))
+        except Exception as exc:
+            schema = None
+            self.constrained_warnings = getattr(self, "constrained_warnings", [])
+            self.constrained_warnings.append(
+                "render schema convert failed for %s: %s" % (list(key), exc)
+            )
+        self._render_schema_cache[key] = schema
+        return schema
+
+    def render(self, turn, extraction, tool_summary=None, allowed_widget_types=None):
         slot = dict(turn.get("slot_state") or {})
         slot.update(extraction.get("slot_updates") or {})
         user = json.dumps(
@@ -511,24 +602,31 @@ class Teacher:
                 "extraction": extraction,
                 "tool_summary": tool_summary or {},
                 "render_intent": extraction.get("render_intent", {}),
+                "allowed_widget_types": list(allowed_widget_types or []),
                 "instruction": (
                     "Return ONLY the JSON object for the chat-render output "
                     "contract: {bot_message, widgets}. Every widget must be a "
                     "valid envelope {schema_version:1, widget_type, variant, "
-                    "payload}. Keep widget-type selection deterministic for the "
-                    "slot state + render_intent."
+                    "payload}, and every required payload field for the widget "
+                    "type must be present. Use only the widget types in "
+                    "allowed_widget_types, in that order, one widget each. Keep "
+                    "widget-type selection deterministic for the slot state + "
+                    "render_intent."
                 ),
             },
             sort_keys=True,
         )
-        obj, usage = self._provider.chat_json(self.render_model, self.render_system_prompt, user)
+        schema = self._render_schema_for(allowed_widget_types)
+        obj, usage = self._provider.chat_json(
+            self.render_model, self.render_system_prompt, user, response_schema=schema
+        )
         self._account(self.render_model, usage)
         return {
             "bot_message": obj.get("bot_message", "") or "",
             "widgets": obj.get("widgets", []) or [],
         }
 
-    def label_turn(self, turn, tool_summary_fn=None):
+    def label_turn(self, turn, tool_summary_fn=None, oracle_render=None):
         """Produce both teacher labels for one turn.
 
         ``tool_summary_fn`` (optional): callable(extraction, slot_state) ->
@@ -536,12 +634,52 @@ class Teacher:
         deterministic fixture the floor sees for its own extraction (keeps the
         floor↔ceiling render comparison apples-to-apples in Phase A, where no
         live MCP call is made).  When absent, render gets an empty summary.
+
+        ``oracle_render`` (optional): the authoritative oracle's render for this
+        turn.  Its widget types pin the per-turn render responseSchema so the
+        teacher fills the *required payload shape* for exactly the contract's
+        widget types — the intent is authoritative, the teacher supplies the
+        copy.  When absent, render is constrained only at the envelope level.
         """
         ex = self.extract(turn)
         slot = dict(turn.get("slot_state") or {})
         slot.update(ex.get("slot_updates") or {})
         ts = tool_summary_fn(ex, slot) if tool_summary_fn else {}
-        rd = self.render(turn, ex, ts)
+        allowed = [
+            w.get("widget_type")
+            for w in (oracle_render or {}).get("widgets", [])
+            if isinstance(w, dict) and w.get("widget_type")
+        ]
+        rd = self.render(turn, ex, ts, allowed_widget_types=allowed)
         if self.request_sleep:
             time.sleep(self.request_sleep)
         return {"extract": ex, "render": rd, "tool_summary": ts}
+
+
+def _normalize_tool_requests(reqs):
+    """Coerce teacher tool-request items onto the contract shape.
+
+    Maps the common drift keys (``tool_id`` / ``tool_name`` -> ``tool``,
+    ``parameters`` / ``args`` -> ``arguments``) and drops anything unexpected, so
+    a request is always ``{tool, arguments}`` — schema-valid and routable by the
+    oracle tool-summary.  Constrained decoding usually makes this a no-op, but it
+    guards the fallback / unconstrained path.
+    """
+    out = []
+    for r in reqs or []:
+        if not isinstance(r, dict):
+            continue
+        tool = r.get("tool") or r.get("tool_id") or r.get("tool_name") or ""
+        args = r.get("arguments")
+        if args is None:
+            args = r.get("parameters")
+        if args is None:
+            args = r.get("args")
+        if not isinstance(args, dict):
+            args = {}
+        if not tool:
+            # unroutable request with no tool key — skip rather than emit an
+            # invalid {arguments-only} item that fails the enum + required check.
+            continue
+        out.append({"tool": tool, "arguments": args})
+    return out

@@ -16,17 +16,29 @@ import importlib.util
 import json
 import os
 
+# PyYAML is present where the CLI runs (-r local), but NOT in the distributed
+# worker image — so the import is optional.  The distributed build playbook packs
+# a pre-parsed ``slm.config.json`` (the generator runs where PyYAML exists), and
+# ``load_config`` reads JSON without needing PyYAML on the worker.  Requiring an
+# image rebuild to add PyYAML is off the table (noetl/ai-meta#140 hard boundary).
 try:
-    import yaml  # PyYAML — present in the runtime
-except Exception as exc:  # pragma: no cover
-    raise SystemExit("PyYAML is required: %s" % exc)
+    import yaml  # PyYAML
+except Exception:  # pragma: no cover
+    yaml = None
 
 
 # ── config + paths ─────────────────────────────────────────────────────────
 
 def load_config(config_path):
     with open(config_path, "r") as fh:
-        cfg = yaml.safe_load(fh)
+        text = fh.read()
+    # A .json config (or any config when PyYAML is absent) is parsed as JSON —
+    # JSON is a strict subset of YAML, so this is lossless for the YAML configs
+    # too once the generator has emitted them as JSON.
+    if config_path.endswith(".json") or yaml is None:
+        cfg = json.loads(text)
+    else:
+        cfg = yaml.safe_load(text)
     cfg_dir = os.path.dirname(os.path.abspath(config_path))
     return cfg, cfg_dir
 
