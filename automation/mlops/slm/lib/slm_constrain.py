@@ -227,36 +227,72 @@ def _strip_unenforceable(node):
     return node
 
 
+def _required_only_top(payload_schema):
+    """Drop the OPTIONAL top-level payload properties, keeping only the
+    ``required`` ones.  The model (trained on the oracle's payloads) only ever
+    emits the required fields; leaving the optional ones in the constraint lets a
+    small model wander into an off-distribution optional key (e.g. flight_list's
+    ``emphasis_offer_id``) mid-payload and then degenerate before closing the
+    envelope — the exact failure that truncated the deep list renders.  Nested
+    object/array schemas keep their full shape (the model copies those verbatim
+    from the tool_summary)."""
+    if not isinstance(payload_schema, dict) or payload_schema.get("type") != "object":
+        return payload_schema
+    req = payload_schema.get("required") or []
+    props = payload_schema.get("properties") or {}
+    out = dict(payload_schema)
+    if req:
+        out["properties"] = {k: v for k, v in props.items() if k in req}
+    return out
+
+
 def _payload_schema(widget_type, widget_dir, cache):
-    """The fully-inlined, lmfe-safe payload schema for one widget type."""
+    """The fully-inlined, lmfe-safe, required-only-top-level payload schema for
+    one widget type."""
     payload_path = os.path.join(widget_dir, "%s.schema.json" % widget_type)
     payload_doc = _load_schema_file(payload_path, cache)
-    return _strip_unenforceable(_inline_refs(
+    inlined = _strip_unenforceable(_inline_refs(
         payload_doc, payload_doc, os.path.dirname(os.path.abspath(payload_path)),
         cache, []))
+    return _required_only_top(inlined)
+
+
+def _envelope_branch(widget_type, widget_dir, cache):
+    """One ``anyOf`` branch: a whole envelope pinned to ``widget_type`` (a
+    single-value enum = the early discriminator) with that type's required-only
+    payload as a CONCRETE schema."""
+    return {
+        "type": "object",
+        # envelope-keys-first / payload-last, matching the training serialization
+        # (slm_finetune._ENVELOPE_KEY_ORDER) so force_json_field_order and the
+        # model's learned order agree.
+        "required": ["widget_type", "variant", "schema_version", "payload"],
+        "properties": {
+            "widget_type": {"type": "string", "enum": [widget_type]},
+            "variant": {"type": "string"},
+            "schema_version": {"type": "integer"},
+            "payload": _payload_schema(widget_type, widget_dir, cache),
+        },
+    }
 
 
 def render_schema_payload_complete(render_schema_path, widget_dir, types=None):
-    """Build the render output schema whose ``widgets[]`` items are a FIXED
-    envelope object whose ``payload`` is an ``anyOf`` over the per-widget-type
-    payload schemas (lever 2).
+    """Build the render output schema whose ``widgets[]`` items are an ``anyOf``
+    over per-widget-type payload-complete ENVELOPE branches (lever 2).
 
-    Why fixed-envelope + anyOf-on-payload (not anyOf-of-envelopes): with an
-    anyOf of whole envelopes, ``force_json_field_order`` can't act — the parser
-    doesn't know which branch's field order to force until the discriminator is
-    set, so the model is free to emit the long ``payload`` FIRST and then truncate
-    before it ever writes ``widget_type`` / the closing braces (the JSON never
-    parses → the widget is dropped → ``widget_type_match`` fails on exactly the
-    data-bearing renders we're trying to fix).  Keeping the envelope a single
-    object lets ``force_json_field_order`` push ``schema_version`` → ``widget_type``
-    → ``variant`` → ``payload``, so the small envelope keys (incl. the chosen
-    ``widget_type``) are emitted FIRST and only the trailing ``payload`` is at risk
-    of the token budget — which the larger render budget + array cap then cover.
-    ``widget_type`` is enum-constrained to the producible set, and the payload is
-    constrained to be a complete instance of SOME producible type's schema; the
-    model's training aligns the payload with the type it just chose.
+    The branch is discriminated by ``widget_type`` as a single-value enum.  This
+    works because the model is trained envelope-keys-first (widget_type emitted
+    FIRST — slm_finetune._ENVELOPE_KEY_ORDER), so it commits the discriminator
+    immediately; the chosen branch's ``payload`` is then a CONCRETE schema (not a
+    nested anyOf), so ``force_json_field_order`` CAN force the payload's required
+    fields in order and the required-only top level keeps the model on its
+    training distribution — together that lets the deep list payloads
+    (flight_list / hotel_list) finish and close the envelope in budget instead of
+    truncating.  (An earlier fixed-envelope + anyOf-ON-PAYLOAD shape could not
+    force order inside the payload anyOf and wandered into off-distribution
+    optional keys → degenerate truncation.)
 
-    ``types`` restricts the type set (default: every ``*.schema.json`` in
+    ``types`` restricts the branch set (default: every ``*.schema.json`` in
     ``widget_dir``)."""
     with open(render_schema_path) as fh:
         schema = json.load(fh)
@@ -267,33 +303,16 @@ def render_schema_payload_complete(render_schema_path, widget_dir, types=None):
             for fn in sorted(os.listdir(widget_dir)):
                 if fn.endswith(".schema.json") and not fn.startswith("_"):
                     types.append(fn[: -len(".schema.json")])
-    payload_branches = []
-    kept_types = []
+    branches = []
     for t in types:
         try:
-            payload_branches.append(_payload_schema(t, widget_dir, cache))
-            kept_types.append(t)
+            branches.append(_envelope_branch(t, widget_dir, cache))
         except Exception:
             continue
-    if payload_branches:
-        item_schema = {
-            "type": "object",
-            # order forced by force_json_field_order: widget_type (the
-            # discriminator the eval reads) FIRST, the long payload LAST — and it
-            # MUST match the training serialization order in
-            # slm_finetune._ENVELOPE_KEY_ORDER so the model's learned generation
-            # order and the constraint agree.
-            "required": ["widget_type", "variant", "schema_version", "payload"],
-            "properties": {
-                "widget_type": {"type": "string", "enum": kept_types},
-                "variant": {"type": "string"},
-                "schema_version": {"type": "integer"},
-                "payload": ({"anyOf": payload_branches} if len(payload_branches) > 1
-                            else payload_branches[0]),
-            },
-        }
+    if branches:
         try:
-            schema["properties"]["widgets"]["items"] = item_schema
+            schema["properties"]["widgets"]["items"] = (
+                {"anyOf": branches} if len(branches) > 1 else branches[0])
         except Exception:
             pass
     return sanitize_for_lmfe(schema)
