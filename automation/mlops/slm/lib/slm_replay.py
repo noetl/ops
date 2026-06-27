@@ -226,24 +226,150 @@ def ingest(base_url, path, limit=500, out_path=None, config_path=None,
     }
 
 
+# ── shadow-comparison ingestion (the data flywheel) ─────────────────────────
+
+def _find_shadow_record(detail, shadow_node="shadow_slm_compare"):
+    """Pull the slm_shadow_comparison record out of an execution's events.  It is
+    the result of the planner's (or selftest's) shadow leaf — the capture object
+    built at ``log_shadow_comparison`` / ``shadow_slm_compare`` time."""
+    for e in detail.get("events", []):
+        if e.get("node_name") != shadow_node:
+            continue
+        if e.get("event_type") not in ("call.done", "command.completed"):
+            continue
+        for _, v in _deep_find(e.get("result"), {"kind"}):
+            pass  # _deep_find yields (key, value); we want the dict carrying kind
+        # locate the dict whose kind == slm_shadow_comparison
+        rec = _locate_shadow_dict(e.get("result"))
+        if rec is not None:
+            return rec
+    return None
+
+
+def _locate_shadow_dict(obj, depth=0, max_depth=14):
+    if depth > max_depth:
+        return None
+    if isinstance(obj, dict):
+        if obj.get("kind") == "slm_shadow_comparison":
+            return obj
+        for v in obj.values():
+            r = _locate_shadow_dict(v, depth + 1, max_depth)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _locate_shadow_dict(v, depth + 1, max_depth)
+            if r is not None:
+                return r
+    return None
+
+
+def ingest_shadow(base_url, path, limit=500, out_path=None, config_path=None,
+                  shadow_node="shadow_slm_compare", status="COMPLETED"):
+    """Read shadow-comparison records (the SLM-vs-live captures from shadow mode)
+    out of real executions and emit a labelable corpus in the SAME shape
+    ``dataset_build`` reads — turning shadow traffic into training data.
+
+    The turn text is re-redacted defensively (it is already redacted at capture).
+    The live (oracle) output the planner actually served is carried as
+    ``prod_extract`` — the same third-reference role the event-log replay uses —
+    so ``dataset_build`` re-labels the input and the captured live label is a
+    sanity reference.  The SLM's own shadow output rides along under
+    ``slm_extract`` for offline agreement analysis.
+    """
+    if config_path:
+        cfg, _ = C.load_config(config_path)
+        repl = cfg.get("slm_domain", {}).get("data", {}).get("event_log_replay", {}) or {}
+        path = path or repl.get("path")
+
+    listing = _get(base_url, "/api/executions?path=%s&limit=%d" % (path, int(limit)))
+    if status:
+        listing = [x for x in listing if x.get("status") == status]
+
+    turns = []
+    skipped = with_slm = fell_back = 0
+    for summ in listing:
+        exec_id = summ.get("execution_id")
+        try:
+            detail = _get(base_url, "/api/executions/%s" % exec_id)
+        except urllib.error.HTTPError:
+            skipped += 1
+            continue
+        rec = _find_shadow_record(detail, shadow_node)
+        if rec is None:
+            skipped += 1
+            continue
+        turn = rec.get("turn", {}) or {}
+        event_type = turn.get("event_type")
+        event_payload = turn.get("event_payload")
+        if not event_type or event_payload in (None, {}):
+            skipped += 1
+            continue
+        live_extract = rec.get("live_extract") or {}
+        prod_extract = {
+            "slot_updates": live_extract.get("slot_updates", {}) or {},
+            "tool_requests": live_extract.get("tool_requests", []) or [],
+            "render_intent": live_extract.get("render_intent", {}) or {},
+        } if live_extract else None
+        out_turn = {
+            "id": "shadow_%s" % exec_id,
+            "intent_label": ((prod_extract or {}).get("render_intent") or {}).get("kind"),
+            "event_type": event_type,
+            "event_payload": redact_payload(event_payload),
+            "slot_state": turn.get("slot_state", {}) or {},
+            "thread_context": [],
+            "source": "shadow_comparison",
+            "execution_id": str(exec_id),
+            "started_at": summ.get("started_at"),
+        }
+        if prod_extract is not None:
+            out_turn["prod_extract"] = prod_extract
+        if rec.get("slm_extract"):
+            out_turn["slm_extract"] = rec.get("slm_extract")
+            out_turn["slm_agreement"] = rec.get("agreement")
+            with_slm += 1
+        if rec.get("fell_back"):
+            fell_back += 1
+        turns.append(out_turn)
+
+    out_path = out_path or "shadow_replay_corpus.jsonl"
+    C.write_jsonl(out_path, turns)
+    return {
+        "out": out_path,
+        "executions_listed": len(listing),
+        "turns_written": len(turns),
+        "skipped": skipped,
+        "with_slm_shadow": with_slm,
+        "fell_back": fell_back,
+        "with_prod_label": sum(1 for t in turns if "prod_extract" in t),
+        "path": path,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default=os.environ.get("NOETL_SERVER_URL", "http://localhost:8082"))
     ap.add_argument("--path", default="muno/playbooks/itinerary-planner")
     ap.add_argument("--limit", type=int, default=500)
-    ap.add_argument("--out", default="replay_corpus.jsonl")
+    ap.add_argument("--out", default=None)
     ap.add_argument("--config", default=None)
     ap.add_argument("--extract-node", default="extract_turn")
+    ap.add_argument("--shadow", action="store_true",
+                    help="ingest shadow-comparison records (the data flywheel) instead of raw extract labels")
+    ap.add_argument("--shadow-node", default="shadow_slm_compare")
     args = ap.parse_args()
-    summary = ingest(
-        args.base_url,
-        args.path,
-        limit=args.limit,
-        out_path=args.out,
-        config_path=args.config,
-        extract_node=args.extract_node,
-    )
-    print("=== replay ingest complete ===")
+    if args.shadow:
+        summary = ingest_shadow(
+            args.base_url, args.path, limit=args.limit,
+            out_path=args.out or "shadow_replay_corpus.jsonl",
+            config_path=args.config, shadow_node=args.shadow_node)
+        print("=== shadow replay ingest complete ===")
+    else:
+        summary = ingest(
+            args.base_url, args.path, limit=args.limit,
+            out_path=args.out or "replay_corpus.jsonl",
+            config_path=args.config, extract_node=args.extract_node)
+        print("=== replay ingest complete ===")
     print(json.dumps(summary, indent=2))
 
 
