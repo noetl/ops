@@ -350,12 +350,22 @@ class SlmRunner:
         self._tok_data = CON.build_tokenizer_data(self._mlx["tokenizer"])
         if self.extract_schema and os.path.isfile(self.extract_schema):
             with open(self.extract_schema) as fh:
-                self._extract_schema_dict = json.load(fh)
-        if self.render_schema and os.path.isfile(self.render_schema):
+                self._extract_schema_dict = CON.sanitize_for_lmfe(json.load(fh))
+        # Render constraint is OFF by default: forcing the widget_type enum +
+        # a generic payload (the render schema doesn't carry per-widget-type
+        # payload requirements) perturbs the model into payloads that fail the
+        # per-type schema and get dropped post-hoc → empty widget lists, which is
+        # worse than plain generation + repair.  Opt in with SLM_CONSTRAIN_RENDER
+        # only if a payload-complete render schema is supplied.  Extract
+        # constraint (the closed-vocab tool + render_intent enums) is the clean,
+        # always-on win.
+        constrain_render = os.environ.get("SLM_CONSTRAIN_RENDER", "").strip().lower() in ("1", "true", "yes")
+        if constrain_render and self.render_schema and os.path.isfile(self.render_schema):
             self._render_schema_dict = CON.render_schema_with_widget_enum(
                 self.render_schema, self.widget_dir)
         self.constrained = True
-        print("constrained decode: ENABLED (logit-level JSON-schema enforcement)", file=sys.stderr)
+        print("constrained decode: ENABLED (extract schema; render_constraint=%s)"
+              % bool(self._render_schema_dict), file=sys.stderr)
 
     # -- stub backend ---------------------------------------------------------
 

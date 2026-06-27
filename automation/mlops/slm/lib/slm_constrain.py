@@ -85,6 +85,33 @@ def available():
         return False
 
 
+# ── schema sanitiser ─────────────────────────────────────────────────────────
+
+def sanitize_for_lmfe(node):
+    """Return a deep copy of a JSON-schema node with constructs lm-format-enforcer
+    can't handle removed:
+
+      * non-string ``const`` (e.g. ``schema_version`` const 1) — lmfe's enum/const
+        completion does ``str.startswith`` and crashes on an int.
+      * ``enum`` lists containing non-strings.
+
+    These only affect numeric literals (which lmfe can't meaningfully constrain
+    anyway); the string enums we care about (tool / render_intent / widget_type)
+    are preserved."""
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k == "const" and not isinstance(v, str):
+                continue
+            if k == "enum" and isinstance(v, list) and not all(isinstance(x, str) for x in v):
+                continue
+            out[k] = sanitize_for_lmfe(v)
+        return out
+    if isinstance(node, list):
+        return [sanitize_for_lmfe(x) for x in node]
+    return node
+
+
 # ── augmented render schema (inject widget_type enum) ────────────────────────
 
 def render_schema_with_widget_enum(render_schema_path, widget_dir):
@@ -104,7 +131,7 @@ def render_schema_with_widget_enum(render_schema_path, widget_dir):
             wt["enum"] = types
     except Exception:
         pass
-    return schema
+    return sanitize_for_lmfe(schema)
 
 
 # ── the mlx logits processor ─────────────────────────────────────────────────
