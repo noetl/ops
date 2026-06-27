@@ -199,17 +199,18 @@ def _mlx_data_pair(ex, sysp):
     format.  With ``--mask-prompt`` the loss is computed on the completion only,
     so the model learns the JSON output given the (masked) instruction prompt.
 
-    The render completion is serialized envelope-keys-first / payload-last (see
-    ``_ordered_render_target``) with ``sort_keys=False`` to preserve that order;
-    the extract completion keeps the stable ``sort_keys=True`` form (no deep
-    nesting, order-insensitive)."""
-    if ex.get("role") == "render":
-        completion = json.dumps(_ordered_render_target(ex["target"]), sort_keys=False)
-    else:
-        completion = json.dumps(ex["target"], sort_keys=True)
+    NOTE: completions are serialized with ``sort_keys=True`` — the stable form v1
+    → v3 used.  An experimental envelope-keys-first / payload-last render
+    serialization (``_ordered_render_target``, intended to let the payload-complete
+    render constraint force field order) was tried for v4/v4b and REVERTED: two
+    independent runs with it collapsed the model's free-running generation
+    (teacher-forced val loss stayed low, but greedy decode degenerated into
+    repetition/gibberish on the extract pass), while the identical recipe with
+    ``sort_keys=True`` (v3) generates cleanly.  The helper is kept for reference
+    but is no longer wired in."""
     return {
         "prompt": _example_prompt(ex, sysp),
-        "completion": completion,
+        "completion": json.dumps(ex["target"], sort_keys=True),
     }
 
 
