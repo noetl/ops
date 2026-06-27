@@ -519,29 +519,40 @@ class SlmRunner:
     # -- shared run surface ---------------------------------------------------
 
     def run_turn(self, turn):
+        # render conditions on the SLM's own constrained extraction (the natural
+        # end-to-end SLM pipeline); run_extract / run_render are the split form
+        # the serving endpoint uses so each shadow pass is exactly one model call.
+        extract = self.run_extract(turn)
+        render = self.run_render(turn, extract)
+        return {"extract": extract, "render": render}
+
+    def run_extract(self, turn):
+        """Extract pass only.  Returns the schema-constrained extract dict — the
+        ``{slot_updates, tool_requests, render_intent}`` contract object the
+        planner's ``extract_turn`` step emits, so a shadow step can compare it
+        field-for-field against the live extraction."""
         if self.backend == "stub":
             proto, _score = self._retrieve(turn)
             raw_ex = (proto or {}).get("extract", {})
-            raw_rd = (proto or {}).get("render", {})
         elif self.backend == "mlx":  # real model + (optional) logit-level constraint
             raw_ex = self._mlx_generate_json(self._extract_prompt(turn), self._extract_schema_dict)
-            # render conditions on the (constrained) extraction
-            ex_for_render = _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
-            raw_rd = self._mlx_generate_json(self._render_prompt(turn, ex_for_render), self._render_schema_dict)
         else:  # peft
             raw_ex = self._peft_generate_json(self._extract_prompt(turn))
-            ex_for_render = _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
-            raw_rd = self._peft_generate_json(self._render_prompt(turn, ex_for_render))
+        return _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
 
-        extract = _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
-        # a minimal always-valid fallback envelope when the proposed widgets are
-        # all rejected by the schema constraint
-        fallback = None
-        for w in (raw_rd.get("widgets") if isinstance(raw_rd, dict) else None) or []:
-            fallback = None  # prefer keeping a valid proposed one; handled in _constrain_render
-            break
-        render = _constrain_render(raw_rd, self.widget_dir, fallback)
-        return {"extract": extract, "render": render}
+    def run_render(self, turn, extraction):
+        """Render pass only, conditioned on ``extraction`` (the SLM's own or a
+        supplied extract) + the turn's ``tool_summary``.  Returns the
+        ``{bot_message, widgets}`` shape the eval engine + a shadow step compare
+        against the live ``render_widget_chat`` envelope."""
+        if self.backend == "stub":
+            proto, _score = self._retrieve(turn)
+            raw_rd = (proto or {}).get("render", {})
+        elif self.backend == "mlx":
+            raw_rd = self._mlx_generate_json(self._render_prompt(turn, extraction), self._render_schema_dict)
+        else:  # peft
+            raw_rd = self._peft_generate_json(self._render_prompt(turn, extraction))
+        return _constrain_render(raw_rd, self.widget_dir, None)
 
     def _extract_prompt(self, turn):
         sysp = self.manifest.get("prompts", {}).get("extract", "")

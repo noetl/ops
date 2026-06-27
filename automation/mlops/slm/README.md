@@ -219,3 +219,61 @@ NOETL_SERVER_URL=http://localhost:8082 \
 NOETL_INTERNAL_API_TOKEN=<token> \
 python3 repos/ops/automation/mlops/slm/lib/slm_registry_smoke.py
 ```
+
+## Shadow rollout (Option A) — serving + data flywheel
+
+The shadow-rollout pieces (RFC
+[`travel/docs/rfc/travel-slm-shadow-rollout.md`](https://github.com/noetl/travel/blob/main/docs/rfc/travel-slm-shadow-rollout.md))
+run the trained v3 SLM ALONGSIDE the live deterministic path on real turns,
+log both outputs for comparison, and turn shadow traffic into training data —
+without ever touching the served response.
+
+- **Serving endpoint**: [`lib/slm_serve.py`](lib/slm_serve.py) — a stdlib
+  `http.server` over `SlmRunner` (the Option-A local MLX pilot). Loads a model
+  artifact once and exposes `POST /extract`, `POST /render`, `GET /healthz`,
+  returning the same `{slot_updates, tool_requests, render_intent}` /
+  `{bot_message, widgets}` shapes the planner's `extract_turn` /
+  `render_widget_chat` emit, plus a `schema_valid` flag computed against the
+  contract + widget schemas. Needs the mlx venv (mlx_lm + lm-format-enforcer):
+
+  ```bash
+  .slm-venv/bin/python lib/slm_serve.py \
+    --config <slm.config.yaml> \
+    --model-artifact <.../v3/models/travel_slm_multitask-mlx> \
+    --host 0.0.0.0 --port 8099 --constrained-decode
+  ```
+
+- **Shadow core**: [`lib/slm_shadow.py`](lib/slm_shadow.py) — the per-turn
+  comparison engine (a `ShadowClient` over the endpoint + per-field agreement
+  extractors identical to `slm_eval`'s, so a captured shadow corpus is scored
+  by the same metric code). The planner's worker step inlines the same urllib
+  POST + equality checks.
+- **Validation harness**: [`lib/slm_shadow_validate.py`](lib/slm_shadow_validate.py)
+  — drives the endpoint over real eval turns, runs the oracle (the live path),
+  and writes shadow-comparison records with per-field agreement + schema
+  validity + latency. Off-cluster proof of the in-planner shadow branch.
+
+  ```bash
+  python3 lib/slm_shadow_validate.py \
+    --config <slm.config.yaml> --endpoint http://localhost:8099 \
+    --eval <.../v3/eval.jsonl> --n 22 --out shadow_corpus.jsonl
+  ```
+
+- **Data flywheel**: [`lib/slm_replay.py`](lib/slm_replay.py) `--shadow` reads
+  the planner's shadow-leaf records out of the event log into a labelable
+  corpus (turn + redacted text + the live label as `prod_extract` + the SLM
+  shadow output), which `dataset_build --corpus` re-labels into a training
+  dataset — closing the loop from production traffic to the next iteration.
+
+  ```bash
+  python3 lib/slm_replay.py --base-url http://localhost:8082 \
+    --path muno/playbooks/itinerary-planner --shadow --out shadow_corpus.jsonl
+  python3 lib/slm_dataset_build.py --config <slm.config.yaml> \
+    --corpus shadow_corpus.jsonl --version shadow_v_next --no-teacher
+  ```
+
+The consuming planner branch (the `shadow_slm_compare` leaf, gated on
+`workload.slm_shadow.enabled`, default OFF) lives in
+[`noetl/travel`](https://github.com/noetl/travel) under
+`playbooks/itinerary-planner.yaml`; a self-contained orchestrator self-test is
+`playbooks/slm/shadow-selftest.yaml` there.
