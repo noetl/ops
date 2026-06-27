@@ -163,7 +163,7 @@ def _mlx_data_pair(ex, sysp):
 
 def _train_mlx(examples, artifact_dir, manifest, *, base_model_hf, iters,
                batch_size, num_layers, learning_rate, max_seq_length,
-               steps_per_report=10, val_fraction=0.15, seed=13):
+               steps_per_report=10, val_fraction=0.15, seed=13, val_batches=12):
     """Real Apple-Silicon multitask LoRA fine-tune via ``mlx_lm`` (the most
     memory-efficient path on Apple unified memory).  Writes the prompt/completion
     corpus to a temp data dir, shells out to ``mlx_lm.lora --train`` (so the
@@ -221,16 +221,26 @@ def _train_mlx(examples, artifact_dir, manifest, *, base_model_hf, iters,
         "--max-seq-length", str(max_seq_length),
         "--steps-per-report", str(steps_per_report),
         "--steps-per-eval", str(max(steps_per_report, iters // 4 or 1)),
-        "--val-batches", "-1",
+        # a bounded validation sample (loss is for monitoring only; the
+        # authoritative scoring is the separate eval stage). Full-val (-1) on a
+        # large corpus costs minutes per eval and dominates wall-clock.
+        "--val-batches", str(val_batches),
         "--adapter-path", adapter_dir,
         "--save-every", str(iters),
         "--seed", str(seed),
     ]
     print("mlx-lm lora :: %s" % " ".join(cmd), file=sys.stderr)
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True)
-    log = proc.stdout or ""
-    print(log)
+    # stream the tuner's output line-by-line (live train/val loss visibility for
+    # long runs) while still collecting it for the loss-curve parse below.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    lines = []
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        lines.append(line)
+    proc.wait()
+    log = "".join(lines)
     if proc.returncode != 0:
         raise RuntimeError("mlx_lm lora failed (exit %s). Tail:\n%s"
                            % (proc.returncode, "\n".join(log.splitlines()[-25:])))
@@ -394,7 +404,7 @@ def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
              out_dir=None, augment_teacher=False, max_steps=2, epochs=1,
              lora_r=8, lora_alpha=16, lora_dropout=0.05, learning_rate=2e-4,
              mlx_iters=400, mlx_batch_size=1, mlx_num_layers=16,
-             mlx_max_seq_length=2048,
+             mlx_max_seq_length=2048, mlx_val_batches=12,
              register=True, model_name=None, tenant=None, project=None):
     cfg, cfg_dir = C.load_config(config_path)
     dom = cfg["slm_domain"]
@@ -476,7 +486,8 @@ def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
         manifest = _train_mlx(
             examples, out_dir, manifest, base_model_hf=base_model_hf,
             iters=mlx_iters, batch_size=mlx_batch_size, num_layers=mlx_num_layers,
-            learning_rate=learning_rate, max_seq_length=mlx_max_seq_length)
+            learning_rate=learning_rate, max_seq_length=mlx_max_seq_length,
+            val_batches=mlx_val_batches)
     elif backend == "peft":  # pragma: no cover
         examples = build_multitask_examples(records, include_teacher=augment_teacher)
         manifest = _train_peft(
@@ -557,6 +568,8 @@ def main():
     ap.add_argument("--mlx-batch-size", type=int, default=1)
     ap.add_argument("--mlx-num-layers", type=int, default=16)
     ap.add_argument("--mlx-max-seq-length", type=int, default=2048)
+    ap.add_argument("--mlx-val-batches", type=int, default=12,
+                    help="validation batches per eval (loss monitoring only; -1 = all)")
     ap.add_argument("--no-register", action="store_true")
     ap.add_argument("--model-name", default=None)
     ap.add_argument("--tenant", default=None)
@@ -571,6 +584,7 @@ def main():
         lora_dropout=args.lora_dropout, learning_rate=args.learning_rate,
         mlx_iters=args.mlx_iters, mlx_batch_size=args.mlx_batch_size,
         mlx_num_layers=args.mlx_num_layers, mlx_max_seq_length=args.mlx_max_seq_length,
+        mlx_val_batches=args.mlx_val_batches,
         register=not args.no_register, model_name=args.model_name,
         tenant=args.tenant, project=args.project)
     print("=== finetune complete ===")

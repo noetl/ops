@@ -67,6 +67,7 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 # finetune (download + train) and infer (load + serve) agree.
 HF_MODEL_ALIASES = {
     "qwen2.5-1.5b-instruct": "Qwen/Qwen2.5-1.5B-Instruct",
+    "qwen2.5-3b-instruct": "Qwen/Qwen2.5-3B-Instruct",
     "qwen2.5-0.5b-instruct": "Qwen/Qwen2.5-0.5B-Instruct",
     "llama-3.2-1b-instruct": "meta-llama/Llama-3.2-1B-Instruct",  # gated — needs HF auth
     "llama-3.2-3b-instruct": "meta-llama/Llama-3.2-3B-Instruct",  # gated — needs HF auth
