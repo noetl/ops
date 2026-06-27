@@ -125,11 +125,15 @@ From the per-predicted-intent breakdown:
   intent is right, the render generation doesn't always reproduce the
   exact valid widget sequence (e.g. the `summary` two-widget case).
 
-## Capacity comparison — Qwen2.5-3B-Instruct
+## Capacity comparison — Qwen2.5-3B-Instruct (aborted)
 
-<!-- FILLED IN AFTER THE 3B RUN -->
-_3B run in progress (same v2 dataset, same recipe).  Results + the
-1.5B-vs-3B comparison land here when it completes._
+The 3B LoRA was started on this v2 dataset to test capacity vs data as the
+ceiling, then **aborted**: the v2 failure modes (the `show_places` over-
+prediction, malformed-output fall-backs, render generation) pointed at
+data/decode, not capacity.  The follow-up **v3** iteration (targeted data +
+grammar-constrained decoding) on the **1.5B** confirmed this — see
+[`../travel-mlx-v3/RESULTS.md`](../travel-mlx-v3/RESULTS.md): tool 0.80→0.94,
+widget_type 0.65→0.79, with `show_places` going 3/14 → 27/27 correct tool.
 
 ## Verdict — not yet Muno-ready by the strict gate, but a large step
 

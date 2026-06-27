@@ -1,0 +1,86 @@
+{
+  "counts": {
+    "by_first_tool": {
+      "(none)": 402,
+      "mcp/amadeus.search_hotels": 158,
+      "mcp/duffel.create_order": 103,
+      "mcp/duffel.search_offers": 117,
+      "mcp/google-places.search_text": 170
+    },
+    "by_render_intent": {
+      "calendar_live": 43,
+      "collect_missing": 97,
+      "flight_detail": 52,
+      "order_confirmation": 103,
+      "show_flights": 117,
+      "show_hotels": 158,
+      "show_places": 170,
+      "summarize": 62,
+      "summary": 148
+    },
+    "eval": 144,
+    "total": 950,
+    "train": 806,
+    "widget_type_distribution": {
+      "calendar_view": 191,
+      "date_range_picker": 44,
+      "flight_card": 52,
+      "flight_list": 117,
+      "hotel_list": 158,
+      "itinerary_summary": 210,
+      "order_confirmation": 103,
+      "party_picker": 35,
+      "place_autocomplete_input": 18,
+      "place_list": 170
+    },
+    "with_widgets": 950
+  },
+  "created_from": "datasets/seed/travel_v3_corpus.jsonl",
+  "domain": "travel",
+  "files": {
+    "eval": "/Volumes/X10/projects/noetl/ai-meta/repos/travel/automation/mlops/slm/travel/datasets/build/travel/v3/eval.jsonl",
+    "train": "/Volumes/X10/projects/noetl/ai-meta/repos/travel/automation/mlops/slm/travel/datasets/build/travel/v3/train.jsonl"
+  },
+  "label_combination": {
+    "authoritative": "deterministic_oracle",
+    "examples_with_valid_teacher_extract": 0,
+    "examples_with_valid_teacher_render_after_repair": 0,
+    "per_example_fields": {
+      "labels": "oracle (authoritative target)",
+      "labels_teacher": "constrained teacher (raw)",
+      "labels_teacher_repaired": "constrained teacher, render payloads repaired to oracle on schema failure"
+    },
+    "teacher_role": "augmentation_after_validation_and_repair"
+  },
+  "label_source": "deterministic_oracle",
+  "registry_stub": {
+    "kind": "dataset",
+    "namespace": "muno/travel",
+    "note": "Stub only \u2014 a real versioned registry entry lands with platform foundation G3 (noetl/ai-meta#146).",
+    "urn": "noetl://travel/datasets/v3"
+  },
+  "schemas": {
+    "extract": "contracts/extract_output.schema.json",
+    "render": "contracts/render_output.schema.json",
+    "widget_schema_dir": "../../../../playbooks/widget-contract"
+  },
+  "split": {
+    "eval_ratio": 0.3,
+    "explicit_split_turns": 950,
+    "seed": "muno-travel-13",
+    "split_mode": "explicit_per_turn"
+  },
+  "teacher": {
+    "enabled": false,
+    "reason": "teacher disabled (--no-teacher)"
+  },
+  "validity": {
+    "examples_all_widgets_valid_rate": 1.0,
+    "extract_schema_valid_rate": 1.0,
+    "render_schema_valid_rate": 1.0,
+    "total_widget_envelopes": 1098,
+    "valid_widget_envelopes": 1098,
+    "widget_envelope_valid_rate": 1.0
+  },
+  "version": "v3"
+}
