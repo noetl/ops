@@ -60,6 +60,117 @@ PROTOTYPES_NAME = "prototypes.jsonl"
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
+# ── base-model id resolution (config short name → HF repo) ──────────────────
+
+# The config carries short, human-friendly model names; the real fine-tune /
+# serving paths need the Hugging Face repo id.  Keep the mapping here so both
+# finetune (download + train) and infer (load + serve) agree.
+HF_MODEL_ALIASES = {
+    "qwen2.5-1.5b-instruct": "Qwen/Qwen2.5-1.5B-Instruct",
+    "qwen2.5-3b-instruct": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen2.5-0.5b-instruct": "Qwen/Qwen2.5-0.5B-Instruct",
+    "llama-3.2-1b-instruct": "meta-llama/Llama-3.2-1B-Instruct",  # gated — needs HF auth
+    "llama-3.2-3b-instruct": "meta-llama/Llama-3.2-3B-Instruct",  # gated — needs HF auth
+}
+
+
+def resolve_hf_model_id(name):
+    """Map a config short model name to a Hugging Face repo id.  A value that
+    already looks like an ``org/repo`` (or a local path) is returned as-is."""
+    if not name:
+        return name
+    key = name.strip().lower()
+    if key in HF_MODEL_ALIASES:
+        return HF_MODEL_ALIASES[key]
+    return name
+
+
+# ── prompt builders (shared by finetune data-prep + real-model inference) ────
+
+# A SINGLE place the prompt format lives so training-time formatting and
+# inference-time formatting never drift (a drift the model would never recover
+# from — it learns the completion given a prompt shape it never sees again).
+# Plain-text instruction format (not the chat template) so the same string is
+# used verbatim at train + infer; ``--mask-prompt`` makes the model learn only
+# the JSON completion that follows the OUTPUT marker.
+
+def build_extract_prompt(system_prompt, turn):
+    body = {"turn": _clean_turn(turn)}
+    return "%s\n\n### INPUT\n%s\n\n### OUTPUT (JSON)\n" % (
+        system_prompt or "", json.dumps(body, sort_keys=True))
+
+
+def _clean_turn(turn):
+    """The prompt body carries only the three input fields the model conditions
+    on; strip any sidecar keys (e.g. a persisted ``tool_summary`` or
+    ``thread_context``) so train-time and infer-time bodies are byte-identical."""
+    return {k: turn.get(k) for k in ("event_type", "event_payload", "slot_state")}
+
+
+def build_render_prompt(system_prompt, turn, extraction, tool_summary=None):
+    # The render role's declared input is "slot_state + extraction + tool_summary
+    # + render_intent".  Conditioning on the tool result lets the model copy real
+    # values (place names, offer ids, hotel data) into schema-valid widget
+    # payloads instead of hallucinating them — the lever for render/widget_type/
+    # arg fidelity.  Backward compatible: tool_summary=None reproduces the old
+    # body so v1 artifacts still load.
+    body = {"turn": _clean_turn(turn), "extraction": extraction}
+    if tool_summary is not None:
+        body["tool_summary"] = tool_summary
+    return "%s\n\n### INPUT\n%s\n\n### OUTPUT (JSON)\n" % (
+        system_prompt or "", json.dumps(body, sort_keys=True))
+
+
+# ── robust JSON extraction from a generated completion ──────────────────────
+
+def parse_json_object(text):
+    """Best-effort parse of the first JSON object in a model completion.
+
+    The model is prompted to emit a bare JSON object, but a small SLM may wrap
+    it in markdown fences or trail extra tokens.  Strip fences, then scan for
+    the first balanced ``{...}`` (string-aware) and ``json.loads`` it.  Returns
+    ``{}`` when nothing parseable is found — the schema-constraint repair then
+    produces a minimal valid output, so a parse failure degrades to the safe
+    form rather than crashing the eval.
+    """
+    if not isinstance(text, str):
+        return {}
+    s = text.strip()
+    if s.startswith("```"):
+        # drop the opening fence (``` or ```json) and any closing fence
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s)
+    start = s.find("{")
+    if start < 0:
+        return {}
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = s[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    return {}
+    return {}
+
+
 # ── featurization (shared by finetune + stub inference) ─────────────────────
 
 def featurize(turn):
@@ -188,23 +299,73 @@ class SlmRunner:
     engine treats it as just another candidate."""
 
     def __init__(self, artifact_path, *, extract_schema=None, widget_dir=None,
-                 tool_vocab=None, intent_vocab=None):
+                 tool_vocab=None, intent_vocab=None, render_schema=None,
+                 constrained_decode=None):
         self.dir = load_artifact_dir(artifact_path)
         with open(os.path.join(self.dir, MANIFEST_NAME)) as fh:
             self.manifest = json.load(fh)
         self.backend = self.manifest.get("backend", "stub")
         self.extract_schema = extract_schema
+        self.render_schema = render_schema
         self.widget_dir = widget_dir
         self.tool_vocab = set(tool_vocab or self.manifest.get("vocab", {}).get("tools", []))
         self.intent_vocab = set(intent_vocab or self.manifest.get("vocab", {}).get("render_intents", []))
         self._prototypes = None
         self._peft = None
+        self._mlx = None
         if self.backend == "stub":
             self._load_prototypes()
         elif self.backend == "peft":
             self._load_peft()
+        elif self.backend == "mlx":
+            self._load_mlx()
         else:
             raise RuntimeError("unknown model backend %r" % self.backend)
+        self._setup_constrained(constrained_decode)
+
+    # -- grammar-constrained decoding (lever 1; flag-gated, mlx only) ----------
+
+    def _setup_constrained(self, flag):
+        """Prepare logit-level schema constraint when enabled + available.
+        ``flag`` None → read env SLM_CONSTRAINED_DECODE (default off)."""
+        self.constrained = False
+        self._constrain = None
+        self._tok_data = None
+        self._extract_schema_dict = None
+        self._render_schema_dict = None
+        if flag is None:
+            flag = os.environ.get("SLM_CONSTRAINED_DECODE", "").strip().lower() in ("1", "true", "yes")
+        if not flag or self.backend != "mlx":
+            return
+        try:
+            import slm_constrain as CON
+        except Exception as exc:
+            print("constrained decode requested but slm_constrain unavailable (%s)" % exc, file=sys.stderr)
+            return
+        if not CON.available():
+            print("constrained decode requested but lm-format-enforcer not installed; "
+                  "falling back to post-hoc repair", file=sys.stderr)
+            return
+        self._constrain = CON
+        self._tok_data = CON.build_tokenizer_data(self._mlx["tokenizer"])
+        if self.extract_schema and os.path.isfile(self.extract_schema):
+            with open(self.extract_schema) as fh:
+                self._extract_schema_dict = CON.sanitize_for_lmfe(json.load(fh))
+        # Render constraint is OFF by default: forcing the widget_type enum +
+        # a generic payload (the render schema doesn't carry per-widget-type
+        # payload requirements) perturbs the model into payloads that fail the
+        # per-type schema and get dropped post-hoc → empty widget lists, which is
+        # worse than plain generation + repair.  Opt in with SLM_CONSTRAIN_RENDER
+        # only if a payload-complete render schema is supplied.  Extract
+        # constraint (the closed-vocab tool + render_intent enums) is the clean,
+        # always-on win.
+        constrain_render = os.environ.get("SLM_CONSTRAIN_RENDER", "").strip().lower() in ("1", "true", "yes")
+        if constrain_render and self.render_schema and os.path.isfile(self.render_schema):
+            self._render_schema_dict = CON.render_schema_with_widget_enum(
+                self.render_schema, self.widget_dir)
+        self.constrained = True
+        print("constrained decode: ENABLED (extract schema; render_constraint=%s)"
+              % bool(self._render_schema_dict), file=sys.stderr)
 
     # -- stub backend ---------------------------------------------------------
 
@@ -268,6 +429,48 @@ class SlmRunner:
         except Exception:
             return {}
 
+    # -- mlx backend (Apple Silicon, real LoRA) -------------------------------
+
+    def _load_mlx(self):
+        """Load the real Apple-Silicon LoRA runtime via ``mlx_lm``.
+
+        The artifact is adapter-only (``adapter/adapters.safetensors`` +
+        ``adapter_config.json``); the base weights are pulled from Hugging Face
+        by ``mlx_lm.load`` and the LoRA layers fused in at load time.  Raises a
+        precise error when mlx isn't installed (e.g. on a Linux/GPU box) so the
+        caller can pick the peft path instead."""
+        try:
+            from mlx_lm import load as _mlx_load  # noqa: F401
+            from mlx_lm import generate as _mlx_generate  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "mlx backend needs mlx-lm (Apple-Silicon training/serving "
+                "runtime). Install it in an arm64 venv (`pip install mlx-lm`), "
+                "or use the peft backend on a CUDA box. Import error: %s" % exc)
+        from mlx_lm import load as mlx_load
+        from mlx_lm import generate as mlx_generate
+
+        base = resolve_hf_model_id(self.manifest.get("base_model_hf")
+                                   or self.manifest["base_model"])
+        adapter_dir = os.path.join(self.dir, "adapter")
+        model, tokenizer = mlx_load(base, adapter_path=adapter_dir)
+        self._mlx = {"model": model, "tokenizer": tokenizer, "generate": mlx_generate,
+                     "max_tokens": int(self.manifest.get("max_new_tokens", 512))}
+
+    def _mlx_generate_json(self, prompt, schema_dict=None):
+        """Greedy-decode a completion and parse the first JSON object out of it.
+        When constrained decoding is enabled and a ``schema_dict`` is given, a
+        logit-level lm-format-enforcer processor masks every token that would
+        break the schema (lever 1); otherwise the post-hoc ``_constrain_*``
+        repair the caller applies is the only guard (the v2 path)."""
+        g = self._mlx
+        kwargs = {"max_tokens": g["max_tokens"], "verbose": False}
+        if self.constrained and schema_dict is not None:
+            proc = self._constrain.make_logits_processor(schema_dict, self._tok_data)
+            kwargs["logits_processors"] = [proc]
+        text = g["generate"](g["model"], g["tokenizer"], prompt=prompt, **kwargs)
+        return parse_json_object(text)
+
     # -- shared run surface ---------------------------------------------------
 
     def run_turn(self, turn):
@@ -275,9 +478,13 @@ class SlmRunner:
             proto, _score = self._retrieve(turn)
             raw_ex = (proto or {}).get("extract", {})
             raw_rd = (proto or {}).get("render", {})
+        elif self.backend == "mlx":  # real model + (optional) logit-level constraint
+            raw_ex = self._mlx_generate_json(self._extract_prompt(turn), self._extract_schema_dict)
+            # render conditions on the (constrained) extraction
+            ex_for_render = _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
+            raw_rd = self._mlx_generate_json(self._render_prompt(turn, ex_for_render), self._render_schema_dict)
         else:  # peft
             raw_ex = self._peft_generate_json(self._extract_prompt(turn))
-            # render conditions on the (constrained) extraction
             ex_for_render = _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
             raw_rd = self._peft_generate_json(self._render_prompt(turn, ex_for_render))
 
@@ -291,11 +498,11 @@ class SlmRunner:
         render = _constrain_render(raw_rd, self.widget_dir, fallback)
         return {"extract": extract, "render": render}
 
-    def _extract_prompt(self, turn):  # pragma: no cover - GPU-only
+    def _extract_prompt(self, turn):
         sysp = self.manifest.get("prompts", {}).get("extract", "")
-        return "%s\n\n### INPUT\n%s\n\n### OUTPUT (JSON)\n" % (sysp, json.dumps(turn, sort_keys=True))
+        return build_extract_prompt(sysp, turn)
 
-    def _render_prompt(self, turn, extraction):  # pragma: no cover - GPU-only
+    def _render_prompt(self, turn, extraction):
         sysp = self.manifest.get("prompts", {}).get("render", "")
-        ctx = {"slot_state": turn.get("slot_state", {}), "extraction": extraction}
-        return "%s\n\n### INPUT\n%s\n\n### OUTPUT (JSON)\n" % (sysp, json.dumps(ctx, sort_keys=True))
+        # the eval/serve turn carries the tool result the render pass conditions on
+        return build_render_prompt(sysp, turn, extraction, turn.get("tool_summary"))

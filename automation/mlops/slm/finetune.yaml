@@ -11,7 +11,7 @@ metadata:
     adapter), writes the adapter as a model artifact, and registers it into the
     G3 registry (kind=model, lineage → the dataset entry).
 
-    Two run modes — same engine (`lib/slm_finetune.py`), same artifact contract:
+    Three run modes — same engine (`lib/slm_finetune.py`), same artifact contract:
 
       * mode=local     — runs the engine inline via `kind: shell` on the CPU.
         With `--backend stub` this is the Phase-B VALIDATION path: a
@@ -19,6 +19,14 @@ metadata:
         that proves the whole orchestration (dataset → finetune → registry →
         eval → release) end-to-end with zero heavy deps and no GPU.  This is the
         default — it's what the kind / CPU smoke runs.
+
+      * mode=mlx       — runs the REAL multitask LoRA fine-tune of
+        qwen2.5-1.5b-instruct (fallback llama-3.2-1b-instruct) LOCALLY on an
+        Apple-Silicon box via `mlx-lm` (--backend mlx).  No GPU node pool, no
+        container — the fine-tune runs in unified memory and the adapter +
+        eval + release register into the (local or server) G3 registry exactly
+        like the container path.  Needs `python_bin` pointed at an arm64 venv
+        with mlx-lm.  This produced the first real fine-tuned travel SLM.
 
       * mode=container — dispatches the REAL LoRA fine-tune of
         qwen2.5-1.5b-instruct (fallback llama-3.2-1b-instruct) as a G1
@@ -46,13 +54,27 @@ workload:
   # ── shared ──
   config: repos/travel/automation/mlops/slm/travel/slm.config.yaml
   slm_lib: repos/ops/automation/mlops/slm/lib
-  mode: local                 # local | container
-  backend: stub               # stub | peft
+  mode: local                 # local | mlx | container
+  backend: stub               # stub | mlx | peft
   dataset_version: v1_constrained
   augment_teacher: "true"     # include the constrained-teacher repaired labels
   base_model: ""              # "" => first config model.candidates entry
   tenant: muno                # registry namespace (muno/slm/* cluster test tag)
   project: travel
+
+  # ── mode=mlx only (Apple Silicon real LoRA) ──
+  # mode=mlx runs the REAL multitask LoRA fine-tune locally on an Apple-Silicon
+  # box via mlx-lm — no GPU node pool, no container.  The engine shells out to
+  # `mlx_lm.lora`, so `python_bin` MUST point at an arm64 Python that has
+  # `mlx-lm` installed (a dedicated venv: `python3 -m venv .slm-venv &&
+  # .slm-venv/bin/pip install mlx-lm`).  The base weights (qwen2.5-1.5b ≈ 3 GB)
+  # are pulled from Hugging Face on first run and cached.
+  python_bin: python3          # set to .slm-venv/bin/python for mode=mlx
+  mlx_iters: "800"
+  mlx_batch_size: "1"
+  mlx_num_layers: "16"
+  mlx_max_seq_length: "2048"
+  learning_rate: "1e-4"
 
   # ── container/GPU mode only (gated) ──
   namespace: noetl
@@ -80,6 +102,8 @@ workflow:
       arcs:
         - step: finetune_local
           when: "{{ workload.mode == 'local' }}"
+        - step: finetune_mlx
+          when: "{{ workload.mode == 'mlx' }}"
         - step: finetune_container
           when: "{{ workload.mode == 'container' }}"
 
@@ -101,6 +125,38 @@ workflow:
           [ -n '{{ workload.base_model }}' ] && ARGS="${ARGS} --base-model {{ workload.base_model }}"
           echo "SLM finetune (local) :: backend=${BACKEND} config=${CONFIG}"
           python3 "${LIB}/slm_finetune.py" ${ARGS}
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  # ── mode=mlx : REAL LoRA fine-tune on Apple Silicon (local, no GPU pool) ──
+  # Runs the SAME engine with --backend mlx.  Requires `python_bin` to be an
+  # arm64 Python with mlx-lm installed (see the workload comment).  This is the
+  # local-GPU-free path that produced the first real fine-tuned travel SLM
+  # (noetl/ai-meta SLM Phase B, local Apple-Silicon track).
+  - step: finetune_mlx
+    desc: Run the real multitask LoRA fine-tune via mlx-lm (Apple Silicon)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          CONFIG='{{ workload.config }}'
+          PY='{{ workload.python_bin }}'
+          export SLM_DATASET_VERSION='{{ workload.dataset_version }}'
+          ARGS="--config ${CONFIG} --backend mlx"
+          ARGS="${ARGS} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          ARGS="${ARGS} --learning-rate {{ workload.learning_rate }}"
+          ARGS="${ARGS} --mlx-iters {{ workload.mlx_iters }}"
+          ARGS="${ARGS} --mlx-batch-size {{ workload.mlx_batch_size }}"
+          ARGS="${ARGS} --mlx-num-layers {{ workload.mlx_num_layers }}"
+          ARGS="${ARGS} --mlx-max-seq-length {{ workload.mlx_max_seq_length }}"
+          [ '{{ workload.augment_teacher }}' = 'true' ] && ARGS="${ARGS} --augment-teacher"
+          [ -n '{{ workload.base_model }}' ] && ARGS="${ARGS} --base-model {{ workload.base_model }}"
+          echo "SLM finetune (mlx / Apple Silicon) :: config=${CONFIG} python=${PY}"
+          "${PY}" "${LIB}/slm_finetune.py" ${ARGS}
     next:
       spec: { mode: exclusive }
       arcs:

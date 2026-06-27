@@ -216,7 +216,8 @@ def _resolve_model_artifact(dom, model_ref, tenant, project):
 
 
 def evaluate(config_path, dataset_dir=None, out_override=None, *, candidate_override=None,
-             model_ref=None, model_artifact=None, register=False, tenant=None, project=None):
+             model_ref=None, model_artifact=None, register=False, tenant=None, project=None,
+             constrained_decode=None):
     cfg, cfg_dir = C.load_config(config_path)
     dom = cfg["slm_domain"]
     name = dom["name"]
@@ -229,6 +230,7 @@ def evaluate(config_path, dataset_dir=None, out_override=None, *, candidate_over
     extract_role = _role(roles, "extract")
     render_role = _role(roles, "render")
     extract_schema = C.resolve(cfg_dir, extract_role.get("output_schema"))
+    render_schema = C.resolve(cfg_dir, render_role.get("output_schema"))
     widget_dir = C.resolve(cfg_dir, render_role.get("widget_schema_dir"))
 
     # vocabularies for the absolute vocab-validity metrics
@@ -259,11 +261,13 @@ def evaluate(config_path, dataset_dir=None, out_override=None, *, candidate_over
                 dom, model_ref, tenant, project)
         runner = INFER.SlmRunner(
             artifact, extract_schema=extract_schema, widget_dir=widget_dir,
-            tool_vocab=tool_vocab, intent_vocab=intent_vocab)
+            tool_vocab=tool_vocab, intent_vocab=intent_vocab,
+            render_schema=render_schema, constrained_decode=constrained_decode)
         produce = runner.run_turn
         slm_meta = dict(slm_meta or {})
         slm_meta.update({"backend": runner.backend, "base_model": runner.manifest.get("base_model"),
-                         "artifact": artifact if isinstance(artifact, str) else "<bytes>"})
+                         "artifact": artifact if isinstance(artifact, str) else "<bytes>",
+                         "constrained_decode": runner.constrained})
     else:
         raise SystemExit("unknown eval candidate %r (expected deterministic_oracle | slm)" % candidate)
 
@@ -284,6 +288,9 @@ def evaluate(config_path, dataset_dir=None, out_override=None, *, candidate_over
             "event_type": exmpl["input"]["event_type"],
             "event_payload": exmpl["input"]["event_payload"],
             "slot_state": exmpl["input"]["slot_state"],
+            # the render pass conditions on the tool result (the production planner
+            # supplies the real one here); the oracle candidate ignores it.
+            "tool_summary": exmpl["input"].get("tool_summary"),
         }
         label = exmpl["labels"]
         t0 = time.perf_counter()
@@ -457,13 +464,18 @@ def main():
     ap.add_argument("--model-ref", default=None, help="registry:// URN or 'latest' (slm candidate)")
     ap.add_argument("--model-artifact", default=None, help="local model artifact dir/.tar.gz (slm candidate)")
     ap.add_argument("--register", action="store_true", help="register the eval run into G3")
+    ap.add_argument("--constrained-decode", dest="constrained_decode", action="store_true",
+                    default=None, help="enable logit-level JSON-schema constrained decoding (lever 1)")
+    ap.add_argument("--no-constrained-decode", dest="constrained_decode", action="store_false",
+                    help="force plain decoding + post-hoc repair (the v2 path)")
     ap.add_argument("--tenant", default=None)
     ap.add_argument("--project", default=None)
     args = ap.parse_args()
     report, out_path = evaluate(
         args.config, args.dataset, args.out, candidate_override=args.candidate,
         model_ref=args.model_ref, model_artifact=args.model_artifact,
-        register=args.register, tenant=args.tenant, project=args.project)
+        register=args.register, tenant=args.tenant, project=args.project,
+        constrained_decode=args.constrained_decode)
     print("=== eval complete ===")
     print("report:", out_path)
     print("candidate:", report["candidate"], "| model:", json.dumps(report.get("model")))

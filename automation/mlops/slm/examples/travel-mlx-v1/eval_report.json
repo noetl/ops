@@ -1,0 +1,430 @@
+{
+  "baseline": {
+    "ceiling": {
+      "divergence_count_by_field": {
+        "arg_fidelity": 6,
+        "render_intent_match": 10,
+        "slot_update_match": 5,
+        "tool_match": 9,
+        "widget_type_match": 1
+      },
+      "divergences": [
+        {
+          "diverged_fields": [
+            "tool_match",
+            "arg_fidelity",
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "mcp/duffel.search_offers",
+            "render_intent": "show_flights",
+            "widget_types": [
+              "flight_list"
+            ]
+          },
+          "id": "t010",
+          "intent_label": "show_flights",
+          "teacher": {
+            "first_tool": "",
+            "render_intent": "clarify",
+            "widget_types": [
+              "flight_list"
+            ]
+          },
+          "text": "what flights are available"
+        },
+        {
+          "diverged_fields": [
+            "tool_match",
+            "arg_fidelity",
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "mcp/duffel.create_order",
+            "render_intent": "order_confirmation",
+            "widget_types": [
+              "order_confirmation"
+            ]
+          },
+          "id": "t013",
+          "intent_label": "order_confirmation",
+          "teacher": {
+            "first_tool": "",
+            "render_intent": "clarify",
+            "widget_types": [
+              "order_confirmation"
+            ]
+          },
+          "text": "confirm and purchase"
+        },
+        {
+          "diverged_fields": [
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "",
+            "render_intent": "summarize",
+            "widget_types": [
+              "itinerary_summary"
+            ]
+          },
+          "id": "t019",
+          "intent_label": "summarize_fallback",
+          "teacher": {
+            "first_tool": "",
+            "render_intent": "show_flights",
+            "widget_types": [
+              "itinerary_summary"
+            ]
+          },
+          "text": "ok"
+        },
+        {
+          "diverged_fields": [
+            "tool_match",
+            "arg_fidelity",
+            "slot_update_match",
+            "render_intent_match",
+            "widget_type_match"
+          ],
+          "floor": {
+            "first_tool": "mcp/google-places.search_text",
+            "render_intent": "show_places",
+            "widget_types": [
+              "place_list"
+            ]
+          },
+          "id": "t020",
+          "intent_label": "show_places_date_submit",
+          "teacher": {
+            "first_tool": "mcp/duffel.search_offers",
+            "render_intent": "show_flights",
+            "widget_types": []
+          },
+          "text": null
+        },
+        {
+          "diverged_fields": [
+            "tool_match",
+            "arg_fidelity",
+            "slot_update_match",
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "mcp/amadeus.search_hotels",
+            "render_intent": "show_hotels",
+            "widget_types": [
+              "hotel_list"
+            ]
+          },
+          "id": "t023",
+          "intent_label": "show_hotels_pick_offer_cta",
+          "teacher": {
+            "first_tool": "",
+            "render_intent": "summary",
+            "widget_types": [
+              "hotel_list"
+            ]
+          },
+          "text": null
+        },
+        {
+          "diverged_fields": [
+            "tool_match",
+            "slot_update_match",
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "",
+            "render_intent": "collect_missing",
+            "widget_types": [
+              "date_range_picker"
+            ]
+          },
+          "id": "t026",
+          "intent_label": "multiturn_1_region",
+          "teacher": {
+            "first_tool": "mcp/google-places.search_text",
+            "render_intent": "show_places",
+            "widget_types": [
+              "date_range_picker"
+            ]
+          },
+          "text": "I'd like to visit New York"
+        },
+        {
+          "diverged_fields": [
+            "tool_match",
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "",
+            "render_intent": "collect_missing",
+            "widget_types": [
+              "place_autocomplete_input"
+            ]
+          },
+          "id": "t031",
+          "intent_label": "edge_unknown_city",
+          "teacher": {
+            "first_tool": "mcp/google-places.search_text",
+            "render_intent": "show_places",
+            "widget_types": [
+              "place_autocomplete_input"
+            ]
+          },
+          "text": "trip to Atlantis"
+        },
+        {
+          "diverged_fields": [
+            "tool_match",
+            "slot_update_match",
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "",
+            "render_intent": "collect_missing",
+            "widget_types": [
+              "party_picker"
+            ]
+          },
+          "id": "t036",
+          "intent_label": "collect_missing_party_paris",
+          "teacher": {
+            "first_tool": "mcp/google-places.search_text",
+            "render_intent": "show_places",
+            "widget_types": [
+              "party_picker"
+            ]
+          },
+          "text": "Paris 2026-06-01 to 2026-06-07"
+        },
+        {
+          "diverged_fields": [
+            "tool_match",
+            "slot_update_match",
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "",
+            "render_intent": "collect_missing",
+            "widget_types": [
+              "date_range_picker"
+            ]
+          },
+          "id": "t042",
+          "intent_label": "collect_missing_dates_nyc",
+          "teacher": {
+            "first_tool": "mcp/google-places.search_text",
+            "render_intent": "show_places",
+            "widget_types": [
+              "date_range_picker"
+            ]
+          },
+          "text": "I'm thinking New York"
+        },
+        {
+          "diverged_fields": [
+            "arg_fidelity"
+          ],
+          "floor": {
+            "first_tool": "mcp/duffel.search_offers",
+            "render_intent": "show_flights",
+            "widget_types": [
+              "flight_list"
+            ]
+          },
+          "id": "t043",
+          "intent_label": "show_flights_rome",
+          "teacher": {
+            "first_tool": "mcp/duffel.search_offers",
+            "render_intent": "show_flights",
+            "widget_types": [
+              "flight_list"
+            ]
+          },
+          "text": "show flights"
+        },
+        {
+          "diverged_fields": [
+            "tool_match",
+            "arg_fidelity",
+            "render_intent_match"
+          ],
+          "floor": {
+            "first_tool": "mcp/amadeus.search_hotels",
+            "render_intent": "show_hotels",
+            "widget_types": [
+              "hotel_list"
+            ]
+          },
+          "id": "t045",
+          "intent_label": "show_hotels_nyc",
+          "teacher": {
+            "first_tool": "",
+            "render_intent": "summary",
+            "widget_types": [
+              "hotel_list"
+            ]
+          },
+          "text": "hotels next"
+        }
+      ],
+      "floor_vs_ceiling_agreement": {
+        "arg_fidelity": 0.5714,
+        "render_intent_match": 0.2857,
+        "slot_update_match": 0.6429,
+        "tool_match": 0.3571,
+        "widget_type_match": 0.9286
+      },
+      "floor_vs_ceiling_gap": {
+        "arg_fidelity": 0.4286,
+        "render_intent_match": 0.7143,
+        "slot_update_match": 0.3571,
+        "tool_match": 0.6429,
+        "widget_type_match": 0.0714
+      },
+      "note": "agreement = fraction of eval turns where the deterministic floor and the teacher ceiling produce the same value for that field; gap = 1 - agreement = the fraction a fine-tuned SLM must learn to win over the floor. The divergences list enumerates the concrete turns where they disagree.",
+      "paired_examples": 14,
+      "source": "teacher (OpenAI) labels stored on the eval split",
+      "status": "computed",
+      "teacher_validity": {
+        "extract_schema_validity": 1.0,
+        "render_intent_vocab_validity": 1.0,
+        "tool_vocab_validity": 1.0,
+        "widget_schema_validity": 1.0
+      }
+    },
+    "floor": {
+      "floor_latency_ms_p50": 9214.977,
+      "floor_latency_ms_p95": 13068.496,
+      "note": "Candidate is the fine-tuned SLM; match-vs-floor measures REAL model quality against the oracle labels (the target), and the absolute validity rates answer 'does the SLM hold the floor's 100%% schema validity'. The deterministic oracle remains the safety floor the model must not regress below.",
+      "source": "deterministic_oracle"
+    }
+  },
+  "by_render_intent": {
+    "clarify": {
+      "n": 1,
+      "tool_hits": 0
+    },
+    "collect_missing": {
+      "n": 3,
+      "tool_hits": 3
+    },
+    "order_confirmation": {
+      "n": 1,
+      "tool_hits": 1
+    },
+    "show_flights": {
+      "n": 4,
+      "tool_hits": 2
+    },
+    "show_hotels": {
+      "n": 1,
+      "tool_hits": 1
+    },
+    "show_places": {
+      "n": 5,
+      "tool_hits": 1
+    },
+    "summary": {
+      "n": 1,
+      "tool_hits": 1
+    }
+  },
+  "candidate": "slm",
+  "dataset_dir": "/Volumes/X10/projects/noetl/ai-meta/repos/travel/automation/mlops/slm/travel/datasets/build/travel/v1_constrained",
+  "domain": "travel",
+  "eval_count": 16,
+  "gate": {
+    "failures": [
+      "tool_match=0.5625 < target 0.9800",
+      "render_intent_match=0.5625 < target 0.9800",
+      "widget_type_match=0.3750 < target 0.9800",
+      "arg_fidelity=0.5625 < target 0.9500",
+      "slot_update_match=0.6250 < target 0.9500"
+    ],
+    "passed": false
+  },
+  "gated_metrics": {
+    "arg_fidelity": {
+      "pass": false,
+      "target": 0.95,
+      "value": 0.5625
+    },
+    "extract_schema_validity": {
+      "pass": true,
+      "target": 1.0,
+      "value": 1.0
+    },
+    "render_intent_match": {
+      "pass": false,
+      "target": 0.98,
+      "value": 0.5625
+    },
+    "render_intent_vocab_validity": {
+      "pass": true,
+      "target": 1.0,
+      "value": 1.0
+    },
+    "slot_update_match": {
+      "pass": false,
+      "target": 0.95,
+      "value": 0.625
+    },
+    "tool_match": {
+      "pass": false,
+      "target": 0.98,
+      "value": 0.5625
+    },
+    "tool_vocab_validity": {
+      "pass": true,
+      "target": 1.0,
+      "value": 1.0
+    },
+    "widget_schema_validity": {
+      "pass": true,
+      "target": 1.0,
+      "value": 1.0
+    },
+    "widget_type_match": {
+      "pass": false,
+      "target": 0.98,
+      "value": 0.375
+    }
+  },
+  "latency_ms": {
+    "mean": 8895.206,
+    "p50": 9214.977,
+    "p95": 13068.496
+  },
+  "metrics": {
+    "arg_fidelity": 0.5625,
+    "extract_schema_validity": 1.0,
+    "output_validity": 1.0,
+    "render_intent_match": 0.5625,
+    "render_intent_vocab_validity": 1.0,
+    "slot_update_match": 0.625,
+    "tool_match": 0.5625,
+    "tool_vocab_validity": 1.0,
+    "widget_schema_validity": 1.0,
+    "widget_type_match": 0.375
+  },
+  "model": {
+    "artifact": "/var/folders/gq/l5864zt53_n52bk_5pjhkpwh0000gn/T/slm_model_vr34i9c7.tar.gz",
+    "backend": "mlx",
+    "base_model": "qwen2.5-1.5b-instruct",
+    "model_ref": "registry://muno/travel/model/travel_slm_multitask/1",
+    "model_version": 1,
+    "project": "travel",
+    "tenant": "muno"
+  },
+  "phase": "B \u2014 fine-tuned SLM candidate vs the deterministic floor",
+  "registry": {
+    "eval_ref": "registry://muno/travel/eval/travel_slm_multitask/1",
+    "model_ref": "registry://muno/travel/model/travel_slm_multitask/1",
+    "project": "travel",
+    "tenant": "muno",
+    "version": 1
+  }
+}
