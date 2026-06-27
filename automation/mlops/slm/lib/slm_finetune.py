@@ -39,6 +39,8 @@ The registry write is server-mediated (data-access-boundary.md) via
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 
@@ -139,6 +141,139 @@ def _train_stub(records, artifact_dir, manifest, *, include_teacher):
     return manifest
 
 
+def _example_prompt(ex, sysp):
+    """Render the instruction prompt for one multitask example, using the SAME
+    builders the inference runner uses so train/infer formatting never drifts."""
+    if ex["role"] == "extract":
+        return INFER.build_extract_prompt(sysp.get("extract", ""), ex["turn"])
+    return INFER.build_render_prompt(sysp.get("render", ""), ex["turn"], ex["extraction"])
+
+
+def _mlx_data_pair(ex, sysp):
+    """One ``{prompt, completion}`` record for mlx-lm's prompt/completion data
+    format.  With ``--mask-prompt`` the loss is computed on the completion only,
+    so the model learns the JSON output given the (masked) instruction prompt."""
+    return {
+        "prompt": _example_prompt(ex, sysp),
+        "completion": json.dumps(ex["target"], sort_keys=True),
+    }
+
+
+def _train_mlx(examples, artifact_dir, manifest, *, base_model_hf, iters,
+               batch_size, num_layers, learning_rate, max_seq_length,
+               steps_per_report=10, val_fraction=0.15, seed=13):
+    """Real Apple-Silicon multitask LoRA fine-tune via ``mlx_lm`` (the most
+    memory-efficient path on Apple unified memory).  Writes the prompt/completion
+    corpus to a temp data dir, shells out to ``mlx_lm.lora --train`` (so the
+    mature mlx tuner owns data loading, LoRA injection, the train loop, and the
+    safetensors checkpoint), then parses the final losses out of its output.
+
+    The adapter lands at ``<artifact_dir>/adapter/`` (``adapters.safetensors`` +
+    ``adapter_config.json``); the base weights are NOT copied — inference pulls
+    them from HF and fuses the LoRA at load time, keeping the artifact small."""
+    try:
+        import mlx_lm  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "mlx backend needs mlx-lm (Apple-Silicon runtime). Install it in an "
+            "arm64 venv (`pip install mlx-lm`), or use --backend peft on a CUDA "
+            "box. Import error: %s" % exc)
+
+    sysp = manifest.get("prompts", {})
+    pairs = [_mlx_data_pair(e, sysp) for e in examples]
+
+    # deterministic train/valid split — valid is for mlx's loss reporting only
+    # (no early stopping); the authoritative scoring is the separate eval stage.
+    import random
+    rng = random.Random(seed)
+    idx = list(range(len(pairs)))
+    rng.shuffle(idx)
+    n_val = max(2, int(round(len(pairs) * val_fraction)))
+    val_idx = set(idx[:n_val])
+    train_rows = [pairs[i] for i in idx if i not in val_idx]
+    valid_rows = [pairs[i] for i in idx if i in val_idx]
+
+    data_dir = os.path.join(artifact_dir, "_mlx_data")
+    os.makedirs(data_dir, exist_ok=True)
+    with open(os.path.join(data_dir, "train.jsonl"), "w") as fh:
+        for r in train_rows:
+            fh.write(json.dumps(r) + "\n")
+    with open(os.path.join(data_dir, "valid.jsonl"), "w") as fh:
+        for r in valid_rows:
+            fh.write(json.dumps(r) + "\n")
+
+    adapter_dir = os.path.join(artifact_dir, "adapter")
+    os.makedirs(adapter_dir, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "mlx_lm", "lora",
+        "--model", base_model_hf,
+        "--train",
+        "--data", data_dir,
+        "--fine-tune-type", "lora",
+        "--mask-prompt",
+        "--iters", str(iters),
+        "--batch-size", str(batch_size),
+        "--num-layers", str(num_layers),
+        "--learning-rate", str(learning_rate),
+        "--max-seq-length", str(max_seq_length),
+        "--steps-per-report", str(steps_per_report),
+        "--steps-per-eval", str(max(steps_per_report, iters // 4 or 1)),
+        "--val-batches", "-1",
+        "--adapter-path", adapter_dir,
+        "--save-every", str(iters),
+        "--seed", str(seed),
+    ]
+    print("mlx-lm lora :: %s" % " ".join(cmd), file=sys.stderr)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True)
+    log = proc.stdout or ""
+    print(log)
+    if proc.returncode != 0:
+        raise RuntimeError("mlx_lm lora failed (exit %s). Tail:\n%s"
+                           % (proc.returncode, "\n".join(log.splitlines()[-25:])))
+
+    train_losses = [float(m) for m in re.findall(r"Train loss ([0-9.]+)", log)]
+    val_losses = [float(m) for m in re.findall(r"Val loss ([0-9.]+)", log)]
+
+    # sanity: the adapter file must exist
+    weights = os.path.join(adapter_dir, "adapters.safetensors")
+    if not os.path.isfile(weights):
+        raise RuntimeError("mlx training produced no adapter at %s" % weights)
+
+    manifest["train"] = {
+        "backend": "mlx",
+        "recipe": "lora",
+        "base_model": base_model_hf,
+        "framework": "mlx-lm",
+        "mlx_lm_version": getattr(mlx_lm, "__version__", None)
+        or _pkg_version("mlx-lm"),
+        "iters": iters,
+        "batch_size": batch_size,
+        "num_layers": num_layers,
+        "learning_rate": learning_rate,
+        "max_seq_length": max_seq_length,
+        "example_count": len(examples),
+        "train_examples": len(train_rows),
+        "valid_examples": len(valid_rows),
+        "final_train_loss": train_losses[-1] if train_losses else None,
+        "final_val_loss": val_losses[-1] if val_losses else None,
+        "train_loss_curve": train_losses,
+        "val_loss_curve": val_losses,
+    }
+    # mlx data dir is a build artifact, not part of the served model — drop it
+    # from the packaged adapter dir's sibling but keep under artifact for audit.
+    return manifest
+
+
+def _pkg_version(dist):
+    try:
+        import importlib.metadata as md
+        return md.version(dist)
+    except Exception:
+        return None
+
+
 def _train_peft(examples, artifact_dir, manifest, *, base_model, max_steps,
                 epochs, lora_r, lora_alpha, lora_dropout, learning_rate):  # pragma: no cover
     """Real multitask LoRA fine-tune.  Only runs where the GPU training deps are
@@ -163,13 +298,7 @@ def _train_peft(examples, artifact_dir, manifest, *, base_model, max_steps,
         tokenizer.pad_token = tokenizer.eos_token
 
     def render_prompt(ex):
-        if ex["role"] == "extract":
-            head = sysp.get("extract", "")
-            body = {"turn": ex["turn"]}
-        else:
-            head = sysp.get("render", "")
-            body = {"turn": ex["turn"], "extraction": ex["extraction"]}
-        prompt = "%s\n\n### INPUT\n%s\n\n### OUTPUT (JSON)\n" % (head, json.dumps(body, sort_keys=True))
+        prompt = _example_prompt(ex, sysp)
         completion = json.dumps(ex["target"], sort_keys=True) + tokenizer.eos_token
         full = prompt + completion
         toks = tokenizer(full, truncation=True, max_length=2048)
@@ -262,6 +391,8 @@ def _registry_client():
 def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
              out_dir=None, augment_teacher=False, max_steps=2, epochs=1,
              lora_r=8, lora_alpha=16, lora_dropout=0.05, learning_rate=2e-4,
+             mlx_iters=400, mlx_batch_size=1, mlx_num_layers=16,
+             mlx_max_seq_length=2048,
              register=True, model_name=None, tenant=None, project=None):
     cfg, cfg_dir = C.load_config(config_path)
     dom = cfg["slm_domain"]
@@ -280,16 +411,25 @@ def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
     manifest_path = os.path.join(dataset_dir, "manifest.json")
     records = C.read_jsonl(train_path)
 
-    # backend selection: explicit, else config recipe, else stub if no torch
+    # backend selection: explicit, else config recipe → the best available real
+    # trainer (mlx on Apple Silicon, peft on CUDA), else the CPU stub.
     if backend is None:
-        backend = "peft" if model_cfg.get("recipe") == "lora" else "stub"
-        try:
-            import torch  # noqa: F401
-        except Exception:
+        if model_cfg.get("recipe") == "lora":
+            try:
+                import mlx_lm  # noqa: F401
+                backend = "mlx"
+            except Exception:
+                try:
+                    import torch  # noqa: F401
+                    backend = "peft"
+                except Exception:
+                    backend = "stub"
+        else:
             backend = "stub"
 
     candidates = model_cfg.get("candidates") or ["qwen2.5-1.5b-instruct"]
     base_model = base_model or candidates[0]
+    base_model_hf = INFER.resolve_hf_model_id(base_model)
 
     if not out_dir:
         out_dir = os.path.join(dataset_dir, "models", "%s-%s" % (model_name, backend))
@@ -305,6 +445,7 @@ def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
         "domain": name,
         "model_name": model_name,
         "base_model": base_model,
+        "base_model_hf": base_model_hf,
         "base_family": model_cfg.get("base_family"),
         "base_size": model_cfg.get("base_size"),
         "recipe": model_cfg.get("recipe", "lora"),
@@ -328,6 +469,12 @@ def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
     t0 = time.time()
     if backend == "stub":
         manifest = _train_stub(records, out_dir, manifest, include_teacher=augment_teacher)
+    elif backend == "mlx":
+        examples = build_multitask_examples(records, include_teacher=augment_teacher)
+        manifest = _train_mlx(
+            examples, out_dir, manifest, base_model_hf=base_model_hf,
+            iters=mlx_iters, batch_size=mlx_batch_size, num_layers=mlx_num_layers,
+            learning_rate=learning_rate, max_seq_length=mlx_max_seq_length)
     elif backend == "peft":  # pragma: no cover
         examples = build_multitask_examples(records, include_teacher=augment_teacher)
         manifest = _train_peft(
@@ -392,7 +539,7 @@ def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--backend", choices=["stub", "peft"], default=None)
+    ap.add_argument("--backend", choices=["stub", "mlx", "peft"], default=None)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--base-model", default=None)
     ap.add_argument("--out", default=None)
@@ -403,6 +550,11 @@ def main():
     ap.add_argument("--lora-alpha", type=int, default=16)
     ap.add_argument("--lora-dropout", type=float, default=0.05)
     ap.add_argument("--learning-rate", type=float, default=2e-4)
+    # mlx backend knobs (Apple Silicon real LoRA)
+    ap.add_argument("--mlx-iters", type=int, default=400)
+    ap.add_argument("--mlx-batch-size", type=int, default=1)
+    ap.add_argument("--mlx-num-layers", type=int, default=16)
+    ap.add_argument("--mlx-max-seq-length", type=int, default=2048)
     ap.add_argument("--no-register", action="store_true")
     ap.add_argument("--model-name", default=None)
     ap.add_argument("--tenant", default=None)
@@ -415,6 +567,8 @@ def main():
         augment_teacher=args.augment_teacher, max_steps=args.max_steps,
         epochs=args.epochs, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout, learning_rate=args.learning_rate,
+        mlx_iters=args.mlx_iters, mlx_batch_size=args.mlx_batch_size,
+        mlx_num_layers=args.mlx_num_layers, mlx_max_seq_length=args.mlx_max_seq_length,
         register=not args.no_register, model_name=args.model_name,
         tenant=args.tenant, project=args.project)
     print("=== finetune complete ===")
