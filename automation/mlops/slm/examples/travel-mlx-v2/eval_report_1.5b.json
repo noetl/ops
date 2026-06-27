@@ -1,0 +1,148 @@
+{
+  "baseline": {
+    "ceiling": {
+      "reason": "No teacher (OpenAI) labels on this eval split \u2014 run dataset_build with an enabled teacher block (RFC decision #6). Once present, ceiling = floor\u2194teacher agreement per field.",
+      "source": "teacher.primary",
+      "status": "deferred"
+    },
+    "floor": {
+      "floor_latency_ms_p50": 7154.73,
+      "floor_latency_ms_p95": 15435.224,
+      "note": "Candidate is the fine-tuned SLM; match-vs-floor measures REAL model quality against the oracle labels (the target), and the absolute validity rates answer 'does the SLM hold the floor's 100%% schema validity'. The deterministic oracle remains the safety floor the model must not regress below.",
+      "source": "deterministic_oracle"
+    }
+  },
+  "by_render_intent": {
+    "calendar_live": {
+      "n": 3,
+      "tool_hits": 3
+    },
+    "clarify": {
+      "n": 4,
+      "tool_hits": 2
+    },
+    "collect_missing": {
+      "n": 23,
+      "tool_hits": 21
+    },
+    "flight_detail": {
+      "n": 7,
+      "tool_hits": 7
+    },
+    "order_confirmation": {
+      "n": 16,
+      "tool_hits": 16
+    },
+    "show_flights": {
+      "n": 19,
+      "tool_hits": 14
+    },
+    "show_hotels": {
+      "n": 19,
+      "tool_hits": 17
+    },
+    "show_places": {
+      "n": 14,
+      "tool_hits": 3
+    },
+    "summarize": {
+      "n": 2,
+      "tool_hits": 0
+    },
+    "summary": {
+      "n": 14,
+      "tool_hits": 14
+    }
+  },
+  "candidate": "slm",
+  "dataset_dir": "/Volumes/X10/projects/noetl/ai-meta/repos/travel/automation/mlops/slm/travel/datasets/build/travel/v2",
+  "domain": "travel",
+  "eval_count": 121,
+  "gate": {
+    "failures": [
+      "tool_match=0.8017 < target 0.9800",
+      "render_intent_match=0.8595 < target 0.9800",
+      "widget_type_match=0.6529 < target 0.9800",
+      "arg_fidelity=0.7934 < target 0.9500",
+      "slot_update_match=0.9091 < target 0.9500"
+    ],
+    "passed": false
+  },
+  "gated_metrics": {
+    "arg_fidelity": {
+      "pass": false,
+      "target": 0.95,
+      "value": 0.7934
+    },
+    "extract_schema_validity": {
+      "pass": true,
+      "target": 1.0,
+      "value": 1.0
+    },
+    "render_intent_match": {
+      "pass": false,
+      "target": 0.98,
+      "value": 0.8595
+    },
+    "render_intent_vocab_validity": {
+      "pass": true,
+      "target": 1.0,
+      "value": 1.0
+    },
+    "slot_update_match": {
+      "pass": false,
+      "target": 0.95,
+      "value": 0.9091
+    },
+    "tool_match": {
+      "pass": false,
+      "target": 0.98,
+      "value": 0.8017
+    },
+    "tool_vocab_validity": {
+      "pass": true,
+      "target": 1.0,
+      "value": 1.0
+    },
+    "widget_schema_validity": {
+      "pass": true,
+      "target": 1.0,
+      "value": 1.0
+    },
+    "widget_type_match": {
+      "pass": false,
+      "target": 0.98,
+      "value": 0.6529
+    }
+  },
+  "latency_ms": {
+    "mean": 8612.644,
+    "p50": 7154.73,
+    "p95": 15435.224
+  },
+  "metrics": {
+    "arg_fidelity": 0.7934,
+    "extract_schema_validity": 1.0,
+    "output_validity": 1.0,
+    "render_intent_match": 0.8595,
+    "render_intent_vocab_validity": 1.0,
+    "slot_update_match": 0.9091,
+    "tool_match": 0.8017,
+    "tool_vocab_validity": 1.0,
+    "widget_schema_validity": 1.0,
+    "widget_type_match": 0.6529
+  },
+  "model": {
+    "artifact": "/Volumes/X10/projects/noetl/ai-meta/repos/travel/automation/mlops/slm/travel/datasets/build/travel/v2/models/travel_slm_multitask-mlx",
+    "backend": "mlx",
+    "base_model": "qwen2.5-1.5b-instruct"
+  },
+  "phase": "B \u2014 fine-tuned SLM candidate vs the deterministic floor",
+  "registry": {
+    "eval_ref": "registry://muno/travel/eval/travel_slm_multitask/2",
+    "model_ref": null,
+    "project": "travel",
+    "tenant": "muno",
+    "version": 2
+  }
+}
