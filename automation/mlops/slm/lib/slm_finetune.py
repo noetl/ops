@@ -151,13 +151,65 @@ def _example_prompt(ex, sysp):
                                      ex["extraction"], ex.get("tool_summary"))
 
 
+# Widget-envelope key order the render completion is serialized in (and the
+# render constraint forces).  widget_type FIRST (the discriminator the eval
+# reads + the type the model commits to early) and the verbose ``payload`` LAST,
+# so when the render budget is tight only the trailing payload is at risk, never
+# the small envelope keys — and the model's learned generation order matches the
+# payload-complete constrained-decode field order (slm_constrain), so the two
+# levers reinforce instead of fighting (the v3→v4 fix: v3 trained with
+# sort_keys=True put payload FIRST alphabetically, which truncated/degenerated
+# the deep flight_list / hotel_list renders under constraint).
+_ENVELOPE_KEY_ORDER = ("widget_type", "variant", "schema_version", "payload")
+
+
+def _ordered_render_target(target):
+    """Reorder a render target so the top level is ``bot_message`` then
+    ``widgets``, and each widget envelope is ``widget_type, variant,
+    schema_version, payload`` — independent of how the stored label happened to
+    be key-sorted on disk.  Payload INNER order is left as-is (the oracle's
+    deterministic insertion order)."""
+    if not isinstance(target, dict):
+        return target
+    out = {}
+    if "bot_message" in target:
+        out["bot_message"] = target["bot_message"]
+    widgets = []
+    for w in target.get("widgets", []) or []:
+        if not isinstance(w, dict):
+            widgets.append(w)
+            continue
+        ow = {}
+        for k in _ENVELOPE_KEY_ORDER:
+            if k in w:
+                ow[k] = w[k]
+        for k, v in w.items():
+            if k not in ow:
+                ow[k] = v
+        widgets.append(ow)
+    out["widgets"] = widgets
+    for k, v in target.items():
+        if k not in out:
+            out[k] = v
+    return out
+
+
 def _mlx_data_pair(ex, sysp):
     """One ``{prompt, completion}`` record for mlx-lm's prompt/completion data
     format.  With ``--mask-prompt`` the loss is computed on the completion only,
-    so the model learns the JSON output given the (masked) instruction prompt."""
+    so the model learns the JSON output given the (masked) instruction prompt.
+
+    The render completion is serialized envelope-keys-first / payload-last (see
+    ``_ordered_render_target``) with ``sort_keys=False`` to preserve that order;
+    the extract completion keeps the stable ``sort_keys=True`` form (no deep
+    nesting, order-insensitive)."""
+    if ex.get("role") == "render":
+        completion = json.dumps(_ordered_render_target(ex["target"]), sort_keys=False)
+    else:
+        completion = json.dumps(ex["target"], sort_keys=True)
     return {
         "prompt": _example_prompt(ex, sysp),
-        "completion": json.dumps(ex["target"], sort_keys=True),
+        "completion": completion,
     }
 
 
@@ -451,6 +503,17 @@ def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
     extract_role = roles.get("extract", {})
     render_role = roles.get("render", {})
 
+    # the distinct widget types the model is actually trained to render — the
+    # render constraint (slm_constrain payload-complete anyOf) restricts its
+    # branch set to these so the lm-format-enforcer parser stays light and only
+    # the producible types are live (faster decode, same correctness).
+    render_widget_types = sorted({
+        w.get("widget_type")
+        for rec in records
+        for w in ((rec.get("labels", {}).get("render", {}) or {}).get("widgets", []) or [])
+        if isinstance(w, dict) and w.get("widget_type")
+    })
+
     manifest = {
         "schema": "noetl.slm.model/1",
         "backend": backend,
@@ -475,6 +538,13 @@ def finetune(config_path, *, backend=None, dataset_dir=None, base_model=None,
         "dataset_dir": dataset_dir,
         "train_records": len(records),
         "augment_teacher": augment_teacher,
+        # render constrained-decode hints (slm_infer reads these when
+        # SLM_CONSTRAIN_RENDER is on): the producible widget-type set + the
+        # larger render token budget / list-item cap the deep payload-complete
+        # renders need to finish within budget.
+        "render_widget_types": render_widget_types,
+        "render_max_tokens": 1100,
+        "render_max_items": 4,
         "created_unix": int(time.time()),
     }
 

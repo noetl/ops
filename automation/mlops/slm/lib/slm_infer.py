@@ -333,6 +333,8 @@ class SlmRunner:
         self._tok_data = None
         self._extract_schema_dict = None
         self._render_schema_dict = None
+        self._render_max_tokens = 512
+        self._render_max_items = 5
         if flag is None:
             flag = os.environ.get("SLM_CONSTRAINED_DECODE", "").strip().lower() in ("1", "true", "yes")
         if not flag or self.backend != "mlx":
@@ -351,21 +353,55 @@ class SlmRunner:
         if self.extract_schema and os.path.isfile(self.extract_schema):
             with open(self.extract_schema) as fh:
                 self._extract_schema_dict = CON.sanitize_for_lmfe(json.load(fh))
-        # Render constraint is OFF by default: forcing the widget_type enum +
-        # a generic payload (the render schema doesn't carry per-widget-type
-        # payload requirements) perturbs the model into payloads that fail the
-        # per-type schema and get dropped post-hoc → empty widget lists, which is
-        # worse than plain generation + repair.  Opt in with SLM_CONSTRAIN_RENDER
-        # only if a payload-complete render schema is supplied.  Extract
-        # constraint (the closed-vocab tool + render_intent enums) is the clean,
-        # always-on win.
+        # Render constraint (lever 2).  The original enum-only render constraint
+        # was OFF by default because forcing the widget_type enum with a GENERIC
+        # payload (the base render schema has no per-type payload requirements)
+        # let the model emit a right-type-but-incomplete payload that then failed
+        # the per-type envelope schema and got dropped → empty widget lists, worse
+        # than plain generation.  The payload-complete builder fixes exactly that:
+        # each widget item is an anyOf over per-widget-type envelope branches that
+        # carry the type's required payload fields, so a chosen widget_type is
+        # forced to be payload-complete and survives ``validate_envelope`` instead
+        # of being dropped — the dominant ``widget_type_match`` bottleneck.
+        #
+        # Opt in with SLM_CONSTRAIN_RENDER=1 (payload-complete builder; default
+        # when on).  SLM_RENDER_ENUM_ONLY=1 falls back to the legacy enum-only
+        # builder for A/B.  Extract constraint (closed-vocab tool + render_intent
+        # enums) stays the clean always-on win regardless.
         constrain_render = os.environ.get("SLM_CONSTRAIN_RENDER", "").strip().lower() in ("1", "true", "yes")
         if constrain_render and self.render_schema and os.path.isfile(self.render_schema):
-            self._render_schema_dict = CON.render_schema_with_widget_enum(
-                self.render_schema, self.widget_dir)
+            enum_only = os.environ.get("SLM_RENDER_ENUM_ONLY", "").strip().lower() in ("1", "true", "yes")
+            if enum_only:
+                self._render_schema_dict = CON.render_schema_with_widget_enum(
+                    self.render_schema, self.widget_dir)
+            else:
+                # Restrict the anyOf branch set to the producible widget types so
+                # the lm-format-enforcer parser stays light (fewer live branches
+                # before the widget_type discriminator commits → faster decode).
+                # Precedence: env SLM_RENDER_TYPES (comma list) > manifest
+                # render_widget_types (the distinct types in the train render
+                # labels, written by finetune) > every type in widget_dir.
+                env_types = os.environ.get("SLM_RENDER_TYPES", "").strip()
+                types = ([t.strip() for t in env_types.split(",") if t.strip()]
+                         or self.manifest.get("render_widget_types")
+                         or None)
+                self._render_schema_dict = CON.render_schema_payload_complete(
+                    self.render_schema, self.widget_dir, types=types)
+        # Deep payload-complete render needs more room than the 512-token default
+        # (a flight/hotel list copies several fully-formed cards) — and a bound on
+        # how many list items the decoder may emit so it always closes the
+        # envelope in budget.  Both env-overridable.
+        self._render_max_tokens = int(os.environ.get("SLM_RENDER_MAX_TOKENS")
+                                      or self.manifest.get("render_max_tokens")
+                                      or max(self._mlx.get("max_tokens", 512) if self._mlx else 512, 1024))
+        self._render_max_items = int(os.environ.get("SLM_RENDER_MAX_ITEMS")
+                                     or self.manifest.get("render_max_items") or 5)
         self.constrained = True
-        print("constrained decode: ENABLED (extract schema; render_constraint=%s)"
-              % bool(self._render_schema_dict), file=sys.stderr)
+        print("constrained decode: ENABLED (extract schema; render_constraint=%s%s)"
+              % (bool(self._render_schema_dict),
+                 " payload-complete" if self._render_schema_dict and
+                 os.environ.get("SLM_RENDER_ENUM_ONLY", "").strip().lower() not in ("1", "true", "yes")
+                 else ""), file=sys.stderr)
 
     # -- stub backend ---------------------------------------------------------
 
@@ -464,9 +500,18 @@ class SlmRunner:
         break the schema (lever 1); otherwise the post-hoc ``_constrain_*``
         repair the caller applies is the only guard (the v2 path)."""
         g = self._mlx
-        kwargs = {"max_tokens": g["max_tokens"], "verbose": False}
+        is_render = schema_dict is not None and schema_dict is self._render_schema_dict
+        max_tokens = self._render_max_tokens if is_render else g["max_tokens"]
+        kwargs = {"max_tokens": max_tokens, "verbose": False}
         if self.constrained and schema_dict is not None:
-            proc = self._constrain.make_logits_processor(schema_dict, self._tok_data)
+            if is_render:
+                # payload-complete anyOf render schema: force widget_type first,
+                # cap whitespace + list length so deep list payloads finish.
+                proc = self._constrain.make_logits_processor(
+                    schema_dict, self._tok_data, force_field_order=True,
+                    max_whitespaces=2, max_array_length=self._render_max_items)
+            else:
+                proc = self._constrain.make_logits_processor(schema_dict, self._tok_data)
             kwargs["logits_processors"] = [proc]
         text = g["generate"](g["model"], g["tokenizer"], prompt=prompt, **kwargs)
         return parse_json_object(text)
