@@ -299,12 +299,14 @@ class SlmRunner:
     engine treats it as just another candidate."""
 
     def __init__(self, artifact_path, *, extract_schema=None, widget_dir=None,
-                 tool_vocab=None, intent_vocab=None):
+                 tool_vocab=None, intent_vocab=None, render_schema=None,
+                 constrained_decode=None):
         self.dir = load_artifact_dir(artifact_path)
         with open(os.path.join(self.dir, MANIFEST_NAME)) as fh:
             self.manifest = json.load(fh)
         self.backend = self.manifest.get("backend", "stub")
         self.extract_schema = extract_schema
+        self.render_schema = render_schema
         self.widget_dir = widget_dir
         self.tool_vocab = set(tool_vocab or self.manifest.get("vocab", {}).get("tools", []))
         self.intent_vocab = set(intent_vocab or self.manifest.get("vocab", {}).get("render_intents", []))
@@ -319,6 +321,41 @@ class SlmRunner:
             self._load_mlx()
         else:
             raise RuntimeError("unknown model backend %r" % self.backend)
+        self._setup_constrained(constrained_decode)
+
+    # -- grammar-constrained decoding (lever 1; flag-gated, mlx only) ----------
+
+    def _setup_constrained(self, flag):
+        """Prepare logit-level schema constraint when enabled + available.
+        ``flag`` None → read env SLM_CONSTRAINED_DECODE (default off)."""
+        self.constrained = False
+        self._constrain = None
+        self._tok_data = None
+        self._extract_schema_dict = None
+        self._render_schema_dict = None
+        if flag is None:
+            flag = os.environ.get("SLM_CONSTRAINED_DECODE", "").strip().lower() in ("1", "true", "yes")
+        if not flag or self.backend != "mlx":
+            return
+        try:
+            import slm_constrain as CON
+        except Exception as exc:
+            print("constrained decode requested but slm_constrain unavailable (%s)" % exc, file=sys.stderr)
+            return
+        if not CON.available():
+            print("constrained decode requested but lm-format-enforcer not installed; "
+                  "falling back to post-hoc repair", file=sys.stderr)
+            return
+        self._constrain = CON
+        self._tok_data = CON.build_tokenizer_data(self._mlx["tokenizer"])
+        if self.extract_schema and os.path.isfile(self.extract_schema):
+            with open(self.extract_schema) as fh:
+                self._extract_schema_dict = json.load(fh)
+        if self.render_schema and os.path.isfile(self.render_schema):
+            self._render_schema_dict = CON.render_schema_with_widget_enum(
+                self.render_schema, self.widget_dir)
+        self.constrained = True
+        print("constrained decode: ENABLED (logit-level JSON-schema enforcement)", file=sys.stderr)
 
     # -- stub backend ---------------------------------------------------------
 
@@ -410,12 +447,18 @@ class SlmRunner:
         self._mlx = {"model": model, "tokenizer": tokenizer, "generate": mlx_generate,
                      "max_tokens": int(self.manifest.get("max_new_tokens", 512))}
 
-    def _mlx_generate_json(self, prompt):
+    def _mlx_generate_json(self, prompt, schema_dict=None):
         """Greedy-decode a completion and parse the first JSON object out of it.
-        Schema constraint is applied by the caller (``_constrain_*``)."""
+        When constrained decoding is enabled and a ``schema_dict`` is given, a
+        logit-level lm-format-enforcer processor masks every token that would
+        break the schema (lever 1); otherwise the post-hoc ``_constrain_*``
+        repair the caller applies is the only guard (the v2 path)."""
         g = self._mlx
-        text = g["generate"](g["model"], g["tokenizer"], prompt=prompt,
-                             max_tokens=g["max_tokens"], verbose=False)
+        kwargs = {"max_tokens": g["max_tokens"], "verbose": False}
+        if self.constrained and schema_dict is not None:
+            proc = self._constrain.make_logits_processor(schema_dict, self._tok_data)
+            kwargs["logits_processors"] = [proc]
+        text = g["generate"](g["model"], g["tokenizer"], prompt=prompt, **kwargs)
         return parse_json_object(text)
 
     # -- shared run surface ---------------------------------------------------
@@ -425,12 +468,15 @@ class SlmRunner:
             proto, _score = self._retrieve(turn)
             raw_ex = (proto or {}).get("extract", {})
             raw_rd = (proto or {}).get("render", {})
-        else:  # peft | mlx — a real model generates JSON under schema constraint
-            gen = self._mlx_generate_json if self.backend == "mlx" else self._peft_generate_json
-            raw_ex = gen(self._extract_prompt(turn))
+        elif self.backend == "mlx":  # real model + (optional) logit-level constraint
+            raw_ex = self._mlx_generate_json(self._extract_prompt(turn), self._extract_schema_dict)
             # render conditions on the (constrained) extraction
             ex_for_render = _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
-            raw_rd = gen(self._render_prompt(turn, ex_for_render))
+            raw_rd = self._mlx_generate_json(self._render_prompt(turn, ex_for_render), self._render_schema_dict)
+        else:  # peft
+            raw_ex = self._peft_generate_json(self._extract_prompt(turn))
+            ex_for_render = _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
+            raw_rd = self._peft_generate_json(self._render_prompt(turn, ex_for_render))
 
         extract = _constrain_extract(raw_ex, self.extract_schema, self.tool_vocab, self.intent_vocab)
         # a minimal always-valid fallback envelope when the proposed widgets are
