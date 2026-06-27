@@ -284,6 +284,9 @@ def evaluate(config_path, dataset_dir=None, out_override=None, *, candidate_over
             "event_type": exmpl["input"]["event_type"],
             "event_payload": exmpl["input"]["event_payload"],
             "slot_state": exmpl["input"]["slot_state"],
+            # the render pass conditions on the tool result (the production planner
+            # supplies the real one here); the oracle candidate ignores it.
+            "tool_summary": exmpl["input"].get("tool_summary"),
         }
         label = exmpl["labels"]
         t0 = time.perf_counter()

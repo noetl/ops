@@ -93,6 +93,7 @@ def build_multitask_examples(records, *, label_field="labels", include_teacher=F
                 "label_source": src_name,
                 "turn": turn,
                 "extraction": labels.get("extract", {}),
+                "tool_summary": rec.get("input", {}).get("tool_summary"),
                 "target": labels.get("render", {}),
             })
     return examples
@@ -146,7 +147,8 @@ def _example_prompt(ex, sysp):
     builders the inference runner uses so train/infer formatting never drifts."""
     if ex["role"] == "extract":
         return INFER.build_extract_prompt(sysp.get("extract", ""), ex["turn"])
-    return INFER.build_render_prompt(sysp.get("render", ""), ex["turn"], ex["extraction"])
+    return INFER.build_render_prompt(sysp.get("render", ""), ex["turn"],
+                                     ex["extraction"], ex.get("tool_summary"))
 
 
 def _mlx_data_pair(ex, sysp):

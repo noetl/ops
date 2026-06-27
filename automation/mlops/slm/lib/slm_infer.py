@@ -94,13 +94,28 @@ def resolve_hf_model_id(name):
 # the JSON completion that follows the OUTPUT marker.
 
 def build_extract_prompt(system_prompt, turn):
-    body = {"turn": turn}
+    body = {"turn": _clean_turn(turn)}
     return "%s\n\n### INPUT\n%s\n\n### OUTPUT (JSON)\n" % (
         system_prompt or "", json.dumps(body, sort_keys=True))
 
 
-def build_render_prompt(system_prompt, turn, extraction):
-    body = {"turn": turn, "extraction": extraction}
+def _clean_turn(turn):
+    """The prompt body carries only the three input fields the model conditions
+    on; strip any sidecar keys (e.g. a persisted ``tool_summary`` or
+    ``thread_context``) so train-time and infer-time bodies are byte-identical."""
+    return {k: turn.get(k) for k in ("event_type", "event_payload", "slot_state")}
+
+
+def build_render_prompt(system_prompt, turn, extraction, tool_summary=None):
+    # The render role's declared input is "slot_state + extraction + tool_summary
+    # + render_intent".  Conditioning on the tool result lets the model copy real
+    # values (place names, offer ids, hotel data) into schema-valid widget
+    # payloads instead of hallucinating them — the lever for render/widget_type/
+    # arg fidelity.  Backward compatible: tool_summary=None reproduces the old
+    # body so v1 artifacts still load.
+    body = {"turn": _clean_turn(turn), "extraction": extraction}
+    if tool_summary is not None:
+        body["tool_summary"] = tool_summary
     return "%s\n\n### INPUT\n%s\n\n### OUTPUT (JSON)\n" % (
         system_prompt or "", json.dumps(body, sort_keys=True))
 
@@ -432,4 +447,5 @@ class SlmRunner:
 
     def _render_prompt(self, turn, extraction):
         sysp = self.manifest.get("prompts", {}).get("render", "")
-        return build_render_prompt(sysp, turn, extraction)
+        # the eval/serve turn carries the tool result the render pass conditions on
+        return build_render_prompt(sysp, turn, extraction, turn.get("tool_summary"))

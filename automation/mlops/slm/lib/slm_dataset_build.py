@@ -181,6 +181,19 @@ def build(config_path, out_override=None, corpus_override=None, version_override
         produced = run_fn(turn)
         ex = produced["extract"]
         rd = produced["render"]
+        # the render role conditions on the tool result (config role render input:
+        # "slot_state + extraction + tool_summary + render_intent").  Persist the
+        # oracle's tool_summary so the render prompt can be conditioned on it at
+        # train + serve time (the production planner supplies the real tool result
+        # here).  run_turn returns it; fall back to the oracle helper otherwise.
+        tool_summary = produced.get("tool_summary")
+        if tool_summary is None and tool_summary_fn is not None:
+            merged_slot = dict(turn.get("slot_state") or {})
+            merged_slot.update(ex.get("slot_updates") or {})
+            try:
+                tool_summary = tool_summary_fn(ex, merged_slot)
+            except Exception:
+                tool_summary = None
 
         v = _validate_labels(ex, rd, extract_schema, render_schema, widget_dir)
         total_envelopes += v["total_envelopes"]
@@ -212,9 +225,15 @@ def build(config_path, out_override=None, corpus_override=None, version_override
                 "event_payload": turn.get("event_payload"),
                 "slot_state": turn.get("slot_state", {}),
                 "thread_context": turn.get("thread_context", []),
+                "tool_summary": tool_summary,
             },
             "labels": {"extract": ex, "render": rd},
             "label_source": label_source,
+            # honour an explicit per-turn split when the corpus carries one
+            # (leak-controlled synthetic corpora pre-assign train/eval so
+            # same-template turns never straddle the split); else fall back to
+            # the deterministic id-hash bucket below.
+            "split": turn.get("split"),
             "valid": {
                 "extract_schema": v["extract_schema"],
                 "render_schema": v["render_schema"],
@@ -272,11 +291,18 @@ def build(config_path, out_override=None, corpus_override=None, version_override
 
         examples.append(example)
 
-    # deterministic split by stable hash of id
+    # split: honour an explicit per-turn split when present (leak-controlled
+    # corpora), else deterministic stable-hash bucket by id.
     train, ev = [], []
+    explicit_split = 0
     for exmpl in examples:
-        bucket = _stable_bucket(str(exmpl["id"]), seed)
-        (ev if bucket < eval_ratio else train).append(exmpl)
+        sp = exmpl.get("split")
+        if sp in ("train", "eval"):
+            explicit_split += 1
+            (ev if sp == "eval" else train).append(exmpl)
+        else:
+            bucket = _stable_bucket(str(exmpl["id"]), seed)
+            (ev if bucket < eval_ratio else train).append(exmpl)
 
     n = len(examples) or 1
     manifest = {
@@ -284,7 +310,10 @@ def build(config_path, out_override=None, corpus_override=None, version_override
         "version": version,
         "label_source": label_source,
         "created_from": os.path.relpath(corpus_path, cfg_dir),
-        "split": {"eval_ratio": eval_ratio, "seed": seed},
+        "split": {"eval_ratio": eval_ratio, "seed": seed,
+                  "explicit_split_turns": explicit_split,
+                  "split_mode": ("explicit_per_turn" if explicit_split == len(examples)
+                                 else "hash" if explicit_split == 0 else "mixed")},
         "teacher": (
             {
                 "enabled": True,
