@@ -60,6 +60,10 @@ workflow:
         import urllib.request
 
         DATASTORE_SCOPE = "https://www.googleapis.com/auth/datastore"
+        METADATA_TOKEN_URL = (
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/token"
+        )
         REDACT_KEYS = {
             "authorization",
             "proxy-authorization",
@@ -135,16 +139,40 @@ workflow:
             }
 
         def _token():
+            # Mint an OAuth2 access token from the GKE metadata server using the
+            # worker pod's Workload Identity. No google-auth library: the metadata
+            # endpoint is exactly what google.auth.default() reads under the hood on
+            # GKE, so a direct urllib GET is the library-free equivalent and removes
+            # the `ModuleNotFoundError: No module named 'google'` fallback that fired
+            # on every Firestore call from the Rust worker image (noetl/ai-meta#137
+            # gave google-places the same treatment; this mirrors it for firestore).
+            # The default service account token carries cloud-platform scope, which
+            # subsumes the datastore scope Firestore REST requires.
+            req = urllib.request.Request(
+                METADATA_TOKEN_URL,
+                headers={"Metadata-Flavor": "Google"},
+                method="GET",
+            )
             try:
-                import google.auth
-                import google.auth.transport.requests
-            except Exception as exc:
-                raise RuntimeError(f"google-auth unavailable in worker image: {type(exc).__name__}: {exc}")
-            credentials, _ = google.auth.default(scopes=[DATASTORE_SCOPE])
-            credentials.refresh(google.auth.transport.requests.Request())
-            if not getattr(credentials, "token", None):
-                raise RuntimeError("ADC returned no access token")
-            return credentials.token
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    "metadata token mint failed HTTP "
+                    f"{exc.code}: Workload Identity is not bound to a GCP service "
+                    f"account with Firestore access for this worker pod ({body})"
+                )
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    "metadata server unreachable "
+                    f"({getattr(exc, 'reason', exc)}): the worker pod has no GKE "
+                    "Workload Identity metadata endpoint (expected off-cluster, e.g. kind)"
+                )
+            token = (payload or {}).get("access_token") if isinstance(payload, dict) else None
+            if not token:
+                raise RuntimeError("metadata token endpoint returned no access_token")
+            return token
 
         def _database_root():
             base = str(firestore_api_base or "https://firestore.googleapis.com/v1").rstrip("/")
@@ -731,6 +759,7 @@ workflow:
             "uuid": uuid,
             "urllib": urllib,
             "DATASTORE_SCOPE": DATASTORE_SCOPE,
+            "METADATA_TOKEN_URL": METADATA_TOKEN_URL,
             "REDACT_KEYS": REDACT_KEYS,
             "REDACT_RE": REDACT_RE,
             "_as_dict": _as_dict,
