@@ -573,6 +573,44 @@ workflow:
                 return _error("batch_append_events", "one or more batch append_event operations failed", errors, 207)
             return _ok("batch_append_events", data, f"batch_append_events {len(results)}/{len(items)}")
 
+        def _batch_write(args):
+            # One-call combined writer: run batch_set_docs over `set_docs` AND
+            # batch_append_events over `append_events` in a single MCP dispatch.
+            # Lets a playbook collapse several fire-and-forget persistence steps
+            # (each otherwise its own `kind: playbook` child = ~3 orchestration
+            # hops) into ONE child dispatch (noetl/ai-meta latency FIX B).  Either
+            # list may be empty/omitted; the other still runs.  Ordering within
+            # each list is preserved, so callers control set-doc last-writer-wins
+            # and event seq ordering by list order.
+            set_items = _as_list(args.get("set_docs") or args.get("docs"))
+            event_items = _as_list(args.get("append_events") or args.get("events"))
+            if not set_items and not event_items:
+                return _error("batch_write", "at least one of set_docs / append_events must be a non-empty list")
+            set_payload = {}
+            event_payload = {}
+            failed = 0
+            if set_items:
+                set_result = _batch_set_docs({"items": set_items})
+                set_payload = _as_dict(set_result.get("data"))
+                if set_result.get("isError"):
+                    failed += 1
+            if event_items:
+                event_result = _batch_append_events({"items": event_items})
+                event_payload = _as_dict(event_result.get("data"))
+                if event_result.get("isError"):
+                    failed += 1
+            data = {
+                "set_docs": set_payload,
+                "append_events": event_payload,
+                "set_count": len(set_items),
+                "event_count": len(event_items),
+                "set_succeeded": _safe_int(set_payload.get("succeeded"), 0),
+                "event_succeeded": _safe_int(event_payload.get("succeeded"), 0),
+            }
+            if failed:
+                return _error("batch_write", "one or more batch_write sub-operations failed", data, 207)
+            return _ok("batch_write", data, f"batch_write set={len(set_items)} events={len(event_items)}")
+
         def _replay_events(args):
             thread_path = _clean_path(args.get("thread_path"))
             if not thread_path:
@@ -718,6 +756,39 @@ workflow:
                     },
                 },
                 {
+                    "name": "batch_write",
+                    "title": "Batch write (set docs + append events)",
+                    "description": "Run batch_set_docs over `set_docs` and batch_append_events over `append_events` in one MCP invocation. Either list may be empty. Collapses multiple persistence steps into a single dispatch.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "set_docs": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["path", "doc"],
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "doc": {"type": "object"},
+                                        "merge": {"type": "boolean", "default": False},
+                                    },
+                                },
+                            },
+                            "append_events": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["thread_path", "event"],
+                                    "properties": {
+                                        "thread_path": {"type": "string"},
+                                        "event": {"type": "object"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                {
                     "name": "replay_events",
                     "title": "Replay events",
                     "description": "Replay events from a thread in seq order, with optional seq range and type filter.",
@@ -747,6 +818,7 @@ workflow:
                 "delete_doc": _delete_doc,
                 "append_event": _append_event,
                 "batch_append_events": _batch_append_events,
+                "batch_write": _batch_write,
                 "replay_events": _replay_events,
             }
             if tool not in dispatch:
@@ -795,6 +867,7 @@ workflow:
             "_commit_event": _commit_event,
             "_append_event": _append_event,
             "_batch_append_events": _batch_append_events,
+            "_batch_write": _batch_write,
             "_replay_events": _replay_events,
             "_tools_list": _tools_list,
             "_tools_call": _tools_call,
