@@ -249,21 +249,35 @@ workflow:
             return ""
 
         def _static_map_url(lat, lng, key, label=""):
-            if lat is None or lng is None or not key:
+            # `key` is optional: when empty the URL is keyless. Widget-bound
+            # image URLs (see _google_summary) are deliberately built keyless so
+            # the server's `google-maps-widget-key` secret never rides the
+            # delivered payload — the response-boundary scrubber would mask a
+            # keyed URL to "[REDACTED]", which is not a valid `uri` and breaks
+            # the place_card render. The browser supplies its own restricted
+            # `VITE_GOOGLE_MAPS_KEY` at <img> time.
+            if lat is None or lng is None:
                 return None
             center = urllib.parse.quote(f"{lat},{lng}", safe="")
             marker_label = urllib.parse.quote(str(label or "")[:12], safe="")
-            return (
+            url = (
                 "https://maps.googleapis.com/maps/api/staticmap"
                 f"?center={center}&zoom=13&size=400x260&scale=2"
-                f"&markers=color:red%7Clabel:{marker_label}%7C{center}&key={urllib.parse.quote(key, safe='')}"
+                f"&markers=color:red%7Clabel:{marker_label}%7C{center}"
             )
+            if key:
+                url += f"&key={urllib.parse.quote(key, safe='')}"
+            return url
 
         def _place_photo_url(photo_resource, key, max_width=400):
-            if not photo_resource or not key:
+            # `key` optional — keyless when empty (see _static_map_url rationale).
+            if not photo_resource:
                 return None
             resource = str(photo_resource).strip().lstrip("/")
-            return f"https://places.googleapis.com/v1/{resource}/media?maxWidthPx={int(max_width)}&key={urllib.parse.quote(key, safe='')}"
+            url = f"https://places.googleapis.com/v1/{resource}/media?maxWidthPx={int(max_width)}"
+            if key:
+                url += f"&key={urllib.parse.quote(key, safe='')}"
+            return url
 
         def _lat_lng_from_item(item):
             geo = item.get("geoCode") if isinstance(item, dict) else {}
@@ -298,12 +312,31 @@ workflow:
                 parts.append("attraction")
             return " ".join(parts)
 
+        def _valid_widget_uri(url):
+            # Widget photos are schema-validated as `format: uri` on the client;
+            # only emit a syntactically valid absolute http(s) URL, else "" so
+            # the place_card simply renders without a photo (never a broken/
+            # invalid-URI token that fails the whole widget).
+            if not isinstance(url, str) or not url:
+                return ""
+            try:
+                parts = urllib.parse.urlsplit(url)
+            except Exception:
+                return ""
+            return url if parts.scheme in ("http", "https") and parts.netloc else ""
+
         def _google_summary(place, widget_key):
             loc = place.get("location") if isinstance(place.get("location"), dict) else {}
             lat = loc.get("latitude")
             lng = loc.get("longitude")
             photo_resource = _photo_name(place)
-            image_url = _static_map_url(lat, lng, widget_key, _display_name(place)) or _place_photo_url(photo_resource, widget_key)
+            # Keyless (widget_key intentionally NOT embedded) — the browser adds
+            # its own VITE_GOOGLE_MAPS_KEY; a server-keyed URL would be scrubbed
+            # to "[REDACTED]" and fail the place_card `uri` contract.
+            image_url = _valid_widget_uri(
+                _static_map_url(lat, lng, "", _display_name(place))
+                or _place_photo_url(photo_resource, "")
+            )
             opening = place.get("regularOpeningHours") if isinstance(place.get("regularOpeningHours"), dict) else {}
             editorial = place.get("editorialSummary") if isinstance(place.get("editorialSummary"), dict) else {}
             return {
@@ -317,7 +350,7 @@ workflow:
                 "summary": editorial.get("text"),
                 "photo_resource": photo_resource,
                 "image_url": image_url,
-                "maps_static_url": _static_map_url(lat, lng, widget_key, _display_name(place)),
+                "maps_static_url": _valid_widget_uri(_static_map_url(lat, lng, "", _display_name(place))),
             }
 
         def _enrich_items(args, project, widget_key, limit):
