@@ -1,0 +1,108 @@
+# Self-healing watchdog for the off-server state-builder wedge
+# (noetl/ai-meta#163).  Schedules system/state_builder_watchdog every 3
+# minutes as the EXTERNAL third layer of defense behind:
+#   1. in-process self-heal (worker recreates the consumer; v5.48.1), and
+#   2. the /livez liveness probe (k8s restarts a pod whose self-heal
+#      can't recover).
+# This CronJob restarts the pool only when 1+2 have NOT cleared a
+# sustained wedge — bounded by cooldown + flap-stop guards in the playbook.
+#
+# CHICKEN-AND-EGG: the watchdog must NOT dispatch through the server
+# orchestrate drive (that drive is the thing wedged — a distributed
+# playbook would compute commands=0 and wedge too).  So it runs the
+# shell-only playbook in LOCAL runtime (`noetl exec --runtime local`) in
+# its own pod, talking straight to the kube-apiserver + the worker
+# /metrics endpoint.  Never touches /api/execute.
+#
+# IMAGE: needs `noetl` (CLI, for `exec --runtime local`) + `kubectl`.
+# Pin a published noetl-cli image that bundles kubectl, or build a tiny
+# one (FROM the noetl CLI image, `apk add kubectl`).  Marked here as a
+# review item — the operator confirms the image at apply time.
+#
+# RBAC: serviceaccount-state-builder-watchdog.yaml grants get/patch on
+# deployments (rollout restart + annotation state) and get/list on pods.
+# Restart-only; no delete, no scale, no data access.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noetl-state-builder-watchdog-playbook
+  namespace: noetl
+  labels:
+    app: noetl-state-builder-watchdog
+    component: system-cron
+data:
+  # Source of truth: playbooks/system/state_builder_watchdog.yaml.
+  # Mounted read-only and executed with `noetl exec --runtime local`.
+  # Keep this in sync with the playbook file (or generate it from the
+  # file at build time).
+  state_builder_watchdog.yaml: |
+    # See playbooks/system/state_builder_watchdog.yaml — mounted here so the
+    # local-runtime CronJob can execute it without the server catalog (which
+    # may be unreachable during the very wedge this repairs).
+    # (Operators: regenerate with
+    #   kubectl create configmap noetl-state-builder-watchdog-playbook \
+    #     --from-file=state_builder_watchdog.yaml=playbooks/system/state_builder_watchdog.yaml \
+    #     -n noetl --dry-run=client -o yaml )
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: noetl-state-builder-watchdog
+  namespace: noetl
+  labels:
+    app: noetl-state-builder-watchdog
+    component: system-cron
+    noetl.io/outage-guardrail: state-builder-wedge
+spec:
+  schedule: "*/3 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0          # a missed tick is fine; the next tick re-checks
+      activeDeadlineSeconds: 180
+      template:
+        metadata:
+          labels:
+            app: noetl-state-builder-watchdog
+        spec:
+          restartPolicy: Never
+          serviceAccountName: noetl-state-builder-watchdog
+          containers:
+            - name: watchdog
+              # REVIEW: must bundle `noetl` (CLI) + `kubectl`.
+              image: ghcr.io/noetl/noetl-cli:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  noetl exec /playbooks/state_builder_watchdog.yaml --runtime local \
+                    --set namespace=noetl \
+                    --set deployment=noetl-worker-system-pool \
+                    --set metrics_url=http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090/metrics \
+                    --set livez_url=http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090/livez \
+                    --set kube_context= \
+                    --set samples=3 --set sample_interval_seconds=2 \
+                    --set cooldown_seconds=600 \
+                    --set flap_window_seconds=3600 \
+                    --set max_attempts=3
+              volumeMounts:
+                - name: playbook
+                  mountPath: /playbooks
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: "10m"
+                  memory: "48Mi"
+                limits:
+                  cpu: "200m"
+                  memory: "128Mi"
+          volumes:
+            - name: playbook
+              configMap:
+                name: noetl-state-builder-watchdog-playbook
