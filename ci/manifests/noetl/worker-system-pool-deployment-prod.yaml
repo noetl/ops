@@ -157,6 +157,33 @@ spec:
               value: "offserver"
             - name: NOETL_STATE_BUILDER_CONSUMER
               value: "noetl_state_builder"
+            # noetl/ai-meta#166 Phase 1 — bounded off-server WAL index.  The
+            # index grew O(all non-terminal event history × full-envelope) to
+            # ~1.28 GiB at idle (654 execs pinned, #163 OOM).  These knobs cap it
+            # to O(active working set).  Prod-verified 2026-06-30: idle RSS
+            # 1265Mi -> 67Mi, holding, 0 OOMKills, drives still served.
+            #   SLIM           — store a lossless projection to the orchestrate-core
+            #                    Event fields (output-equivalent from_events).
+            #   TTL_SECS=900   — evict idle/abandoned non-terminal chains (the class
+            #                    terminal eviction misses); 15min >> a Muno hop so
+            #                    active flows are never evicted mid-drive.
+            #   MAX_BYTES      — hard ceiling on the byte LEDGER (the approx
+            #                    JSON-byte estimate, ~5-7× under true resident); 256Mi
+            #                    ledger ≈ ~1.5-1.7 GiB RSS backstop, under the 2Gi limit.
+            #   REHYDRATE_ON_MISS — targeted retained-WAL re-replay on a cache miss,
+            #                    makes eviction wedge-safe with tail-attach off.
+            #   SWEEP_SECS=30  — bounded-cache sweep cadence (runs idle + busy).
+            # Instant rollback: remove these 5 vars (behavior-neutral, unbounded).
+            - name: NOETL_STATE_INDEX_SLIM
+              value: "true"
+            - name: NOETL_STATE_INDEX_TTL_SECS
+              value: "900"
+            - name: NOETL_STATE_INDEX_MAX_BYTES
+              value: "268435456"
+            - name: NOETL_STATE_INDEX_REHYDRATE_ON_MISS
+              value: "true"
+            - name: NOETL_STATE_INDEX_SWEEP_SECS
+              value: "30"
           volumeMounts:
             # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
             # container-runtime default /dev/shm is a 64 MiB tmpfs; the
