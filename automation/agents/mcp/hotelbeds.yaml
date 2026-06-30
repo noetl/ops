@@ -38,7 +38,27 @@ metadata:
     Endpoint (per official docs): POST /hotel-api/1.0/hotels with a JSON body
     {stay:{checkIn,checkOut}, occupancies:[{rooms,adults,children}],
     geolocation:{latitude,longitude,radius,unit}}. Response hotels live under
-    body.hotels.hotels[].
+    body.hotels.hotels[]. Each availability rate carries a `rateKey` — the
+    opaque, short-lived token that identifies a bookable rate. search_hotels
+    surfaces the cheapest room's first `rateKey` so the planner can carry it to
+    booking (mirrors how a Duffel offer id flows to create_order).
+
+    Booking (TEST/SANDBOX ONLY) — book_hotel mirrors the Duffel create_order
+    flow. APITUDE booking is a two-call dance:
+      1. checkRate (POST /hotel-api/1.0/checkrates with
+         {rooms:[{rateKey}]}) re-prices the selected rate and returns a fresh,
+         confirmed rateKey + final net price. Availability rateKeys can drift
+         in price or expire; checkRate is the authoritative re-price.
+      2. bookings (POST /hotel-api/1.0/bookings with
+         {holder:{name,surname}, rooms:[{rateKey, paxes:[...]}],
+         clientReference}) confirms the reservation and returns
+         booking.reference, booking.hotel.{name,checkIn,checkOut},
+         booking.totalNet, booking.currency, booking.status.
+    SAFETY: book_hotel refuses to issue a booking unless the configured base
+    host is the HotelBeds TEST/SANDBOX host (api.test.hotelbeds.com). A
+    non-test base returns a `not_sandbox` error and books nothing — no
+    real-money reservation is ever issued from this playbook. This is the
+    HotelBeds analogue of the Duffel create_order `duffel_env=test` gate.
 
     Operator prerequisites (until these land, backend calls return a clear
     auth/permission error — NOT a missing-library or parse error):
@@ -51,11 +71,12 @@ metadata:
     tools/call, so a single planner turn stays well inside the limit. Do not
     loop it.
 
-    Tools: search_hotels (availability), list_destinations (debug).
+    Tools: search_hotels (availability), book_hotel (TEST/SANDBOX
+    checkRate+booking), list_destinations (debug).
   agent: true
   exposes_as_mcp: true
   exposed_in_ui: false
-  version: "1.0"
+  version: "1.1"
   tags: [mcp, hotelbeds, apitude, travel, hotels]
   terminal:
     visible: true
@@ -112,7 +133,14 @@ workflow:
             "instance/service-accounts/default/token"
         )
         AVAILABILITY_PATH = "/hotel-api/1.0/hotels"
+        CHECKRATES_PATH = "/hotel-api/1.0/checkrates"
+        BOOKINGS_PATH = "/hotel-api/1.0/bookings"
         DESTINATIONS_PATH = "/hotel-api/1.0/locations/destinations"
+        # SAFETY: any base host whose substring matches one of these is treated
+        # as the APITUDE test/sandbox environment. book_hotel refuses to issue a
+        # reservation against any other host so a real-money booking can never
+        # be made from this playbook.
+        SANDBOX_HOST_MARKERS = ("api.test.hotelbeds.com", "sandbox")
 
         # City -> geolocation fallback. Mirrors the planner's `_city_hint` known
         # cities so a bare "hotels in Paris" (no coords resolved yet) still issues
@@ -316,11 +344,46 @@ workflow:
                     return geo["latitude"], geo["longitude"]
             return None, None
 
+        def _first_bookable_rate(hotel):
+            # Availability hotels carry rooms[].rates[]; each rate has the
+            # short-lived `rateKey` needed to book. Pick the cheapest rate
+            # (lowest net) across all rooms so the planner can carry one
+            # bookable token per hotel — the HotelBeds analogue of a Duffel
+            # offer id flowing to create_order.
+            best = None
+            best_net = None
+            for room in _as_list(hotel.get("rooms")):
+                if not isinstance(room, dict):
+                    continue
+                for rate in _as_list(room.get("rates")):
+                    if not isinstance(rate, dict):
+                        continue
+                    key = _text(rate.get("rateKey"))
+                    if not key:
+                        continue
+                    try:
+                        net = float(rate.get("net")) if rate.get("net") is not None else None
+                    except (TypeError, ValueError):
+                        net = None
+                    if best is None or (net is not None and (best_net is None or net < best_net)):
+                        best = {
+                            "rateKey": key,
+                            "net": rate.get("net"),
+                            "rateClass": rate.get("rateClass"),
+                            "rateType": rate.get("rateType"),
+                            "boardName": rate.get("boardName") or rate.get("boardCode"),
+                            "roomName": room.get("name"),
+                            "roomCode": room.get("code"),
+                        }
+                        best_net = net
+            return best or {}
+
         def _hotel_summary(hotel):
             hotel = _as_dict(hotel)
             rates = _as_list(hotel.get("rooms"))
             min_rate = hotel.get("minRate")
             currency = hotel.get("currency")
+            bookable = _first_bookable_rate(hotel)
             return {
                 "code": hotel.get("code"),
                 "name": hotel.get("name"),
@@ -336,6 +399,13 @@ workflow:
                 "rooms_count": len(rates),
                 "reviews": _as_list(hotel.get("reviews")),
                 "address": hotel.get("address"),
+                # Bookable rate token (short-lived) + its board/class so the
+                # planner can carry it from search → book_hotel.
+                "rateKey": bookable.get("rateKey", ""),
+                "boardName": bookable.get("boardName"),
+                "rateClass": bookable.get("rateClass"),
+                "rateType": bookable.get("rateType"),
+                "roomName": bookable.get("roomName"),
             }
 
         def _tools_list():
@@ -357,6 +427,24 @@ workflow:
                             "adults": {"type": "integer", "minimum": 1, "default": 2},
                             "rooms": {"type": "integer", "minimum": 1, "default": 1},
                             "children": {"type": "integer", "minimum": 0, "default": 0},
+                        },
+                    },
+                },
+                {
+                    "name": "book_hotel",
+                    "title": "Book a hotel (TEST/SANDBOX)",
+                    "description": "Confirm a HotelBeds reservation for a selected rate. checkRate re-prices the rateKey, then bookings confirms. TEST/SANDBOX environment only — no real money. Required: rate_key. Optional: holder_name, holder_surname, adults, children, rooms, client_reference.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["rate_key"],
+                        "properties": {
+                            "rate_key": {"type": "string", "description": "Bookable rateKey from search_hotels"},
+                            "holder_name": {"type": "string", "default": "Alex"},
+                            "holder_surname": {"type": "string", "default": "Traveler"},
+                            "adults": {"type": "integer", "minimum": 1, "default": 1},
+                            "children": {"type": "integer", "minimum": 0, "default": 0},
+                            "rooms": {"type": "integer", "minimum": 1, "default": 1},
+                            "client_reference": {"type": "string", "description": "Caller booking reference (defaults to a generated MUNO-* tag)"},
                         },
                     },
                 },
@@ -431,6 +519,126 @@ workflow:
                 {"status_code": status_code, "hotels_total": len(summarised)},
             )
 
+        def _is_sandbox(base):
+            low = _text(base).lower()
+            return any(marker in low for marker in SANDBOX_HOST_MARKERS)
+
+        def _checkrate(base, apikey, secret, rate_key):
+            # Re-price the selected availability rateKey. Returns the fresh,
+            # bookable rateKey (rates expire / drift; checkRate is the
+            # authoritative re-price) plus the confirmed net/currency.
+            payload = {"rooms": [{"rateKey": rate_key}]}
+            ok, status_code, body = _request("POST", base + CHECKRATES_PATH, apikey, secret, payload=payload)
+            if not ok:
+                return None, status_code, body
+            hotel = _as_dict(body.get("hotel") if isinstance(body, dict) else {})
+            for room in _as_list(hotel.get("rooms")):
+                for rate in _as_list(_as_dict(room).get("rates")):
+                    rate = _as_dict(rate)
+                    fresh = _text(rate.get("rateKey"))
+                    if fresh:
+                        return {
+                            "rateKey": fresh,
+                            "net": rate.get("net"),
+                            "currency": hotel.get("currency"),
+                            "boardName": rate.get("boardName"),
+                            "rateClass": rate.get("rateClass"),
+                            "rooms_payload": _as_list(rate.get("rooms")),
+                            "hotel_name": hotel.get("name"),
+                            "checkIn": hotel.get("checkIn"),
+                            "checkOut": hotel.get("checkOut"),
+                        }, status_code, body
+            return None, status_code, body
+
+        def _safe_booking(booking):
+            booking = _as_dict(booking)
+            hotel = _as_dict(booking.get("hotel"))
+            return {
+                "reference": booking.get("reference"),
+                "status": booking.get("status"),
+                "clientReference": booking.get("clientReference"),
+                "creationDate": booking.get("creationDate"),
+                "hotel_name": hotel.get("name"),
+                "hotel_code": hotel.get("code"),
+                "destinationName": hotel.get("destinationName"),
+                "zoneName": hotel.get("zoneName"),
+                "checkIn": hotel.get("checkIn"),
+                "checkOut": hotel.get("checkOut"),
+                "totalNet": hotel.get("totalNet") or booking.get("totalNet"),
+                "currency": hotel.get("currency") or booking.get("currency"),
+                "rooms": [
+                    {
+                        "name": _as_dict(room).get("name"),
+                        "boardName": _as_dict(room).get("rates", [{}])[0].get("boardName") if _as_list(_as_dict(room).get("rates")) else None,
+                    }
+                    for room in _as_list(hotel.get("rooms"))
+                ],
+            }
+
+        def _book_hotel(args, base, apikey, secret):
+            # SAFETY GATE — never book against a non test/sandbox host.
+            if not _is_sandbox(base):
+                return _error(
+                    "book_hotel",
+                    "refusing to book: configured HotelBeds host is not the test/sandbox environment "
+                    f"(base={base!r}). No reservation was issued.",
+                    code="not_sandbox",
+                )
+            rate_key = _text(args.get("rate_key") or args.get("rateKey"))
+            if not rate_key:
+                return _error("book_hotel", "rate_key is required (from search_hotels)", code="validation_error")
+            holder_name = _text(args.get("holder_name") or "Alex") or "Alex"
+            holder_surname = _text(args.get("holder_surname") or "Traveler") or "Traveler"
+            try:
+                adults = max(1, int(args.get("adults") or 1))
+            except (TypeError, ValueError):
+                adults = 1
+            try:
+                children = max(0, int(args.get("children") or 0))
+            except (TypeError, ValueError):
+                children = 0
+            # 1) re-price the rate (authoritative bookable rateKey).
+            checked, status_code, body = _checkrate(base, apikey, secret, rate_key)
+            if not checked or not checked.get("rateKey"):
+                return _error("book_hotel", f"HotelBeds checkRate failed HTTP {status_code}", body, status_code, code="checkrate_failed")
+            # 2) build paxes (room 1) and confirm the booking.
+            paxes = [{"roomId": 1, "type": "AD", "name": holder_name, "surname": holder_surname}]
+            for idx in range(max(0, adults - 1)):
+                paxes.append({"roomId": 1, "type": "AD", "name": f"Guest{idx + 2}", "surname": holder_surname})
+            for idx in range(children):
+                paxes.append({"roomId": 1, "type": "CH", "age": 8, "name": f"Child{idx + 1}", "surname": holder_surname})
+            client_reference = _text(args.get("client_reference")) or f"MUNO-{int(time.time())}"
+            payload = {
+                "holder": {"name": holder_name, "surname": holder_surname},
+                "rooms": [{"rateKey": checked["rateKey"], "paxes": paxes}],
+                "clientReference": client_reference[:50],
+                "remark": "Muno test booking",
+                "tolerance": 2.0,
+            }
+            ok, status_code, body = _request("POST", base + BOOKINGS_PATH, apikey, secret, payload=payload)
+            if not ok:
+                return _error("book_hotel", f"HotelBeds booking failed HTTP {status_code}", body, status_code, code="booking_failed")
+            booking = _safe_booking(body.get("booking") if isinstance(body, dict) else {})
+            text = f"HotelBeds booking {booking.get('reference') or 'confirmed'} ({booking.get('status') or 'OK'})"
+            return _ok(
+                "book_hotel",
+                {
+                    "source": "hotelbeds",
+                    "hotelbeds_env": hotelbeds_env,
+                    "status_code": status_code,
+                    "booking": booking,
+                    "booking_reference": booking.get("reference"),
+                    "status": booking.get("status"),
+                    "hotel_name": booking.get("hotel_name"),
+                    "checkIn": booking.get("checkIn"),
+                    "checkOut": booking.get("checkOut"),
+                    "totalNet": booking.get("totalNet"),
+                    "currency": booking.get("currency"),
+                },
+                text,
+                {"status_code": status_code, "booking_reference": booking.get("reference"), "status": booking.get("status")},
+            )
+
         def _list_destinations(args, base, apikey, secret):
             params = {
                 "fields": "all",
@@ -475,10 +683,18 @@ workflow:
             "_decode_body": _decode_body,
             "_request": _request,
             "_geo_from_args": _geo_from_args,
+            "_first_bookable_rate": _first_bookable_rate,
             "_hotel_summary": _hotel_summary,
             "_tools_list": _tools_list,
             "_search_hotels": _search_hotels,
+            "_is_sandbox": _is_sandbox,
+            "_checkrate": _checkrate,
+            "_safe_booking": _safe_booking,
+            "_book_hotel": _book_hotel,
             "_list_destinations": _list_destinations,
+            "CHECKRATES_PATH": CHECKRATES_PATH,
+            "BOOKINGS_PATH": BOOKINGS_PATH,
+            "SANDBOX_HOST_MARKERS": SANDBOX_HOST_MARKERS,
         })
 
         method_name = _text(method, "tools/list").lower()
@@ -493,7 +709,7 @@ workflow:
             result = _tools_list()
         elif method_name != "tools/call":
             result = _error(method_name, f"Unknown MCP method: {method_name}")
-        elif tool_name not in ("search_hotels", "list_destinations"):
+        elif tool_name not in ("search_hotels", "book_hotel", "list_destinations"):
             result = _error(tool_name or "unknown", f"Unknown tool: {tool_name}. Run tools/list to see the catalog.")
         else:
             # Resolve the HotelBeds apikey/secret from GSM via Workload Identity.
@@ -507,6 +723,8 @@ workflow:
                 try:
                     if tool_name == "search_hotels":
                         result = _search_hotels(args, base, apikey, secret, limit)
+                    elif tool_name == "book_hotel":
+                        result = _book_hotel(args, base, apikey, secret)
                     else:
                         result = _list_destinations(args, base, apikey, secret)
                 except Exception as exc:
