@@ -668,6 +668,13 @@ workflow:
                 return _error("create_order", "offer_id is required", code="validation_error")
             ok, status_code, offer_body = _offer_by_id(offer_id)
             if not ok:
+                # The offer re-fetch is the first Duffel call on the booking
+                # path; if the provider is down it fails here (already retried,
+                # since _offer_by_id is retryable). Surface the same friendly
+                # message rather than a raw blob, and do NOT proceed to POST.
+                if _is_transient_provider_error(status_code, offer_body):
+                    return _error("create_order", "Duffel get_offer failed before order creation", offer_body, status_code,
+                                  code="provider_unavailable", user_message=PROVIDER_UNAVAILABLE_MSG)
                 return _error("create_order", "Duffel get_offer failed before order creation", offer_body, status_code)
             offer = offer_body.get("data") if isinstance(offer_body, dict) and isinstance(offer_body.get("data"), dict) else {}
             expires_at = _parse_ts(offer.get("expires_at"))
