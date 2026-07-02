@@ -41,7 +41,7 @@ metadata:
   agent: true
   exposes_as_mcp: true
   exposed_in_ui: false
-  version: "1.2"
+  version: "1.3"
   tags: [mcp, duffel, travel, flights, ai-os]
   terminal:
     visible: true
@@ -89,6 +89,8 @@ workflow:
       code: |
         import base64
         import json
+        import random
+        import time
         from datetime import datetime, timezone
         import urllib.error
         import urllib.parse
@@ -199,23 +201,50 @@ workflow:
             value = default if value is None else value
             return str(value).strip()
 
-        def _error(tool_name, message, detail=None, status_code=0, code=None):
+        def _error(tool_name, message, detail=None, status_code=0, code=None, user_message=None):
+            # `text` is the full diagnostic (message + the raw provider body),
+            # kept in _meta/data for logs. `display` is what the caller surfaces
+            # to the end user: when a friendly `user_message` is supplied (e.g.
+            # for a transient provider 5xx) we show that instead of the raw
+            # Duffel JSON blob. The travel planner renders error_card.description
+            # from this response's `summary`, so a raw blob here is exactly what
+            # leaked to the Muno UI before (noetl/ai-meta Duffel-5xx hardening).
             text = message if detail is None else f"{message}: {str(detail)[:700]}"
+            display = user_message or text
             payload = {"ok": False, "status": "error", "error": text[:2000], "status_code": status_code}
             if code:
                 payload["code"] = code
+            if user_message:
+                payload["user_message"] = user_message
             return {
                 # Keep the NoETL step green; MCP clients read isError plus
                 # control_data.status for the upstream/tool-level error.
                 "status": "ok",
-                "content": [{"type": "text", "text": text}],
+                "content": [{"type": "text", "text": display}],
                 "isError": True,
                 "_meta": {"backend": "duffel", "tool": tool_name, "duffel_env": duffel_env, "status_code": status_code, "error": text[:2000], "code": code},
                 "data": payload,
                 "control_data": payload,
-                "summary": text,
-                "text": text,
+                "summary": display,
+                "text": display,
             }
+
+        # A friendly, retry-safe line for any transient Duffel failure surfaced
+        # to a human. Keep it generic ("Flights") so it reads the same whether
+        # the failing call was a search or a booking.
+        PROVIDER_UNAVAILABLE_MSG = "Flights are temporarily unavailable, please try again in a moment."
+
+        def _is_transient_provider_error(status_code, body):
+            # Transient == worth surfacing as "try again": provider 5xx, a
+            # network-layer failure (status_code 0 from URLError / timeout), or
+            # Duffel's explicit service_unavailable error code.
+            if isinstance(status_code, int) and (status_code >= 500 or status_code == 0):
+                return True
+            errors = body.get("errors") if isinstance(body, dict) else None
+            for err in errors or []:
+                if isinstance(err, dict) and str(err.get("code")) == "service_unavailable":
+                    return True
+            return False
 
         def _ok(tool_name, data, text=None, meta=None):
             meta = meta if isinstance(meta, dict) else {}
@@ -232,7 +261,15 @@ workflow:
                 "text": text or f"Duffel {tool_name} ok",
             }
 
-        def _request(http_method, path, payload=None, params=None):
+        def _request(http_method, path, payload=None, params=None, retryable=False, max_attempts=3):
+            # retryable=True is passed only by idempotent-safe calls (flight/
+            # place/airline searches and GET fetches). A transient failure
+            # (5xx or network error) on those is retried with exponential
+            # backoff + jitter. create_order (POST /air/orders) leaves the
+            # default retryable=False: Duffel exposes NO Idempotency-Key
+            # header, so a retried create_order can double-book. See
+            # https://duffel.com/docs/api/overview/response-handling — a 503 on
+            # order creation "may have created the order"; do not auto-retry.
             base = _text(duffel_api_base, "https://api.duffel.com").rstrip("/")
             url = base + path
             if params:
@@ -246,23 +283,38 @@ workflow:
             if payload is not None:
                 headers["Content-Type"] = "application/json"
                 body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            req = urllib.request.Request(url, data=body, headers=headers, method=http_method)
-            try:
-                with urllib.request.urlopen(req, timeout=45) as resp:
-                    raw = resp.read().decode("utf-8")
-                    parsed = json.loads(raw or "{}")
-                    return True, resp.status, parsed
-            except urllib.error.HTTPError as exc:
-                raw = exc.read().decode("utf-8", errors="replace")
+
+            attempts = max(1, int(max_attempts)) if retryable else 1
+            last = (False, 0, {"error": "request not attempted"})
+            for attempt in range(attempts):
+                req = urllib.request.Request(url, data=body, headers=headers, method=http_method)
                 try:
-                    parsed = json.loads(raw or "{}")
-                except Exception:
-                    parsed = {"raw": raw[:2000]}
-                return False, exc.code, parsed
-            except urllib.error.URLError as exc:
-                return False, 0, {"error": str(getattr(exc, "reason", exc))}
-            except Exception as exc:
-                return False, 0, {"error": f"{type(exc).__name__}: {exc}"}
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        raw = resp.read().decode("utf-8")
+                        parsed = json.loads(raw or "{}")
+                        return True, resp.status, parsed
+                except urllib.error.HTTPError as exc:
+                    raw = exc.read().decode("utf-8", errors="replace")
+                    try:
+                        parsed = json.loads(raw or "{}")
+                    except Exception:
+                        parsed = {"raw": raw[:2000]}
+                    last = (False, exc.code, parsed)
+                    transient = exc.code >= 500
+                except urllib.error.URLError as exc:
+                    last = (False, 0, {"error": str(getattr(exc, "reason", exc))})
+                    transient = True
+                except Exception as exc:
+                    last = (False, 0, {"error": f"{type(exc).__name__}: {exc}"})
+                    transient = True
+                # Retry only when the caller opted in AND the failure looks
+                # transient AND we have another attempt left; otherwise return
+                # the last result unchanged (4xx and non-retryable calls fall
+                # straight through here on the first pass).
+                if not (retryable and transient and attempt < attempts - 1):
+                    return last
+                time.sleep(min(4.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25))
+            return last
 
         def _duration(value):
             return _text(value, "?") or "?"
@@ -453,12 +505,17 @@ workflow:
                     "cabin_class": cabin,
                 }
             }
-            ok, status_code, body = _request("POST", "/air/offer_requests", payload=payload, params={"return_offers": "true"})
+            # search_offers is idempotent-safe (it only creates a throwaway
+            # offer_request — no booking, no charge), so retry transient 5xx.
+            ok, status_code, body = _request("POST", "/air/offer_requests", payload=payload, params={"return_offers": "true"}, retryable=True)
             data = body.get("data") if isinstance(body, dict) else {}
             offers = _as_list(data.get("offers") if isinstance(data, dict) else [])
             cap = _cap(args.get("max_offers"), default=10, maximum=10)
             normalised = [_normalise_offer(offer) for offer in offers[:cap] if isinstance(offer, dict)]
             if not ok:
+                if _is_transient_provider_error(status_code, body):
+                    return _error("search_offers", "Duffel search_offers failed", body, status_code,
+                                  code="provider_unavailable", user_message=PROVIDER_UNAVAILABLE_MSG)
                 return _error("search_offers", "Duffel search_offers failed", body, status_code)
             currency = None
             for offer in normalised:
@@ -486,7 +543,7 @@ workflow:
             offer_id = _text(args.get("offer_id") or args.get("id"))
             if not offer_id:
                 return _error("get_offer", "offer_id is required")
-            ok, status_code, body = _request("GET", f"/air/offers/{urllib.parse.quote(offer_id, safe='')}")
+            ok, status_code, body = _request("GET", f"/air/offers/{urllib.parse.quote(offer_id, safe='')}", retryable=True)
             if not ok:
                 return _error("get_offer", "Duffel get_offer failed", body, status_code)
             return _ok("get_offer", {"source": "duffel", "status_code": status_code, "offer": body.get("data") if isinstance(body, dict) else body}, "Duffel offer fetched", {"status_code": status_code})
@@ -501,7 +558,7 @@ workflow:
             for key in ("lat", "lng", "rad"):
                 if args.get(key) not in (None, ""):
                     params[key] = args.get(key)
-            ok, status_code, body = _request("GET", "/places/suggestions", params=params)
+            ok, status_code, body = _request("GET", "/places/suggestions", params=params, retryable=True)
             if not ok:
                 return _error("search_places", "Duffel search_places failed", body, status_code)
             items = _as_list(body.get("data") if isinstance(body, dict) else [])
@@ -509,7 +566,7 @@ workflow:
 
         def _get_airlines(args):
             limit = _cap(args.get("limit"), default=200, maximum=200)
-            ok, status_code, body = _request("GET", "/air/airlines", params={"limit": limit})
+            ok, status_code, body = _request("GET", "/air/airlines", params={"limit": limit}, retryable=True)
             if not ok:
                 return _error("get_airlines", "Duffel get_airlines failed", body, status_code)
             items = _as_list(body.get("data") if isinstance(body, dict) else [])
@@ -571,7 +628,7 @@ workflow:
             }
 
         def _offer_by_id(offer_id):
-            return _request("GET", f"/air/offers/{urllib.parse.quote(offer_id, safe='')}")
+            return _request("GET", f"/air/offers/{urllib.parse.quote(offer_id, safe='')}", retryable=True)
 
         def _normalise_passengers(input_passengers, offer):
             passengers = _as_list(input_passengers)
@@ -611,6 +668,13 @@ workflow:
                 return _error("create_order", "offer_id is required", code="validation_error")
             ok, status_code, offer_body = _offer_by_id(offer_id)
             if not ok:
+                # The offer re-fetch is the first Duffel call on the booking
+                # path; if the provider is down it fails here (already retried,
+                # since _offer_by_id is retryable). Surface the same friendly
+                # message rather than a raw blob, and do NOT proceed to POST.
+                if _is_transient_provider_error(status_code, offer_body):
+                    return _error("create_order", "Duffel get_offer failed before order creation", offer_body, status_code,
+                                  code="provider_unavailable", user_message=PROVIDER_UNAVAILABLE_MSG)
                 return _error("create_order", "Duffel get_offer failed before order creation", offer_body, status_code)
             offer = offer_body.get("data") if isinstance(offer_body, dict) and isinstance(offer_body.get("data"), dict) else {}
             expires_at = _parse_ts(offer.get("expires_at"))
@@ -631,8 +695,16 @@ workflow:
                     "payments": [{"type": "balance", "amount": amount, "currency": currency}],
                 }
             }
+            # No retryable=True here on purpose: create_order is NOT idempotent
+            # and Duffel has no Idempotency-Key header, so a retried POST could
+            # double-book. On a transient provider failure (5xx / network /
+            # service_unavailable) surface a clean, retry-safe message instead
+            # of the raw Duffel JSON blob and let the user re-initiate booking.
             ok, status_code, body = _request("POST", "/air/orders", payload=payload)
             if not ok:
+                if _is_transient_provider_error(status_code, body):
+                    return _error("create_order", "Duffel create_order failed", body, status_code,
+                                  code="provider_unavailable", user_message=PROVIDER_UNAVAILABLE_MSG)
                 return _error("create_order", "Duffel create_order failed", body, status_code)
             order = body.get("data") if isinstance(body, dict) else {}
             # Duffel issues itinerary receipt documents asynchronously after
@@ -644,6 +716,7 @@ workflow:
                 ok2, _status2, refresh = _request(
                     "GET",
                     f"/air/orders/{urllib.parse.quote(str(order_id_for_refresh), safe='')}",
+                    retryable=True,
                 )
                 if ok2 and isinstance(refresh, dict) and isinstance(refresh.get("data"), dict):
                     order = refresh["data"]
@@ -659,7 +732,7 @@ workflow:
             order_id = _text(args.get("order_id") or args.get("id"))
             if not order_id:
                 return _error("get_order", "order_id is required", code="validation_error")
-            ok, status_code, body = _request("GET", f"/air/orders/{urllib.parse.quote(order_id, safe='')}")
+            ok, status_code, body = _request("GET", f"/air/orders/{urllib.parse.quote(order_id, safe='')}", retryable=True)
             if not ok:
                 return _error("get_order", "Duffel get_order failed", body, status_code)
             order = body.get("data") if isinstance(body, dict) else {}
