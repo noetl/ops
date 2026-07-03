@@ -76,7 +76,7 @@ metadata:
   agent: true
   exposes_as_mcp: true
   exposed_in_ui: false
-  version: "1.1"
+  version: "1.2"
   tags: [mcp, hotelbeds, apitude, travel, hotels]
   terminal:
     visible: true
@@ -118,6 +118,10 @@ workflow:
         google_project: "{{ workload.google_project | default('noetl-demo-19700101') }}"
         hotelbeds_secret_name: "{{ workload.hotelbeds_secret_name | default('hotelbeds-api-test') }}"
         max_hotels: "{{ workload.max_hotels | default(10) }}"
+        # book_hotel tolerance (%). HotelBeds default is 2.0; in TEST/SANDBOX the
+        # price drifts between checkRate and bookings, so a generous default lets
+        # the re-priced test booking complete (no real money). Override per call.
+        book_tolerance: "{{ workload.book_tolerance | default(15) }}"
       code: |
         import base64
         import gzip
@@ -176,22 +180,38 @@ workflow:
             value = default if value is None else value
             return str(value).strip()
 
-        def _error(tool_name, message, detail=None, status_code=0, code=None):
+        # A friendly, retry-safe line for a human when a HotelBeds call fails.
+        # Keep them generic so they read the same across search vs booking.
+        HOTELS_UNAVAILABLE_MSG = "Hotels are temporarily unavailable, please try again in a moment."
+        BOOKING_UNAVAILABLE_MSG = "Hotel booking is temporarily unavailable — please try again in a moment."
+
+        def _error(tool_name, message, detail=None, status_code=0, code=None, user_message=None):
+            # `text` is the full diagnostic (message + the raw HotelBeds body),
+            # kept in _meta/data for logs. `display` is what the caller surfaces
+            # to the end user: when a friendly `user_message` is supplied (e.g.
+            # a price change or a provider 5xx) we show that instead of the raw
+            # HotelBeds JSON blob. The travel planner renders
+            # error_card.description from this response's `summary`, so a raw
+            # blob here is exactly what leaked to the Muno UI before — this
+            # mirrors the Duffel-5xx hardening (noetl/ai-meta#173).
             text = message if detail is None else f"{message}: {str(detail)[:700]}"
+            display = user_message or text
             payload = {"ok": False, "status": "error", "error": text[:2000], "status_code": status_code, "hotels": []}
             if code:
                 payload["code"] = code
+            if user_message:
+                payload["user_message"] = user_message
             return {
                 # Keep the NoETL step green; MCP clients read isError plus
                 # control_data.status for the upstream/tool-level error.
                 "status": "ok",
-                "content": [{"type": "text", "text": text}],
+                "content": [{"type": "text", "text": display}],
                 "isError": True,
                 "_meta": {"backend": "hotelbeds", "tool": tool_name, "hotelbeds_env": hotelbeds_env, "status_code": status_code, "error": text[:2000], "code": code},
                 "data": payload,
                 "control_data": payload,
-                "summary": text,
-                "text": text,
+                "summary": display,
+                "text": display,
             }
 
         def _ok(tool_name, data, text=None, meta=None):
@@ -406,7 +426,71 @@ workflow:
                 "rateClass": bookable.get("rateClass"),
                 "rateType": bookable.get("rateType"),
                 "roomName": bookable.get("roomName"),
+                # Photo URLs, filled from the Content API after availability
+                # (availability itself carries no images). Empty until enriched.
+                "images": [],
             }
+
+        # HotelBeds AVAILABILITY responses carry no photos — hotel images live
+        # in the separate Content API (hotel content by code). Each image is a
+        # `path` (e.g. 29/290725/290725a_hb_ro_037.jpg) served from the GIATA
+        # CDN; prepend the CDN base to get a browser-fetchable URL. `bigger` is
+        # a card-sized derivative (original size can be multi-MB per photo).
+        CONTENT_IMAGES_PATH = "/hotel-content-api/1.0/hotels"
+        PHOTO_CDN = "https://photos.hotelbeds.com/giata/bigger/"
+
+        def _image_url(path):
+            p = _text(path).lstrip("/")
+            return (PHOTO_CDN + p) if p else ""
+
+        def _image_order(img):
+            img = _as_dict(img)
+            raw = img.get("visualOrder") if img.get("visualOrder") is not None else img.get("order")
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return 9999
+
+        def _hotel_images(base, apikey, secret, codes, max_per=6):
+            # Fetch images for ALL availability hotel codes in ONE Content API
+            # call and map code -> [CDN url]. Fully graceful: any failure (no
+            # content entitlement on the test key, network, parse) returns {} so
+            # search still returns hotels with the prior empty-photos behaviour
+            # — the availability path is never broken by a content hiccup.
+            code_list = [str(c) for c in codes if _text(c)]
+            if not code_list:
+                return {}, None
+            window = max(1, min(len(code_list), 50))
+            params = {
+                "fields": "images",
+                "codes": ",".join(code_list[:50]),
+                "language": "ENG",
+                "from": 1,
+                "to": window,
+                "useSecondaryLanguage": "false",
+            }
+            try:
+                ok, status_code, body = _request("GET", base + CONTENT_IMAGES_PATH, apikey, secret, params=params)
+            except Exception as exc:  # noqa: BLE001 — never break search on content
+                return {}, f"{type(exc).__name__}: {exc}"
+            if not ok:
+                return {}, f"content images HTTP {status_code}"
+            out = {}
+            for hotel in _as_list(_as_dict(body).get("hotels")):
+                hotel = _as_dict(hotel)
+                code = str(hotel.get("code") or "")
+                if not code:
+                    continue
+                urls = []
+                for img in sorted(_as_list(hotel.get("images")), key=_image_order):
+                    url = _image_url(_as_dict(img).get("path"))
+                    if url and url not in urls:
+                        urls.append(url)
+                    if len(urls) >= max_per:
+                        break
+                if urls:
+                    out[code] = urls
+            return out, None
 
         def _tools_list():
             tools = [
@@ -492,10 +576,18 @@ workflow:
             }
             ok, status_code, body = _request("POST", base + AVAILABILITY_PATH, apikey, secret, payload=payload)
             if not ok:
-                return _error("search_hotels", f"HotelBeds availability failed HTTP {status_code}", body, status_code)
+                return _error("search_hotels", f"HotelBeds availability failed HTTP {status_code}", body, status_code,
+                              code="availability_failed", user_message=HOTELS_UNAVAILABLE_MSG)
             container = _as_dict(body.get("hotels") if isinstance(body, dict) else {})
             hotels = _as_list(container.get("hotels"))
             summarised = [_hotel_summary(hotel) for hotel in hotels[:limit] if isinstance(hotel, dict)]
+            # Enrich each hotel with photo URLs from the Content API (one call
+            # for all codes). Graceful: on any failure hotels keep empty photos.
+            images_map, images_error = _hotel_images(
+                base, apikey, secret, [h.get("code") for h in summarised])
+            for h in summarised:
+                h["images"] = images_map.get(str(h.get("code") or ""), [])
+            images_with_photos = sum(1 for h in summarised if h.get("images"))
             currency = None
             for hotel in summarised:
                 if hotel.get("currency"):
@@ -513,10 +605,12 @@ workflow:
                     "checkIn": check_in,
                     "checkOut": check_out,
                     "geolocation": payload["geolocation"],
-                    "meta": {"count": len(summarised), "source": "hotelbeds", "currency": currency},
+                    "meta": {"count": len(summarised), "source": "hotelbeds", "currency": currency,
+                             "images_source": "hotelbeds-content" if images_with_photos else None,
+                             "images_with_photos": images_with_photos, "images_error": images_error},
                 },
                 f"{len(summarised)} HotelBeds hotel(s)",
-                {"status_code": status_code, "hotels_total": len(summarised)},
+                {"status_code": status_code, "hotels_total": len(summarised), "images_with_photos": images_with_photos},
             )
 
         def _is_sandbox(base):
@@ -575,7 +669,13 @@ workflow:
                 ],
             }
 
-        def _book_hotel(args, base, apikey, secret):
+        def _num(value):
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def _book_hotel(args, base, apikey, secret, tolerance=15.0):
             # SAFETY GATE — never book against a non test/sandbox host.
             if not _is_sandbox(base):
                 return _error(
@@ -583,10 +683,12 @@ workflow:
                     "refusing to book: configured HotelBeds host is not the test/sandbox environment "
                     f"(base={base!r}). No reservation was issued.",
                     code="not_sandbox",
+                    user_message=BOOKING_UNAVAILABLE_MSG,
                 )
             rate_key = _text(args.get("rate_key") or args.get("rateKey"))
             if not rate_key:
-                return _error("book_hotel", "rate_key is required (from search_hotels)", code="validation_error")
+                return _error("book_hotel", "rate_key is required (from search_hotels)", code="validation_error",
+                              user_message="Please pick a hotel from the search results first.")
             holder_name = _text(args.get("holder_name") or "Alex") or "Alex"
             holder_surname = _text(args.get("holder_surname") or "Traveler") or "Traveler"
             try:
@@ -597,11 +699,32 @@ workflow:
                 children = max(0, int(args.get("children") or 0))
             except (TypeError, ValueError):
                 children = 0
-            # 1) re-price the rate (authoritative bookable rateKey).
+            # The price the user saw at search time (optional). When supplied we
+            # can report a material re-price after checkRate.
+            expected_net = _num(args.get("expected_net") if args.get("expected_net") is not None else args.get("expected_price"))
+            # 1) re-price the rate. checkRate returns the authoritative BOOKABLE
+            # rateKey + its current net; a stale/expired rate can't be booked.
             checked, status_code, body = _checkrate(base, apikey, secret, rate_key)
             if not checked or not checked.get("rateKey"):
-                return _error("book_hotel", f"HotelBeds checkRate failed HTTP {status_code}", body, status_code, code="checkrate_failed")
-            # 2) build paxes (room 1) and confirm the booking.
+                return _error("book_hotel", f"HotelBeds checkRate failed HTTP {status_code}", body, status_code,
+                              code="checkrate_failed",
+                              user_message="That hotel is no longer available at that rate — please search again.")
+            checked_net = _num(checked.get("net"))
+            checked_currency = _text(checked.get("currency"))
+            price_changed = bool(
+                expected_net is not None and checked_net is not None and expected_net > 0
+                and abs(checked_net - expected_net) / expected_net > 0.02
+            )
+            # 2) build paxes (room 1) and confirm the booking using the fresh,
+            # re-priced rateKey. HotelBeds' booking `tolerance` (% default 2.0)
+            # rejects if the price moved beyond it. In TEST/SANDBOX prices drift
+            # between checkRate and bookings, so we book against the re-priced
+            # rateKey with a generous tolerance — the test booking completes and
+            # `price_changed` records that the amount moved. No real money.
+            try:
+                tol = max(2.0, min(float(tolerance), 100.0))
+            except (TypeError, ValueError):
+                tol = 15.0
             paxes = [{"roomId": 1, "type": "AD", "name": holder_name, "surname": holder_surname}]
             for idx in range(max(0, adults - 1)):
                 paxes.append({"roomId": 1, "type": "AD", "name": f"Guest{idx + 2}", "surname": holder_surname})
@@ -613,11 +736,24 @@ workflow:
                 "rooms": [{"rateKey": checked["rateKey"], "paxes": paxes}],
                 "clientReference": client_reference[:50],
                 "remark": "Muno test booking",
-                "tolerance": 2.0,
+                "tolerance": tol,
             }
             ok, status_code, body = _request("POST", base + BOOKINGS_PATH, apikey, secret, payload=payload)
             if not ok:
-                return _error("book_hotel", f"HotelBeds booking failed HTTP {status_code}", body, status_code, code="booking_failed")
+                # NO raw HotelBeds JSON reaches the UI — the raw body stays in
+                # _meta/data; `user_message` is what the planner renders. A
+                # residual price-tolerance rejection surfaces the fresh price
+                # for the user to re-confirm (search again to book the latest).
+                blob = (body if isinstance(body, str) else json.dumps(body, default=str)).lower()
+                if "price" in blob and ("tolerance" in blob or "changed" in blob):
+                    price_line = ""
+                    if checked_net is not None:
+                        price_line = f" The latest rate is {checked_net}{(' ' + checked_currency) if checked_currency else ''}."
+                    return _error("book_hotel", f"HotelBeds booking failed HTTP {status_code}", body, status_code,
+                                  code="price_changed",
+                                  user_message=f"That hotel's price just changed.{price_line} Please search again to book the latest rate.")
+                return _error("book_hotel", f"HotelBeds booking failed HTTP {status_code}", body, status_code,
+                              code="booking_failed", user_message=BOOKING_UNAVAILABLE_MSG)
             booking = _safe_booking(body.get("booking") if isinstance(body, dict) else {})
             text = f"HotelBeds booking {booking.get('reference') or 'confirmed'} ({booking.get('status') or 'OK'})"
             return _ok(
@@ -634,9 +770,15 @@ workflow:
                     "checkOut": booking.get("checkOut"),
                     "totalNet": booking.get("totalNet"),
                     "currency": booking.get("currency"),
+                    # Re-price transparency: whether the confirmed net moved from
+                    # the search-time price the user saw, and by how much.
+                    "price_changed": price_changed,
+                    "expected_net": expected_net,
+                    "checked_net": checked_net,
+                    "tolerance_used": tol,
                 },
                 text,
-                {"status_code": status_code, "booking_reference": booking.get("reference"), "status": booking.get("status")},
+                {"status_code": status_code, "booking_reference": booking.get("reference"), "status": booking.get("status"), "price_changed": price_changed},
             )
 
         def _list_destinations(args, base, apikey, secret):
@@ -685,16 +827,24 @@ workflow:
             "_geo_from_args": _geo_from_args,
             "_first_bookable_rate": _first_bookable_rate,
             "_hotel_summary": _hotel_summary,
+            "_image_url": _image_url,
+            "_image_order": _image_order,
+            "_hotel_images": _hotel_images,
             "_tools_list": _tools_list,
             "_search_hotels": _search_hotels,
             "_is_sandbox": _is_sandbox,
             "_checkrate": _checkrate,
             "_safe_booking": _safe_booking,
+            "_num": _num,
             "_book_hotel": _book_hotel,
             "_list_destinations": _list_destinations,
             "CHECKRATES_PATH": CHECKRATES_PATH,
             "BOOKINGS_PATH": BOOKINGS_PATH,
+            "CONTENT_IMAGES_PATH": CONTENT_IMAGES_PATH,
+            "PHOTO_CDN": PHOTO_CDN,
             "SANDBOX_HOST_MARKERS": SANDBOX_HOST_MARKERS,
+            "HOTELS_UNAVAILABLE_MSG": HOTELS_UNAVAILABLE_MSG,
+            "BOOKING_UNAVAILABLE_MSG": BOOKING_UNAVAILABLE_MSG,
         })
 
         method_name = _text(method, "tools/list").lower()
@@ -704,6 +854,13 @@ workflow:
         project = _text(google_project, "noetl-demo-19700101")
         secret_name = _text(hotelbeds_secret_name, "hotelbeds-api-test")
         limit = _cap(max_hotels, default=10, maximum=25)
+        try:
+            book_tol = float(book_tolerance)
+        except (TypeError, ValueError):
+            book_tol = 15.0
+        # A friendly per-tool line so a credential / unexpected failure never
+        # leaks a raw diagnostic to the Muno UI (search vs booking wording).
+        _friendly = BOOKING_UNAVAILABLE_MSG if tool_name == "book_hotel" else HOTELS_UNAVAILABLE_MSG
 
         if method_name == "tools/list":
             result = _tools_list()
@@ -718,17 +875,17 @@ workflow:
             try:
                 apikey, secret = _secret_json(project, secret_name)
             except Exception as exc:
-                result = _error(tool_name, "HotelBeds credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable")
+                result = _error(tool_name, "HotelBeds credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable", user_message=_friendly)
             if "result" not in locals() or result is None:
                 try:
                     if tool_name == "search_hotels":
                         result = _search_hotels(args, base, apikey, secret, limit)
                     elif tool_name == "book_hotel":
-                        result = _book_hotel(args, base, apikey, secret)
+                        result = _book_hotel(args, base, apikey, secret, tolerance=book_tol)
                     else:
                         result = _list_destinations(args, base, apikey, secret)
                 except Exception as exc:
-                    result = _error(tool_name, "HotelBeds tool failed", f"{type(exc).__name__}: {exc}")
+                    result = _error(tool_name, "HotelBeds tool failed", f"{type(exc).__name__}: {exc}", user_message=_friendly)
     next:
       spec: { mode: exclusive }
       arcs:
