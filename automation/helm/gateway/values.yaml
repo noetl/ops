@@ -5,6 +5,29 @@ image:
   tag: "latest"
   pullPolicy: Always
 
+# ---------------------------------------------------------------------------
+# EHDB (Event Horizon Database) integration — DISABLED BY DEFAULT.
+#
+# When `enabled: false` (the default) the gateway deployment renders
+# byte-identical to pre-EHDB: no NOETL_EHDB_* env, no attach, no behavior
+# change.
+#
+# The gateway is a CONTROL-PLANE role.  When enabled it receives
+# control-plane-only EHDB env (NOETL_EHDB_MODE=control_plane,
+# NOETL_EHDB_CAPABILITIES=control_plane) and NEVER a data-plane storage handle
+# (no NOETL_EHDB_LOCAL_REFERENCE_LOG).  The boundary is enforced in
+# `templates/_ehdb.tpl` keyed on the gateway client role — it is not
+# values-configurable.  The noetl worker/system data-plane roles live in the
+# separate `automation/helm/noetl` chart.
+#
+# See https://github.com/noetl/ehdb/wiki/Claude-Handoff-EHDB-NoETL-Integration
+# (Phase A).
+ehdb:
+  enabled: false
+  roles:
+    gateway:
+      enabled: true
+
 service:
   type: LoadBalancer
   port: 8090

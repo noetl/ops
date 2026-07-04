@@ -12,4 +12,8 @@ data:
   {{ $key }}: {{ $value | quote }}
 {{- end }}
   NOETL_PROJECTOR_SHARD_COUNT: {{ .Values.projector.replicas | quote }}
+{{- if and .Values.ehdb .Values.ehdb.enabled }}
+  # EHDB bounded data-plane env (system role, local_reference) — see templates/_ehdb.tpl.
+{{- include "noetl.ehdb.configmapEnv" (dict "clientRole" "system" "roleKey" "projector" "root" $) | nindent 2 }}
+{{- end }}
 {{- end }}
