@@ -1,0 +1,101 @@
+# Job — EHDB local-reference smoke against the NoETL image (kind gate).
+# noetl/ehdb#234 Phase A (ops/runtime enablement).
+# =============================================================================
+# Exercises the packaged `ehdb-local-reference` helper through NoETL's
+# feature-gated integration, in the WORKER LOCAL-REFERENCE (data-plane) mode,
+# entirely inside the NoETL image — no server, no DB, no NATS, no network.
+#
+# The Job runs `scripts/smoke_ehdb_local_reference_summary.py`, which invokes
+# `read_ehdb_local_reference_summary_from_env` against a bounded local JSONL
+# log and prints the deterministic domain counts.  A non-zero exit (missing
+# helper binary, contract-validation failure, disabled surface) fails the Job.
+#
+# This is a DATA-PLANE role smoke: it sets NOETL_EHDB_MODE=local_reference +
+# NOETL_EHDB_CLIENT_ROLE=worker + NOETL_EHDB_LOCAL_REFERENCE_LOG — the exact env
+# the `automation/helm/noetl` chart renders for a worker when
+# `ehdb.enabled=true`.  Gateway/API/server (control-plane) roles do NOT run this
+# helper; the chart withholds the local-reference log from them.
+#
+# Kind validation recipe (from repos/noetl or wherever the image is built):
+#
+#   # 1. Build the NoETL image with the pinned ehdb helper (Podman on kind-noetl):
+#   env -u XDG_DATA_HOME podman build --platform linux/arm64 \
+#     -t local/noetl:ehdb-helper-image-test \
+#     -f docker/noetl/dev/Dockerfile .
+#
+#   # 2. Load it into the kind cluster (Podman keeps the localhost/ prefix):
+#   KIND_EXPERIMENTAL_PROVIDER=podman \
+#     kind load docker-image localhost/local/noetl:ehdb-helper-image-test --name noetl
+#   # (verify with: podman exec noetl-control-plane crictl images | grep ehdb)
+#
+#   # 3. Run the smoke Job and wait:
+#   kubectl --context kind-noetl apply -f ci/manifests/noetl/ehdb/smoke-job.yaml
+#   kubectl --context kind-noetl -n noetl wait --for=condition=complete \
+#     job/noetl-ehdb-local-reference-smoke --timeout=120s
+#   kubectl --context kind-noetl -n noetl logs job/noetl-ehdb-local-reference-smoke
+#
+# `image` is the locally-loaded ref with `imagePullPolicy: Never` so the Job
+# runs the exact image loaded into kind (never pulls from a registry).
+# Override the image for other clusters via `kubectl set image` or an overlay.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: noetl-ehdb-local-reference-smoke
+  namespace: noetl
+  labels:
+    app: noetl-ehdb-smoke
+    component: ehdb-smoke
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: noetl-ehdb-smoke
+        component: ehdb-smoke
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ehdb-smoke
+          # Loaded into the kind node under the Podman `localhost/` prefix; with
+          # imagePullPolicy: Never containerd resolves this exact local ref and
+          # never reaches a registry.  Rename to match your loaded ref if you
+          # tagged it differently.
+          image: localhost/local/noetl:ehdb-helper-image-test
+          imagePullPolicy: Never
+          command:
+            - python
+            - scripts/smoke_ehdb_local_reference_summary.py
+            - --log
+            - /opt/noetl/data/ehdb/local-reference.jsonl
+          # Worker local-reference (data-plane) env — mirrors what the
+          # automation/helm/noetl chart renders for a worker when
+          # ehdb.enabled=true.  The smoke script re-asserts these internally;
+          # they are set here so the Job pod visibly runs in worker
+          # local_reference mode.
+          env:
+            - name: NOETL_EHDB_ENABLED
+              value: "true"
+            - name: NOETL_EHDB_MODE
+              value: "local_reference"
+            - name: NOETL_EHDB_CLIENT_ROLE
+              value: "worker"
+            - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
+              value: "/opt/noetl/data/ehdb/local-reference.jsonl"
+          volumeMounts:
+            - name: ehdb-data
+              mountPath: /opt/noetl/data
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        # Ephemeral pod-local scratch for the bounded JSONL log — no PVC, no
+        # shared state.  The local-reference fixture is a reference fixture,
+        # not production durable storage.
+        - name: ehdb-data
+          emptyDir: {}

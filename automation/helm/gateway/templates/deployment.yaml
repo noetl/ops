@@ -70,6 +70,10 @@ spec:
             - name: GATEWAY_AUTH0_AUDIENCE
               value: {{ .Values.env.auth0Audience | quote }}
             {{- end }}
+            {{- if and .Values.ehdb .Values.ehdb.enabled }}
+            # EHDB control-plane-only env (gateway role) — see templates/_ehdb.tpl.
+            {{- include "noetl.ehdb.podEnv" (dict "clientRole" "gateway" "roleKey" "gateway" "root" $) | nindent 12 }}
+            {{- end }}
           resources:
 {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:

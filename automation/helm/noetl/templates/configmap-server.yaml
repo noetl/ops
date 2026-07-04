@@ -26,3 +26,7 @@ data:
   NOETL_EVENT_NATS_STREAM: {{ .Values.config.projector.NOETL_PROJECTOR_NATS_STREAM | quote }}
   NOETL_EVENT_NATS_SUBJECT_PREFIX: "noetl.events"
   NOETL_EVENT_NATS_SHARD_COUNT: {{ .Values.projector.replicas | quote }}
+{{- if and .Values.ehdb .Values.ehdb.enabled }}
+  # EHDB control-plane-only env (server role) — see templates/_ehdb.tpl.
+{{- include "noetl.ehdb.configmapEnv" (dict "clientRole" "server" "roleKey" "server" "root" $) | nindent 2 }}
+{{- end }}

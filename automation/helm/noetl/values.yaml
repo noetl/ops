@@ -5,6 +5,63 @@ image:
   tag: "latest"
   pullPolicy: Always
 
+# ---------------------------------------------------------------------------
+# EHDB (Event Horizon Database) integration — DISABLED BY DEFAULT.
+#
+# When `enabled: false` (the default) the chart renders byte-identical to
+# pre-EHDB: no NOETL_EHDB_* env appears in ANY configmap or pod, no attach,
+# no behavior change.  Enabling is explicit — flip `enabled: true` in a values
+# overlay (optionally scoping to specific roles via `roles.<role>.enabled`).
+#
+# When enabled, each NoETL role receives role-specific EHDB env with a hard
+# control-plane vs data-plane boundary enforced in `templates/_ehdb.tpl`
+# (NOT here — an operator editing values cannot leak a data-plane storage
+# handle into a control-plane role):
+#   * Control-plane roles (server, api, gateway) get control-plane-only env:
+#       NOETL_EHDB_MODE=control_plane, NOETL_EHDB_CAPABILITIES=control_plane.
+#       They NEVER receive NOETL_EHDB_LOCAL_REFERENCE_LOG.
+#   * Data-plane roles (worker, playbook, system) get bounded local-reference
+#       env: NOETL_EHDB_MODE=local_reference plus NOETL_EHDB_LOCAL_REFERENCE_LOG
+#       pointing at a pod-local JSONL log under NOETL_DATA_DIR.
+#
+# `roles.<key>` maps a chart deployment (server/worker/workerPool/projector/
+# outboxPublisher) to its NoETL client role.  worker + workerPool are worker
+# data-plane; projector + outboxPublisher are system data-plane; server is
+# control-plane.  The gateway (a separate chart, automation/helm/gateway) is
+# control-plane.  Set a role's `enabled: false` to withhold EHDB env from just
+# that role while leaving the master switch on.
+#
+# The env contract is validated by `noetl.core.ehdb_contract`
+# (feature-gated, disabled-by-default) in the noetl image.  Under a runtime
+# that does not read NOETL_EHDB_* (e.g. the Rust gateway) the vars are inert.
+#
+# See https://github.com/noetl/ehdb/wiki/Claude-Handoff-EHDB-NoETL-Integration
+# (Phase A) and the local kind smoke Job at
+# `ci/manifests/noetl/ehdb/smoke-job.yaml`.
+ehdb:
+  enabled: false
+  # Pod-local path for the worker/playbook/system local-reference JSONL log.
+  # Lives under NOETL_DATA_DIR on the shared data PVC.
+  localReferenceLog: "/opt/noetl/data/ehdb/local-reference.jsonl"
+  # Optional per-role opt-out.  Each chart deployment maps to a fixed NoETL
+  # client role (server=control-plane; worker + workerPool=worker data-plane;
+  # projector + outboxPublisher=system data-plane) — that mapping is hardcoded
+  # in `templates/_ehdb.tpl` and cannot be overridden here (the boundary is not
+  # values-configurable).  Every role defaults to enabled when the master
+  # switch above is on; set a role's `enabled: false` to withhold EHDB env
+  # from just that deployment.
+  roles:
+    server:
+      enabled: true
+    worker:
+      enabled: true
+    workerPool:
+      enabled: true
+    projector:
+      enabled: true
+    outboxPublisher:
+      enabled: true
+
 server:
   replicas: 2
   strategy:
