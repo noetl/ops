@@ -1,0 +1,95 @@
+# GCP metadata bridge — KIND-DEV ONLY.  DO NOT APPLY TO GKE / PROD.
+#
+# kind (podman provider) has no GKE metadata server, so neither GSM
+# resolution path in the NoETL stack works out of the box:
+#
+#   1. Server-side keychain `provider: gcp` (repos/server GcpSecretManager)
+#      mints a token from NOETL_GCP_METADATA_TOKEN_URL, then calls Secret
+#      Manager REST.
+#   2. Worker in-python provider MCP playbooks (duffel / hotelbeds /
+#      google-places / firestore) do a stdlib-urllib GET
+#      http://metadata.google.internal/.../token INSIDE a `kind: python`
+#      step.  That URL is HARD-CODED (no env override), so it needs an
+#      in-cluster relay + a hostAliases entry.
+#
+# This Deployment + Service is the in-cluster half of the bridge: an
+# alpine pod running `socat` that forwards :80 to the host ADC-token
+# shim (see gcp-token-shim.py + README.md in this directory).  The
+# Service is pinned to a FIXED clusterIP so worker-pool `hostAliases`
+# entries (metadata.google.internal -> this IP) survive pod AND cluster
+# restarts — the whole point of the durable variant (noetl/ai-meta#151
+# workstream B; supersedes the session-artifact bridge from Phase 2).
+#
+# No secret material lives here: the relay forwards bytes; the host shim
+# mints tokens from the developer's own `gcloud` Application Default
+# Credentials and never logs them.  See README.md for setup + the
+# pod-restart durability proof.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gcp-metadata
+  namespace: noetl
+  labels:
+    app: gcp-metadata
+    noetl.io/kind-dev-only: "true"
+  annotations:
+    noetl.io/description: >-
+      KIND-DEV ONLY relay of metadata.google.internal:80 to the host ADC
+      token shim (host.containers.internal:48710). Never deploy to GKE.
+spec:
+  # Pinned clusterIP so worker hostAliases point at a stable address
+  # across pod/cluster restarts.  10.96.0.53 is free in the kind service
+  # CIDR (10.96.0.0/12; only .1 kubernetes + .10 kube-dns are taken in
+  # the .0.x block).  If a future kind config changes the service CIDR,
+  # update this IP and the hostAliases patch in apply-bridge.sh together.
+  clusterIP: 10.96.0.53
+  selector:
+    app: gcp-metadata
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-metadata-bridge
+  namespace: noetl
+  labels:
+    app: gcp-metadata
+    noetl.io/kind-dev-only: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gcp-metadata
+  template:
+    metadata:
+      labels:
+        app: gcp-metadata
+        noetl.io/kind-dev-only: "true"
+    spec:
+      containers:
+        - name: socat
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              apk add --no-cache socat >/dev/null 2>&1 || apk add --no-cache socat
+              echo "relay: metadata.google.internal:80 -> host.containers.internal:48710"
+              exec socat -d TCP-LISTEN:80,fork,reuseaddr TCP:host.containers.internal:48710
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

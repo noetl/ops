@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd unit for the KIND-DEV GCP metadata-token shim (macOS).
+     Restart-safe: KeepAlive relaunches the shim if it exits or after a
+     host reboot / logout-login.  Install per README.md:
+
+       cp gcp-token-shim.py ~/.noetl/gcp-token-shim.py
+       cp com.noetl.gcp-token-shim.plist ~/Library/LaunchAgents/
+       launchctl load  ~/Library/LaunchAgents/com.noetl.gcp-token-shim.plist
+
+     Adjust the ProgramArguments path if you install the script elsewhere.
+     No secret material is written to the log files (the shim never logs
+     tokens); stdout/stderr only carry the startup line + any gcloud error. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.noetl.gcp-token-shim</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>REPLACE_WITH_HOME/.noetl/gcp-token-shim.py</string>
+    </array>
+
+    <!-- Relaunch on crash and keep running across login sessions. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- gcloud must be on PATH for `application-default print-access-token`.
+         Adjust if your gcloud SDK lives elsewhere. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_HOME/.noetl/gcp-token-shim.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_HOME/.noetl/gcp-token-shim.err.log</string>
+</dict>
+</plist>
