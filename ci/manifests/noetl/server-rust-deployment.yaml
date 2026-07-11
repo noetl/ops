@@ -74,6 +74,17 @@ spec:
             # /api/execute's NATS publish (noetl/server#26).
             - name: NOETL_PUBLIC_SERVER_URL
               value: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
+            # EHDB Data Query Interface (noetl/ai-meta#178) — the worker
+            # data-plane query base URL the server relays raw tier queries
+            # (`GET /api/ehdb/tiers/{tier}`) to.  The server stays control-plane
+            # and never opens EHDB tier storage; it makes a synchronous HTTP read
+            # straight to the worker's query port (the worker metrics/query
+            # Service on :9090).  Points at the user drive pool, which executes
+            # real playbook drives and holds the mirrored eventlog/kv + durable
+            # per-shard segment stores.  Harmless when EHDB is disabled (the
+            # default): the worker returns an `outcome=disabled` body.
+            - name: NOETL_EHDB_WORKER_QUERY_URL
+              value: "http://noetl-worker-rust-metrics.noetl.svc.cluster.local:9090"
             # 10-bit machine id for the application-side snowflake
             # generator added in Phase F R1.5 of noetl/ai-meta#49
             # (server v2.10.1+; see noetl/server#42 + #43).  Each
