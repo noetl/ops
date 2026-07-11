@@ -1,0 +1,170 @@
+# Local kind validation manifest for the external EHDB Flight SQL driver
+# endpoint (noetl/ai-meta#184).
+#
+# A DEDICATED data-plane endpoint fronting the worker: it runs the same
+# noetl-worker image but its job is to serve the read-only Arrow Flight SQL
+# projection-tier surface to applications OUTSIDE the platform — NOT the
+# control-plane server. It reads the local-reference projection read-model and
+# never writes it (read-only by construction).
+#
+# Off by default in every other deployment: the endpoint only binds because
+# NOETL_EHDB_FLIGHT_SQL=true here. It is fail-closed — the non-loopback bind
+# requires NOETL_EHDB_FLIGHT_SQL_TOKEN_ALIAS, so it never serves an open
+# external read surface.
+#
+# Kind-only rig (per agents/rules/deployment-validation.md). Not a GKE/prod
+# manifest. The projection log lives on an emptyDir shared in-pod: the worker's
+# projection shadow (and `ehdb-selfcheck mirror-projection` for a deterministic
+# seed) write it; the in-process Flight SQL endpoint reads it.
+#
+# Image: localhost/noetl-worker:ehdb-flightsql-184 (built locally with podman
+# from the noetl/worker external-driver branch). imagePullPolicy: Never so kind
+# uses the loaded image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-ehdb-flightsql
+  namespace: noetl
+  labels:
+    app: noetl-ehdb-flightsql
+    component: ehdb-flightsql
+    runtime: rust
+    worker-pool: ehdb-flightsql-pool
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: noetl-ehdb-flightsql
+      worker-pool: ehdb-flightsql-pool
+  template:
+    metadata:
+      labels:
+        app: noetl-ehdb-flightsql
+        component: ehdb-flightsql
+        runtime: rust
+        worker-pool: ehdb-flightsql-pool
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: noetl-worker
+      initContainers:
+        - name: wait-for-api
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "until curl -sf http://noetl.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL API...'; sleep 3; done"
+      containers:
+        - name: worker
+          image: localhost/noetl-worker:ehdb-flightsql-184
+          imagePullPolicy: Never
+          ports:
+            - name: flightsql
+              containerPort: 8092
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: WORKER_POOL_NAME
+              value: ehdb-flightsql-pool
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Distinct NATS consumer + a filter subject that carries no traffic:
+            # this pod hosts the Flight SQL endpoint, it does not compete for
+            # real commands with the user / system pools.
+            - name: NATS_URL
+              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
+            - name: NATS_STREAM
+              value: NOETL_COMMANDS
+            - name: NATS_CONSUMER
+              value: noetl_ehdb_flightsql
+            - name: NATS_FILTER_SUBJECT
+              value: noetl.commands.flightsql.>
+            - name: NOETL_SERVER_URL
+              value: http://noetl.noetl.svc.cluster.local:8082
+            - name: WORKER_HEARTBEAT_INTERVAL
+              value: "15"
+            - name: WORKER_MAX_CONCURRENT
+              value: "2"
+            - name: WORKER_METRICS_BIND
+              value: "0.0.0.0:9090"
+            - name: RUST_LOG
+              value: "info,noetl_worker=debug,ehdb_service=debug"
+            - name: NOETL_IPC_CACHE_BUDGET_BYTES
+              value: "268435456" # 256 MiB
+
+            # ---- EHDB local-reference data plane (projection tier) ----
+            - name: NOETL_EHDB_ENABLED
+              value: "true"
+            - name: NOETL_EHDB_MODE
+              value: local_reference
+            - name: NOETL_EHDB_CLIENT_ROLE
+              value: worker
+            # Projection shadow enabled so the local-reference read-model is
+            # populated (by the drain and by `ehdb-selfcheck mirror-projection`).
+            - name: NOETL_EHDB_PROJECTION
+              value: shadow
+            - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
+              value: /ehdb-fsql/projection.jsonl
+
+            # ---- external Flight SQL endpoint (noetl/ai-meta#184) ----
+            - name: NOETL_EHDB_FLIGHT_SQL
+              value: "true"
+            - name: NOETL_EHDB_FLIGHT_SQL_BIND
+              value: "0.0.0.0:8092"
+            # Scoped read-only token resolved from the platform keychain
+            # (control-plane credential API → keychain → GSM). Seed the alias
+            # before validating:
+            #   POST /api/credentials {name: ehdb-flight-read, type: bearer,
+            #                          data: {token: "<opaque>"}}
+            # No token value lives in this manifest.
+            - name: NOETL_EHDB_FLIGHT_SQL_TOKEN_ALIAS
+              value: ehdb-flight-read
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: ehdb-fsql
+              mountPath: /ehdb-fsql
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "768Mi"
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 320Mi
+        # Pod-local projection read-model store shared between the worker
+        # process (writer, via projection shadow / mirror-projection) and the
+        # in-process Flight SQL endpoint (reader).
+        - name: ehdb-fsql
+          emptyDir: {}
+---
+# ClusterIP service exposing the Flight SQL endpoint. In prod this fronts a
+# dedicated replica set; in kind, port-forward it (or the pod) to reach the
+# endpoint from an external Flight SQL client:
+#   kubectl -n noetl port-forward svc/noetl-ehdb-flightsql 8092:8092
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-ehdb-flightsql
+  namespace: noetl
+  labels:
+    app: noetl-ehdb-flightsql
+spec:
+  selector:
+    app: noetl-ehdb-flightsql
+  ports:
+    - name: flightsql
+      port: 8092
+      targetPort: 8092
+      protocol: TCP
