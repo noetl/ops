@@ -1,0 +1,39 @@
+# EHDB durable event-log SHADOW store for the prod event-writer pool.
+#
+# Part of noetl/ehdb#254 Stage B′ (prod durable-SHADOW). GATED — apply only on
+# the prod team's explicit go per ehdb-wiki Runbook-Durable-EventLog-Prod-Signoff.
+# Bound by worker-system-pool-deployment-prod.yaml (volume `ehdb-durable`).
+#
+# The durable_segment backend writes CRC-framed, fsync'd append segments here so
+# they survive pod delete + reschedule (D3 — restart durability). SHADOW never
+# serves; the PVC is disposable until Stage C′ (durable-primary) is separately
+# authorised.
+#
+# OPEN DECISIONS before this is applied (do NOT guess — settle with the user):
+#   * R2 — storageClassName. Left as the cluster default marker below. Prod GKE
+#     wants a PD-SSD/balanced RWO class whose CSI fsync-durability + node-failure
+#     reattach timing are verified in the shadow soak (incl. a node-kill). If the
+#     shared cold-load tier is ever put on RWX, the class must support RWX; else
+#     keep single-writer RWO + an object-tier shared medium.
+#   * Sizing — 10Gi is a starting point sized to the keep-last-N retention
+#     (NOETL_EHDB_EVENTLOG_GC_MAX_RETAINED_SEGMENTS in the Deployment) at the
+#     default 8 MiB segment cap, with headroom + a PVC free-bytes alert (R1/R4).
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: noetl-worker-system-pool-ehdb-durable
+  namespace: noetl
+  labels:
+    app: noetl-worker-system-pool
+    component: system-worker
+    ehdb: durable-eventlog-shadow
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName: <decide-with-user>   # R2 — uncomment + set the verified
+  #                                          prod class before applying. Omitting
+  #                                          it uses the cluster default class.
+  resources:
+    requests:
+      storage: 10Gi
