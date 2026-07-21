@@ -1,0 +1,61 @@
+# NoETL worker autoscaler — EHDB command bus (L1 T4, SHADOW)
+#
+# noetl/ai-meta#194 L1 (the NATS takeover), path A. When the command bus runs
+# on EHDB (`NOETL_COMMAND_BUS=ehdb`/`shadow`), the per-shard writer — co-located
+# in the system-pool worker — exposes `ehdb_feed_total_lag` (the shard backlog:
+# undelivered + in-flight-unacked commands) on its Prometheus `/metrics`
+# endpoint. This ScaledObject scales the worker pool on that backlog, the EHDB
+# twin of the NATS-JetStream-lag scaler (`scaledobject-worker-system-pool.yaml`).
+#
+# ── SHADOW POSTURE ──────────────────────────────────────────────────────────
+# Applied with `autoscaling.keda.sh/paused: "true"` so KEDA reads/publishes the
+# metric but does NOT drive scaling — the "scaling has a signal before any
+# cutover" (hard-ordering) guardrail: the lag signal is validated in shadow
+# BEFORE the command bus is flipped off NATS (T4) and before this scaler is
+# activated. To activate: remove the `paused` annotation once the EHDB bus is
+# the authoritative command path and the signal is confirmed to track backlog.
+#
+# ── PREREQUISITES (part of the gated kind/prod deploy, NOT applied here) ─────
+# 1. The worker runs with `NOETL_COMMAND_BUS=ehdb` (or `shadow`) and, on the
+#    writer-host pool, `NOETL_COMMAND_BUS_HOST=true` +
+#    `NOETL_COMMAND_BUS_METRICS_BIND` exposing `/metrics`.
+# 2. A VMServiceScrape covers that metrics port so `ehdb_feed_total_lag` reaches
+#    VictoriaMetrics (`vmservicescrape-ehdb-command-bus.yaml`).
+# 3. The writer's durable command-log dir (`NOETL_COMMAND_BUS_WRITER_DIR`) is a
+#    PVC so it survives pod restarts.
+# See the runbook: https://github.com/noetl/ehdb/wiki/Runbook-L1-Command-Bus-Cutover
+#
+# kind/local shadow only — NOT applied to prod. NATS stays authoritative and the
+# NATS-lag scaler stays the active one until T4.
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: noetl-worker-system-pool-ehdb-command-bus
+  namespace: noetl
+  labels:
+    app: noetl-worker-system-pool
+    worker-pool: worker-system-pool
+    command-bus: ehdb
+    managed-by: noetl
+  annotations:
+    # SHADOW: KEDA evaluates the trigger but does not scale. Remove to activate.
+    autoscaling.keda.sh/paused: "true"
+    noetl.io/command-bus: "ehdb-shadow"
+spec:
+  scaleTargetRef:
+    name: noetl-worker-system-pool
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  pollingInterval: 10
+  cooldownPeriod: 30
+  triggers:
+    - type: prometheus
+      metadata:
+        # VictoriaMetrics single-node Prometheus-compatible query API.
+        serverAddress: http://vmsingle-vmstack-victoria-metrics-k8s-stack.vmstack.svc.cluster.local:8428
+        metricName: ehdb_feed_total_lag
+        # Total command backlog across the pool's shard writers.
+        query: sum(ehdb_feed_total_lag)
+        threshold: "10"
+        activationThreshold: "1"
