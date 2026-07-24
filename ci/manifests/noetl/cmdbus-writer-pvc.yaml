@@ -1,0 +1,57 @@
+# EHDB command-bus writer — durable shard log volume (noetl/ai-meta#194 L1 T4).
+#
+# The per-shard command log the writer appends to
+# (`NOETL_COMMAND_BUS_WRITER_DIR`).  It MUST be a PVC, not an emptyDir: the log
+# is the command bus's durability boundary once `NOETL_COMMAND_BUS=ehdb`, and an
+# emptyDir loses every unacked command when the pod restarts.
+#
+# Inert until the bus flag is flipped — nothing reads or writes this volume
+# while `NOETL_COMMAND_BUS=nats` (the shipped default); the writer faces only
+# spawn in `ehdb`/`shadow`.  See the cutover runbook:
+#   https://github.com/noetl/ehdb/wiki/Runbook-L1-Command-Bus-Cutover
+#
+# ── ⚠ OPERATOR: CONFIRM THE STORAGE CLASS BEFORE APPLY ──────────────────────
+# `premium-rwo` = GKE PD-SSD.  Chosen deliberately: the writer's durability
+# posture is fsync-per-append (posture A), so append latency is a direct
+# function of the disk's sync-write latency.  On PD-standard (spinning,
+# `standard`) a synced append is tens of ms and the bus would sit far outside
+# the NATS envelope; PD-balanced (`standard-rwo`) is the acceptable middle.
+# The T0 latency work measured ~4ms first-observed on local NVMe and attributed
+# it to fsync, NOT to the bus (pure transport = 137us) — so the disk IS the
+# latency budget here.
+#
+# Verify the class exists in the target cluster before applying:
+#   kubectl -n noetl get sc
+# If it does not, the PVC stays `Pending` and the writer pod stays `Pending`.
+# That failure mode is SAFE (the bus is still NATS, nothing degrades) but it
+# blocks Step 0's gate, so check first.
+#
+# ── ⚠ OPERATOR: CONFIRM THE SIZE ────────────────────────────────────────────
+# 20Gi is a starting point, not a measured number.  Sizing driver: during the
+# SHADOW window the workers still consume NATS, so NOTHING claims from this log
+# — every mirrored command accumulates for the whole window.  Size it as
+#   (commands/sec observed in the Step 1 baseline) x (shadow window seconds)
+#   x (record size) x 3 safety
+# and shorten the shadow window rather than over-provisioning.  Once the bus is
+# authoritative (Step 3+) the log is claimed and acked continuously and growth
+# is bounded by retention, not by the window.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: noetl-cmdbus-writer-data
+  namespace: noetl
+  labels:
+    app: noetl-cmdbus-writer
+    component: cmdbus-writer
+    managed-by: noetl
+spec:
+  accessModes:
+    # RWO is correct and load-bearing: the shard log has exactly ONE writer.
+    # It is also what forces `strategy: Recreate` on the Deployment — see the
+    # split-brain note there.
+    - ReadWriteOnce
+  storageClassName: premium-rwo
+  resources:
+    requests:
+      storage: 20Gi

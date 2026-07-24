@@ -1,0 +1,224 @@
+# EHDB command-bus writer — the per-shard log owner (noetl/ai-meta#194 L1 T4).
+#
+# Topology (c), "writer as broker": the server publishes command notifications
+# into a per-shard durable log; worker replicas compete to claim from it.  This
+# Deployment owns shard 0's log and serves its three faces:
+#
+#   :9100  ingest   — the noetl-server publishes here (NOETL_COMMAND_BUS_WRITER_ADDRS)
+#   :9101  claim    — worker replicas compete here  (NOETL_COMMAND_BUS_CLAIM_ADDR)
+#   :9102  /metrics — `ehdb_feed_total_lag` / `ehdb_feed_shard_lag{shard}`, the KEDA signal
+#
+# ── WHY A DEDICATED DEPLOYMENT (and not the system pool) ────────────────────
+# The kind validation co-located the writer in `noetl-worker-system-pool`
+# (`NOETL_COMMAND_BUS_HOST=true` on that Deployment), where the pool was a fixed
+# 1 replica.  In prod that pool is KEDA-scaled `min 1 / max 20`.  Co-locating
+# there means a scale-up gives N pods that EACH open shard 0's log and EACH
+# answer ingest/claim behind one round-robin ClusterIP — split-brain on the
+# command bus, with an RWO PVC leaving the surplus pods unschedulable on top.
+# The writer is a singleton by construction, so it gets its own singleton
+# Deployment that nothing autoscales.  (Prod finding #4 on the L1 T4 pre-flight;
+# the kind rig could not surface it because nothing scaled there.)
+#
+# INVARIANT: never add a ScaledObject/HPA targeting this Deployment, and never
+# raise `replicas` above 1.  Two writers on one shard = duplicate delivery and a
+# forked log.
+#
+# ── FLAG-NEUTRAL AS SHIPPED ─────────────────────────────────────────────────
+# `NOETL_COMMAND_BUS=nats` below (the code default).  In `nats` mode the worker
+# binary does NOT spawn the writer faces — this pod runs as an inert worker on a
+# dead-end subject and touches nothing.  Applying this manifest changes no
+# transport behaviour anywhere.  The cutover flips the flag with `set env`, per
+# the runbook; it is never flipped by applying a manifest.
+#   https://github.com/noetl/ehdb/wiki/Runbook-L1-Command-Bus-Cutover
+#
+# ── WHY IT STILL LOOKS LIKE A WORKER ────────────────────────────────────────
+# The `noetl-worker` binary always constructs a command source, so this pod
+# registers as a worker and subscribes like one.  It is pinned to the dead-end
+# pool segment `cmdbus`: on NATS it binds a durable consumer filtered to
+# `noetl.commands.cmdbus.>`, and on the EHDB bus its subject filter derives to
+# `commands.cmdbus.>` (worker `segment_from_filter`).  The server publishes only
+# `shared` / `system` subjects, so the writer can never claim real work off
+# either bus.  Same pattern as `ehdb-flightsql-deployment.yaml`.
+#
+# ── IMAGE ───────────────────────────────────────────────────────────────────
+# v5.78.0 — the first released worker carrying the subject-routed command bus
+# (`EhdbCommandSource`, `spawn_writer_host`, ehdb pin f5dd76b = the pool-isolation
+# fix).  Tag-pinned here for review legibility; prod convention is to pin by
+# immutable digest — resolve and substitute it before apply:
+#   gcloud artifacts docker images describe \
+#     us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust:v5.78.0 \
+#     --format='value(image_summary.digest)'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-cmdbus-writer
+  namespace: noetl
+  labels:
+    app: noetl-cmdbus-writer
+    component: cmdbus-writer
+    runtime: rust
+    command-bus: ehdb
+    managed-by: noetl
+spec:
+  # SINGLETON — see the invariant above.  Not autoscaled.
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: the log PVC is RWO, so a surge pod could
+    # never attach the volume and the rollout would deadlock.  It also keeps the
+    # "exactly one writer" invariant true THROUGH a rollout, not just at rest.
+    # Cost: a brief bus gap on restart.  Both sides tolerate it — the server's
+    # publish path and the workers' claim clients lazily reconnect and redial on
+    # error, and unacked commands redeliver after NOETL_COMMAND_BUS_ACK_WAIT_SECS.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: noetl-cmdbus-writer
+  template:
+    metadata:
+      labels:
+        app: noetl-cmdbus-writer
+        component: cmdbus-writer
+        runtime: rust
+        command-bus: ehdb
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9102"
+    spec:
+      serviceAccountName: noetl-worker
+      initContainers:
+        - name: wait-for-api
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "until curl -sf http://noetl-server-rust.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL API...'; sleep 3; done"
+      containers:
+        - name: cmdbus-writer
+          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust:v5.78.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: cmdbus-ingest
+              containerPort: 9100
+              protocol: TCP
+            - name: cmdbus-claim
+              containerPort: 9101
+              protocol: TCP
+            - name: cmdbus-lag
+              containerPort: 9102
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            # ---- identity: the dead-end pool segment (see header) ----
+            - name: WORKER_POOL_NAME
+              value: cmdbus-writer
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # NATS_URL carries an inline credential in this cluster
+            # (noetl/ai-meta#188, retired with T5).  Sourced from the existing
+            # ConfigMap rather than re-inlined here so this PR adds no new copy
+            # of it.
+            - name: NATS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: noetl-worker-config
+                  key: NATS_URL
+            - name: NATS_STREAM
+              value: NOETL_COMMANDS_RUST
+            # Own durable consumer on a subject nothing publishes to, so this
+            # pod never competes with the user / system pools.
+            - name: NATS_CONSUMER
+              value: noetl_cmdbus_writer
+            - name: NATS_FILTER_SUBJECT
+              value: noetl.commands.cmdbus.>
+            - name: NOETL_SERVER_URL
+              value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+            - name: WORKER_HEARTBEAT_INTERVAL
+              value: "15"
+            # It must never execute a command; 1 is the floor, not a tuning knob.
+            - name: WORKER_MAX_CONCURRENT
+              value: "1"
+            - name: WORKER_METRICS_BIND
+              value: "0.0.0.0:9090"
+            - name: RUST_LOG
+              value: "info,noetl_worker=info,ehdb_feed=info"
+
+            # ---- command bus (noetl/ai-meta#194 L1 T4) ----
+            # SHIPPED AS `nats` = the code default = writer faces NOT spawned.
+            # The cutover flips this to `shadow` (Step 2) then `ehdb` (Step 4)
+            # with `kubectl set env`.  Everything below is inert until then.
+            - name: NOETL_COMMAND_BUS
+              value: "nats"
+            # This pod IS the shard owner — the whole reason it exists.
+            - name: NOETL_COMMAND_BUS_HOST
+              value: "true"
+            - name: NOETL_COMMAND_BUS_SHARD
+              value: "0"
+            # Must equal the server's and every worker's NOETL_COMMAND_SHARD_COUNT.
+            # Prod is single-shard today (no NOETL_COMMAND_SHARD_COUNT set
+            # anywhere; the code default is 1).  Raising it means one writer
+            # Deployment PER SHARD, each with its own PVC and Service.
+            - name: NOETL_COMMAND_SHARD_COUNT
+              value: "1"
+            - name: NOETL_COMMAND_BUS_WRITER_DIR
+              value: /data/cmdbus
+            - name: NOETL_COMMAND_BUS_INGEST_BIND
+              value: "0.0.0.0:9100"
+            - name: NOETL_COMMAND_BUS_CLAIM_BIND
+              value: "0.0.0.0:9101"
+            - name: NOETL_COMMAND_BUS_METRICS_BIND
+              value: "0.0.0.0:9102"
+            # Redelivery window for a claimed-but-unacked command.  30s matches
+            # the code default; the kind validation ran 15s and proved 0-loss
+            # redelivery on a forced worker kill.
+            - name: NOETL_COMMAND_BUS_ACK_WAIT_SECS
+              value: "30"
+          volumeMounts:
+            - name: cmdbus-data
+              mountPath: /data/cmdbus
+          resources:
+            # ── ⚠ OPERATOR: EYEBALL THESE ───────────────────────────────────
+            # Sized from the code's two in-memory growth terms, not from a prod
+            # measurement (there is no prod data point yet — kind ran trivial
+            # volume):
+            #
+            #  1. `SubjectConsumerGroup.pending` (a VecDeque of every pulled but
+            #     unassigned record) and `.inflight` (a BTreeMap of every
+            #     delivered-but-unacked record) are IN MEMORY.  Bounded by the
+            #     claim rate once the bus is authoritative.
+            #  2. `ClaimCoordinator::lag()` — polled every 2s by the /metrics
+            #     sampler — calls `read_partition_after(shard, committed_cursor)`
+            #     and takes `.len()`, i.e. it MATERIALISES the whole undelivered
+            #     backlog every 2 seconds.  Cost is O(backlog), and during the
+            #     SHADOW window the backlog only grows (nothing claims).  This is
+            #     the dominant term and it is why the shadow window should be
+            #     hours, not weeks.
+            #
+            # Watch RSS and CPU on this pod as an explicit Step 2 gate; if the
+            # 2s sampler shows up as steady CPU that climbs with the window,
+            # that is term 2 and the window should be cut short.
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          livenessProbe:
+            # Probes the worker metrics port, which binds in every mode — the
+            # cmdbus ports only bind once the flag is flipped, so probing them
+            # would fail the pod as shipped.
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 6
+      volumes:
+        - name: cmdbus-data
+          persistentVolumeClaim:
+            claimName: noetl-cmdbus-writer-data

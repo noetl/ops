@@ -1,0 +1,57 @@
+# Scrape the EHDB command-bus writer (noetl/ai-meta#194 L1 T4).
+#
+# Prerequisite #2 of `ci/manifests/keda/scaledobject-worker-ehdb-command-bus.yaml`:
+# that ScaledObject queries `sum(ehdb_feed_total_lag)` from VictoriaMetrics, so
+# the gauge has to be scraped first or the scaler is blind.  Same relationship
+# `vmscrape-worker.yaml` has to the materializer-lag rules.
+#
+# Two endpoints on the writer pod:
+#   cmdbus-lag (:9102) — `ehdb_feed_total_lag`, `ehdb_feed_shard_lag{shard}`.
+#                        The per-shard command backlog (undelivered +
+#                        in-flight-unacked).  The KEDA signal, and the cutover's
+#                        primary health gauge.
+#   metrics    (:9090) — the ordinary worker metrics surface.  The writer never
+#                        executes commands, so these are near-flat by design;
+#                        they are worth having for process-level visibility
+#                        (uptime, registration) during the cutover.
+#
+# A separate scrape rather than adding `noetl-cmdbus-writer` to
+# `vmscrape-worker.yaml`'s app list: that scrape only knows the `metrics` port
+# name, and the lag gauge is on a different port.  Keeping it separate also
+# means this whole L1 T4 surface reverts by deleting one file.
+#
+# 10s interval (vs 15s for the worker pools): during the canary and full flip
+# this gauge is the thing being watched, and it also feeds an autoscaler.
+#
+# Inert as shipped — while `NOETL_COMMAND_BUS=nats` the writer binds no :9102
+# and the target is simply down.
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: noetl-cmdbus-writer-scrape
+  namespace: noetl
+  labels:
+    app: noetl-cmdbus-writer
+    command-bus: ehdb
+spec:
+  endpoints:
+    - port: cmdbus-lag
+      path: /metrics
+      interval: 10s
+    - port: metrics
+      path: /metrics
+      interval: 15s
+  selector:
+    matchLabels:
+      app: noetl-cmdbus-writer
+  namespaceSelector:
+    matchNames:
+      - noetl
+  relabelConfigs:
+    - sourceLabels: [__meta_kubernetes_service_name]
+      targetLabel: service
+    - sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod

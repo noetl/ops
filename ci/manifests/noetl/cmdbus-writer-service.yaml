@@ -1,0 +1,57 @@
+# EHDB command-bus writer — ClusterIP (noetl/ai-meta#194 L1 T4).
+#
+# The stable name the server publishes to and the workers claim from:
+#
+#   noetl-cmdbus-writer.noetl.svc.cluster.local:9100   server  -> NOETL_COMMAND_BUS_WRITER_ADDRS="0@<dns>:9100"
+#   noetl-cmdbus-writer.noetl.svc.cluster.local:9101   workers -> NOETL_COMMAND_BUS_CLAIM_ADDR="<dns>:9101"
+#   noetl-cmdbus-writer.noetl.svc.cluster.local:9102   VictoriaMetrics scrape (ehdb_feed_*)
+#
+# ── WHY ClusterIP AND NOT headless ──────────────────────────────────────────
+# L1 T4 finding #2: the addresses were originally parsed as `SocketAddr`, so a
+# DNS name did not work and the kind rig fronted the writer with a ClusterIP
+# (headless has no stable IP to hand out).  That was fixed — server PR #282 and
+# worker v5.78.0 keep the address as a `host:port` STRING and resolve it at
+# connect time, so this DNS name works directly and no IP is ever hardcoded.
+# ClusterIP is still the right choice: it gives one stable name in front of a
+# singleton that is replaced (new pod IP) on every rollout.
+#
+# Because the writer Deployment is a pinned singleton, this Service always has
+# exactly one endpoint — there is no round-robin across writers, which is the
+# property the whole design depends on.  If this Service ever shows >1 endpoint,
+# the bus is in split-brain: check that nothing scaled the Deployment.
+#   kubectl -n noetl get endpoints noetl-cmdbus-writer
+#
+# Inert as shipped: in `NOETL_COMMAND_BUS=nats` the backing pod binds none of
+# these ports, so the Service simply has no ready endpoint on them.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-cmdbus-writer
+  namespace: noetl
+  labels:
+    app: noetl-cmdbus-writer
+    component: cmdbus-writer
+    command-bus: ehdb
+    managed-by: noetl
+spec:
+  type: ClusterIP
+  selector:
+    app: noetl-cmdbus-writer
+  ports:
+    - name: cmdbus-ingest
+      port: 9100
+      targetPort: cmdbus-ingest
+      protocol: TCP
+    - name: cmdbus-claim
+      port: 9101
+      targetPort: cmdbus-claim
+      protocol: TCP
+    - name: cmdbus-lag
+      port: 9102
+      targetPort: cmdbus-lag
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
