@@ -1,13 +1,92 @@
-# NoETL Rust worker pool autoscaler — PRODUCTION (GKE noetl-demo-19700101)
+# NoETL Rust worker pool autoscaler — PRODUCTION (GKE shastaratech-noetl-prod)
 # =============================================================================
 # Phase F R5 of noetl/ai-meta#49 — autoscaling for the post-cutover Rust worker
-# pool.  Mirrors the Python pool's KEDA scaler (3→20 on NATS JetStream lag) but
-# reads the DEDICATED Rust command stream + consumer:
+# pool.  Mirrors the Python pool's KEDA scaler (2→20 on backlog) but reads the
+# DEDICATED Rust command stream + consumer:
 #   - stream:   NOETL_COMMANDS_RUST   (subjects noetl.commands.>)
 #   - consumer: noetl_worker_rust_shared (filter noetl.commands.shared.>)
 # Endpoint + account match the prod Python scaler (nats-headless / $G), NOT the
 # kind sample (scaledobject-worker-rust-pool.yaml, which is drift-guarded and
 # targets the shared NOETL_COMMANDS stream on kind).
+#
+# ── SECOND TRIGGER: EHDB command-bus lag (noetl/ai-meta#194 T5 prerequisite) ──
+# The command bus is LIVE on EHDB in prod (`NOETL_COMMAND_BUS=ehdb` on the
+# server and every pool).  NATS still exists but no longer carries commands, so
+# the `nats-jetstream` trigger below reads a consumer whose backlog is
+# permanently 0 — and at T5 (NATS deletion) it loses its signal entirely.  With
+# only that trigger, deleting NATS freezes this pool at its current slots
+# (minReplicaCount 2 × WORKER_MAX_CONCURRENT 4 = 8) with no way to absorb a
+# burst.  That is the hard-ordering rule from the RFC: **scaling must have a
+# signal before NATS goes away.**
+#
+# So the EHDB trigger is ADDED alongside the NATS one rather than replacing it.
+# KEDA's HPA reconciler takes the MAX desired-replicas across triggers, so:
+#   - today  — the NATS trigger reads 0, the EHDB trigger drives scaling; no
+#              regression while NATS is still installed.
+#   - at T5  — the NATS trigger is deleted with the rest of the NATS wiring and
+#              nothing about this pool's scaling changes.
+# Removing the NATS trigger is a T5 step, not a prerequisite for it.
+#
+# ── WHY metrics-api AND NOT prometheus ───────────────────────────────────────
+# This cluster has **no in-cluster PromQL endpoint**.  Prod monitoring is Google
+# Managed Prometheus: the writer's `/metrics` is scraped by
+# `PodMonitoring/noetl-cmdbus-writer` (gmp/podmonitoring-cmdbus-writer.yaml) and
+# the samples land in Cloud Monitoring — queryable over the GMP HTTP API, not
+# from inside the cluster.  (The VictoriaMetrics endpoint the kind sample
+# `scaledobject-worker-ehdb-command-bus.yaml` points at does not exist here; the
+# `vmservicescrape` CRD is not even installed.)
+#
+# Two ways to give KEDA a `prometheus` trigger were considered and rejected:
+#   1. Deploy the GMP query frontend (gmp-public/frontend) — needs a GSA with
+#      `roles/monitoring.viewer` + a Workload Identity binding.  The project has
+#      NO monitoring.* role binding today, so this is a new IAM grant: a
+#      human-gated change, and a new always-on workload sitting in the query
+#      path of an autoscaler.
+#   2. KEDA's `gcp-stackdriver` trigger — same IAM problem, plus either a
+#      service-account key in a Secret or Workload Identity on keda-operator.
+#
+# `metrics-api` needs neither: it scrapes the writer's Prometheus endpoint
+# **directly, in-cluster**, over the same ClusterIP the workers already claim
+# through.  Fewer moving parts between the backlog and the scaler, and no
+# dependency on the monitoring pipeline being healthy for autoscaling to work —
+# the right coupling for a T5 prerequisite.  The GMP scrape stays as the
+# *observability* path (dashboards, alerting, auditing this scaler).
+#
+# ── THE valueLocation IS A CONTRACT ──────────────────────────────────────────
+# KEDA's metrics-api scaler in `format: prometheus` has NO label selector: it
+# prefix-matches `valueLocation` against the whole `name{labels}` token of each
+# exposition line and takes the first match
+# (kedacore/keda@v2.15.0 pkg/scalers/metrics_api_scaler.go).  The ehdb renderer
+# emits sorted, single-label, space-free lines precisely so this stays stable; a
+# test in noetl/ehdb (`the_exposition_line_is_byte_stable_for_kedas_prefix_match`)
+# pins the byte shape.  Do not "tidy" the value below.
+#
+# ── THRESHOLD ────────────────────────────────────────────────────────────────
+# `targetValue` is an AverageValue: desiredReplicas = ceil(lag / targetValue).
+# Each replica runs WORKER_MAX_CONCURRENT=4 commands, so at minReplicaCount=2
+# the pool has 8 slots.  targetValue=2 adds a replica per 2 queued commands —
+# the pool reaches its 8-slot capacity in replicas at a backlog of 8, with a
+# replica of headroom already on the way up.  Scaling only once backlog exceeds
+# capacity (targetValue=4) is too late: the #205 saturating-burst measurement
+# showed p50 dispatch spiking to ~2 s purely from queueing once the slots were
+# full.  maxReplicaCount 20 × 4 = 80 slots, reached at a backlog of 40.
+#
+# ── FALLBACK ─────────────────────────────────────────────────────────────────
+# If the writer's /metrics is unreachable (writer pod restarting, per
+# noetl/ai-meta#208) the scaler errors.  Without a fallback KEDA holds the last
+# known replica count indefinitely; with it the pool settles at 2 — the same
+# floor it has when idle — after 3 consecutive failures (~30 s at
+# pollingInterval 10).  A writer that is down means the bus is down, so holding
+# a floor beats scaling on a stale reading.
+#
+# ── PAUSED ───────────────────────────────────────────────────────────────────
+# Applied with `autoscaling.keda.sh/paused: "true"`, matching the posture the
+# live object has carried since 2026-07-26.  Paused means KEDA still evaluates
+# the triggers and reports their health — so the EHDB trigger can be PROVEN to
+# read the backlog — but does not drive the Deployment's replica count.
+# Unpausing is a deliberate step (see the README section "Activate the EHDB lag
+# trigger"), not a side effect of applying this file.
+---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -16,7 +95,15 @@ metadata:
   labels:
     app: noetl-worker-rust
     worker-pool: worker-rust-pool
+    command-bus: ehdb
     managed-by: noetl
+    # KEDA stamps this itself; carried in the manifest so a re-apply does not
+    # prune it out from under the controller.
+    scaledobject.keda.sh/name: noetl-worker-rust
+  annotations:
+    # PAUSED: triggers are evaluated and reported, but scaling is not driven.
+    # Remove to activate — see the README.
+    autoscaling.keda.sh/paused: "true"
 spec:
   scaleTargetRef:
     name: noetl-worker-rust
@@ -24,7 +111,32 @@ spec:
   maxReplicaCount: 20
   pollingInterval: 10
   cooldownPeriod: 30
+  fallback:
+    failureThreshold: 3
+    replicas: 2
   triggers:
+    # (1) EHDB command bus — the authoritative signal today, and the only one
+    #     that survives T5.
+    - type: metrics-api
+      metadata:
+        url: "http://noetl-cmdbus-writer-0.noetl.svc.cluster.local:9102/metrics"
+        format: prometheus
+        # Whole-bus backlog.  Prod runs a single shard (NOETL_COMMAND_SHARD_COUNT=1)
+        # carrying BOTH pools, so this over-reports the user pool's own queue by
+        # the system pool's backlog.  Safe in the scale-up direction (the user
+        # pool's backlog is a subset of it), but it means a stuck system-pool
+        # command pins the shard's committed cursor and would hold this pool at
+        # maxReplicaCount.  The per-pool split lands with noetl/ehdb#303; once a
+        # worker image exposing it is deployed, replace the line below with:
+        #
+        #   valueLocation: 'ehdb_feed_subject_lag{subject="commands.shared.shard.0"}'
+        #
+        # and nothing else about this trigger changes.
+        valueLocation: "ehdb_feed_total_lag"
+        targetValue: "2"
+        activationTargetValue: "1"
+    # (2) NATS JetStream — a no-op while the bus is EHDB (this consumer's
+    #     backlog is permanently 0), kept until the T5 NATS teardown removes it.
     - type: nats-jetstream
       metadata:
         natsServerMonitoringEndpoint: nats-headless.nats.svc.cluster.local:8222
