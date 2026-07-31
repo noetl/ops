@@ -1,0 +1,56 @@
+# GMP PodMonitoring — the EHDB command-bus writer's lag + worker metrics.
+# =============================================================================
+# PROD-ONLY (GKE shastaratech-noetl-prod).  The GMP-native equivalent of the
+# kind VMServiceScrape; the VictoriaMetrics CRDs do not exist on this cluster.
+# Sibling of podmonitoring-noetl.yaml, which selects the worker pools by `app`
+# and so does not cover the writer (its `app` is per-shard:
+# `noetl-cmdbus-writer-0`, `noetl-cmdbus-writer-1`, …).  This one selects the
+# stable `component: cmdbus-writer` label instead, so a new shard's writer is
+# scraped the moment it exists without editing this file.
+#
+# Two endpoints, because the writer pod runs two metric surfaces:
+#   - `cmdbus-lag` (:9102) — the ehdb-feed scaler endpoint:
+#     `ehdb_feed_shard_lag{shard}`, `ehdb_feed_total_lag`,
+#     `ehdb_feed_shard_committed{shard}` (noetl/ai-meta#208), and — once the
+#     worker adopts noetl/ehdb#303 — `ehdb_feed_subject_lag{subject}`.
+#     Scraped at 10s: this is the command-bus backlog, and a minute-resolution
+#     view of a queue that drains in seconds is not useful.
+#   - `metrics` (:9090) — the ordinary noetl-worker metrics surface (the writer
+#     is a worker binary hosting the writer faces).
+#
+# This is the OBSERVABILITY path — dashboards, alerting, and auditing the
+# autoscaler.  It is NOT how KEDA reads the lag: the user-pool ScaledObject
+# (keda/scaledobject-worker-rust-prod.yaml) scrapes :9102 directly with a
+# `metrics-api` trigger, so autoscaling does not depend on the monitoring
+# pipeline being healthy.  See that file's header for why.
+#
+# Applying this is observability-only and non-traffic-affecting.  It was applied
+# by hand during the noetl/ai-meta#194 L1 T4 prod cutover on 2026-07-27 and is
+# committed here to close that drift; re-applying it is a no-op.
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: noetl-cmdbus-writer
+  namespace: noetl
+  labels:
+    app: noetl-cmdbus-writer
+    command-bus: ehdb
+    managed-by: noetl
+spec:
+  selector:
+    matchLabels:
+      component: cmdbus-writer
+  endpoints:
+    - port: cmdbus-lag
+      path: /metrics
+      interval: 10s
+    - port: metrics
+      path: /metrics
+      interval: 15s
+  targetLabels:
+    metadata:
+      - container
+      - pod
+      - top_level_controller_name
+      - top_level_controller_type

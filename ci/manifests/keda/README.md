@@ -149,3 +149,113 @@ the worker runs with `NOETL_COMMAND_BUS_HOST=true` +
 `NOETL_COMMAND_BUS_METRICS_BIND`, a VMServiceScrape covers that metrics port,
 and `NOETL_COMMAND_BUS_WRITER_DIR` is a PVC. No drift-guard fixture — this is
 a hand-authored Prometheus-trigger manifest, not generator output.
+
+## User-pool EHDB-lag trigger (prod) — the T5 prerequisite, 2026-07-30
+
+`scaledobject-worker-rust-prod.yaml` now carries **two** triggers: the
+existing `nats-jetstream` one and a new `metrics-api` one reading the
+EHDB command-bus backlog off the writer's `:9102` endpoint.
+
+This is the last prerequisite for T5 (deleting NATS) on
+[noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194). The
+command bus is already LIVE on EHDB in prod, so the NATS consumer this
+scaler watched has a permanently-zero backlog; at T5 it loses its signal
+outright. With only that trigger, deleting NATS would freeze the user
+pool at its current slots (`minReplicaCount` 2 × `WORKER_MAX_CONCURRENT`
+4 = 8) with nothing able to absorb a burst.
+
+The EHDB trigger is **added, not substituted**. KEDA's HPA reconciler
+takes the `MAX` desired-replicas across triggers, so nothing regresses
+while NATS is still installed, and removing the NATS trigger becomes a
+T5 teardown step rather than a prerequisite for it.
+
+### Why `metrics-api` and not `prometheus`
+
+The prod cluster has **no in-cluster PromQL endpoint**. Monitoring is
+Google Managed Prometheus: `PodMonitoring/noetl-cmdbus-writer`
+(`ci/manifests/noetl/gmp/podmonitoring-cmdbus-writer.yaml`) scrapes the
+writer and the samples land in Cloud Monitoring, queryable over the GMP
+HTTP API but not from inside the cluster. The VictoriaMetrics endpoint
+the kind sample `scaledobject-worker-ehdb-command-bus.yaml` points at
+does not exist here — the `vmservicescrape` CRD is not installed.
+
+Giving KEDA a `prometheus` trigger would mean deploying the GMP query
+frontend (`gmp-public/frontend`), which needs a GSA with
+`roles/monitoring.viewer` plus a Workload Identity binding. The project
+has **no** `monitoring.*` role binding today, so that is a new IAM grant
+— human-gated — and it puts a new always-on workload in an autoscaler's
+query path. `gcp-stackdriver` has the same IAM problem.
+
+`metrics-api` scrapes the writer's Prometheus endpoint directly,
+in-cluster, over the same ClusterIP the workers already claim through:
+no IAM, no new workload, and autoscaling does not depend on the
+monitoring pipeline being healthy.
+
+### The `valueLocation` is a contract
+
+KEDA's `metrics-api` scaler in `format: prometheus` has **no label
+selector** — it prefix-matches `valueLocation` against the whole
+`name{labels}` token of each exposition line and returns the first hit
+([`metrics_api_scaler.go`](https://github.com/kedacore/keda/blob/v2.15.0/pkg/scalers/metrics_api_scaler.go)).
+The ehdb renderer emits sorted, single-label, space-free lines so this
+stays stable, and a test in `noetl/ehdb` pins the byte shape. Do not
+reformat the value.
+
+### Threshold
+
+`targetValue` is an AverageValue, so `desiredReplicas = ceil(lag /
+targetValue)`. At `targetValue: "2"` the pool adds a replica per 2 queued
+commands: it reaches its 8-slot capacity in replicas at a backlog of 8,
+with headroom already on the way up. Waiting for backlog to exceed
+capacity (`targetValue: "4"`) is too late — the noetl/ai-meta#205
+saturating-burst measurement showed p50 dispatch spiking to ~2 s purely
+from queueing once the slots filled.
+
+### Activate the EHDB lag trigger
+
+The manifest ships **paused**, matching the live object's posture. Paused
+still evaluates the triggers and reports their health, so the EHDB
+trigger can be proven to read the backlog before it drives anything.
+
+```bash
+# 1. Confirm the trigger is healthy and reading the writer.
+kubectl -n noetl get scaledobject noetl-worker-rust \
+  -o jsonpath='{.status.health}{"\n"}{.status.externalMetricNames}{"\n"}'
+# expect: s0-metrics-api-... : {"numberOfFailures":0,"status":"Happy"}
+
+# 2. Confirm the value it reads matches the writer.
+kubectl -n noetl get --raw \
+  "/apis/external.metrics.k8s.io/v1beta1/namespaces/noetl/s0-metrics-api-ehdb_feed_total_lag"
+
+# 3. Unpause.
+kubectl -n noetl annotate scaledobject noetl-worker-rust \
+  autoscaling.keda.sh/paused-
+```
+
+### Rollback
+
+```bash
+# Re-pause (instant; the Deployment keeps its current replica count).
+kubectl -n noetl annotate scaledobject noetl-worker-rust \
+  autoscaling.keda.sh/paused=true --overwrite
+
+# Or drop back to the NATS-only scaler (valid only while NATS still exists).
+kubectl -n noetl apply -f \
+  https://raw.githubusercontent.com/noetl/ops/<pre-change-sha>/ci/manifests/keda/scaledobject-worker-rust-prod.yaml
+
+# Or remove autoscaling entirely and pin the pool by hand.
+kubectl -n noetl delete scaledobject noetl-worker-rust
+kubectl -n noetl scale deploy noetl-worker-rust --replicas=2
+```
+
+Deleting the ScaledObject also deletes `keda-hpa-noetl-worker-rust`; the
+Deployment keeps whatever replica count it had at that moment, so a
+manual `scale` afterwards is what sets the floor.
+
+### Per-shard writers
+
+The trigger names one writer (`noetl-cmdbus-writer-0`) because prod runs
+a single command shard (`NOETL_COMMAND_SHARD_COUNT=1`). Adding a shard
+means adding one `metrics-api` trigger per writer service — KEDA takes
+the `MAX` across them, which is the correct aggregation for "some shard
+is backed up".
