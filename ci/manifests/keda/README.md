@@ -213,23 +213,43 @@ from queueing once the slots filled.
 
 ### Activate the EHDB lag trigger
 
-The manifest ships **paused**, matching the live object's posture. Paused
-still evaluates the triggers and reports their health, so the EHDB
-trigger can be proven to read the backlog before it drives anything.
+**Done on 2026-07-31** — the manifest is now active and this section is the
+record of how, plus the procedure for any future pool.
+
+The trigger reads **this pool's own** backlog,
+`ehdb_feed_subject_lag{subject="commands.shared.shard.0"}`, which requires a
+worker image carrying noetl/worker#197 (≥ **v5.82.0**). Order matters: applying
+the per-subject `valueLocation` against an older writer points KEDA at a series
+that does not exist, and a `valueLocation` matching no line is a **scaler
+error**, not a backlog of 0.
+
+Do not expect to prove anything while paused. KEDA 2.15's
+`autoscaling.keda.sh/paused` **deletes the HPA and stops the scaler loop** —
+`get hpa` returns nothing, the external-metrics API 404s, and
+`.status.externalMetricNames` freezes on whatever trigger was live when it was
+paused. So step 1 below only becomes answerable *after* unpausing.
 
 ```bash
-# 1. Confirm the trigger is healthy and reading the writer.
+# 0. Writer first: confirm the per-subject series actually exists.
+kubectl -n noetl run lagprobe --rm -i --restart=Never \
+  --image=curlimages/curl:8.10.1 --command -- \
+  curl -s http://noetl-cmdbus-writer-0.noetl.svc.cluster.local:9102/metrics \
+  | grep ehdb_feed_subject_lag
+# expect: ehdb_feed_subject_lag{subject="commands.shared.shard.0"} 0
+
+# 1. Apply the manifest (no paused annotation) and unpause any live object.
+kubectl -n noetl apply -f scaledobject-worker-rust-prod.yaml
+kubectl -n noetl annotate scaledobject noetl-worker-rust \
+  autoscaling.keda.sh/paused- --overwrite
+
+# 2. KEDA should now create the HPA and register the external metric.
+kubectl -n noetl get hpa
 kubectl -n noetl get scaledobject noetl-worker-rust \
   -o jsonpath='{.status.health}{"\n"}{.status.externalMetricNames}{"\n"}'
-# expect: s0-metrics-api-... : {"numberOfFailures":0,"status":"Happy"}
 
-# 2. Confirm the value it reads matches the writer.
+# 3. Confirm the value served matches the writer.
 kubectl -n noetl get --raw \
-  "/apis/external.metrics.k8s.io/v1beta1/namespaces/noetl/s0-metrics-api-ehdb_feed_total_lag"
-
-# 3. Unpause.
-kubectl -n noetl annotate scaledobject noetl-worker-rust \
-  autoscaling.keda.sh/paused-
+  "/apis/external.metrics.k8s.io/v1beta1/namespaces/noetl/s0-metric-api-ehdb_feed_subject_lag%7Bsubject=%22commands.shared.shard.0%22%7D"
 ```
 
 ### Rollback

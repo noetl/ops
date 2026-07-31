@@ -79,13 +79,23 @@
 # pollingInterval 10).  A writer that is down means the bus is down, so holding
 # a floor beats scaling on a stale reading.
 #
-# ── PAUSED ───────────────────────────────────────────────────────────────────
-# Applied with `autoscaling.keda.sh/paused: "true"`, matching the posture the
-# live object has carried since 2026-07-26.  Paused means KEDA still evaluates
-# the triggers and reports their health — so the EHDB trigger can be PROVEN to
-# read the backlog — but does not drive the Deployment's replica count.
-# Unpausing is a deliberate step (see the README section "Activate the EHDB lag
-# trigger"), not a side effect of applying this file.
+# ── ACTIVATION (2026-07-31) ──────────────────────────────────────────────────
+# This object carried `autoscaling.keda.sh/paused: "true"` from 2026-07-26 until
+# 2026-07-31.  That was not a soft pause: **KEDA 2.15 deletes the HPA and stops
+# running the scaler loop** while the annotation is set, so the user pool had no
+# autoscaling of any kind for that window (noetl/ai-meta#210) — `get hpa`
+# returned nothing and the external-metrics API 404'd.  Worse, the object still
+# *looked* configured, because `.status.externalMetricNames` does not refresh on
+# a paused object and went on naming the old NATS metric.
+#
+# The annotation is now removed and the pool scales on the EHDB per-subject lag
+# above.  Two consequences worth knowing before editing this file:
+#
+#   - Re-adding the annotation is the instant rollback, but it re-enters the
+#     no-autoscaling state above; it pins the Deployment at its current replica
+#     count rather than returning it to a floor.
+#   - A paused ScaledObject cannot be *proven* on the cluster.  The trigger shape
+#     was proven in kind against a real EHDB bus before unpausing here.
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -100,10 +110,8 @@ metadata:
     # KEDA stamps this itself; carried in the manifest so a re-apply does not
     # prune it out from under the controller.
     scaledobject.keda.sh/name: noetl-worker-rust
-  annotations:
-    # PAUSED: triggers are evaluated and reported, but scaling is not driven.
-    # Remove to activate — see the README.
-    autoscaling.keda.sh/paused: "true"
+  # ACTIVE.  The `autoscaling.keda.sh/paused` annotation this file used to carry
+  # is gone deliberately — see "Activation" in the header comment.
 spec:
   scaleTargetRef:
     name: noetl-worker-rust
@@ -121,18 +129,22 @@ spec:
       metadata:
         url: "http://noetl-cmdbus-writer-0.noetl.svc.cluster.local:9102/metrics"
         format: prometheus
-        # Whole-bus backlog.  Prod runs a single shard (NOETL_COMMAND_SHARD_COUNT=1)
-        # carrying BOTH pools, so this over-reports the user pool's own queue by
-        # the system pool's backlog.  Safe in the scale-up direction (the user
-        # pool's backlog is a subset of it), but it means a stuck system-pool
-        # command pins the shard's committed cursor and would hold this pool at
-        # maxReplicaCount.  The per-pool split lands with noetl/ehdb#303; once a
-        # worker image exposing it is deployed, replace the line below with:
+        # THIS POOL'S OWN backlog, not the whole shard's.  Prod runs a single
+        # command shard (NOETL_COMMAND_SHARD_COUNT=1) carrying BOTH
+        # `commands.shared.shard.0` (this pool) and `commands.system.shard.0`, and
+        # `SubjectConsumerGroup::lag` counts every subject past one committed
+        # cursor.  Triggering on `ehdb_feed_total_lag` would therefore over-report
+        # this pool's queue by the system pool's — safe upward, but a **stuck
+        # system-pool command pins the global committed cursor**, pinning
+        # whole-shard lag high forever and holding this pool at maxReplicaCount
+        # indefinitely.  noetl/ehdb#303 splits the backlog by routing subject;
+        # noetl/worker#197 exposes it from the writer.
         #
-        #   valueLocation: 'ehdb_feed_subject_lag{subject="commands.shared.shard.0"}'
-        #
-        # and nothing else about this trigger changes.
-        valueLocation: "ehdb_feed_total_lag"
+        # The quoting matters: KEDA prefix-matches this against the whole
+        # `name{labels}` token, so the label must be byte-identical to what the
+        # writer renders (single label, no spaces).  YAML single quotes keep the
+        # inner double quotes literal.
+        valueLocation: 'ehdb_feed_subject_lag{subject="commands.shared.shard.0"}'
         targetValue: "2"
         activationTargetValue: "1"
     # (2) NATS JetStream — a no-op while the bus is EHDB (this consumer's
