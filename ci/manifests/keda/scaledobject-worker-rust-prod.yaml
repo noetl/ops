@@ -1,31 +1,15 @@
 # NoETL Rust worker pool autoscaler — PRODUCTION (GKE shastaratech-noetl-prod)
 # =============================================================================
-# Phase F R5 of noetl/ai-meta#49 — autoscaling for the post-cutover Rust worker
-# pool.  Mirrors the Python pool's KEDA scaler (2→20 on backlog) but reads the
-# DEDICATED Rust command stream + consumer:
-#   - stream:   NOETL_COMMANDS_RUST   (subjects noetl.commands.>)
-#   - consumer: noetl_worker_rust_shared (filter noetl.commands.shared.>)
-# Endpoint + account match the prod Python scaler (nats-headless / $G), NOT the
-# kind sample (scaledobject-worker-rust-pool.yaml, which is drift-guarded and
-# targets the shared NOETL_COMMANDS stream on kind).
+# Scales the post-cutover Rust worker pool (the USER pool — the one that serves
+# customer playbook traffic) 2→20 on the EHDB command bus's per-pool backlog.
 #
-# ── SECOND TRIGGER: EHDB command-bus lag (noetl/ai-meta#194 T5 prerequisite) ──
-# The command bus is LIVE on EHDB in prod (`NOETL_COMMAND_BUS=ehdb` on the
-# server and every pool).  NATS still exists but no longer carries commands, so
-# the `nats-jetstream` trigger below reads a consumer whose backlog is
-# permanently 0 — and at T5 (NATS deletion) it loses its signal entirely.  With
-# only that trigger, deleting NATS freezes this pool at its current slots
-# (minReplicaCount 2 × WORKER_MAX_CONCURRENT 4 = 8) with no way to absorb a
-# burst.  That is the hard-ordering rule from the RFC: **scaling must have a
-# signal before NATS goes away.**
-#
-# So the EHDB trigger is ADDED alongside the NATS one rather than replacing it.
-# KEDA's HPA reconciler takes the MAX desired-replicas across triggers, so:
-#   - today  — the NATS trigger reads 0, the EHDB trigger drives scaling; no
-#              regression while NATS is still installed.
-#   - at T5  — the NATS trigger is deleted with the rest of the NATS wiring and
-#              nothing about this pool's scaling changes.
-# Removing the NATS trigger is a T5 step, not a prerequisite for it.
+# ── ONE TRIGGER, DELIBERATELY ────────────────────────────────────────────────
+# The command bus is LIVE on EHDB in prod (`NOETL_COMMAND_BUS=ehdb` on the server
+# and every pool) since the T4 cutover of 2026-07-27.  This object used to carry a
+# second `nats-jetstream` trigger, kept on the theory that it was a harmless
+# no-op until the T5 teardown.  It was not harmless — see the note at the bottom
+# of `triggers:`.  The EHDB trigger is the authoritative signal and the only one
+# that survives T5 (noetl/ai-meta#194, noetl/ai-meta#210).
 #
 # ── WHY metrics-api AND NOT prometheus ───────────────────────────────────────
 # This cluster has **no in-cluster PromQL endpoint**.  Prod monitoring is Google
@@ -147,14 +131,27 @@ spec:
         valueLocation: 'ehdb_feed_subject_lag{subject="commands.shared.shard.0"}'
         targetValue: "2"
         activationTargetValue: "1"
-    # (2) NATS JetStream — a no-op while the bus is EHDB (this consumer's
-    #     backlog is permanently 0), kept until the T5 NATS teardown removes it.
-    - type: nats-jetstream
-      metadata:
-        natsServerMonitoringEndpoint: nats-headless.nats.svc.cluster.local:8222
-        account: "$G"
-        stream: NOETL_COMMANDS_RUST
-        consumer: noetl_worker_rust_shared
-        lagThreshold: "10"
-        activationLagThreshold: "1"
-        useHttps: "false"
+    # (2) NATS JetStream — REMOVED 2026-07-31.  It was kept here as a
+    #     "harmless no-op until the T5 teardown" on the premise that its
+    #     consumer's backlog is permanently 0 now that the bus is EHDB.
+    #     **That premise was wrong, and it mis-scaled prod the moment this
+    #     object was unpaused.**
+    #
+    #     `noetl_worker_rust_shared` still holds the messages that were
+    #     undelivered when the T4 cutover happened — 149 of them, last delivery
+    #     2026-07-28.  Nothing subscribes to that consumer any more, so the
+    #     backlog is frozen, not draining.  KEDA takes MAX across triggers, so
+    #     with `lagThreshold: 10` this trigger asked for ~15 replicas
+    #     unconditionally and forever; the pool went 2 -> 4 within 40 s of
+    #     unpausing and was climbing to maxReplicaCount.
+    #
+    #     A stale queue is indistinguishable from a busy one at the scaler
+    #     interface — which is the same failure mode the per-subject EHDB lag
+    #     above exists to avoid (a stuck command pinning a pool at max).  The
+    #     EHDB trigger is the authoritative signal and the only one that
+    #     survives T5, so removing this one now is strictly correct rather than
+    #     merely early.
+    #
+    #     Purging the stale consumer would also have worked, but leaving a
+    #     trigger pointed at a transport that carries no commands is a trap for
+    #     the next person; deleting it removes the trap.
