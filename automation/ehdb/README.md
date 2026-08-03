@@ -236,13 +236,44 @@ noetl run automation/ehdb/ehdb_platform.yaml -r local \
   --set context=gke_shastaratech-noetl-prod_us-central1_noetl-prod-autopilot \
   --set writer_storage_mode=claim \
   --set writer_storage_class=premium-rwo \
-  --set writer_image=ghcr.io/noetl/worker@sha256:<digest> \
+  --set writer_image=us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:<digest> \
   --set writer_image_pull_policy=IfNotPresent \
-  --set state_builder_shadow=false \
-  --set gateway_reconcile=true
+  --set gateway_reconcile=true \
+  --set autoscaler_enabled=false
 ```
 
-Things to know before that run:
+### The defaults now describe prod
+
+Read-only discovery against `shastaratech-noetl-prod` on 2026-08-03 found six
+defaults in this playbook set that disagreed with the cluster they would be
+applied to. Applied as they stood, a `profile=prod` converge would have turned
+a running subsystem off, mounted PVCs that do not exist, aborted half-way on a
+container name, and halved the writer's memory limit. All six now carry prod's
+measured value, which is why the command above is shorter than the one it
+replaces — but every one of them is a **reading from one day, not an
+invariant**, and each must be re-confirmed in the plan diff before converge:
+
+| Default | Value | Was | Confirm in the plan by |
+| :-- | :-- | :-- | :-- |
+| `state_builder` | `offserver` | `server` | `NOETL_STATE_BUILDER=offserver` on the server **and both** system-pool patches |
+| `writer_claim_cmdbus` | `noetl-cmdbus-writer-0-data` | `noetl-cmdbus-writer-data` | `claimName:` in the rendered StatefulSet vs `kubectl get pvc` |
+| `writer_claim_eventbus` | `noetl-eventbus-writer-0-data` | `noetl-eventbus-writer-data` | same |
+| `writer_claim_kv` | `noetl-eventbus-kv-0-data` | `noetl-eventbus-kv-data` | same |
+| `user_pool_container` | `noetl-worker` | `worker` | the user-pool patch's `"name"` field |
+| `gateway_namespace` / `gateway_deployment` | `gateway` / `gateway` | `noetl` / `noetl-gateway` | a `PLAN gateway` block appears at all |
+| `writer_memory_limit` | `4Gi` | `2Gi` | `limits: { cpu: "2", memory: "4Gi" }` |
+
+Two defaults were checked and are **right** for prod, contrary to earlier notes
+in this file: `state_shard_write=true` and the three-group `verify_groups`.
+Prod runs all three materializer groups — `:9106` reports
+`noetl_state_materializer` live at lag 0 alongside the other two. Narrowing
+either would make this playbook's own verify read a live group as absent and
+fail on it.
+
+Full record: `playbooks/223-ehdb-prod-runbook/P0-discovery.md` in
+[noetl/ai-meta](https://github.com/noetl/ai-meta).
+
+### Things to know before that run
 
 - **`writer_storage_mode=claim` is not optional on prod.** The existing PVCs
   hold the live command and event logs. `template` would provision new ones and
@@ -250,10 +281,18 @@ Things to know before that run:
 - **`premium-rwo`.** The writer's durability posture is fsync-per-append, so
   disk sync latency *is* the append-latency budget. On PD-standard a synced
   append is tens of ms and the bus falls outside the envelope NATS set.
-- **`state_builder_shadow=false`.** Prod runs `NOETL_STATE_BUILDER=server`; the
-  off-server subsystem is off there, and enabling the shadow drain would put a
-  new client on `:9108` in production
-  ([noetl/ai-meta#217](https://github.com/noetl/ai-meta/issues/217)).
+- **The per-shard Service's selector is REPLACED, not merged.** `kubectl apply`
+  is a three-way merge, and a selector key that exists on the live Service but
+  in neither the applied config nor its `last-applied-configuration` annotation
+  is preserved by design. Prod's writer Services were created imperatively
+  during the cutover, so they carry no such annotation and their old
+  `app: noetl-cmdbus-writer-0` selector would survive the apply, ANDed with the
+  new pod-name selector that the StatefulSet's pod does not satisfy. The Service
+  then resolves to **zero endpoints** while the pod stays 1/1 Running, and every
+  client — server, both pools, gateway, KEDA — is silently cut off. Reproduced
+  in kind on 2026-08-03 (`endpoints <none>` after a clean converge); the render
+  step now forces `/spec/selector` with a JSON patch and prints what it removed,
+  and the writer's status step fails if any per-shard Service has no endpoints.
 - **The Deployment→StatefulSet conversion drops the writer pod once.** The
   `drain_legacy_deployment` step scales and deletes the old Deployment before
   the StatefulSet can attach the RWO volumes. Commands issued in that window are
@@ -262,6 +301,23 @@ Things to know before that run:
   later, so it is survivable — but it is a real interruption, not a no-op.
 - **Prod's gateway must be reconciled explicitly** (`gateway_reconcile=true`).
   The kind rig has no gateway, so `auto` skips it there and says so loudly.
+- **Two system pools.** `system_pool_deployment` is a whitespace-separated list
+  and defaults to `noetl-worker-system-pool noetl-worker-system-pool-shard1`,
+  because prod runs both on the same `commands.system.>` subject (`-shard1` is a
+  second replica, not a shard-1 pool). Absent names are skipped.
+- **A wrong container name is rejected, not ignored.** A strategic merge on
+  `containers` keys by name, so an unknown name appends a second, imageless
+  container and the API server refuses the whole patch
+  (`spec.template.spec.containers[0].image: Required value`) — aborting the
+  converge with the earlier workloads already patched. `ehdb_runtime.yaml`
+  resolves every container name against the live Deployment for that reason:
+  exact match wins, a single-container Deployment resolves to its only container
+  with a loud note, anything ambiguous is a hard error naming what it found.
+- **Expected non-no-op on the first prod converge:**
+  `NOETL_STATE_BUILDER_SHADOW=false` is rendered unconditionally and prod
+  carries no such variable today, so both system pools will roll once. The value
+  is semantically what prod already has (unset is falsey); the rollout is the
+  cost of declaring it.
 
 ## A re-apply reports the StatefulSet as `configured`
 

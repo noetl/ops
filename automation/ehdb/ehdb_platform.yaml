@@ -33,20 +33,41 @@
 #         so the :9108 fan-out face has a real client.
 #   prod  GKE.  `premium-rwo` (PD-SSD) — the writer's durability posture is
 #         fsync-per-append, so disk sync latency IS the append-latency budget;
-#         on PD-standard a synced append is tens of ms.  Digest-pinned images.
-#         `state_builder_shadow=false`, because the shadow drain is a kind-only
-#         way to put a client on :9108 and prod already has a real one.
-#
-#         ⚠ prod runs `NOETL_STATE_BUILDER=offserver`, not `server` — measured
-#         2026-08-03, contradicting the earlier note that cited
-#         noetl/ai-meta#217.  A prod converge must pass
-#         `--set state_builder=offserver` explicitly or it will turn a running
-#         subsystem off.  Prod also runs all three materializer groups, so
-#         `state_shard_write=true` and the default `verify_groups` are both
-#         correct there.
+#         on PD-standard a synced append is tens of ms.  Digest-pinned images,
+#         and `writer_storage_mode=claim` to adopt the existing PVCs.
 #
 # Anything a profile sets can be overridden on the command line; the profile is
 # a set of defaults, not a lock.
+#
+# ── THE DEFAULTS DESCRIBE PROD, NOT KIND ─────────────────────────────────────
+# Read-only discovery against shastaratech-noetl-prod on 2026-08-03 found six
+# defaults in this file that disagreed with the cluster they would be applied
+# to.  Applied as they stood, a `profile=prod` converge would have turned a
+# running subsystem off, mounted PVCs that do not exist, aborted half-way on a
+# container name, and halved the writer's memory limit.  All six now carry
+# prod's measured value, because a default that is wrong on the most dangerous
+# target is the defect this playbook set exists to remove:
+#
+#   state_builder            offserver  (was `server` — would have turned the
+#                                       off-server state builder OFF; prod runs
+#                                       it on the server AND both system pools)
+#   writer_claim_*           shard-INDEXED names (`noetl-cmdbus-writer-0-data`,
+#                                       …) — the un-indexed ones came from the
+#                                       kind soak and match no PVC in prod
+#   user_pool_container      noetl-worker (was `worker`)
+#   gateway_namespace        gateway      (was `noetl`)
+#   gateway_deployment       gateway      (was `noetl-gateway`)
+#   writer_memory_limit      4Gi          (was 2Gi, prod runs 4Gi)
+#
+# Two defaults were checked and are RIGHT for prod, contrary to earlier notes:
+# `state_shard_write=true` and the three-group `verify_groups` — prod runs all
+# three materializer groups (:9106 shows noetl_state_materializer live at lag
+# 0).  Narrowing either would make this playbook's own verify read a live group
+# as absent and fail on it.
+#
+# Full record: noetl/ai-meta `playbooks/223-ehdb-prod-runbook/P0-discovery.md`.
+# Everything marked "measured" above must be RE-CONFIRMED against prod at apply
+# time — it is a reading from one day, not an invariant.
 #
 # ── WHAT THIS DOES NOT DO ────────────────────────────────────────────────────
 # It does not install KEDA, create the namespace, deploy Postgres, or build
@@ -74,7 +95,12 @@ workload:
 
   context: kind-noetl
   namespace: noetl
-  gateway_namespace: noetl
+  # The gateway is NOT in the platform namespace on prod — it is Deployment
+  # `gateway` in namespace `gateway` (shastaratech-noetl-prod, 2026-08-03).
+  # With the old `noetl` / `noetl-gateway` defaults, `gateway_reconcile=true`
+  # failed the run outright and `auto` silently skipped the workload carrying
+  # the SPA's only live-update path.  See gateway_deployment below.
+  gateway_namespace: gateway
 
   writer_name: noetl-cmdbus-writer
   shard_count: "1"
@@ -89,8 +115,14 @@ workload:
   writer_cmdbus_storage: 5Gi
   writer_eventbus_storage: 5Gi
   writer_kv_storage: 1Gi
+  # Prod's live writer: requests 250m / 512Mi, limits 2 CPU / 4Gi (measured
+  # 2026-08-03).  The old 100m/256Mi/2Gi defaults would have SHRUNK a running
+  # workload on adoption — a converge must not quietly take memory away from the
+  # process holding both buses' L0 index.
+  writer_cpu_request: 250m
   writer_cpu_limit: "2"
-  writer_memory_limit: 2Gi
+  writer_memory_request: 512Mi
+  writer_memory_limit: 4Gi
   # storage_mode=claim only — the names of the PVCs the StatefulSet adopts.
   # These are shard-indexed because that is what the cluster being adopted
   # actually names them; read off shastaratech-noetl-prod on 2026-08-03:
@@ -107,14 +139,30 @@ workload:
   server_deployment: noetl-server-rust
   server_container: noetl-server
   user_pool_deployment: noetl-worker-rust
-  user_pool_container: worker
-  system_pool_deployment: noetl-worker-system-pool
+  # Prod names every worker container `noetl-worker`, the user pool's included;
+  # the kind rig names that one `worker`.  A wrong container name does NOT
+  # no-op — a strategic merge appends a second, imageless container and the API
+  # server rejects the patch, aborting the converge half-applied.  So this is
+  # prod's name and ehdb_runtime.yaml resolves it against the live Deployment.
+  user_pool_container: noetl-worker
+  # Whitespace-separated.  Prod runs two system pools on the same
+  # `commands.system.>` subject (`-shard1` is a second replica, not a shard).
+  # Absent names are skipped, so this is safe on a one-pool cluster.
+  system_pool_deployment: "noetl-worker-system-pool noetl-worker-system-pool-shard1"
   system_pool_container: noetl-worker
   gateway_reconcile: auto
-  gateway_deployment: noetl-gateway
+  gateway_deployment: gateway
   gateway_container: gateway
-  state_builder: server
-  state_builder_shadow: "true"
+  # `offserver` is what prod runs — server AND both system pools, with
+  # NOETL_STATE_BUILDER_SOURCE=ehdb and a live :9108 WAL client (measured
+  # 2026-08-03).  The old `server` default would have turned that subsystem OFF
+  # on a converge.  A kind rig that wants the server-side builder passes
+  # `--set state_builder=server`.
+  state_builder: offserver
+  # `offserver` already puts a real client on :9108, and prod carries no
+  # NOETL_STATE_BUILDER_SHADOW at all — the shadow drain is the kind-only
+  # substitute for a real client and must not be paired with the default above.
+  state_builder_shadow: "false"
   # Enables the third materializer group (noetl_state_materializer) on the
   # system pool.  Threaded because `--set state_shard_write=...` on this entry
   # point silently did nothing before — the child defaulted it and the value
@@ -173,18 +221,29 @@ workflow:
               --set action=converge --set profile=kind --set context=kind-noetl \
               --set writer_image=localhost/noetl-worker:<tag>
 
-          prod (after gcloud re-auth; adopts the existing PVCs):
+          prod (after gcloud re-auth; adopts the existing PVCs).  Every setting
+          below is required; `profile=prod` sets no defaults on its own, it is a
+          context guard.  The defaults for state_builder, the claim names, the
+          container name, the gateway location and the writer memory limit now
+          carry prod's measured values, so they do NOT appear here — but they
+          MUST be re-confirmed against the cluster in the plan diff before the
+          converge:
+
             noetl run automation/ehdb/ehdb_platform.yaml -r local \
               --set action=plan --set profile=prod \
               --set context=gke_shastaratech-noetl-prod_us-central1_noetl-prod-autopilot \
               --set writer_storage_mode=claim \
               --set writer_storage_class=premium-rwo \
-              --set writer_image=ghcr.io/noetl/worker@sha256:<digest> \
+              --set writer_image=<AR ref>@sha256:<digest> \
               --set writer_image_pull_policy=IfNotPresent \
-              --set state_builder_shadow=false \
-              --set gateway_reconcile=true
+              --set gateway_reconcile=true \
+              --set autoscaler_enabled=false
 
-          Read the plan output before running converge against prod.
+          Read the plan output before running converge against prod.  Confirm in
+          the diff: the three writer_claim_* names match the live PVCs verbatim;
+          NOETL_STATE_BUILDER renders `offserver` on the server and both system
+          pools; the writer's memory limit is 4Gi; the gateway patch targets
+          namespace `gateway`.
 
           TXT
               # Every child no-ops on an action it does not own, so `help`
@@ -249,7 +308,9 @@ workflow:
         claim_cmdbus: "{{ workload.writer_claim_cmdbus }}"
         claim_eventbus: "{{ workload.writer_claim_eventbus }}"
         claim_kv: "{{ workload.writer_claim_kv }}"
+        cpu_request: "{{ workload.writer_cpu_request }}"
         cpu_limit: "{{ workload.writer_cpu_limit }}"
+        memory_request: "{{ workload.writer_memory_request }}"
         memory_limit: "{{ workload.writer_memory_limit }}"
         server_url: "http://{{ workload.server_deployment }}.{{ workload.namespace }}.svc.cluster.local:8082"
     next:

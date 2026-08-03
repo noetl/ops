@@ -81,10 +81,22 @@ workload:
   executions: "20"
   concurrency: "10"
 
-  # Materializer groups whose cursors must advance.  Prod runs only the first
-  # two: NOETL_STATE_BUILDER=server disables the off-server state builder and
-  # takes the state materializer with it (noetl/ai-meta#217).  Override to
-  # "noetl_materializer noetl_result_materializer" for a prod-shaped cluster.
+  # Materializer groups whose cursors must advance.
+  #
+  # All THREE are correct for prod, and the earlier note here — "prod runs only
+  # the first two, NOETL_STATE_BUILDER=server disables the state materializer
+  # (noetl/ai-meta#217)" — was wrong in both halves.  Measured on
+  # shastaratech-noetl-prod 2026-08-03: both system pools carry
+  # NOETL_STATE_SHARD_WRITE=true (that, not a `*_MATERIALIZER_ENABLED` var, is
+  # the state materializer's enable flag) and the writer's :9106 reports
+  # noetl_state_materializer live at cursor 4022, lag 0, alongside the other
+  # two.  Narrowing this list to two groups on prod would leave a LIVE group
+  # unverified; widening it on a cluster that really runs two makes the missing
+  # group read `NA`, which this rig counts as a FAILURE, never a zero.
+  #
+  # So: match the list to the cluster's actual NOETL_STATE_SHARD_WRITE, and let
+  # it fail loudly if they disagree.  Do not "fix" a failure here by trimming
+  # the list without first reading :9106.
   groups: "noetl_materializer noetl_result_materializer noetl_state_materializer"
 
   sse_subscribers: "3"

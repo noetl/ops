@@ -112,10 +112,20 @@ workload:
 
   server_url: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
 
-  cpu_request: 100m
+  # Prod's live writer, measured on shastaratech-noetl-prod 2026-08-03:
+  # requests 250m / 512Mi, limits 2 CPU / 4Gi.  These defaults are those values.
+  #
+  # They used to be 100m / 256Mi / 2 / 2Gi, which meant a converge would have
+  # HALVED the running writer's memory limit and cut its requests — shrinking a
+  # live workload as a side effect of declaring it.  The writer holds the L0
+  # index for both buses in memory; 2Gi is not a headroom the adoption converge
+  # gets to take away.  A kind rig that wants less passes `--set
+  # writer_memory_limit=2Gi` (a limit is a cap, not a reservation, so 4Gi costs
+  # a kind node nothing until the process actually grows).
+  cpu_request: 250m
   cpu_limit: "2"
-  memory_request: 256Mi
-  memory_limit: 2Gi
+  memory_request: 512Mi
+  memory_limit: 4Gi
 
   ack_wait_secs: "30"
   event_ack_wait_secs: "30"
@@ -401,12 +411,18 @@ workflow:
                       limits:   { cpu: "{{ workload.cpu_limit }}",   memory: "{{ workload.memory_limit }}" }
                     # Probes point at :9101 and MUST NOT be pointed at any
                     # events face.  A tcpSocket probe connects and closes
-                    # without a frame; `ehdb_feed::serve` handshakes inside its
+                    # without a frame; ehdb_feed::serve handshakes inside its
                     # accept loop, so that drops the listener and kills the face
                     # for the life of the process (noetl/ehdb#311).  :9108 dies
                     # on the first such connect.  The command-bus claim face at
                     # :9101 does not share that shape and tolerates the probe —
                     # verified over a full rollout of 5s periods.
+                    #
+                    # No backticks in this block: it is inside an UNQUOTED
+                    # heredoc (the one that expands ${NAME}), so a backtick pair
+                    # is command substitution, not quoting.  It printed
+                    # "ehdb_feed::serve: command not found" on every render and
+                    # dropped the name out of the manifest it was documenting.
                     readinessProbe:
                       tcpSocket: { port: cmdbus-claim }
                       initialDelaySeconds: 5
@@ -465,6 +481,51 @@ workflow:
             fi
           } > "$OUT/statefulset.yaml"
 
+          # ── the selector that `kubectl apply` will NOT fix ──────────────────
+          # `apply` is a THREE-WAY merge: a key present on the LIVE object but
+          # in neither the applied config nor the last-applied-configuration
+          # annotation is PRESERVED, by design.  The per-shard Services being
+          # adopted here were created imperatively during the 07-31/08-01
+          # cutover, so they carry no last-applied annotation at all — and
+          # their existing `app: <name>-<ordinal>` selector therefore SURVIVES
+          # the apply and is ANDed with the pod-name selector rendered above.
+          # The StatefulSet's pod is labelled `app: <name>` (no ordinal), so it
+          # matches neither conjunct: the Service resolves to ZERO endpoints and
+          # every client that addresses the writer through it — the server, both
+          # worker pools, the gateway and the KEDA scaler — is silently cut off
+          # while the pod itself looks perfectly healthy.
+          #
+          # Reproduced in kind on 2026-08-03: a clean converge left
+          # `kubectl get endpoints noetl-cmdbus-writer-0` reading `<none>`.
+          #
+          # A JSON-patch `replace` on /spec/selector is the only shape that sets
+          # the map to exactly what was rendered — strategic merge and JSON
+          # merge both merge maps and cannot drop a key they were not told
+          # about.  This runs on every converge and is a no-op once the selector
+          # already matches.
+          force_selector() {
+            _svc="$1"; _want="$2"
+            _live="$(kubectl --context "$CTX" -n "$NS" get service "$_svc" \
+              -o jsonpath='{.spec.selector}' 2>/dev/null || true)"
+            if [ -z "$_live" ]; then return 0; fi
+            if [ "$ACTION" = "plan" ]; then
+              if [ "$_live" != "$_want" ]; then
+                echo "  PLAN selector on Service/$_svc will be REPLACED"
+                echo "       live:   $_live"
+                echo "       wanted: $_want"
+                echo "       (apply alone would keep the extra key and the Service would select nothing)"
+              fi
+              return 0
+            fi
+            if [ "$_live" != "$_want" ]; then
+              kubectl --context "$CTX" -n "$NS" patch service "$_svc" --type=json \
+                -p "[{\"op\":\"replace\",\"path\":\"/spec/selector\",\"value\":${_want}}]" >/dev/null
+              echo "  selector on Service/$_svc replaced: $_live -> $_want"
+            fi
+          }
+
+          HEADLESS_SEL="{\"app\":\"${NAME}\"}"
+
           if [ "$ACTION" = "plan" ]; then
             echo "── rendered manifests ──────────────────────────────────────"
             cat "$OUT/services.yaml"
@@ -473,11 +534,23 @@ workflow:
             echo "── server-side dry-run ─────────────────────────────────────"
             kubectl --context "$CTX" apply --dry-run=server -f "$OUT/services.yaml"
             kubectl --context "$CTX" apply --dry-run=server -f "$OUT/statefulset.yaml"
+            force_selector "${NAME}-headless" "$HEADLESS_SEL"
+            i=0
+            while [ "$i" -lt "$SHARDS" ]; do
+              force_selector "${NAME}-${i}" "{\"statefulset.kubernetes.io/pod-name\":\"${NAME}-${i}\"}"
+              i=$((i + 1))
+            done
             exit 0
           fi
 
           echo "── converge ───────────────────────────────────────────────"
           kubectl --context "$CTX" apply -f "$OUT/services.yaml"
+          force_selector "${NAME}-headless" "$HEADLESS_SEL"
+          i=0
+          while [ "$i" -lt "$SHARDS" ]; do
+            force_selector "${NAME}-${i}" "{\"statefulset.kubernetes.io/pod-name\":\"${NAME}-${i}\"}"
+            i=$((i + 1))
+          done
           # A StatefulSet's volumeClaimTemplates are immutable after creation.
           # A converge that changes only storage sizing must therefore be told
           # explicitly, rather than failing an otherwise-idempotent apply.
@@ -545,6 +618,29 @@ workflow:
           $K rollout status statefulset/{{ workload.name }} --timeout={{ workload.rollout_timeout }}
           $K get statefulset,pod,pvc,svc -l app={{ workload.name }} -o wide 2>/dev/null || true
           echo ""
+          echo "── addressability ──────────────────────────────────────────"
+          # A listening face on a Service that resolves to nothing is invisible
+          # to every client.  The adoption path can produce exactly that (see
+          # force_selector in the render step), and the pod stays 1/1 Running
+          # throughout, so the face check below would report nine green ports on
+          # a writer nobody can reach.  Endpoints are the honest gate.
+          rc_addr=0
+          i=0
+          while [ "$i" -lt "{{ workload.shard_count }}" ]; do
+            SVC="{{ workload.name }}-${i}"
+            eps="$($K get endpoints "$SVC" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
+            if [ -n "$eps" ]; then
+              echo "  OK   Service/$SVC -> $eps"
+            else
+              echo "  FAIL Service/$SVC has NO endpoints — check its selector against the pod labels."
+              echo "       Everything addresses the writer through this Service; a healthy pod behind"
+              echo "       an empty Service is the silent-outage shape this playbook guards against."
+              rc_addr=1
+            fi
+            i=$((i + 1))
+          done
+
+          echo ""
           echo "── faces ───────────────────────────────────────────────────"
           # A bound listener is the gate: a face that is configured but not
           # listening is the silent-default failure this topology keeps
@@ -571,6 +667,7 @@ workflow:
             done
             i=$((i + 1))
           done
+          exit $rc_addr
     next:
       arcs:
         - step: end
