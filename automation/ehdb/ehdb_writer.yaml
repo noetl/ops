@@ -1,0 +1,576 @@
+# EHDB command/events writer — declared as a NoETL playbook.
+# =============================================================================
+# Reconciles the singleton-per-shard writer that hosts BOTH buses:
+#
+#   9100 cmdbus ingest   9103 events ingest    9106 events lag/metrics
+#   9101 cmdbus claim    9104 events claim     9107 KV
+#   9102 cmdbus lag      9105 events SSE       9108 WAL fan-out
+#   9090 worker metrics
+#
+# ── WHY THIS FILE EXISTS ─────────────────────────────────────────────────────
+# Until now there was no EHDB-only IaC anywhere.  `origin/main` carried zero
+# occurrences of `NOETL_COMMAND_BUS`; the prod topology was produced with
+# `kubectl set env` / `kubectl patch` during the 2026-07-31/08-01 NATS→EHDB
+# cutover and never written back, so there was nothing to redeploy from.  The
+# EHDB-only kind soak had to reconstruct it from the worker source.  This
+# playbook is that reconstruction, made declarative and re-runnable.
+#
+# ── WHY A StatefulSet AND NOT N COPY-PASTED Deployments ──────────────────────
+# The writer is a singleton *per command shard* over an RWO volume.  Prod ran
+# that as one hand-copied Deployment per shard (`noetl-cmdbus-writer-0`,
+# `-1`), which is how a two-shard cluster ended up with two files differing
+# only in an index.  A StatefulSet expresses the same invariant natively:
+#
+#   - Pod names ARE the shard identity: `noetl-cmdbus-writer-0` is shard 0.
+#     Same names prod already resolves, so this is a drop-in for the per-shard
+#     Deployments rather than a re-address.
+#   - `volumeClaimTemplates` gives each shard its own RWO volumes without a
+#     second copy of the PVC manifest.
+#   - The controller will not run two pods with the same ordinal, so "exactly
+#     one writer per shard" survives a rollout without relying on an operator
+#     remembering `strategy: Recreate`.
+#
+# The container ENTRYPOINT is exec-form (`./noetl-worker`, no shell), so the
+# ordinal is turned into `NOETL_COMMAND_BUS_SHARD` / `NOETL_EVENT_BUS_SHARD` by
+# a one-line `sh -c` wrapper in `command:`.  That wrapper is the ONLY reason
+# one manifest covers N shards — do not "simplify" it away.
+#
+# ── ADDRESSING ───────────────────────────────────────────────────────────────
+# Two Service shapes, both rendered here:
+#   - `<name>-headless` (clusterIP: None) — StatefulSet governing service.
+#   - `<name>-<ordinal>` ClusterIP per shard, selecting the single pod by
+#     `statefulset.kubernetes.io/pod-name`.  This is what preserves the prod
+#     DNS name `noetl-cmdbus-writer-0.noetl.svc.cluster.local` that the server
+#     env and the user-pool ScaledObject already point at.
+#
+# There is deliberately NO aggregate ClusterIP across shards: at shard_count>1
+# it would round-robin claim/ingest traffic across shards, which is silent
+# mis-routing of exactly the class tracked as noetl/ai-meta#218.
+#
+# ── STORAGE MODES ────────────────────────────────────────────────────────────
+#   storage_mode=template  (default)  volumeClaimTemplates; PVCs are named
+#                                     `<vct>-<sts>-<ordinal>`.  The shape for a
+#                                     fresh cluster and for shard_count > 1.
+#   storage_mode=claim                Mount pre-existing, explicitly named
+#                                     PVCs.  Requires shard_count=1.  This is
+#                                     the ADOPTION path for a cluster that
+#                                     already runs the writer as a Deployment
+#                                     with hand-named PVCs (prod today) —
+#                                     it converts the workload to a StatefulSet
+#                                     without moving a byte of the durable log.
+#
+# Naming trap carried over from the source: `NOETL_COMMAND_SHARD_COUNT` and
+# `NOETL_EVENT_SHARD_COUNT` carry no `_BUS_`, while every bind does.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ehdb_writer
+  path: automation/ehdb/ehdb-writer
+  description: Reconcile the EHDB command/events writer (StatefulSet + PVCs + per-shard ClusterIP)
+  labels:
+    noetl.io/component: cmdbus-writer
+    noetl.io/command-bus: ehdb
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # converge | plan | status | delete | teardown
+  # Anything else (help, verify, …) makes every step a no-op, so this playbook
+  # is safe to place in a linear chain that carries actions it does not own.
+  action: status
+
+  context: kind-noetl
+  namespace: noetl
+  name: noetl-cmdbus-writer
+
+  # One writer pod per command shard.  Must equal the server's
+  # NOETL_COMMAND_SHARD_COUNT — ehdb_runtime.yaml renders the addresses from
+  # the same number, and ehdb_platform.yaml passes one value to both.
+  shard_count: "1"
+
+  image: "localhost/noetl-worker:h5209b"
+  image_pull_policy: Never
+  container_name: noetl-worker
+
+  # template | claim  (see header)
+  storage_mode: template
+  storage_class: ""
+  cmdbus_storage: 5Gi
+  eventbus_storage: 5Gi
+  kv_storage: 1Gi
+  # storage_mode=claim only
+  claim_cmdbus: noetl-cmdbus-writer-data
+  claim_eventbus: noetl-eventbus-writer-data
+  claim_kv: noetl-eventbus-kv-data
+
+  server_url: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
+
+  cpu_request: 100m
+  cpu_limit: "2"
+  memory_request: 256Mi
+  memory_limit: 2Gi
+
+  ack_wait_secs: "30"
+  event_ack_wait_secs: "30"
+  cursor_persist_secs: "5"
+  # tail | earliest — what a group falls back to with no persisted cursor.
+  cursor_fallback: tail
+
+  # A dead-end pool segment: the writer registers as a worker, and this filter
+  # guarantees it can never claim real work.  Every `>` MUST stay quoted — an
+  # unquoted one truncates to `noetl.commands.cmdbus.` and resolves to a
+  # different pool (noetl/ai-meta#218).
+  feed_filter_subject: "noetl.commands.cmdbus.>"
+
+  log_level: "info,noetl_worker=info,ehdb_feed=info"
+
+  rollout_timeout: 300s
+
+  # A cluster migrating off the pre-StatefulSet shape has a Deployment with
+  # this name holding the RWO volumes.  The StatefulSet cannot bind them while
+  # it runs, so `converge` removes it first when this is true.
+  drain_legacy_deployment: "true"
+
+workflow:
+  - step: start
+    desc: Dispatch on action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          echo "ehdb_writer: action={{ workload.action }} context={{ workload.context }} shards={{ workload.shard_count }} storage={{ workload.storage_mode }}"
+          if [ "{{ workload.storage_mode }}" = "claim" ] && [ "{{ workload.shard_count }}" != "1" ]; then
+            echo "ERROR: storage_mode=claim mounts explicitly named PVCs and only makes sense at shard_count=1 (got {{ workload.shard_count }})." >&2
+            exit 1
+          fi
+    next:
+      arcs:
+        - step: drain_legacy
+
+  - step: drain_legacy
+    desc: Remove a pre-StatefulSet Deployment of the same name so the RWO volumes are free
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          K="kubectl --context {{ workload.context }} -n {{ workload.namespace }}"
+          if [ "{{ workload.drain_legacy_deployment }}" != "true" ]; then
+            echo "drain_legacy: disabled"
+            exit 0
+          fi
+          # Two legacy naming shapes, because two existed.  A single-shard
+          # cluster ran one Deployment named `<name>`; a sharded one ran a
+          # hand-copied Deployment per shard named `<name>-<ordinal>` — the same
+          # names the StatefulSet's PODS will take.  Both hold the RWO volumes,
+          # so both have to go before the StatefulSet can attach them.
+          LEGACY="{{ workload.name }}"
+          i=0
+          while [ "$i" -lt "{{ workload.shard_count }}" ]; do
+            LEGACY="$LEGACY {{ workload.name }}-${i}"
+            i=$((i + 1))
+          done
+
+          found=0
+          for d in $LEGACY; do
+            $K get deployment "$d" >/dev/null 2>&1 || continue
+            found=1
+            echo "drain_legacy: found legacy Deployment/$d — scaling to 0 and deleting"
+            # Scale first: deleting alone leaves the pod terminating while the
+            # StatefulSet's pod is already trying to attach the same RWO volume,
+            # which shows up as a multi-attach error rather than as this step.
+            $K scale deployment "$d" --replicas=0
+            $K wait --for=delete pod -l app="$d" --timeout=120s 2>/dev/null || true
+            $K delete deployment "$d" --wait=true
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "drain_legacy: no legacy writer Deployment ($LEGACY) — already converged or fresh cluster"
+          fi
+
+          # The pre-StatefulSet topology also left an AGGREGATE ClusterIP named
+          # exactly `<name>`, selecting every writer pod.  At one shard it is
+          # merely redundant; at more than one it round-robins claim and ingest
+          # traffic across shards, which is silent mis-routing
+          # (noetl/ai-meta#218).  Nothing this playbook renders uses it — every
+          # address is per-shard — and ehdb_runtime.yaml re-points the server,
+          # the pools and the gateway in the same run, so removing it here does
+          # not strand anything.
+          if $K get service {{ workload.name }} >/dev/null 2>&1; then
+            echo "drain_legacy: removing the aggregate Service/{{ workload.name }} (superseded by the per-shard ClusterIPs)"
+            $K delete service {{ workload.name }}
+          fi
+    next:
+      arcs:
+        - step: render
+
+  - step: render
+    desc: Render the writer manifests and apply (or server-side dry-run for plan)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|plan) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          CTX="{{ workload.context }}"
+          NS="{{ workload.namespace }}"
+          NAME="{{ workload.name }}"
+          SHARDS="{{ workload.shard_count }}"
+          MODE="{{ workload.storage_mode }}"
+          OUT="$(mktemp -d)"
+          trap 'rm -rf "$OUT"' EXIT
+
+          # ── Services ────────────────────────────────────────────────────────
+          # Rendered before the StatefulSet so the governing service exists when
+          # the controller creates pods.
+          {
+            cat <<YAML
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${NAME}-headless
+            namespace: ${NS}
+            labels:
+              app: ${NAME}
+              component: cmdbus-writer
+              command-bus: ehdb
+              managed-by: noetl
+          spec:
+            clusterIP: None
+            selector:
+              app: ${NAME}
+            ports:
+          YAML
+            for p in "cmdbus-ingest 9100" "cmdbus-claim 9101" "cmdbus-lag 9102" "metrics 9090" \
+                     "events-ingest 9103" "events-claim 9104" "events-sse 9105" "events-lag 9106" \
+                     "events-kv 9107" "events-wal 9108"; do
+              set -- $p
+              printf '    - { name: %s, port: %s, targetPort: %s }\n' "$1" "$2" "$1"
+            done
+
+            # Per-shard ClusterIP: the stable address the server, the pools, the
+            # gateway and KEDA all resolve.  Selecting by pod-name is what makes
+            # `noetl-cmdbus-writer-0` mean *shard 0* and nothing else.
+            i=0
+            while [ "$i" -lt "$SHARDS" ]; do
+              cat <<YAML
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${NAME}-${i}
+            namespace: ${NS}
+            labels:
+              app: ${NAME}
+              component: cmdbus-writer
+              command-bus: ehdb
+              shard: "${i}"
+              managed-by: noetl
+          spec:
+            type: ClusterIP
+            selector:
+              statefulset.kubernetes.io/pod-name: ${NAME}-${i}
+            ports:
+          YAML
+              for p in "cmdbus-ingest 9100" "cmdbus-claim 9101" "cmdbus-lag 9102" "metrics 9090" \
+                       "events-ingest 9103" "events-claim 9104" "events-sse 9105" "events-lag 9106" \
+                       "events-kv 9107" "events-wal 9108"; do
+                set -- $p
+                printf '    - { name: %s, port: %s, targetPort: %s }\n' "$1" "$2" "$1"
+              done
+              i=$((i + 1))
+            done
+          } > "$OUT/services.yaml"
+
+          # ── StatefulSet ─────────────────────────────────────────────────────
+          # `\${HOSTNAME##*-}` is escaped: it must reach the container as a shell
+          # expansion, not be resolved by this rendering shell.
+          {
+            cat <<YAML
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: ${NAME}
+            namespace: ${NS}
+            labels:
+              app: ${NAME}
+              component: cmdbus-writer
+              command-bus: ehdb
+              managed-by: noetl
+          spec:
+            serviceName: ${NAME}-headless
+            replicas: ${SHARDS}
+            podManagementPolicy: Parallel
+            updateStrategy:
+              type: RollingUpdate
+            selector:
+              matchLabels:
+                app: ${NAME}
+            template:
+              metadata:
+                labels:
+                  app: ${NAME}
+                  component: cmdbus-writer
+                  command-bus: ehdb
+                  managed-by: noetl
+              spec:
+                terminationGracePeriodSeconds: 60
+                containers:
+                  - name: {{ workload.container_name }}
+                    image: {{ workload.image }}
+                    imagePullPolicy: {{ workload.image_pull_policy }}
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -e
+                        ORD="\${HOSTNAME##*-}"
+                        case "\$ORD" in ''|*[!0-9]*) echo "cannot derive shard from HOSTNAME=\$HOSTNAME" >&2; exit 1 ;; esac
+                        export NOETL_COMMAND_BUS_SHARD="\$ORD"
+                        export NOETL_EVENT_BUS_SHARD="\$ORD"
+                        echo "writer shard \$ORD (host \$HOSTNAME)"
+                        exec ./noetl-worker
+                    ports:
+          YAML
+            for p in "cmdbus-ingest 9100" "cmdbus-claim 9101" "cmdbus-lag 9102" "metrics 9090" \
+                     "events-ingest 9103" "events-claim 9104" "events-sse 9105" "events-lag 9106" \
+                     "events-kv 9107" "events-wal 9108"; do
+              set -- $p
+              # Twelve spaces: this is a literal inside the printf format, so the
+              # YAML block scalar's own indent strip does not apply to it.  The
+              # rendered line has to land under `ports:` in the container spec.
+              printf '            - { name: %s, containerPort: %s }\n' "$1" "$2"
+            done
+            cat <<YAML
+                    env:
+                      # -- worker identity ------------------------------------
+                      - { name: WORKER_POOL_NAME, value: "cmdbus-writer" }
+                      - { name: NOETL_SERVER_URL, value: "{{ workload.server_url }}" }
+                      - { name: WORKER_MAX_CONCURRENT, value: "1" }
+                      - { name: WORKER_METRICS_BIND, value: "0.0.0.0:9090" }
+                      - { name: RUST_LOG, value: "{{ workload.log_level }}" }
+                      # -- command bus: host the writer faces ------------------
+                      - { name: NOETL_COMMAND_BUS, value: "ehdb" }
+                      - { name: NOETL_COMMAND_BUS_HOST, value: "true" }
+                      - { name: NOETL_COMMAND_SHARD_COUNT, value: "${SHARDS}" }
+                      - { name: NOETL_COMMAND_BUS_WRITER_DIR, value: "/data/cmdbus" }
+                      - { name: NOETL_COMMAND_BUS_INGEST_BIND, value: "0.0.0.0:9100" }
+                      - { name: NOETL_COMMAND_BUS_CLAIM_BIND, value: "0.0.0.0:9101" }
+                      - { name: NOETL_COMMAND_BUS_METRICS_BIND, value: "0.0.0.0:9102" }
+                      - { name: NOETL_COMMAND_BUS_ACK_WAIT_SECS, value: "{{ workload.ack_wait_secs }}" }
+                      # Its own claim face, over loopback.
+                      - { name: NOETL_COMMAND_BUS_CLAIM_ADDR, value: "127.0.0.1:9101" }
+                      - { name: NOETL_FEED_FILTER_SUBJECT, value: "{{ workload.feed_filter_subject }}" }
+                      # -- events bus: same pod, own engine, own PVC -----------
+                      - { name: NOETL_EVENT_BUS_HOST, value: "true" }
+                      - { name: NOETL_EVENT_SHARD_COUNT, value: "${SHARDS}" }
+                      - { name: NOETL_EVENT_BUS_WRITER_DIR, value: "/data/eventbus" }
+                      - { name: NOETL_EVENT_BUS_KV_DIR, value: "/data/eventkv" }
+                      - { name: NOETL_EVENT_BUS_INGEST_BIND, value: "0.0.0.0:9103" }
+                      - { name: NOETL_EVENT_BUS_CLAIM_BIND, value: "0.0.0.0:9104" }
+                      - { name: NOETL_EVENT_BUS_SSE_BIND, value: "0.0.0.0:9105" }
+                      - { name: NOETL_EVENT_BUS_METRICS_BIND, value: "0.0.0.0:9106" }
+                      - { name: NOETL_EVENT_BUS_KV_BIND, value: "0.0.0.0:9107" }
+                      - { name: NOETL_EVENT_BUS_WAL_BIND, value: "0.0.0.0:9108" }
+                      - { name: NOETL_EVENT_BUS_ACK_WAIT_SECS, value: "{{ workload.event_ack_wait_secs }}" }
+                      - { name: NOETL_EVENT_BUS_CURSOR_PERSIST_SECS, value: "{{ workload.cursor_persist_secs }}" }
+                      - { name: NOETL_EVENT_BUS_CURSOR_FALLBACK, value: "{{ workload.cursor_fallback }}" }
+                    resources:
+                      requests: { cpu: "{{ workload.cpu_request }}", memory: "{{ workload.memory_request }}" }
+                      limits:   { cpu: "{{ workload.cpu_limit }}",   memory: "{{ workload.memory_limit }}" }
+                    # Probes point at :9101 and MUST NOT be pointed at any
+                    # events face.  A tcpSocket probe connects and closes
+                    # without a frame; `ehdb_feed::serve` handshakes inside its
+                    # accept loop, so that drops the listener and kills the face
+                    # for the life of the process (noetl/ehdb#311).  :9108 dies
+                    # on the first such connect.  The command-bus claim face at
+                    # :9101 does not share that shape and tolerates the probe —
+                    # verified over a full rollout of 5s periods.
+                    readinessProbe:
+                      tcpSocket: { port: cmdbus-claim }
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                    livenessProbe:
+                      tcpSocket: { port: cmdbus-claim }
+                      initialDelaySeconds: 30
+                      periodSeconds: 20
+                    volumeMounts:
+                      - { name: cmdbus-data,  mountPath: /data/cmdbus }
+                      - { name: eventbus-data, mountPath: /data/eventbus }
+                      - { name: eventbus-kv,   mountPath: /data/eventkv }
+          YAML
+
+            if [ "$MODE" = "claim" ]; then
+              cat <<YAML
+                volumes:
+                  - { name: cmdbus-data,   persistentVolumeClaim: { claimName: "{{ workload.claim_cmdbus }}" } }
+                  - { name: eventbus-data, persistentVolumeClaim: { claimName: "{{ workload.claim_eventbus }}" } }
+                  - { name: eventbus-kv,   persistentVolumeClaim: { claimName: "{{ workload.claim_kv }}" } }
+          YAML
+            else
+              # Eight spaces: the rendered line has to land as a sibling of
+              # `accessModes` inside each template's `spec`.  Empty when no
+              # class is pinned, which leaves a blank line — valid YAML, and it
+              # means "cluster default" rather than "" (which would mean
+              # *disable dynamic provisioning*).
+              SC=""
+              if [ -n "{{ workload.storage_class }}" ]; then
+                SC="        storageClassName: {{ workload.storage_class }}"
+              fi
+              cat <<YAML
+            volumeClaimTemplates:
+              - metadata:
+                  name: cmdbus-data
+                  labels: { app: ${NAME}, component: cmdbus-writer, managed-by: noetl }
+                spec:
+                  accessModes: [ReadWriteOnce]
+          ${SC}
+                  resources: { requests: { storage: "{{ workload.cmdbus_storage }}" } }
+              - metadata:
+                  name: eventbus-data
+                  labels: { app: ${NAME}, component: eventbus-writer, managed-by: noetl }
+                spec:
+                  accessModes: [ReadWriteOnce]
+          ${SC}
+                  resources: { requests: { storage: "{{ workload.eventbus_storage }}" } }
+              - metadata:
+                  name: eventbus-kv
+                  labels: { app: ${NAME}, component: eventbus-kv, managed-by: noetl }
+                spec:
+                  accessModes: [ReadWriteOnce]
+          ${SC}
+                  resources: { requests: { storage: "{{ workload.kv_storage }}" } }
+          YAML
+            fi
+          } > "$OUT/statefulset.yaml"
+
+          if [ "$ACTION" = "plan" ]; then
+            echo "── rendered manifests ──────────────────────────────────────"
+            cat "$OUT/services.yaml"
+            echo "---"
+            cat "$OUT/statefulset.yaml"
+            echo "── server-side dry-run ─────────────────────────────────────"
+            kubectl --context "$CTX" apply --dry-run=server -f "$OUT/services.yaml"
+            kubectl --context "$CTX" apply --dry-run=server -f "$OUT/statefulset.yaml"
+            exit 0
+          fi
+
+          echo "── converge ───────────────────────────────────────────────"
+          kubectl --context "$CTX" apply -f "$OUT/services.yaml"
+          # A StatefulSet's volumeClaimTemplates are immutable after creation.
+          # A converge that changes only storage sizing must therefore be told
+          # explicitly, rather than failing an otherwise-idempotent apply.
+          if ! kubectl --context "$CTX" apply -f "$OUT/statefulset.yaml"; then
+            echo "" >&2
+            echo "StatefulSet apply rejected.  If the diff is in volumeClaimTemplates," >&2
+            echo "those are immutable: delete the StatefulSet with --cascade=orphan," >&2
+            echo "re-run apply, then reconcile the PVCs by hand." >&2
+            exit 1
+          fi
+    next:
+      arcs:
+        - step: delete
+
+  - step: delete
+    desc: Remove the writer StatefulSet and Services (PVCs are left in place)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in delete|teardown) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          K="kubectl --context {{ workload.context }} -n {{ workload.namespace }}"
+          # PVCs are deliberately NOT deleted: they hold the durable command and
+          # event logs.  Removing them is a separate, explicit operator act.
+          $K delete statefulset {{ workload.name }} --ignore-not-found
+          $K delete service {{ workload.name }}-headless --ignore-not-found
+          i=0
+          while [ "$i" -lt "{{ workload.shard_count }}" ]; do
+            $K delete service {{ workload.name }}-${i} --ignore-not-found
+            i=$((i + 1))
+          done
+          echo "PVCs left in place; delete them explicitly if you mean to discard the logs."
+    next:
+      arcs:
+        - step: status
+
+  - step: status
+    desc: Wait for the writer to be ready and report the faces it is serving
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|status) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          K="kubectl --context {{ workload.context }} -n {{ workload.namespace }}"
+          if ! $K get statefulset {{ workload.name }} >/dev/null 2>&1; then
+            echo "writer: StatefulSet/{{ workload.name }} not present"
+            exit 0
+          fi
+          $K rollout status statefulset/{{ workload.name }} --timeout={{ workload.rollout_timeout }}
+          $K get statefulset,pod,pvc,svc -l app={{ workload.name }} -o wide 2>/dev/null || true
+          echo ""
+          echo "── faces ───────────────────────────────────────────────────"
+          # A bound listener is the gate: a face that is configured but not
+          # listening is the silent-default failure this topology keeps
+          # producing, so an env read would not do.
+          #
+          # But the check must never CONNECT.  `ehdb_feed::serve` handshakes
+          # inside its accept loop, and a connection that closes without a frame
+          # drops the listener permanently (noetl/ehdb#311) — `nc -z` and a
+          # kubernetes `tcpSocket` probe both kill :9108 that way.  Reading the
+          # pod's own listening sockets is free and touches nothing.
+          i=0
+          while [ "$i" -lt "{{ workload.shard_count }}" ]; do
+            POD="{{ workload.name }}-${i}"
+            echo "shard ${i} (${POD}):"
+            listening="$($K exec "$POD" -- sh -c 'netstat -ltn 2>/dev/null' | awk '{print $4}')"
+            for pp in "9100 cmdbus-ingest" "9101 cmdbus-claim" "9102 cmdbus-lag" "9103 events-ingest" \
+                      "9104 events-claim" "9105 events-sse" "9106 events-lag" "9107 events-kv" "9108 events-wal"; do
+              set -- $pp
+              if printf '%s\n' "$listening" | grep -q ":$1\$"; then
+                echo "  OK   $1 $2"
+              else
+                echo "  DOWN $1 $2"
+              fi
+            done
+            i=$((i + 1))
+          done
+    next:
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
