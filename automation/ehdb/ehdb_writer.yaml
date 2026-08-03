@@ -100,10 +100,15 @@ workload:
   cmdbus_storage: 5Gi
   eventbus_storage: 5Gi
   kv_storage: 1Gi
-  # storage_mode=claim only
-  claim_cmdbus: noetl-cmdbus-writer-data
-  claim_eventbus: noetl-eventbus-writer-data
-  claim_kv: noetl-eventbus-kv-data
+  # storage_mode=claim only.  Shard-indexed, because that is what the cluster
+  # being adopted actually names them — read off shastaratech-noetl-prod on
+  # 2026-08-03 (all premium-rwo, Bound, 20Gi/50Gi/20Gi).  The un-indexed names
+  # these previously defaulted to came from the kind soak reconstruction and
+  # match no PVC in prod; mounting the wrong claim strands the live command and
+  # event logs.  ehdb_platform.yaml now forwards all three explicitly.
+  claim_cmdbus: noetl-cmdbus-writer-0-data
+  claim_eventbus: noetl-eventbus-writer-0-data
+  claim_kv: noetl-eventbus-kv-0-data
 
   server_url: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
 

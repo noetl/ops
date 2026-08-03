@@ -34,9 +34,16 @@
 #   prod  GKE.  `premium-rwo` (PD-SSD) — the writer's durability posture is
 #         fsync-per-append, so disk sync latency IS the append-latency budget;
 #         on PD-standard a synced append is tens of ms.  Digest-pinned images.
-#         `state_builder_shadow=false`, because prod runs
-#         `NOETL_STATE_BUILDER=server` and the off-server subsystem is off
-#         there (noetl/ai-meta#217).
+#         `state_builder_shadow=false`, because the shadow drain is a kind-only
+#         way to put a client on :9108 and prod already has a real one.
+#
+#         ⚠ prod runs `NOETL_STATE_BUILDER=offserver`, not `server` — measured
+#         2026-08-03, contradicting the earlier note that cited
+#         noetl/ai-meta#217.  A prod converge must pass
+#         `--set state_builder=offserver` explicitly or it will turn a running
+#         subsystem off.  Prod also runs all three materializer groups, so
+#         `state_shard_write=true` and the default `verify_groups` are both
+#         correct there.
 #
 # Anything a profile sets can be overridden on the command line; the profile is
 # a set of defaults, not a lock.
@@ -84,6 +91,17 @@ workload:
   writer_kv_storage: 1Gi
   writer_cpu_limit: "2"
   writer_memory_limit: 2Gi
+  # storage_mode=claim only — the names of the PVCs the StatefulSet adopts.
+  # These are shard-indexed because that is what the cluster being adopted
+  # actually names them; read off shastaratech-noetl-prod on 2026-08-03:
+  #   noetl-cmdbus-writer-0-data / noetl-eventbus-writer-0-data /
+  #   noetl-eventbus-kv-0-data   (all premium-rwo, 20Gi/50Gi/20Gi, Bound).
+  # Mounting the wrong claim strands the live command and event logs, so these
+  # are threaded to ehdb_writer.yaml rather than left to the child's defaults —
+  # `--set claim_cmdbus=...` on this entry point silently did nothing before.
+  writer_claim_cmdbus: noetl-cmdbus-writer-0-data
+  writer_claim_eventbus: noetl-eventbus-writer-0-data
+  writer_claim_kv: noetl-eventbus-kv-0-data
 
   # ── runtime ───────────────────────────────────────────────────────────────
   server_deployment: noetl-server-rust
@@ -97,6 +115,19 @@ workload:
   gateway_container: gateway
   state_builder: server
   state_builder_shadow: "true"
+  # Enables the third materializer group (noetl_state_materializer) on the
+  # system pool.  Threaded because `--set state_shard_write=...` on this entry
+  # point silently did nothing before — the child defaulted it and the value
+  # never reached ehdb_runtime.yaml, so a converge could only ever apply the
+  # child's default whatever the operator asked for.
+  #
+  # Default `true` matches prod: on shastaratech-noetl-prod (2026-08-03) both
+  # system pools carry NOETL_STATE_SHARD_WRITE=true and the writer's :9106
+  # reports all three groups live at lag 0 — noetl_materializer,
+  # noetl_result_materializer AND noetl_state_materializer.  Earlier notes
+  # claiming prod does not run the third group are wrong; see the P0 discovery
+  # record in noetl/ai-meta playbooks/223-ehdb-prod-runbook/P0-discovery.md.
+  state_shard_write: "true"
 
   # ── autoscaler ────────────────────────────────────────────────────────────
   autoscaler_enabled: "true"
@@ -215,6 +246,9 @@ workflow:
         cmdbus_storage: "{{ workload.writer_cmdbus_storage }}"
         eventbus_storage: "{{ workload.writer_eventbus_storage }}"
         kv_storage: "{{ workload.writer_kv_storage }}"
+        claim_cmdbus: "{{ workload.writer_claim_cmdbus }}"
+        claim_eventbus: "{{ workload.writer_claim_eventbus }}"
+        claim_kv: "{{ workload.writer_claim_kv }}"
         cpu_limit: "{{ workload.writer_cpu_limit }}"
         memory_limit: "{{ workload.writer_memory_limit }}"
         server_url: "http://{{ workload.server_deployment }}.{{ workload.namespace }}.svc.cluster.local:8082"
@@ -245,6 +279,7 @@ workflow:
         gateway_container: "{{ workload.gateway_container }}"
         state_builder: "{{ workload.state_builder }}"
         state_builder_shadow: "{{ workload.state_builder_shadow }}"
+        state_shard_write: "{{ workload.state_shard_write }}"
     next:
       arcs:
         - step: autoscaler

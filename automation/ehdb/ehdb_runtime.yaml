@@ -82,13 +82,28 @@ workload:
   gateway_deployment: noetl-gateway
   gateway_container: gateway
 
-  # server | offserver.  Prod runs `server`: the off-server state builder is
-  # disabled there, which also takes the state materializer off the execution
-  # path (noetl/ai-meta#217).
+  # server | offserver.
+  #
+  # ⚠ This default does NOT match prod.  Measured on shastaratech-noetl-prod
+  # 2026-08-03: the server and both system pools run
+  # NOETL_STATE_BUILDER=offserver with NOETL_STATE_BUILDER_SOURCE=ehdb, and the
+  # system pools hold a live :9108 WAL client.  Converging prod without
+  # `--set state_builder=offserver` would flip a running subsystem OFF.  The
+  # older note here — "prod runs `server`, the off-server builder is disabled
+  # there (noetl/ai-meta#217)" — is wrong; see the P0 discovery record in
+  # noetl/ai-meta playbooks/223-ehdb-prod-runbook/P0-discovery.md.
+  #
+  # Left at `server` because that is the kind default and flipping it is a
+  # behaviour change for every caller; prod passes it explicitly instead.
   state_builder: server
   # Runs the WAL chain-walk against :9108 with no drive impact.  The only way to
   # put the fan-out face under real load without putting #217 on the path.
   state_builder_shadow: "false"
+  # Enables the third materializer group (noetl_state_materializer).  `true`
+  # matches prod as measured 2026-08-03: both system pools carry
+  # NOETL_STATE_SHARD_WRITE=true and the writer's :9106 reports all three
+  # groups live at lag 0.  ehdb_platform.yaml now forwards this — before, a
+  # `--set state_shard_write=...` on the entry point was silently discarded.
   state_shard_write: "true"
 
   event_ingest_publish_only: "true"
