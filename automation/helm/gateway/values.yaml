@@ -51,7 +51,6 @@ env:
   noetlBaseUrl: "http://noetl.noetl.svc.cluster.local:8082"
   rustLog: "info,gateway=debug"
   corsAllowedOrigins: "http://localhost:8080,http://localhost:8090,http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173,https://mestumre.dev,https://travel.mestumre.dev,https://gateway.mestumre.dev"
-  natsUrl: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
   # NATS subject prefix the gateway's playbook_state listener
   # subscribes to (``{prefix}>``).  Must match the noetl event publisher's
   # ``NOETL_EVENT_NATS_SUBJECT_PREFIX`` (``noetl.events`` by default),

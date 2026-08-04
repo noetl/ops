@@ -66,8 +66,6 @@ spec:
             - name: NOETL_SCHEMA
               value: "noetl"
             # NATS connection — same broker the Python server uses.
-            - name: NOETL_NATS_URL
-              value: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
             # Publicly-reachable URL embedded in NATS command
             # notifications so workers know where to call back
             # for command details + result POSTs.  Required by

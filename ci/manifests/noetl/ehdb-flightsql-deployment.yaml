@@ -78,8 +78,6 @@ spec:
             # Distinct NATS consumer + a filter subject that carries no traffic:
             # this pod hosts the Flight SQL endpoint, it does not compete for
             # real commands with the user / system pools.
-            - name: NATS_URL
-              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
             - name: NATS_STREAM
               value: NOETL_COMMANDS
             - name: NATS_CONSUMER

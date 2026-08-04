@@ -80,8 +80,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: NATS_URL
-              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
             # Dedicated Rust-stack stream (subjects noetl.commands.>).
             # Disjoint from Python's NOETL_COMMANDS (flat noetl.commands),
             # so Python's stream is never touched.
