@@ -1,0 +1,519 @@
+# EHDB-only runtime env for the server, the worker pools and the gateway.
+# =============================================================================
+# The writer (ehdb_writer.yaml) serves the buses; this playbook points everything
+# else at them and strips the NATS-era variables off the same Deployments.
+#
+# ── WHY A PATCH AND NOT A FULL Deployment MANIFEST ───────────────────────────
+# The EHDB cutover is a *dimension* of these Deployments, not the whole of them:
+# server image, Postgres wiring, keychain, resources, probes and shard config all
+# live in `ci/manifests/noetl/*.yaml` and are owned there.  Re-declaring a whole
+# Deployment here to change its bus would fork that ownership and silently revert
+# whatever else had moved.
+#
+# So each Deployment gets a rendered strategic-merge patch covering exactly the
+# EHDB env, and `kubectl patch` is a no-op when the patch is already satisfied —
+# which is what makes a second converge clean.  Env *removal* cannot be expressed
+# in a strategic merge (the list merges by `name`, it does not prune), so the
+# NATS-era variables come off with `kubectl set env VAR-`, guarded by a presence
+# check so an already-converged Deployment is not rolled for nothing.
+#
+# ── WHAT "EHDB-ONLY" MEANS PER WORKLOAD ──────────────────────────────────────
+# server        publishes commands to :9100 and events to :9103
+# user pool     claims commands from :9101 on `commands.shared.>`
+# system pool   claims commands from :9101 on `commands.system.>`, claims events
+#               from :9104 for the materializer groups, and reaches the WAL
+#               fan-out at :9108
+# gateway       session cache + request store on the KV face :9107, and the
+#               execution-lifecycle SSE feed at :9105
+#
+# ── THE FAIL-LOUD MATERIALIZER SOURCES ───────────────────────────────────────
+# `NOETL_MATERIALIZER_SOURCE`, `NOETL_RESULT_MATERIALIZER_SOURCE`,
+# `NOETL_STATE_MATERIALIZER_SOURCE` and `NOETL_STATE_BUILDER_SOURCE` are
+# mandatory on the system pool (noetl/ai-meta#221, worker#211): unset used to
+# fall through to the deleted NATS transport, so a materializer would sit on a
+# flat cursor while executions kept completing and nothing errored.  They are
+# rendered unconditionally here for that reason — never make them optional.
+#
+# `NOETL_STATE_BUILDER=shadow` is NOT how shadow is spelled.  `builder_mode()`
+# only recognises `offserver` on that variable and otherwise falls through to a
+# *separate* flag, so a sensible-looking `shadow` silently means Off and the WAL
+# fan-out face at :9108 never gets a client.  Shadow is
+# `state_builder_shadow: "true"`.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ehdb_runtime
+  path: automation/ehdb/ehdb-runtime
+  description: Point the server, worker pools and gateway at the EHDB buses and strip the NATS-era env
+  labels:
+    noetl.io/command-bus: ehdb
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # converge | plan | status
+  # Anything else makes every step a no-op.
+  action: status
+
+  context: kind-noetl
+  namespace: noetl
+  # NOT `noetl` — the gateway has its own namespace on prod.  See gateway_* below.
+  gateway_namespace: gateway
+
+  writer_name: noetl-cmdbus-writer
+  shard_count: "1"
+
+  server_deployment: noetl-server-rust
+  server_container: noetl-server
+
+  user_pool_deployment: noetl-worker-rust
+  # Prod names EVERY worker container `noetl-worker`, including the user pool's
+  # (measured on shastaratech-noetl-prod 2026-08-03).  The kind rig names that
+  # one `worker`.  The name is resolved against the live Deployment rather than
+  # trusted — see `resolve_container` in the reconcile step — so this default is
+  # prod's truth and kind still converges without an override.
+  user_pool_container: noetl-worker
+  user_pool_subject: "noetl.commands.shared.>"
+
+  # One or more, whitespace-separated.  Prod runs TWO system pools —
+  # `noetl-worker-system-pool` and `noetl-worker-system-pool-shard1`, the second
+  # being a second replica claiming the same `commands.system.>` subject from
+  # writer-0, not a shard-1 pool (the name is misleading).  Both carry the four
+  # materializer sources, so both have to be reconciled or the IaC describes half
+  # the running topology.  A name that does not exist on the cluster is skipped.
+  system_pool_deployment: "noetl-worker-system-pool noetl-worker-system-pool-shard1"
+  system_pool_container: noetl-worker
+  system_pool_subject: "noetl.commands.system.>"
+
+  # auto  — reconcile the gateway only if the Deployment exists
+  # true  — reconcile it, and fail if it does not exist
+  # false — skip
+  #
+  # The gateway does NOT live beside the rest of the platform: on
+  # shastaratech-noetl-prod it is Deployment `gateway` in namespace `gateway`
+  # (measured 2026-08-03), not `noetl-gateway` in `noetl`.  With the old
+  # defaults, `gateway_reconcile=true` failed outright and `auto` silently
+  # skipped the one workload that carries the SPA's live-update path.  The kind
+  # rig has no gateway at all, so prod's names are the right defaults here.
+  gateway_reconcile: auto
+  gateway_deployment: gateway
+  gateway_container: gateway
+
+  # server | offserver.
+  #
+  # `offserver` is what PROD runs.  Measured on shastaratech-noetl-prod
+  # 2026-08-03: the server and BOTH system pools carry
+  # NOETL_STATE_BUILDER=offserver with NOETL_STATE_BUILDER_SOURCE=ehdb, and the
+  # system pools hold a live :9108 WAL client.  The earlier note in this file —
+  # "prod runs `server`, the off-server builder is disabled there
+  # (noetl/ai-meta#217)" — was wrong, and converging on it would have turned a
+  # running subsystem OFF.  See the P0 discovery record in noetl/ai-meta
+  # playbooks/223-ehdb-prod-runbook/P0-discovery.md.
+  #
+  # The default is therefore prod's value, not kind's: an IaC default that
+  # disagrees with the cluster it is most dangerous on is the defect this whole
+  # workstream exists to remove.  A kind rig that wants the server-side builder
+  # passes `--set state_builder=server`.
+  state_builder: offserver
+  # The shadow drain runs the WAL chain-walk against :9108 with no drive impact —
+  # a kind-only way to put a client on the fan-out face.  `offserver` puts a real
+  # one there, and prod carries no NOETL_STATE_BUILDER_SHADOW at all, so `false`
+  # is both prod's effective value and the right pairing with the default above.
+  state_builder_shadow: "false"
+  # Enables the third materializer group (noetl_state_materializer).  `true`
+  # matches prod as measured 2026-08-03: both system pools carry
+  # NOETL_STATE_SHARD_WRITE=true and the writer's :9106 reports all three
+  # groups live at lag 0.  ehdb_platform.yaml now forwards this — before, a
+  # `--set state_shard_write=...` on the entry point was silently discarded.
+  state_shard_write: "true"
+
+  event_ingest_publish_only: "true"
+
+  # Removed from every workload.  `NATS_FILTER_SUBJECT` is the legacy fallback
+  # for `NOETL_FEED_FILTER_SUBJECT`, so it only comes off once the replacement
+  # is set — which the same patch does, in the same change.
+  remove_env: "NATS_URL NATS_STREAM NATS_CONSUMER NATS_FILTER_SUBJECT NOETL_NATS_URL NOETL_EVENT_NATS_SUBJECT_PREFIX WORKER_NATS_LAG_POLL_INTERVAL"
+  remove_env_gateway: "NATS_URL NATS_USERNAME NATS_PASSWORD NATS_UPDATES_SUBJECT_PREFIX NATS_CALLBACK_SUBJECT_PREFIX"
+
+  rollout_timeout: 300s
+
+workflow:
+  - step: start
+    desc: Dispatch on action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          echo "ehdb_runtime: action={{ workload.action }} context={{ workload.context }} shards={{ workload.shard_count }}"
+    next:
+      arcs:
+        - step: reconcile
+
+  - step: reconcile
+    desc: Render and apply the EHDB-only patches for server, pools and gateway
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|plan) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          CTX="{{ workload.context }}"
+          NS="{{ workload.namespace }}"
+          WRITER="{{ workload.writer_name }}"
+          SHARDS="{{ workload.shard_count }}"
+          K="kubectl --context $CTX -n $NS"
+
+          # Per-shard addresses, built from the same shard count the writer
+          # StatefulSet is sized with.  `N@host:port` is the server's multi-shard
+          # address form; a missing shard is an error at publish time, not at
+          # boot, so the two counts must not drift.
+          ingest_addrs=""; event_addrs=""
+          i=0
+          while [ "$i" -lt "$SHARDS" ]; do
+            host="${WRITER}-${i}.${NS}.svc.cluster.local"
+            ingest_addrs="${ingest_addrs:+$ingest_addrs,}${i}@${host}:9100"
+            event_addrs="${event_addrs:+$event_addrs,}${i}@${host}:9103"
+            i=$((i + 1))
+          done
+          # Shard 0's ClusterIP is the claim/KV/SSE/WAL endpoint for the
+          # single-shard topology.  Multi-shard claim addressing is per-pool and
+          # is set on the pool Deployments in ci/manifests, not here.
+          SHARD0="${WRITER}-0.${NS}.svc.cluster.local"
+
+          echo "  command ingest : $ingest_addrs"
+          echo "  event ingest   : $event_addrs"
+          echo "  claim/KV/SSE   : $SHARD0"
+          echo ""
+
+          # Renders a strategic-merge patch for one container's env.
+          # Strategic merge keys `env` on `name` and merges in place; a JSON
+          # merge patch would REPLACE the whole containers array and wipe every
+          # variable not named here.  That distinction is the reason this is
+          # `kubectl patch -p` (strategic by default for built-in kinds) and
+          # never `--type merge`.
+          # A strategic-merge patch on `containers` keys by NAME and merges in
+          # place — so a name that does not exist on the Deployment does not
+          # no-op.  It APPENDS a second container carrying only the env, and the
+          # API server rejects the whole object with
+          #   spec.template.spec.containers[0].image: Required value
+          # which aborts the converge with the earlier workloads already patched.
+          # Verified against kind on 2026-08-03 by patching container `worker`
+          # onto a Deployment whose container is `noetl-worker`.
+          #
+          # Prod names every worker container `noetl-worker`; the kind rig names
+          # the user pool's `worker`.  No single default is right for both, and
+          # guessing is what produced this class of defect, so the name is
+          # RESOLVED against the live Deployment: exact match wins; a
+          # single-container Deployment resolves to its only container with a
+          # loud note; anything ambiguous is a hard error naming what it found.
+          resolve_container() {
+            _ns="$1"; _deploy="$2"; _want="$3"
+            _names="$(kubectl --context "$CTX" -n "$_ns" get deployment "$_deploy" \
+              -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true)"
+            if [ -z "$_names" ]; then
+              # Absent Deployment — apply_patch reports the SKIP.
+              echo "$_want"; return 0
+            fi
+            case " $_names " in
+              *" $_want "*) echo "$_want"; return 0 ;;
+            esac
+            # shellcheck disable=SC2086
+            set -- $_names
+            if [ "$#" -eq 1 ]; then
+              echo "  NOTE $_deploy has no container '$_want'; resolved to its only container '$1'" >&2
+              echo "$1"; return 0
+            fi
+            echo "ERROR: Deployment/$_deploy has no container '$_want' (containers: $_names)." >&2
+            echo "       Pass the right *_container — a wrong name is rejected, not ignored." >&2
+            return 1
+          }
+
+          render_patch() {
+            container="$1"; shift
+            printf '{"spec":{"template":{"spec":{"containers":[{"name":"%s","env":[' "$container"
+            first=1
+            for kv in "$@"; do
+              name="${kv%%=*}"; value="${kv#*=}"
+              [ "$first" -eq 1 ] || printf ','
+              first=0
+              printf '{"name":"%s","value":"%s"}' "$name" "$value"
+            done
+            printf ']}]}}}}'
+          }
+
+          apply_patch() {
+            deploy="$1"; patch="$2"
+            if ! $K get deployment "$deploy" >/dev/null 2>&1; then
+              echo "  SKIP $deploy (not present)"
+              return 0
+            fi
+            if [ "$ACTION" = "plan" ]; then
+              echo "  PLAN $deploy"
+              echo "$patch" | python3 -m json.tool 2>/dev/null || echo "$patch"
+              $K patch deployment "$deploy" --dry-run=server -p "$patch" >/dev/null
+              return 0
+            fi
+            out="$($K patch deployment "$deploy" -p "$patch")"
+            echo "  $out"
+          }
+
+          # `kubectl set env VAR-` on an absent variable still issues a patch and
+          # can bump the pod template, so a converged cluster would roll on every
+          # run.  Check first; only strip what is actually there.
+          strip_env() {
+            deploy="$1"; container="$2"; shift 2
+            if ! $K get deployment "$deploy" >/dev/null 2>&1; then return 0; fi
+            present=""
+            existing="$($K get deployment "$deploy" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$container')].env[*].name}")"
+            for v in "$@"; do
+              case " $existing " in *" $v "*) present="$present $v-" ;; esac
+            done
+            if [ -z "$present" ]; then
+              echo "  clean $deploy (no NATS-era env)"
+              return 0
+            fi
+            if [ "$ACTION" = "plan" ]; then
+              echo "  PLAN strip from $deploy:$present"
+              return 0
+            fi
+            # shellcheck disable=SC2086
+            $K set env deployment/"$deploy" -c "$container" $present
+          }
+
+          echo "── server ──────────────────────────────────────────────────"
+          SRV_C="$(resolve_container "$NS" "{{ workload.server_deployment }}" "{{ workload.server_container }}")" || exit 1
+          apply_patch "{{ workload.server_deployment }}" "$(render_patch "$SRV_C" \
+            "NOETL_COMMAND_BUS=ehdb" \
+            "NOETL_EVENT_BUS=ehdb" \
+            "NOETL_COMMAND_SHARD_COUNT=${SHARDS}" \
+            "NOETL_COMMAND_BUS_INGEST_ADDRS=${ingest_addrs}" \
+            "NOETL_COMMAND_BUS_WRITER_ADDRS=${ingest_addrs}" \
+            "NOETL_EVENT_BUS_WRITER_ADDRS=${event_addrs}" \
+            "NOETL_EVENT_INGEST_PUBLISH_ONLY={{ workload.event_ingest_publish_only }}" \
+            "NOETL_STATE_BUILDER={{ workload.state_builder }}")"
+          strip_env "{{ workload.server_deployment }}" "$SRV_C" {{ workload.remove_env }}
+
+          echo "── user pool ───────────────────────────────────────────────"
+          USR_C="$(resolve_container "$NS" "{{ workload.user_pool_deployment }}" "{{ workload.user_pool_container }}")" || exit 1
+          apply_patch "{{ workload.user_pool_deployment }}" "$(render_patch "$USR_C" \
+            "NOETL_COMMAND_BUS=ehdb" \
+            "NOETL_COMMAND_BUS_HOST=false" \
+            "NOETL_COMMAND_SHARD_COUNT=${SHARDS}" \
+            "NOETL_COMMAND_BUS_CLAIM_ADDR=${SHARD0}:9101" \
+            "NOETL_FEED_FILTER_SUBJECT={{ workload.user_pool_subject }}")"
+          strip_env "{{ workload.user_pool_deployment }}" "$USR_C" {{ workload.remove_env }}
+
+          # Prod runs TWO system pools on the same `commands.system.>` subject.
+          # Reconciling only the first leaves half the materializer tier
+          # undeclared, so this walks the whole list; absent names are skipped.
+          #
+          # NOETL_STATE_BUILDER is set HERE as well as on the server: prod's
+          # system pools carry it (offserver) and it is what puts the real client
+          # on :9108.  Omitting it left the pool's builder mode entirely outside
+          # the IaC — invisible, and unrecoverable from this playbook.
+          for SP in {{ workload.system_pool_deployment }}; do
+            echo "── system pool: $SP ────────────────────────────────────────"
+            SYS_C="$(resolve_container "$NS" "$SP" "{{ workload.system_pool_container }}")" || exit 1
+            apply_patch "$SP" "$(render_patch "$SYS_C" \
+              "NOETL_COMMAND_BUS=ehdb" \
+              "NOETL_COMMAND_BUS_HOST=false" \
+              "NOETL_COMMAND_SHARD_COUNT=${SHARDS}" \
+              "NOETL_COMMAND_BUS_CLAIM_ADDR=${SHARD0}:9101" \
+              "NOETL_FEED_FILTER_SUBJECT={{ workload.system_pool_subject }}" \
+              "NOETL_EVENT_BUS_CLAIM_ADDR=${SHARD0}:9104" \
+              "NOETL_EVENT_BUS_WAL_ADDR=${SHARD0}:9108" \
+              "NOETL_MATERIALIZER_ENABLED=true" \
+              "NOETL_MATERIALIZER_SOURCE=ehdb" \
+              "NOETL_RESULT_MATERIALIZER_ENABLED=true" \
+              "NOETL_RESULT_MATERIALIZER_SOURCE=ehdb" \
+              "NOETL_STATE_SHARD_WRITE={{ workload.state_shard_write }}" \
+              "NOETL_STATE_MATERIALIZER_SOURCE=ehdb" \
+              "NOETL_STATE_BUILDER={{ workload.state_builder }}" \
+              "NOETL_STATE_BUILDER_SOURCE=ehdb" \
+              "NOETL_STATE_BUILDER_SHADOW={{ workload.state_builder_shadow }}")"
+            strip_env "$SP" "$SYS_C" {{ workload.remove_env }}
+          done
+
+          echo "── gateway ─────────────────────────────────────────────────"
+          GW="{{ workload.gateway_reconcile }}"
+          GWNS="{{ workload.gateway_namespace }}"
+          GWD="{{ workload.gateway_deployment }}"
+          if [ "$GW" = "false" ]; then
+            echo "  SKIP (gateway_reconcile=false)"
+          elif ! kubectl --context "$CTX" -n "$GWNS" get deployment "$GWD" >/dev/null 2>&1; then
+            if [ "$GW" = "true" ]; then
+              echo "ERROR: gateway_reconcile=true but Deployment/$GWD not found in $GWNS" >&2
+              exit 1
+            fi
+            # Loud, not silent: the gateway carries the SPA's only live-update
+            # path, and "not deployed here" must not read the same as "done".
+            echo "  ABSENT Deployment/$GWD in namespace $GWNS — gateway NOT reconciled."
+            echo "         The kind rig has no gateway; prod does.  Run with"
+            echo "         --set gateway_reconcile=true against a cluster that has one,"
+            echo "         and check gateway_namespace/gateway_deployment: prod is"
+            echo "         ns 'gateway' / Deployment 'gateway', not ns 'noetl' /"
+            echo "         'noetl-gateway'."
+          else
+            GW_C="$(resolve_container "$GWNS" "$GWD" "{{ workload.gateway_container }}")" || exit 1
+            gw_patch="$(render_patch "$GW_C" \
+              "NOETL_KV_ADDR=${SHARD0}:9107" \
+              "NOETL_EVENT_FEED_ADDR=${SHARD0}:9105")"
+            if [ "$ACTION" = "plan" ]; then
+              echo "  PLAN $GWD"
+              echo "$gw_patch" | python3 -m json.tool 2>/dev/null || echo "$gw_patch"
+            else
+              kubectl --context "$CTX" -n "$GWNS" patch deployment "$GWD" -p "$gw_patch"
+            fi
+            existing="$(kubectl --context "$CTX" -n "$GWNS" get deployment "$GWD" \
+              -o jsonpath="{.spec.template.spec.containers[?(@.name=='$GW_C')].env[*].name}")"
+            present=""
+            for v in {{ workload.remove_env_gateway }}; do
+              case " $existing " in *" $v "*) present="$present $v-" ;; esac
+            done
+            if [ -n "$present" ] && [ "$ACTION" != "plan" ]; then
+              # shellcheck disable=SC2086
+              kubectl --context "$CTX" -n "$GWNS" set env deployment/"$GWD" -c "$GW_C" $present
+            elif [ -n "$present" ]; then
+              echo "  PLAN strip from $GWD:$present"
+            else
+              echo "  clean $GWD (no NATS-era env)"
+            fi
+          fi
+    next:
+      arcs:
+        - step: status
+
+  - step: status
+    desc: Wait for rollouts and assert no NATS-era env survives
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|status) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          CTX="{{ workload.context }}"
+          NS="{{ workload.namespace }}"
+          K="kubectl --context $CTX -n $NS"
+          rc=0
+
+          # Same resolution rule as the reconcile step: assert against the
+          # container the Deployment actually has, or the assertion reads an
+          # empty env list and reports a healthy workload as broken.
+          resolve_container() {
+            _ns="$1"; _deploy="$2"; _want="$3"
+            _names="$(kubectl --context "$CTX" -n "$_ns" get deployment "$_deploy" \
+              -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true)"
+            if [ -z "$_names" ]; then echo "$_want"; return 0; fi
+            case " $_names " in
+              *" $_want "*) echo "$_want"; return 0 ;;
+            esac
+            # shellcheck disable=SC2086
+            set -- $_names
+            if [ "$#" -eq 1 ]; then echo "$1"; return 0; fi
+            echo "ERROR: Deployment/$_deploy has no container '$_want' (containers: $_names)." >&2
+            return 1
+          }
+
+          SYSTEM_POOLS="{{ workload.system_pool_deployment }}"
+
+          for d in "{{ workload.server_deployment }}" "{{ workload.user_pool_deployment }}" $SYSTEM_POOLS; do
+            $K get deployment "$d" >/dev/null 2>&1 || continue
+            $K rollout status deployment/"$d" --timeout={{ workload.rollout_timeout }}
+          done
+
+          echo ""
+          echo "── EHDB-only assertion ─────────────────────────────────────"
+          # The gate is the ABSENCE of the NATS-era variables plus the PRESENCE
+          # of the fail-loud sources.  Both matter: the cutover's two silent
+          # defects were a bus that looked configured and a materializer source
+          # that was not set at all.
+          PAIRS="{{ workload.server_deployment }}:{{ workload.server_container }} {{ workload.user_pool_deployment }}:{{ workload.user_pool_container }}"
+          for sp in $SYSTEM_POOLS; do
+            PAIRS="$PAIRS ${sp}:{{ workload.system_pool_container }}"
+          done
+          for pair in $PAIRS; do
+            d="${pair%%:*}"; c="${pair##*:}"
+            $K get deployment "$d" >/dev/null 2>&1 || continue
+            c="$(resolve_container "$NS" "$d" "$c")" || { rc=1; continue; }
+            env_names="$($K get deployment "$d" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$c')].env[*].name}")"
+            leftovers=""
+            for v in $env_names; do
+              case "$v" in NATS_*|NOETL_NATS_*) leftovers="$leftovers $v" ;; esac
+            done
+            bus="$($K get deployment "$d" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$c')].env[?(@.name=='NOETL_COMMAND_BUS')].value}")"
+            if [ "$bus" != "ehdb" ]; then
+              echo "  FAIL $d: NOETL_COMMAND_BUS='$bus' (want ehdb)"; rc=1
+            elif [ -n "$leftovers" ]; then
+              echo "  FAIL $d: NATS-era env still present:$leftovers"; rc=1
+            else
+              echo "  OK   $d: bus=ehdb, no NATS_* env"
+            fi
+          done
+
+          # Every system pool, not just the first — prod runs two, and a source
+          # missing on the second is exactly as silent as one missing on the
+          # first.  NOETL_STATE_BUILDER is asserted alongside the sources because
+          # it is what decides whether the :9108 client exists at all.
+          for d in $SYSTEM_POOLS; do
+            $K get deployment "$d" >/dev/null 2>&1 || continue
+            c="$(resolve_container "$NS" "$d" "{{ workload.system_pool_container }}")" || { rc=1; continue; }
+            for v in NOETL_MATERIALIZER_SOURCE NOETL_RESULT_MATERIALIZER_SOURCE \
+                     NOETL_STATE_MATERIALIZER_SOURCE NOETL_STATE_BUILDER_SOURCE; do
+              val="$($K get deployment "$d" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$c')].env[?(@.name=='$v')].value}")"
+              if [ "$val" = "ehdb" ]; then echo "  OK   $d: $v=ehdb"
+              else echo "  FAIL $d: $v='$val' (want ehdb — unset selects the deleted NATS transport, noetl/ai-meta#221)"; rc=1; fi
+            done
+            val="$($K get deployment "$d" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$c')].env[?(@.name=='NOETL_STATE_BUILDER')].value}")"
+            if [ "$val" = "{{ workload.state_builder }}" ]; then echo "  OK   $d: NOETL_STATE_BUILDER={{ workload.state_builder }}"
+            else echo "  FAIL $d: NOETL_STATE_BUILDER='$val' (want {{ workload.state_builder }})"; rc=1; fi
+          done
+
+          d="{{ workload.server_deployment }}"
+          if $K get deployment "$d" >/dev/null 2>&1; then
+            c="$(resolve_container "$NS" "$d" "{{ workload.server_container }}")" || rc=1
+            val="$($K get deployment "$d" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$c')].env[?(@.name=='NOETL_STATE_BUILDER')].value}")"
+            if [ "$val" = "{{ workload.state_builder }}" ]; then echo "  OK   $d: NOETL_STATE_BUILDER={{ workload.state_builder }}"
+            else echo "  FAIL $d: NOETL_STATE_BUILDER='$val' (want {{ workload.state_builder }} — converging the wrong value here turns a live subsystem off)"; rc=1; fi
+          fi
+
+          GWNS="{{ workload.gateway_namespace }}"; GWD="{{ workload.gateway_deployment }}"
+          if kubectl --context "$CTX" -n "$GWNS" get deployment "$GWD" >/dev/null 2>&1; then
+            kubectl --context "$CTX" -n "$GWNS" rollout status deployment/"$GWD" --timeout={{ workload.rollout_timeout }}
+            GW_C="$(resolve_container "$GWNS" "$GWD" "{{ workload.gateway_container }}")" || rc=1
+            for v in NOETL_KV_ADDR NOETL_EVENT_FEED_ADDR; do
+              val="$(kubectl --context "$CTX" -n "$GWNS" get deployment "$GWD" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$GW_C')].env[?(@.name=='$v')].value}")"
+              if [ -n "$val" ]; then echo "  OK   $GWD: $v=$val"
+              else echo "  FAIL $GWD: $v unset (gateway v3.7.1 exits at boot)"; rc=1; fi
+            done
+          elif [ "{{ workload.gateway_reconcile }}" = "true" ]; then
+            echo "  FAIL $GWD not found in namespace $GWNS but gateway_reconcile=true"; rc=1
+          else
+            echo "  n/a  $GWD not deployed in $GWNS"
+          fi
+
+          exit $rc
+    next:
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

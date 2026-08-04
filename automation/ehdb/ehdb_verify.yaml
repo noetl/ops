@@ -1,0 +1,424 @@
+# Functional proof that the EHDB-only platform actually works.
+# =============================================================================
+# ── THE GATE IS PAIRED EVIDENCE, NEVER AN EXECUTION COUNT ────────────────────
+# Every defect the NATS deletion produced failed *silently while executions
+# still completed*.  Two are worth restating, because they are why this file
+# does not simply count green runs:
+#
+#   - `should_publish` required a NATS connection.  Removing `NOETL_NATS_URL`
+#     made the gate false for every event, so the server quietly fell back to a
+#     synchronous insert.  Nothing errored, executions completed, the durable
+#     log was written — and the entire CQRS publish path was inert with the feed
+#     cursor flat.
+#   - The off-server state builder turned out to be an uninventoried fourth
+#     consumer of the events feed.  With NATS gone every orchestrate returned
+#     `WAL chain incomplete`, executions stalled at RUNNING, and no error
+#     appeared anywhere.
+#
+# A green execution count would have signed off on both.  So the verdict pairs
+# the counters against each other:
+#
+#   published == projected
+#     AND every materializer group's cursor advanced by that same delta,
+#         ending at lag 0
+#     AND ehdb_events_cursor_errors == 0
+#     AND ehdb_l0_out_of_order_appends == 0
+#     AND 0 publish errors, 0 duplicate execution ids
+#     AND every SSE subscriber saw frames
+#
+# `noetl_events_materialized_total` is NOT a substitute for
+# `noetl_events_projected_total` — it counts an `events/materialize` sink this
+# deployment does not use, and reads 0 forever.
+#
+# ── AN UNREADABLE METRIC IS A FAILURE, NOT A ZERO ────────────────────────────
+# Every read here can return the literal `NA`, and `NA` counts as *not drained*.
+# A blind poll that coerces unreadable to 0 "drains" instantly and passes; that
+# false pass has already been produced by this rig's own harness once.
+#
+# ── DO NOT CONNECT TO :9104, :9107 OR :9108 TO CHECK THEM ────────────────────
+# Those faces speak the ehdb-feed wire protocol (4-byte BE length + JSON), not
+# HTTP, and `ehdb_feed::serve` handshakes *inside* its accept loop — so a
+# connection that fails to complete the handshake escapes the whole function
+# and drops the listener.  The face is then dead for the life of the process,
+# with one ERROR line and nothing else (noetl/ehdb#311).
+#
+# It is not only a *malformed* frame that does this.  **A connect that sends
+# nothing and closes is enough** — `read_frame` returns `early eof` and takes
+# the same path.  This playbook's preflight was originally `nc -z` and it
+# killed :9108 on its first run against a freshly converged writer.  A
+# kubernetes `tcpSocket` probe would do the same, every period, forever.
+#
+# So liveness here is read from the pod's own listening sockets with
+# `netstat -ltn` and nothing is ever connected to.  :9108's real exercise is
+# the state-builder WAL drain; :9107's is the gateway.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ehdb_verify
+  path: automation/ehdb/ehdb-verify
+  description: Prove the EHDB-only platform works — paired evidence, not an execution count
+  labels:
+    noetl.io/command-bus: ehdb
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # converge | verify run the proof; anything else makes every step a no-op, so
+  # this playbook is safe at the end of a chain that also carries plan/teardown.
+  action: verify
+
+  context: kind-noetl
+  namespace: noetl
+
+  writer_name: noetl-cmdbus-writer
+  shard: "0"
+  server_service: noetl-server-rust
+
+  playbook_path: "fixtures/playbooks/hello_world"
+  playbook_version: "1"
+  executions: "20"
+  concurrency: "10"
+
+  # Materializer groups whose cursors must advance.
+  #
+  # All THREE are correct for prod, and the earlier note here — "prod runs only
+  # the first two, NOETL_STATE_BUILDER=server disables the state materializer
+  # (noetl/ai-meta#217)" — was wrong in both halves.  Measured on
+  # shastaratech-noetl-prod 2026-08-03: both system pools carry
+  # NOETL_STATE_SHARD_WRITE=true (that, not a `*_MATERIALIZER_ENABLED` var, is
+  # the state materializer's enable flag) and the writer's :9106 reports
+  # noetl_state_materializer live at cursor 4022, lag 0, alongside the other
+  # two.  Narrowing this list to two groups on prod would leave a LIVE group
+  # unverified; widening it on a cluster that really runs two makes the missing
+  # group read `NA`, which this rig counts as a FAILURE, never a zero.
+  #
+  # So: match the list to the cluster's actual NOETL_STATE_SHARD_WRITE, and let
+  # it fail loudly if they disagree.  Do not "fix" a failure here by trimming
+  # the list without first reading :9106.
+  groups: "noetl_materializer noetl_result_materializer noetl_state_materializer"
+
+  sse_subscribers: "3"
+  drain_timeout_secs: "240"
+
+  # Local ports for the port-forwards.  Change if they collide.
+  port_server: "18099"
+  port_cmd_lag: "19102"
+  port_evt_lag: "19106"
+  port_sse: "19105"
+
+workflow:
+  - step: preflight
+    desc: Every face must be listening before a single execution is fired
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -uo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime, and a
+          # verification step that skips itself half the time is worse than no
+          # verification at all.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|verify) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          CTX="{{ workload.context }}"; NS="{{ workload.namespace }}"
+          POD="{{ workload.writer_name }}-{{ workload.shard }}"
+          K="kubectl --context $CTX -n $NS"
+          rc=0
+          if ! $K get pod "$POD" >/dev/null 2>&1; then
+            echo "FAIL: writer pod $POD not present — run ehdb_platform.yaml --set action=converge first" >&2
+            exit 1
+          fi
+          # Face liveness is read from the pod's own listening sockets, NEVER by
+          # connecting.  `ehdb_feed::serve` handshakes inside its accept loop, so
+          # a connection that closes without sending a frame escapes the whole
+          # function and drops the listener — the face is then dead for the life
+          # of the process, silently (noetl/ehdb#311).  A bare `nc -z`, or a
+          # kubernetes `tcpSocket` probe, is exactly such a connection: this
+          # check used to be `nc -z` and it killed :9108 on its first run.
+          #
+          # `netstat -ltn` costs nothing and is authoritative — a face whose
+          # accept loop has died no longer appears.
+          listening="$($K exec "$POD" -- sh -c 'netstat -ltn 2>/dev/null' | awk '{print $4}')"
+          for pp in "9100 cmdbus-ingest" "9101 cmdbus-claim" "9102 cmdbus-lag" "9103 events-ingest" \
+                    "9104 events-claim" "9105 events-sse" "9106 events-lag" "9107 events-kv" "9108 events-wal"; do
+            set -- $pp
+            if printf '%s\n' "$listening" | grep -q ":$1\$"; then
+              echo "  OK   $1 $2"
+            else
+              echo "  DOWN $1 $2"; rc=1
+            fi
+          done
+          exit $rc
+    next:
+      arcs:
+        - step: probe
+
+  - step: probe
+    desc: Fire executions and read the paired evidence
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -uo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime, and a
+          # verification step that skips itself half the time is worse than no
+          # verification at all.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|verify) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          CTX="{{ workload.context }}"; NS="{{ workload.namespace }}"
+          WRITER="{{ workload.writer_name }}-{{ workload.shard }}"
+          N="{{ workload.executions }}"; CONC="{{ workload.concurrency }}"
+          SRV="{{ workload.port_server }}"; CMDP="{{ workload.port_cmd_lag }}"
+          EVTP="{{ workload.port_evt_lag }}"; SSEP="{{ workload.port_sse }}"
+          RUN="$(mktemp -d)"
+          k() { kubectl --context "$CTX" -n "$NS" "$@"; }
+
+          # Only the forwards are backgrounded here.  A bare `wait` would also
+          # wait on them and block forever — this rig has done exactly that.
+          #
+          # `kubectl` is invoked directly rather than through the k() helper: a
+          # backgrounded function makes `$!` the subshell's pid, so killing it
+          # leaves the real kubectl orphaned and the local port held for the next
+          # run.  That is how a previous run of this playbook found port 18099
+          # already taken, failed every execution, and reported the platform
+          # broken when it was fine.
+          FWD_PIDS=""
+          cleanup() {
+            for p in $FWD_PIDS; do
+              pkill -P "$p" 2>/dev/null
+              kill "$p" 2>/dev/null
+            done
+            rm -rf "$RUN"
+          }
+          trap cleanup EXIT
+
+          kubectl --context "$CTX" -n "$NS" port-forward "svc/{{ workload.server_service }}" "${SRV}:8082" >/dev/null 2>&1 &
+          FWD_PIDS="$FWD_PIDS $!"
+          for m in "${CMDP}:9102" "${EVTP}:9106" "${SSEP}:9105"; do
+            kubectl --context "$CTX" -n "$NS" port-forward "svc/${WRITER}" "$m" >/dev/null 2>&1 &
+            FWD_PIDS="$FWD_PIDS $!"
+          done
+
+          SRV_URL="http://127.0.0.1:${SRV}/metrics"
+          EVT_URL="http://127.0.0.1:${EVTP}/metrics"
+          CMD_URL="http://127.0.0.1:${CMDP}/metrics"
+
+          # Wait for every forward, and fail loudly if one never comes up.  A
+          # dead forward reads exactly like a dead platform — unreachable
+          # metrics and rejected executions — and this playbook must not report
+          # one as the other.
+          for u in "$SRV_URL" "$EVT_URL" "$CMD_URL"; do
+            i=0
+            until curl -sf --max-time 3 "$u" >/dev/null 2>&1; do
+              i=$((i + 1))
+              if [ "$i" -ge 20 ]; then
+                echo "FAIL: port-forward to $u never came up (is the local port already in use?)" >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          done
+
+          # Exact-match on the whole `name{labels}` token.  Matching the bare
+          # name against a labelled series returns NA, and an NA treated as a
+          # pass is precisely what this rig exists to catch.
+          metric() {
+            curl -s --max-time 10 "$1" 2>/dev/null \
+              | awk -v m="$2" '$1==m {print $2; found=1} END{if(!found) print "NA"}'
+          }
+          metric_sum() {
+            curl -s --max-time 10 "$1" 2>/dev/null \
+              | awk -v m="$2" 'index($1,m)==1 {s+=$NF; f=1} END{if(f) print s; else print "NA"}'
+          }
+          num() { case "$1" in ''|*[!0-9.-]*) echo "" ;; *) echo "$1" ;; esac; }
+
+          GROUPS_LIST="{{ workload.groups }}"
+
+          snap() { # snap <prefix-file>
+            f="$1"
+            {
+              echo "published $(metric_sum "$SRV_URL" 'noetl_ehdb_events_published_total')"
+              echo "publish_errors $(metric_sum "$SRV_URL" 'noetl_ehdb_events_publish_errors_total')"
+              echo "projected $(metric "$SRV_URL" 'noetl_events_projected_total')"
+              echo "cursor_errors $(metric "$EVT_URL" 'ehdb_events_cursor_errors')"
+              echo "out_of_order $(metric "$CMD_URL" 'ehdb_l0_out_of_order_appends')"
+              for g in $GROUPS_LIST; do
+                echo "committed_$g $(metric "$EVT_URL" "ehdb_events_group_committed{group=\"$g\"}")"
+                echo "lag_$g $(metric "$EVT_URL" "ehdb_events_group_lag{group=\"$g\"}")"
+              done
+            } > "$f"
+            cat "$f"
+          }
+          get() { awk -v k="$2" '$1==k {print $2}' "$1"; }
+
+          echo "── SSE subscribers (broadcast: each must see every frame) ──"
+          i=1
+          while [ "$i" -le "{{ workload.sse_subscribers }}" ]; do
+            ( curl -sN --max-time 600 "http://127.0.0.1:${SSEP}/feed" > "$RUN/sse-$i.raw" 2>/dev/null ) &
+            FWD_PIDS="$FWD_PIDS $!"
+            i=$((i + 1))
+          done
+          sleep 3
+
+          echo "── before ──────────────────────────────────────────────────"
+          snap "$RUN/before"
+
+          echo ""
+          echo "── firing $N executions (concurrency $CONC) ────────────────"
+          fire() {
+            r=$(curl -s --max-time 90 -X POST -H 'content-type: application/json' \
+                  -d "{\"path\":\"{{ workload.playbook_path }}\",\"version\":{{ workload.playbook_version }},\"input\":{}}" \
+                  "http://127.0.0.1:${SRV}/api/execute" 2>/dev/null)
+            case "$r" in
+              *execution_id*) echo "$r" | sed -n 's/.*"execution_id":"\([0-9]*\)".*/\1/p' >> "$RUN/ids" ;;
+              *)              echo "ERR:$r" >> "$RUN/ids" ;;
+            esac
+          }
+          : > "$RUN/ids"
+          fired=0
+          while [ "$fired" -lt "$N" ]; do
+            batch=0
+            pids=""
+            while [ "$batch" -lt "$CONC" ] && [ "$fired" -lt "$N" ]; do
+              fire & pids="$pids $!"
+              batch=$((batch + 1)); fired=$((fired + 1))
+            done
+            for p in $pids; do wait "$p" 2>/dev/null; done
+          done
+          ok_ids=$(grep -c '^[0-9]' "$RUN/ids" || true)
+          err_ids=$(grep -c '^ERR' "$RUN/ids" || true)
+          dup_ids=$(sort "$RUN/ids" | uniq -d | grep -c '^[0-9]' || true)
+          echo "accepted=$ok_ids errors=$err_ids duplicate_ids=$dup_ids"
+
+          echo ""
+          echo "── draining (lag 0 on every group AND the command shard) ────"
+          # Lag 0 means the bus drained, not that the playbooks finished — so the
+          # command-shard lag is polled alongside the event groups.
+          deadline=$(( $(date +%s) + {{ workload.drain_timeout_secs }} ))
+          unreadable=0
+          while :; do
+            total=0; bad=0
+            for g in $GROUPS_LIST; do
+              v="$(metric "$EVT_URL" "ehdb_events_group_lag{group=\"$g\"}")"
+              if [ "$(num "$v")" = "" ]; then bad=1; unreadable=$((unreadable + 1)); else total=$((total + ${v%%.*})); fi
+            done
+            sl="$(metric "$CMD_URL" "ehdb_feed_shard_lag{shard=\"{{ workload.shard }}\"}")"
+            if [ "$(num "$sl")" = "" ]; then bad=1; unreadable=$((unreadable + 1)); else total=$((total + ${sl%%.*})); fi
+            if [ "$bad" -eq 0 ] && [ "$total" -eq 0 ]; then echo "drained (lag 0)"; break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "TIMEOUT: still lag=$total unreadable_reads=$unreadable after {{ workload.drain_timeout_secs }}s"
+              break
+            fi
+            sleep 5
+          done
+          # The projector runs on its own interval; give it one before reading.
+          sleep 10
+
+          echo ""
+          echo "── after ───────────────────────────────────────────────────"
+          snap "$RUN/after"
+
+          echo ""
+          echo "── verdict ─────────────────────────────────────────────────"
+          rc=0
+          fail() { echo "  FAIL $*"; rc=1; }
+          pass() { echo "  OK   $*"; }
+
+          # A Prometheus counter that has never been incremented emits no series
+          # at all, so a BEFORE read of a fresh writer legitimately returns NA.
+          #
+          # This is the one place NA may be read as 0, and only for the *before*
+          # side of a delta.  It cannot manufacture a pass: substituting 0 only
+          # makes the delta larger, and an inert publish path reads NA on the
+          # AFTER side too — which stays a failure below.  Every gauge, and
+          # every after-read of these counters, keeps NA == failure.
+          zero_before() { case "$1" in NA|'') echo 0 ;; *) echo "$1" ;; esac; }
+
+          pub_b="$(zero_before "$(get "$RUN/before" published)")";  pub_a="$(get "$RUN/after" published)"
+          prj_b="$(zero_before "$(get "$RUN/before" projected)")";  prj_a="$(get "$RUN/after" projected)"
+          if [ "$(num "$pub_a")" = "" ]; then
+            fail "published unreadable after the run ($pub_b -> $pub_a) — the CQRS publish path is inert"
+          elif [ "$(num "$prj_a")" = "" ]; then
+            fail "projected unreadable after the run ($prj_b -> $prj_a) — the durable log did not materialize"
+          else
+            d_pub=$(( ${pub_a%%.*} - ${pub_b%%.*} ))
+            d_prj=$(( ${prj_a%%.*} - ${prj_b%%.*} ))
+            echo "  published +$d_pub   projected +$d_prj"
+            [ "$d_pub" -gt 0 ] || fail "published did not advance — nothing reached the events feed"
+            [ "$d_prj" -gt 0 ] || fail "projected did not advance — the durable log did not materialize"
+            if [ "$d_pub" -gt 0 ] && [ "$d_prj" -ne "$d_pub" ]; then
+              fail "published($d_pub) != projected($d_prj)"
+            elif [ "$d_pub" -gt 0 ]; then
+              pass "published == projected == $d_pub"
+            fi
+            for g in $GROUPS_LIST; do
+              cb="$(get "$RUN/before" "committed_$g")"; ca="$(get "$RUN/after" "committed_$g")"
+              lg="$(get "$RUN/after" "lag_$g")"
+              if [ "$(num "$cb")" = "" ] || [ "$(num "$ca")" = "" ]; then
+                fail "$g cursor unreadable ($cb -> $ca)"
+              else
+                d=$(( ${ca%%.*} - ${cb%%.*} ))
+                if [ "$d" -le 0 ]; then fail "$g cursor flat (+$d) — this group consumed nothing"
+                elif [ "$lg" != "0" ]; then fail "$g lag=$lg (want 0)"
+                else pass "$g cursor +$d, lag 0"; fi
+              fi
+            done
+          fi
+
+          # cursor_errors and out_of_order are emitted unconditionally by the
+          # writer, so NA there means the endpoint was unreadable — a failure,
+          # never a zero.
+          for m in cursor_errors out_of_order; do
+            v="$(get "$RUN/after" "$m")"
+            case "$v" in
+              0|0.0) pass "$m == 0" ;;
+              NA|'') fail "$m unreadable — the writer's metrics endpoint did not answer" ;;
+              *)     fail "$m == $v (want 0)" ;;
+            esac
+          done
+          # publish_errors is a counter: absent means it was never incremented,
+          # which is the healthy state.  Reading it as 0 here is safe precisely
+          # because the published/projected equality above already proves the
+          # publish path ran — an endpoint that answered nothing at all would
+          # have failed there first.
+          v="$(get "$RUN/after" publish_errors)"
+          case "$v" in
+            0|0.0|NA|'') pass "publish_errors == 0" ;;
+            *)           fail "publish_errors == $v (want 0)" ;;
+          esac
+
+          [ "$err_ids" -eq 0 ] || fail "$err_ids execution requests rejected"
+          [ "$dup_ids" -eq 0 ] || fail "$dup_ids duplicate execution ids"
+          [ "$ok_ids" -eq "$N" ] || fail "accepted $ok_ids of $N executions"
+
+          # SSE is a broadcast, not a queue: one subscriber cannot tell fan-out
+          # from competing consumers, so every subscriber is checked.
+          i=1; sse_ok=1
+          while [ "$i" -le "{{ workload.sse_subscribers }}" ]; do
+            # `grep -c` already prints 0 on no match; an `|| echo 0` fallback
+            # appends a SECOND line when the file is missing, and the two-line
+            # value then breaks every numeric test downstream.
+            frames=0
+            [ -f "$RUN/sse-$i.raw" ] && frames=$(grep -c '^data:' "$RUN/sse-$i.raw" 2>/dev/null)
+            frames=${frames:-0}
+            echo "  sse-$i frames=$frames"
+            [ "$frames" -gt 0 ] || sse_ok=0
+            i=$((i + 1))
+          done
+          if [ "$sse_ok" -eq 1 ]; then pass "every SSE subscriber received frames"
+          else fail "an SSE subscriber received nothing — the :9105 broadcast face is not fanning out"; fi
+
+          echo ""
+          if [ "$rc" -eq 0 ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
+          exit $rc
+    next:
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
