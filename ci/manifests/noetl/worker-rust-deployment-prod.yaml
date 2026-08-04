@@ -101,6 +101,30 @@ spec:
             # server keeps its own Service).
             - name: NOETL_SERVER_URL
               value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+            # Bearer for /api/internal/* (noetl/ai-meta#199 Slice A).
+            #
+            # Sink steps are author-declared (`sink: true`) on ORDINARY playbook
+            # steps, so they run on this pool — which therefore now posts
+            # /api/internal/sink-state/{mark,confirm} to tell the server's
+            # Feather result-tier GC which executions still hold un-sunk business
+            # context.  Before Slice A this pool had no reason to call
+            # /api/internal/* and correctly carried no token.
+            #
+            # Without this the server answers **403 Forbidden** and the worker
+            # swallows it by design — `post_sink_state` must never fail a
+            # connector step that has already written to the customer's store —
+            # so the gate is silently starved and `noetl.sink_pending` stays
+            # empty for ever.  Observed exactly that way in kind before the
+            # token was added.
+            #
+            # Same Secret the system pool already uses; adding the env is the
+            # whole change.  Inert on its own: the gate stays off until
+            # NOETL_RESULT_TIER_GC_SINK_GATE is set on the server.
+            - name: NOETL_INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: noetl-internal-api-token
+                  key: token
             - name: WORKER_HEARTBEAT_INTERVAL
               value: "15"
             - name: WORKER_MAX_CONCURRENT
