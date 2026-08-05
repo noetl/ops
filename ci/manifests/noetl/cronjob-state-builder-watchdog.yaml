@@ -15,7 +15,7 @@
 #
 # Image: `alpine/k8s` (kubectl + sh + curl — public, no build needed).
 # The script is the deployable twin of playbooks/system/state_builder_watchdog.yaml
-# (the NoETL-playbook form, runnable via `noetl exec --runtime local` once a
+# (the NoETL-playbook form, runnable via `noetl run --runtime local` once a
 # noetl-cli+kubectl image is published).  Source of truth for the bash:
 # state-builder-watchdog.sh — the ConfigMap is generated from it:
 #   kubectl create configmap noetl-state-builder-watchdog-script \
