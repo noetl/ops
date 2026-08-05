@@ -164,3 +164,62 @@ spec:
             description: >-
               A group cursor failed to persist, so consumer progress is not
               durable. Expected value is 0 at all times.
+
+        # ── Silent-loss signals added 2026-08-05 ────────────────────────────
+        #
+        # Each of these three conditions existed ONLY as a log line until the
+        # PRs below.  They sit on the dispatch path and the durable log, they
+        # produce no other symptom, and a log line on an unscraped workload is
+        # not a signal.  They are grouped here rather than spread across files
+        # because an operator triaging "did we lose work?" wants them together.
+        #
+        # NOTE all three live on noetl-server / noetl-worker, which are NOT
+        # scraped until podmonitoring-noetl.yaml is applied — see the runbook.
+
+        # A command notification the server gave up publishing is a dispatch
+        # that is never claimed: the execution stops with no terminal event to
+        # notice it.  noetl/ai-meta#208 was exactly this and ran unnoticed in
+        # production for ~2.4 days.  Any occurrence is worth waking on.
+        - alert: EhdbCommandPublishGaveUp
+          expr: increase(noetl_ehdb_command_publish_failed_total{reason="gave_up"}[10m]) > 0
+          for: 0m
+          labels: { severity: critical, component: ehdb-cmdbus }
+          annotations:
+            summary: "Server gave up publishing {{ $value }} command(s) in 10m"
+            description: >-
+              The publish retry window was exhausted, so the command was never
+              placed on the bus and no worker will claim it. The execution stalls
+              with no terminal event. Expected value is 0. Compare against
+              reason="attempt", which spikes harmlessly during a writer restart —
+              a restart shows attempts recovering, this does not.
+              Added by noetl/server#309.
+
+        # An event abandoned after every retry never reached the durable log.
+        # Replay reconstructs from that log, so what is missing was never there.
+        - alert: WorkerEventEmissionAbandoned
+          expr: increase(noetl_worker_event_emit_failed_total[10m]) > 0
+          for: 0m
+          labels: { severity: critical, component: worker }
+          annotations:
+            summary: "Worker abandoned {{ $value }} event emission(s) in 10m"
+            description: >-
+              Distinct from noetl_worker_event_emit_retries_total, which rising
+              only means a flaky control plane with eventual success. This means
+              the event is GONE: the execution's history has a hole from that
+              point and no later read can tell. Expected value is 0.
+              Added by noetl/worker#230.
+
+        # Boot-time misconfiguration that silently stops the durable log.
+        - alert: EhdbEventPublisherUnconfigured
+          expr: noetl_ehdb_event_publisher_configured == 0
+          for: 5m
+          labels: { severity: critical, component: ehdb-events }
+          annotations:
+            summary: "EHDB events publisher has no writer routes"
+            description: >-
+              NOETL_EVENT_BUS selects EHDB but NOETL_EVENT_BUS_WRITER_ADDRS
+              resolved to no routes, so every event publish is skipped. Post-T5
+              the events feed is the sole writer of noetl.event, so the log stops
+              growing while the API keeps answering — a cluster in this state is
+              indistinguishable from an idle one. Fix the env var and roll.
+              Added by noetl/server#313.
