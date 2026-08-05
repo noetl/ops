@@ -1,0 +1,146 @@
+# State-builder wedge alerting — the recurring login-outage guardrail
+# (noetl/ai-meta#163; root cause memory 161-nats-bounce-systempool-statebuilder-wedge).
+#
+# A NATS server bounce orphans the system-pool worker's state_builder
+# JetStream consumer.  Before noetl/worker v5.48.1 the drain looped a
+# `503 "no responders"` storm against the dead consumer forever, the WAL
+# index froze, `__orchestrate__` computed `commands=0`, and EVERY
+# off-server drive (auth login + planner) wedged until a manual
+# `rollout restart deploy/noetl-worker-system-pool`.  The pod's tcpSocket
+# liveness probe stayed green the whole time, so nothing alerted.
+#
+# v5.48.1 makes the worker self-heal (recreate the consumer on a sustained
+# dead signal) and exposes the wedge directly:
+#   - noetl_worker_state_builder_healthy        gauge  1 serving / 0 wedged
+#   - noetl_worker_state_builder_consumer_recreate_total{reason}  counter
+#       reason=drain_dead    — self-heal fired (consumer was orphaned)
+#       reason=connect_error — a (re)connect attempt failed
+# These rules page on the wedge the old outage had no signal for.
+#
+# Signals (cheapest, earliest first):
+#   1. Healthy gauge == 0 — the drain has been unable to serve past its
+#      unhealthy window (NOETL_STATE_BUILDER_UNHEALTHY_SECS, default 45s);
+#      the /livez backstop is failing and the in-process self-heal has not
+#      recovered.  This is the direct successor signal to the #161 outage.
+#   2. Recreate storm — the consumer keeps dying + being recreated
+#      (drain_dead rate sustained); self-heal is firing repeatedly, which
+#      means NATS / JetStream is unstable.  Healthy-but-noisy → investigate.
+#   3. Connect-error storm — sustained inability to (re)connect to NATS.
+#   4. Absent — the system-pool worker isn't scraped at all (pod gone /
+#      metrics down): the healthy/recreate series vanish, so the gauge
+#      alerts can't fire — this is the absent-metric backstop.
+#
+# Scrape path: the system-pool worker exposes /metrics on :9090 with
+# prometheus.io/scrape annotations (worker-system-pool-deployment.yaml);
+# PodMonitoring selects app=noetl-worker-system-pool.  VMAlert selects this
+# VMRule (vmstack-values.yaml vmalert.spec.selectAllByDefault: true).
+#
+# Requires noetl/worker >= v5.48.1 for the series to exist.  Mirror of the
+# GMP-native rule gmp/rules-state-builder-wedge.yaml — keep the two in
+# lockstep when either changes.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: noetl-state-builder-wedge
+  namespace: noetl
+  labels:
+    app: noetl
+    component: state-builder
+    # The recurring-outage guardrail for noetl/ai-meta#163.
+    noetl.io/outage-guardrail: state-builder-wedge
+spec:
+  groups:
+    - name: noetl-state-builder-wedge
+      interval: 15s
+      rules:
+        # CRITICAL / page — the off-server drive is wedged.  The drain has
+        # reported unhealthy (gauge 0) for 2m: the self-heal recreate has
+        # not recovered AND the /livez liveness restart has not cleared it
+        # (NATS down, or a deeper fault).  This is exactly the #161 login
+        # outage condition — every off-server drive (auth + planner) is
+        # computing commands=0.  Remediation (rollout restart) is automated
+        # by the system/state_builder_watchdog CronJob, but a sustained
+        # firing means the watchdog's attempts are not clearing it either.
+        - alert: StateBuilderWedged
+          expr: max(noetl_worker_state_builder_healthy) == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: state-builder
+            noetl_io_outage_guardrail: state-builder-wedge
+          annotations:
+            summary: "Off-server state-builder WEDGED — drives stalled (commands=0)"
+            description: >-
+              noetl_worker_state_builder_healthy has been 0 for 2m on the
+              system pool: the off-server WAL drain cannot serve, so
+              __orchestrate__ computes commands=0 and every off-server drive
+              (auth login + planner) is wedged. The in-process self-heal
+              (consumer recreate) and the /livez liveness restart have not
+              recovered it. Check NATS (the noetl_events consumer) and the
+              system-pool worker. The system/state_builder_watchdog CronJob
+              auto-rollout-restarts the pool, but a sustained firing means
+              that has not helped — escalate.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-state-builder-wedge.md#statebuilderwedged"
+
+        # WARNING — the consumer keeps dying and being recreated.  Self-heal
+        # is working (this is the success path, not a stall) but a sustained
+        # recreate rate means NATS/JetStream is flapping; worth a look before
+        # it escalates to a wedge.
+        - alert: StateBuilderConsumerRecreateStorm
+          expr: sum(rate(noetl_worker_state_builder_consumer_recreate_total{reason="drain_dead"}[5m])) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            component: state-builder
+            noetl_io_outage_guardrail: state-builder-wedge
+          annotations:
+            summary: "State-builder consumer recreating repeatedly ({{ $value | printf \"%.3f\" }}/s)"
+            description: >-
+              noetl_worker_state_builder_consumer_recreate_total{reason=drain_dead}
+              has been climbing for 10m: the state-builder's JetStream
+              consumer keeps getting orphaned and self-healed. The drive is
+              recovering each time (good), but NATS / JetStream is unstable —
+              investigate the NATS server (restarts, JetStream health) before
+              a recreate fails to recover and the wedge alert fires.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-state-builder-wedge.md#statebuilderconsumerrecreatestorm"
+
+        # WARNING — sustained inability to (re)connect to NATS.  The drain is
+        # in connect_with_backoff and not serving; if it persists past the
+        # unhealthy window the wedge alert fires.
+        - alert: StateBuilderConnectErrors
+          expr: sum(rate(noetl_worker_state_builder_consumer_recreate_total{reason="connect_error"}[5m])) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+            component: state-builder
+            noetl_io_outage_guardrail: state-builder-wedge
+          annotations:
+            summary: "State-builder cannot reconnect to NATS ({{ $value | printf \"%.3f\" }}/s connect errors)"
+            description: >-
+              noetl_worker_state_builder_consumer_recreate_total{reason=connect_error}
+              is climbing for 10m: the state-builder drain cannot reconnect to
+              NATS / recreate its consumer. It retries with backoff and the
+              /livez backstop will restart the pod if it stays down past
+              NOETL_STATE_BUILDER_UNHEALTHY_SECS. Check NATS reachability and
+              credentials from the system pool.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-state-builder-wedge.md#statebuilderconnecterrors"
+
+        # CRITICAL / page — the absent-metric backstop.  If the system-pool
+        # worker is not scraped at all the healthy gauge vanishes and the
+        # wedge alert (== 0) cannot fire.  Page on the gauge being absent.
+        - alert: StateBuilderAbsent
+          expr: absent(noetl_worker_state_builder_healthy)
+          for: 5m
+          labels:
+            severity: critical
+            component: state-builder
+            noetl_io_outage_guardrail: state-builder-wedge
+          annotations:
+            summary: "State-builder metrics ABSENT — system-pool worker not scraped"
+            description: >-
+              noetl_worker_state_builder_healthy is absent for 5m: the
+              system-pool worker is not running or its /metrics endpoint is
+              down, so the wedge alert cannot evaluate. The off-server drive
+              has no host. Restore the system pool
+              (noetl-worker-system-pool) and confirm /metrics on :9090.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-state-builder-wedge.md#statebuilderabsent"

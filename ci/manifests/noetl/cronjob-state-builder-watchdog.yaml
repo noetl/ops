@@ -1,0 +1,89 @@
+# Self-healing watchdog for the off-server state-builder wedge
+# (noetl/ai-meta#163).  Runs system/state_builder_watchdog's logic every 3
+# minutes as the EXTERNAL third layer of defense behind:
+#   1. in-process self-heal (worker recreates the consumer; v5.48.1), and
+#   2. the /livez liveness probe (k8s restarts a pod whose self-heal
+#      can't recover).
+# This CronJob restarts the pool only when 1+2 have NOT cleared a
+# sustained wedge — bounded by cooldown + flap-stop guards.
+#
+# CHICKEN-AND-EGG: the watchdog must NOT dispatch through the server
+# orchestrate drive (that drive is the thing wedged — a distributed
+# playbook would compute commands=0 and wedge too).  So it runs as a
+# standalone shell script straight against the kube-apiserver + the worker
+# /metrics endpoint.  Never touches /api/execute.
+#
+# Image: `alpine/k8s` (kubectl + sh + curl — public, no build needed).
+# The script is the deployable twin of playbooks/system/state_builder_watchdog.yaml
+# (the NoETL-playbook form, runnable via `noetl exec --runtime local` once a
+# noetl-cli+kubectl image is published).  Source of truth for the bash:
+# state-builder-watchdog.sh — the ConfigMap is generated from it:
+#   kubectl create configmap noetl-state-builder-watchdog-script \
+#     --from-file=watchdog.sh=ci/manifests/noetl/state-builder-watchdog.sh \
+#     -n noetl --dry-run=client -o yaml | kubectl apply -f -
+#
+# RBAC: serviceaccount-state-builder-watchdog.yaml grants get/patch on
+# deployments (rollout restart + annotation state) and get/list on pods.
+# Restart-only; no delete, no scale, no data access.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: noetl-state-builder-watchdog
+  namespace: noetl
+  labels:
+    app: noetl-state-builder-watchdog
+    component: system-cron
+    noetl.io/outage-guardrail: state-builder-wedge
+spec:
+  schedule: "*/3 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0          # a missed tick is fine; the next tick re-checks
+      activeDeadlineSeconds: 180
+      template:
+        metadata:
+          labels:
+            app: noetl-state-builder-watchdog
+        spec:
+          restartPolicy: Never
+          serviceAccountName: noetl-state-builder-watchdog
+          containers:
+            - name: watchdog
+              image: docker.io/alpine/k8s:1.31.0
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/watchdog.sh"]
+              env:
+                - { name: NS, value: "noetl" }
+                - { name: DEPLOY, value: "noetl-worker-system-pool" }
+                - { name: METRICS_URL, value: "http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090/metrics" }
+                - { name: LIVEZ_URL, value: "http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090/livez" }
+                - { name: SAMPLES, value: "3" }
+                - { name: SAMPLE_INTERVAL_SECONDS, value: "2" }
+                - { name: COOLDOWN_SECONDS, value: "600" }
+                - { name: FLAP_WINDOW_SECONDS, value: "3600" }
+                - { name: MAX_ATTEMPTS, value: "3" }
+                - { name: FORCE_UNHEALTHY, value: "false" }
+                - { name: DRY_RUN, value: "false" }
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: "10m"
+                  memory: "48Mi"
+                limits:
+                  cpu: "200m"
+                  memory: "128Mi"
+          volumes:
+            - name: script
+              configMap:
+                name: noetl-state-builder-watchdog-script
+                items:
+                  - key: watchdog.sh
+                    path: watchdog.sh

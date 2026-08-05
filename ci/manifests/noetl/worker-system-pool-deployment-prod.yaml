@@ -220,8 +220,20 @@ spec:
               # steady for index growth under load, plus the 320Mi /dev/shm
               # tmpfs (Arrow IPC cache) which is also charged to this cgroup.
               memory: "2Gi"
+          # noetl/ai-meta#163: liveness now hits /livez (was tcpSocket:9090).
+          # The metrics server stays bound on :9090 while the off-server
+          # state_builder is wedged (a NATS bounce orphaned its consumer), so
+          # the old tcpSocket probe stayed green through a ~22h login outage and
+          # k8s never restarted the pod.  /livez fails once the drain has been
+          # unable to serve for NOETL_STATE_BUILDER_UNHEALTHY_SECS (default
+          # 45s) — longer than the in-process self-heal's rebuild window, so a
+          # transient consumer loss recovers without a restart, but a wedge the
+          # self-heal can't clear trips a restart backstop here
+          # (~45s + periodSeconds*failureThreshold = ~135s).  Readiness stays
+          # tcpSocket: restart — not de-routing — is the wedge remedy.
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /livez
               port: 9090
             initialDelaySeconds: 20
             periodSeconds: 15

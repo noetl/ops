@@ -213,6 +213,19 @@ spec:
               cpu: "1"
               # 320Mi (/dev/shm tmpfs, charged to the cgroup) + worker RSS.
               memory: "768Mi"
+          # noetl/ai-meta#163: /livez fails when the off-server state_builder
+          # drain has been wedged > NOETL_STATE_BUILDER_UNHEALTHY_SECS (45s),
+          # so k8s restarts a pod whose in-process self-heal can't recover.
+          # Harmless in the default kind `server` mode (the drain isn't
+          # spawned → the health gauge defaults to 1 → /livez always 200);
+          # meaningful when the kind rig flips NOETL_STATE_BUILDER=offserver.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 9090
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 6
       volumes:
         - name: dshm
           emptyDir:

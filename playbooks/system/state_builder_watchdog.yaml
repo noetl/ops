@@ -1,0 +1,199 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: state_builder_watchdog
+  path: system/state_builder_watchdog
+  description: |
+    Bounded self-healing watchdog for the off-server state-builder wedge
+    (noetl/ai-meta#163; recurring Muno login outage).
+
+    A NATS bounce can orphan the system-pool worker's state_builder
+    JetStream consumer.  noetl/worker >= v5.48.1 self-heals in-process and
+    a /livez liveness probe restarts a pod whose self-heal can't recover.
+    This watchdog is the THIRD, external layer: it independently detects a
+    sustained wedge and, when the in-process heal + liveness restart have
+    NOT cleared it, issues a bounded `kubectl rollout restart` of the
+    system pool — the exact manual action that resolved the #161 outage,
+    now automated and rate-limited.
+
+    SAFETY — this playbook ONLY restarts (rollout restart).  It never
+    deletes data, never scales to zero, never touches result_store / OQ5 /
+    IAM / secrets / the tail-attach flag.  It is bounded three ways:
+      * sustained-detection gate — must read state_builder_healthy==0 (or
+        /livez 503) on every one of `samples` probes before acting;
+      * cooldown — at most one remediation per `cooldown_seconds`
+        (default 10m), tracked via the deployment annotation
+        noetl.io/watchdog-last-remediation;
+      * flap-stop — at most `max_attempts` remediations per
+        `flap_window_seconds` (default 3 per hour); beyond that it STOPS
+        and alerts (loud no-op) instead of restarting, so a deeper fault
+        (NATS down) doesn't cause restart thrash.
+
+    CHICKEN-AND-EGG: when the drive is wedged, a distributed playbook would
+    itself wedge (its own __orchestrate__ would compute commands=0).  So
+    this playbook uses ONLY the `shell` tool and runs in LOCAL runtime
+    (`noetl exec --runtime local`) inside its own CronJob pod — it never
+    depends on the server orchestrate drive it is repairing.
+
+    Deployed by cronjob-state-builder-watchdog.yaml every few minutes.
+    Audit trail = the CronJob pod logs + the deployment annotations it
+    writes (append-only event emission is optional, see emit_audit_event).
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # Target.
+  namespace: noetl
+  deployment: noetl-worker-system-pool
+  # In-cluster the headless metrics Service resolves to the (replicas=1)
+  # system pod.  For local kind validation, pass a port-forwarded URL
+  # (e.g. http://localhost:9099/metrics) via --set.
+  metrics_url: "http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090/metrics"
+  livez_url: "http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090/livez"
+  # kubectl context.  Empty = in-cluster default SA (the CronJob case).
+  # Local validation passes --set kube_context=kind-noetl.
+  kube_context: ""
+  # Detection: require a wedged reading on every probe (sustained).
+  samples: "3"
+  sample_interval_seconds: "2"
+  # Bounds.
+  cooldown_seconds: "600"        # at most 1 remediation / 10m
+  flap_window_seconds: "3600"    # window for the flap counter
+  max_attempts: "3"              # stop + alert after this many in the window
+  # Test affordances (defaults are the production no-op values).
+  force_unhealthy: "false"       # bypass detection (kind validation only)
+  dry_run: "false"               # log the decision, take no kubectl action
+
+workflow:
+  - step: start
+    desc: >-
+      Detect a sustained state-builder wedge and, if bounds allow, issue a
+      rate-limited rollout restart of the system pool.  Shell-only so it
+      runs in local runtime, independent of the wedged orchestrate drive.
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -uo pipefail
+
+          NS='{{ workload.namespace }}'
+          DEPLOY='{{ workload.deployment }}'
+          METRICS_URL='{{ workload.metrics_url }}'
+          LIVEZ_URL='{{ workload.livez_url }}'
+          KCTX='{{ workload.kube_context }}'
+          SAMPLES='{{ workload.samples }}'
+          INTERVAL='{{ workload.sample_interval_seconds }}'
+          COOLDOWN='{{ workload.cooldown_seconds }}'
+          FLAP_WINDOW='{{ workload.flap_window_seconds }}'
+          MAX_ATTEMPTS='{{ workload.max_attempts }}'
+          FORCE_UNHEALTHY='{{ workload.force_unhealthy }}'
+          DRY_RUN='{{ workload.dry_run }}'
+
+          # kubectl with optional context (in-cluster: no --context).
+          KC="kubectl -n $NS"
+          if [ -n "$KCTX" ]; then KC="kubectl --context $KCTX -n $NS"; fi
+
+          NOW=$(date +%s)
+          log() { echo "[watchdog $(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
+
+          log "state-builder watchdog: deploy=$DEPLOY samples=$SAMPLES cooldown=${COOLDOWN}s max_attempts=$MAX_ATTEMPTS force=$FORCE_UNHEALTHY dry_run=$DRY_RUN"
+
+          # -------- 1. DETECT (sustained) --------
+          WEDGED=true
+          if [ "$FORCE_UNHEALTHY" = "true" ]; then
+            log "FORCE_UNHEALTHY=true — bypassing detection (test affordance)"
+          else
+            for i in $(seq 1 "$SAMPLES"); do
+              HEALTHY=$(curl -fsS --max-time 5 "$METRICS_URL" 2>/dev/null \
+                         | awk '/^noetl_worker_state_builder_healthy /{print $2}')
+              LIVEZ=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 "$LIVEZ_URL" 2>/dev/null)
+              log "probe $i/$SAMPLES: state_builder_healthy='${HEALTHY:-<absent>}' livez=$LIVEZ"
+              # Conservative: only treat as wedged on a DEFINITIVE readable
+              # healthy==0 (or /livez 503).  A curl failure / absent metric is
+              # NOT remediated here — that is the StateBuilderAbsent alert's
+              # job (paging a human), so the watchdog never restarts blind.
+              if [ "$HEALTHY" = "1" ] || [ "$LIVEZ" = "200" ]; then
+                WEDGED=false; break
+              fi
+              if [ -z "$HEALTHY" ] && [ "$LIVEZ" != "503" ]; then
+                # metrics unreachable / inconclusive — do not act.
+                log "metrics inconclusive (healthy absent, livez=$LIVEZ) — treating as NOT-wedged (StateBuilderAbsent alert covers this)"
+                WEDGED=false; break
+              fi
+              [ "$i" -lt "$SAMPLES" ] && sleep "$INTERVAL"
+            done
+          fi
+
+          if [ "$WEDGED" != "true" ]; then
+            log "DECISION: HEALTHY — no remediation needed."
+            exit 0
+          fi
+          log "DETECTED: state-builder WEDGED (healthy=0 sustained over $SAMPLES probes)."
+
+          # -------- 2. COOLDOWN guard --------
+          LAST=$($KC get deploy "$DEPLOY" -o jsonpath='{.metadata.annotations.noetl\.io/watchdog-last-remediation}' 2>/dev/null)
+          LAST=${LAST:-0}
+          if [ "$LAST" -gt 0 ] 2>/dev/null; then
+            AGO=$((NOW - LAST))
+            if [ "$AGO" -lt "$COOLDOWN" ]; then
+              log "DECISION: COOLDOWN — last remediation ${AGO}s ago < ${COOLDOWN}s; skipping (no restart)."
+              exit 0
+            fi
+          fi
+
+          # -------- 3. FLAP-STOP guard --------
+          # noetl.io/watchdog-remediations = comma-separated epoch list; prune
+          # to the flap window and count.  >= max_attempts => STOP + ALERT.
+          RAW=$($KC get deploy "$DEPLOY" -o jsonpath='{.metadata.annotations.noetl\.io/watchdog-remediations}' 2>/dev/null)
+          PRUNED=""
+          COUNT=0
+          OLDIFS="$IFS"; IFS=','
+          for ts in $RAW; do
+            case "$ts" in ''|*[!0-9]*) continue ;; esac
+            if [ $((NOW - ts)) -lt "$FLAP_WINDOW" ]; then
+              PRUNED="${PRUNED:+$PRUNED,}$ts"; COUNT=$((COUNT + 1))
+            fi
+          done
+          IFS="$OLDIFS"
+          log "flap window: ${COUNT} remediation(s) in last ${FLAP_WINDOW}s (max ${MAX_ATTEMPTS})"
+          if [ "$COUNT" -ge "$MAX_ATTEMPTS" ]; then
+            log "DECISION: FLAP-STOP — ${COUNT} remediations >= max ${MAX_ATTEMPTS} in window; NOT restarting."
+            log "ALERT: state-builder wedge is NOT clearing after ${COUNT} rollout restarts — a rollout restart is not fixing it (NATS down / deeper fault). ESCALATE (see StateBuilderWedged alert)."
+            $KC annotate deploy "$DEPLOY" "noetl.io/watchdog-flap-stopped-at=$NOW" --overwrite >/dev/null 2>&1 || true
+            exit 0
+          fi
+
+          # -------- 4. REMEDIATE (restart only) --------
+          REASON="state_builder wedged: healthy=0 sustained over ${SAMPLES} probes"
+          if [ "$DRY_RUN" = "true" ]; then
+            log "DRY_RUN: would 'rollout restart deploy/$DEPLOY' now (reason: $REASON). No action taken."
+            exit 0
+          fi
+          log "REMEDIATE: kubectl rollout restart deploy/$DEPLOY (reason: $REASON)"
+          if ! $KC rollout restart "deployment/$DEPLOY"; then
+            log "ERROR: rollout restart command failed — leaving state for the next tick / human."
+            exit 1
+          fi
+          NEW_LIST="${PRUNED:+$PRUNED,}$NOW"
+          $KC annotate deploy "$DEPLOY" \
+            "noetl.io/watchdog-last-remediation=$NOW" \
+            "noetl.io/watchdog-remediations=$NEW_LIST" \
+            "noetl.io/watchdog-last-reason=$REASON" --overwrite >/dev/null 2>&1 || true
+          # Wait (bounded) for the new pod; non-fatal if it lags.
+          $KC rollout status "deployment/$DEPLOY" --timeout=120s || \
+            log "WARN: rollout status did not converge in 120s — next tick will re-check."
+          log "REMEDIATED: rollout restart issued at $NOW. attempts-in-window now $((COUNT + 1)). AUDIT: $REASON"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: done
+
+  - step: done
+    desc: Terminal — the shell step has already logged its decision + audit line.
+    tool:
+      kind: shell
+      cmds:
+        - "echo '[watchdog] tick complete'"
