@@ -117,7 +117,7 @@ kubectl --context kind-noetl -n postgres exec "$POSTGRES_POD" -- \
 echo
 echo "==> Sampling /metrics from the Rust worker"
 WORKER_POD=$(kubectl --context kind-noetl -n noetl get pod -l app=noetl-worker-rust -o jsonpath='{.items[0].metadata.name}')
-kubectl --context kind-noetl -n noetl exec "$WORKER_POD" -- \
+kubectl --context kind-noetl -n noetl run "$WORKER_POD" -- \
     python3 -c "
 import urllib.request
 text = urllib.request.urlopen('http://127.0.0.1:9090/metrics').read().decode()
