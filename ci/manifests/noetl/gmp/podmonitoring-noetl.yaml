@@ -1,6 +1,14 @@
 # GMP PodMonitoring — production scrape for noetl worker + server /metrics.
 # =============================================================================
-# PROD-ONLY (GKE noetl-demo-19700101).  The production cluster runs **Google
+# NOT APPLIED IN PRODUCTION as of 2026-08-05.  `kubectl -n noetl get
+# podmonitoring` on shastaratech-noetl-prod returns exactly one object,
+# `noetl-cmdbus-writer` — neither PodMonitoring below exists in the cluster, so
+# the server and every worker pool are unscraped.  That is the collection half
+# of noetl/ai-meta#238: alerting rules keyed on `noetl_worker_*` /
+# `noetl_event_*` cannot fire because the series never reach Managed Prometheus.
+# Applying this file is step 1 of `runbooks/noetl-alerting-bootstrap.md`.
+#
+# PROD-ONLY.  The production cluster runs **Google
 # Managed Prometheus** (namespaces gke-gmp-system / gmp-public), NOT the
 # VictoriaMetrics operator that the kind cluster uses.  The kind scrape config
 # (`ci/manifests/noetl-scrape/vmscrape*.yaml`, kind:
@@ -39,17 +47,27 @@ metadata:
     # The scrape half of the flip guardrail for noetl/ai-meta#103.
     noetl.io/flip-guardrail: publish-only
 spec:
+  # Selected by the PRESENCE of `worker-pool`, not by an enumerated list of
+  # `app` values.  The list this replaced named four pools and had gone stale:
+  # `noetl-worker-system-pool-shard1` — the #166 Phase 5 second system shard,
+  # live in prod — was absent, so applying the old form would have produced a
+  # healthy-looking PodMonitoring that scraped half the system pool with nothing
+  # to say so.  Two of the four names it did list
+  # (`noetl-worker-rust-subscription-pool`, `noetl-worker`) do not exist at all.
+  #
+  # Verified 2026-08-05 against prod: `worker-pool` is carried by all four
+  # worker pods and by no other pod in the namespace — it excludes the server,
+  # the cmdbus writer, and both CronJobs.  A pool added later is picked up with
+  # no edit here, which an `app`-name list can never be.
   selector:
     matchExpressions:
-      - key: app
-        operator: In
-        values:
-          - noetl-worker-system-pool
-          - noetl-worker-rust
-          - noetl-worker-rust-subscription-pool
-          - noetl-worker
+      - key: worker-pool
+        operator: Exists
   endpoints:
-    - port: metrics        # named container port (9090) on every worker pool
+    # Container port `metrics` (9090).  Confirmed 2026-08-05 on
+    # noetl-worker-system-pool-shard1: the port is named `metrics` on every
+    # pool and /metrics answers with real series.
+    - port: metrics
       path: /metrics
       interval: 15s
 ---
@@ -63,6 +81,9 @@ metadata:
     component: server
     noetl.io/flip-guardrail: publish-only
 spec:
+  # Verified 2026-08-05 against prod: the live Deployment's pod template carries
+  # app=noetl-server-rust, so this selector matches (unlike the worker half
+  # above, this one had not drifted).
   selector:
     matchLabels:
       app: noetl-server-rust
@@ -71,6 +92,10 @@ spec:
     # /metrics — including noetl_event_ingest_published_total, the
     # "gate is ON and active" signal the MaterializerStalledUnderGate /
     # MaterializerAbsentUnderGate alerts depend on.
+    #
+    # Confirmed 2026-08-05: container `noetl-server` declares port name `http`
+    # (8082), and /metrics answers with 75 `noetl_*` series.  Those 75 series
+    # reach nothing today — this PodMonitoring is not applied.
     - port: http
       path: /metrics
       interval: 30s

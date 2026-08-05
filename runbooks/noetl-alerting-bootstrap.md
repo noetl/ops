@@ -36,12 +36,34 @@ Alerting needs three things, and only the third is in this repo today.
 | `noetl-cmdbus-writer` cmdbus-lag + metrics | yes | **yes** | the only live scrape |
 | `noetl-cmdbus-writer` **events-lag (9106)** | **added in this PR** | no | `ehdb_events_*` is ingested by nothing today |
 | `noetl-server-rust` | yes (`podmonitoring-noetl.yaml`) | **no** | `noetl_server_*` descriptors: 0 |
-| worker pools | yes (`podmonitoring-noetl.yaml`) | **no** | |
+| worker pools | yes (`podmonitoring-noetl.yaml`) | **no** | selector was stale — **fixed in this PR** |
 
-`podmonitoring-noetl.yaml` is **correct and simply unapplied** — its selectors
-(`app: noetl-server-rust`, and the worker `matchExpressions`) match live pod
-labels, and the named ports (`http:8082`, `metrics:9090`) exist on the live
-containers. Verified 2026-08-05. It needs applying, not fixing.
+`kubectl -n noetl get podmonitoring` returns exactly one object,
+`noetl-cmdbus-writer`. Both PodMonitorings in `podmonitoring-noetl.yaml` are
+absent from the cluster, so the server and every worker pool are unscraped.
+
+**An earlier revision of this runbook said the file was "correct and simply
+unapplied". That was half right, and the wrong half is the interesting one.**
+Checking each selector against live pods on 2026-08-05:
+
+| half | selector | verdict |
+| :-- | :-- | :-- |
+| server | `app: noetl-server-rust`, port `http` | matches; port exists; /metrics serves 75 `noetl_*` series |
+| workers | `app In (…4 names…)`, port `metrics` | **stale** — omitted `noetl-worker-system-pool-shard1` |
+
+`noetl-worker-system-pool-shard1` is the #166 Phase 5 second system shard and
+has been live in prod since that rollout; it was never added to the list. Two of
+the four names the list *did* carry
+(`noetl-worker-rust-subscription-pool`, `noetl-worker`) do not exist at all.
+
+Applying the old form would have produced a green PodMonitoring scraping **half
+the system pool**, with no signal distinguishing that from full coverage — the
+failure mode is a materializer-lag alert that stays quiet because the lagging
+shard is the unscraped one. This PR replaces the name list with
+`worker-pool: Exists`, which matches all four worker pods, excludes the server /
+writer / CronJobs, and picks up future pools without an edit.
+
+So: the server half needs applying; the worker half needed fixing first.
 
 ### 2. Notification channels — none exist
 
