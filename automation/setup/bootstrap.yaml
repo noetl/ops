@@ -592,7 +592,7 @@ workflow:
 
       echo "  3. Test execution:"
 
-      echo "     noetl execute catalog/test/hello_world"
+      echo "     noetl run catalog/test/hello_world"
 
       echo ""
 

@@ -32,7 +32,7 @@ metadata:
     CHICKEN-AND-EGG: when the drive is wedged, a distributed playbook would
     itself wedge (its own __orchestrate__ would compute commands=0).  So
     this playbook uses ONLY the `shell` tool and runs in LOCAL runtime
-    (`noetl exec --runtime local`) inside its own CronJob pod — it never
+    (`noetl run --runtime local`) inside its own CronJob pod — it never
     depends on the server orchestrate drive it is repairing.
 
     Deployed by cronjob-state-builder-watchdog.yaml every few minutes.
