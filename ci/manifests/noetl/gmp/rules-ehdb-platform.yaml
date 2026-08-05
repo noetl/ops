@@ -1,0 +1,166 @@
+# GMP Rules — EHDB platform alerting (noetl/ai-meta#238).
+# =============================================================================
+# PROD (GKE shastaratech-noetl-prod).  `monitoring.googleapis.com/v1 Rules`,
+# evaluated by the GMP managed rule-evaluator, same shape as the existing
+# `rules-materializer-lag.yaml`.
+#
+# ── WHY THIS FILE EXISTS ─────────────────────────────────────────────────────
+# As of 2026-08-05 the cluster has ZERO alerting of any kind:
+#
+#   GMP rules / clusterrules / globalrules / prometheusrules   0
+#   Cloud Monitoring alertPolicies                             0
+#   Cloud Monitoring notificationChannels                      0
+#
+# while metrics ARE being collected and ingested.  Every incident in the EHDB
+# workstream had to be found by a human looking at the right thing.  Each rule
+# below names the incident it would have caught, so the threshold can be argued
+# with rather than guessed at.
+#
+# ── APPLYING THIS ALONE DOES NOT PRODUCE ALERTS ──────────────────────────────
+# There are no notification channels.  A firing rule with nowhere to route is
+# still invisible.  Creating channels + choosing who pages is deliberately NOT
+# part of this file — see #238.
+#
+# ── SCRAPE PREREQUISITE ──────────────────────────────────────────────────────
+# The events-bus series (`ehdb_events_*`) are NOT ingested today: the writer
+# exposes them on the `events-lag` (9106) port and no PodMonitoring scraped it.
+# The companion change to `podmonitoring-cmdbus-writer.yaml` in this PR adds
+# that endpoint.  **Rules keyed on `ehdb_events_*` are inert until that scrape
+# is applied** — they are included because the alternative is leaving the
+# platform's least observable surface unalerted once it is fixed.
+#
+# Verified ingested today (so these are live on apply):
+#   ehdb_feed_subject_lag, ehdb_feed_total_lag, ehdb_feed_shard_committed,
+#   ehdb_feed_shard_resume_*, ehdb_l0_appends,
+#   ehdb_l0_out_of_order_appends, ehdb_l0_recovered_active_records
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: noetl-ehdb-platform
+  namespace: noetl
+  labels:
+    app: noetl
+    component: ehdb
+spec:
+  groups:
+    - name: noetl-ehdb-integrity
+      interval: 15s
+      rules:
+        # ── Delivery loss (noetl/ai-meta#203) ────────────────────────────────
+        # The writer assigns the feed ordering key; an append whose key does not
+        # advance means a follower cursor can skip it.  Pre-fix this produced
+        # 17/40 commands stuck with lag frozen.  Steady state is exactly 0, so
+        # ANY increase is actionable — no threshold to tune.
+        - alert: EhdbOutOfOrderAppends
+          expr: increase(ehdb_l0_out_of_order_appends[10m]) > 0
+          for: 0m
+          labels: { severity: critical, component: ehdb }
+          annotations:
+            summary: "EHDB assigned an out-of-order sort key ({{ $value }} in 10m)"
+            description: >-
+              ehdb_l0_out_of_order_appends increased. This is the noetl/ai-meta#203
+              delivery-loss detector: an append whose assigned key did not advance
+              can be skipped by every follower cursor. Expected value is 0 at all
+              times. Check the writer log and ehdb_feed_shard_committed for a
+              stalled cursor.
+
+        # ── Unclean restart (noetl/ai-meta#209) ─────────────────────────────
+        # >0 means the writer replayed an unsealed part after an unclean exit.
+        # A GRACEFUL restart seals and reports 0 — today's v5.95.3 roll did
+        # exactly that on both engines.  So a non-zero value is a real signal
+        # that the SIGTERM seal did not run, not routine restart noise.
+        - alert: EhdbUncleanWriterRestart
+          expr: increase(ehdb_l0_recovered_active_records[15m]) > 0
+          for: 0m
+          labels: { severity: warning, component: ehdb }
+          annotations:
+            summary: "EHDB recovered {{ $value }} records from an unsealed part"
+            description: >-
+              The writer replayed an unsealed active part on open, meaning the
+              previous exit did not seal (noetl/ai-meta#209). A graceful restart
+              reports 0. Check for OOMKill/eviction on noetl-cmdbus-writer-0 and
+              whether the shutdown budget was exceeded.
+
+    - name: noetl-ehdb-dispatch
+      interval: 15s
+      rules:
+        # ── Command dispatch backlog ─────────────────────────────────────────
+        # Per-subject lag is the user-pool autoscaler's trigger. A sustained
+        # backlog means either the pool is not scaling or claims are failing.
+        # noetl/ai-meta#210: the user pool had NO autoscaling for a week and
+        # nothing surfaced it.
+        - alert: EhdbCommandBacklogWarning
+          expr: max by (subject) (ehdb_feed_subject_lag) > 100
+          for: 10m
+          labels: { severity: warning, component: ehdb }
+          annotations:
+            summary: "Command backlog on {{ $labels.subject }} ({{ $value }})"
+            description: >-
+              ehdb_feed_subject_lag has exceeded 100 for 10m. Healthy steady
+              state is 0. Either the pool for this subject is not scaling
+              (check the KEDA ScaledObject and HPA) or workers are failing to
+              claim. Related: noetl/ai-meta#210.
+
+        - alert: EhdbCommandBacklogCritical
+          expr: max by (subject) (ehdb_feed_subject_lag) > 1000
+          for: 5m
+          labels: { severity: critical, component: ehdb }
+          annotations:
+            summary: "Severe command backlog on {{ $labels.subject }} ({{ $value }})"
+            description: >-
+              Commands are being issued far faster than claimed. Under
+              NOETL_STATE_BUILDER=offserver a stalled dispatch means executions
+              hang mid-flight rather than failing.
+
+        # ── The bus stopped moving entirely ─────────────────────────────────
+        # Deliberately paired with the backlog rules: lag==0 is ambiguous — it
+        # reads identically for "drained" and "nothing was ever published".
+        # That ambiguity is exactly what made the wedge invisible, so absence of
+        # appends is alerted on separately rather than inferred from lag.
+        - alert: EhdbNoAppends
+          expr: increase(ehdb_l0_appends[30m]) == 0
+          for: 30m
+          labels: { severity: warning, component: ehdb }
+          annotations:
+            summary: "No EHDB appends in 30m"
+            description: >-
+              The writer has accepted no appends for 30 minutes. On an idle
+              cluster this is expected; during business hours it means the
+              ingest path is broken. Tune the window to the traffic profile
+              before enabling — this rule is the most likely of the set to be
+              noisy on a quiet cluster.
+
+    # ── EVENTS BUS ──────────────────────────────────────────────────────────
+    # INERT until the events-lag scrape in this PR is applied — see the header.
+    - name: noetl-ehdb-events
+      interval: 15s
+      rules:
+        # The 3h24m wedge: all three materializer groups frozen, cursors static,
+        # /readyz green, cursor_errors 0, ten faces listening, 6 ESTABLISHED
+        # connections on :9104. Connected, healthy-looking, consuming nothing.
+        - alert: EhdbEventsGroupLag
+          expr: max by (group) (ehdb_events_group_lag) > 50
+          for: 10m
+          labels: { severity: critical, component: ehdb-events }
+          annotations:
+            summary: "Events group {{ $labels.group }} is behind ({{ $value }})"
+            description: >-
+              A named consumer group has been behind for 10m. Post-T5 the events
+              feed is the SOLE writer of the durable noetl.event log, so a stalled
+              group means the append-only log has stopped advancing while the API
+              still answers. This is the signal the 3h24m consumer wedge needed:
+              every other indicator read green throughout. Remedy per
+              noetl/ai-meta#161 is a rollout restart of the consuming pool.
+
+        # Cursor persistence failure — progress is not durable, so a restart
+        # replays or (worse) skips.
+        - alert: EhdbEventsCursorErrors
+          expr: increase(ehdb_events_cursor_errors[10m]) > 0
+          for: 0m
+          labels: { severity: critical, component: ehdb-events }
+          annotations:
+            summary: "EHDB events cursor persist failed ({{ $value }} in 10m)"
+            description: >-
+              A group cursor failed to persist, so consumer progress is not
+              durable. Expected value is 0 at all times.
