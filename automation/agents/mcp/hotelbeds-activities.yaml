@@ -118,20 +118,32 @@ workflow:
             value = default if value is None else value
             return str(value).strip()
 
-        def _error(tool_name, message, detail=None, status_code=0, code=None):
+        ACTIVITIES_UNAVAILABLE_MSG = ("Activities are temporarily unavailable — please try again in a moment.")
+
+        # noetl/ai-meta#175 — do NOT surface the raw provider body to the end
+        # user.  `text` stays the full diagnostic (message + raw body) for logs
+        # and `_meta`/`data`; `display` is what the caller renders.  The travel
+        # planner builds `error_card.description` from this response's
+        # `summary`, so returning `text` there is exactly how the HotelBeds
+        # `{...auditData...}` JSON blob leaked into the Muno UI.  Same fix
+        # already applied to duffel.yaml (#173) and hotelbeds.yaml.
+        def _error(tool_name, message, detail=None, status_code=0, code=None, user_message=None):
             text = message if detail is None else f"{message}: {str(detail)[:700]}"
+            display = user_message or text
             payload = {"ok": False, "status": "error", "error": text[:2000], "status_code": status_code, "activities": []}
             if code:
                 payload["code"] = code
+            if user_message:
+                payload["user_message"] = user_message
             return {
                 "status": "ok",
-                "content": [{"type": "text", "text": text}],
+                "content": [{"type": "text", "text": display}],
                 "isError": True,
                 "_meta": {"backend": "hotelbeds-activities", "tool": tool_name, "hotelbeds_env": hotelbeds_env, "status_code": status_code, "error": text[:2000], "code": code},
                 "data": payload,
                 "control_data": payload,
-                "summary": text,
-                "text": text,
+                "summary": display,
+                "text": display,
             }
 
         def _ok(tool_name, data, text=None, meta=None):
@@ -369,7 +381,7 @@ workflow:
             }
             ok, status_code, body = _request("POST", base + AVAILABILITY_PATH, apikey, secret, payload=payload)
             if not ok:
-                return _error("search_activities", f"HotelBeds activities availability failed HTTP {status_code}", body, status_code)
+                return _error("search_activities", f"HotelBeds activities availability failed HTTP {status_code}", body, status_code, user_message=ACTIVITIES_UNAVAILABLE_MSG)
             activities = _as_list(body.get("activities") if isinstance(body, dict) else [])
             summarised = [_activity_summary(a) for a in activities[:limit] if isinstance(a, dict)]
             currency = None
@@ -440,12 +452,12 @@ workflow:
             try:
                 apikey, secret = _secret_json(project, secret_name)
             except Exception as exc:
-                result = _error(tool_name, "HotelBeds activities credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable")
+                result = _error(tool_name, "HotelBeds activities credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable", user_message=ACTIVITIES_UNAVAILABLE_MSG)
             if "result" not in locals() or result is None:
                 try:
                     result = _search_activities(args, base, apikey, secret, limit)
                 except Exception as exc:
-                    result = _error(tool_name, "HotelBeds activities tool failed", f"{type(exc).__name__}: {exc}")
+                    result = _error(tool_name, "HotelBeds activities tool failed", f"{type(exc).__name__}: {exc}", user_message=ACTIVITIES_UNAVAILABLE_MSG)
     next:
       spec: { mode: exclusive }
       arcs:
