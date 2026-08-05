@@ -148,6 +148,31 @@ anywhere in this directory**. The chain is linear, every child receives the
 action, and each step guards itself in shell with a `case`. A step that does
 not own the current action prints `skip (action=…)` and exits 0.
 
+> **2026-08-04 — the "roughly half the time" half is now root-caused and fixed
+> in [noetl/cli#78](https://github.com/noetl/cli/pull/78), but this directory's
+> no-`when:` rule STAYS.** Two defects were found in
+> `executor/src/condition.rs`, and they do not cover the whole symptom:
+>
+> - **The non-determinism is explained.** Variable substitution iterated a
+>   `HashMap` — order randomised per instance — doing a naive substring
+>   `replace` per key, so when one variable name was a prefix of another the
+>   result depended on which came first. Measured 858 true / 1142 false over
+>   2000 runs of the same inputs. That is the observed "roughly half".
+> - **A false guard fired its arc.** The falsy check was case-sensitive
+>   (`value != "false"`), and the template engine renders a boolean
+>   Python-style, so `"False"` was truthy.
+>
+> **Neither explains "on 4.19.0 a TRUE condition never takes its arc."** The
+> case-sensitivity bug fires an arc that should not fire; it does not suppress
+> one that should. So the 4.19.0 behaviour recorded above is either a third
+> defect or a different mechanism, and it is **not** fixed.
+>
+> Do not relax the no-`when:` rule here: the fix is unreleased, the 4.19.0
+> symptom is unexplained, and a silent no-op in IaC costs more than the shell
+> `case` guards do. Revisit only once cli#78 has shipped **and** a true `when:`
+> arc has been demonstrated to fire on the CLI version this directory is
+> actually run with.
+
 **Templating is plain substitution.** `{{ workload.x }}` works; `{{ 'a' if x
 else y }}`, `{% if %}` and filters are passed through as literal text. That is
 why every child speaks the same action vocabulary as the parent — there is
