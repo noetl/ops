@@ -148,6 +148,23 @@ workload:
   # it runs, so `converge` removes it first when this is true.
   drain_legacy_deployment: "true"
 
+  # Shrinking `shard_count` — or converging a cluster that was hand-built at a
+  # higher shard count — leaves `<name>-<i>` Deployments and Services for every
+  # ordinal at or above the new count.  `drain_legacy` cannot see them: it walks
+  # 0..shard_count-1 by construction, so an ordinal ABOVE the count is outside
+  # its loop forever.
+  #
+  # Found on prod 2026-08-04: a `noetl-cmdbus-writer-1` Deployment at 0 replicas
+  # on an image 8 days older than the running writer — predating the #203 feed
+  # ordering fix and the #208 writer-restart fixes — plus its ClusterIP with no
+  # endpoints.  Harmless while it is scaled to zero, and precisely the thing a
+  # future operator scales back up when a shard-1 writer is wanted.
+  prune_orphan_shards: "true"
+  # How far above `shard_count` to look.  Bounded on purpose: an unbounded
+  # `kubectl get deploy | grep` would also match a future workload that merely
+  # shares the prefix.
+  orphan_scan_depth: "8"
+
 workflow:
   - step: start
     desc: Dispatch on action
@@ -224,6 +241,95 @@ workflow:
           if $K get service {{ workload.name }} >/dev/null 2>&1; then
             echo "drain_legacy: removing the aggregate Service/{{ workload.name }} (superseded by the per-shard ClusterIPs)"
             $K delete service {{ workload.name }}
+          fi
+    next:
+      arcs:
+        - step: prune_orphan_shards
+
+  - step: prune_orphan_shards
+    desc: Remove per-shard writer workloads for ordinals at or above shard_count
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Same shell-guard rationale as drain_legacy: a `when:` arc is
+          # non-deterministic in the local runtime, and a silently-skipped
+          # reconcile step is the failure class this whole file exists to stop.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|plan) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          if [ "{{ workload.prune_orphan_shards }}" != "true" ]; then
+            echo "prune_orphan_shards: disabled"
+            exit 0
+          fi
+          K="kubectl --context {{ workload.context }} -n {{ workload.namespace }}"
+          NAME="{{ workload.name }}"
+          SHARDS="{{ workload.shard_count }}"
+          DEPTH="{{ workload.orphan_scan_depth }}"
+
+          i="$SHARDS"
+          last=$((SHARDS + DEPTH))
+          found=0
+          while [ "$i" -lt "$last" ]; do
+            D="${NAME}-${i}"
+
+            if $K get deployment "$D" >/dev/null 2>&1; then
+              found=1
+              REPLICAS=$($K get deployment "$D" -o jsonpath='{.spec.replicas}' 2>/dev/null)
+              REPLICAS="${REPLICAS:-0}"
+              # A writer above the configured shard count that is actually
+              # RUNNING is not drift to tidy — it means this cluster is serving
+              # a shard the server no longer publishes to, or `shard_count` is
+              # set too low for the topology.  Deleting it could drop a durable
+              # log that still has a claimant.  Refuse and make a human look.
+              if [ "$REPLICAS" -gt 0 ]; then
+                echo "ERROR: Deployment/$D is RUNNING ($REPLICAS replica(s)) but shard_count=$SHARDS." >&2
+                echo "       That is either a shard the server no longer publishes to, or a" >&2
+                echo "       shard_count that is too low.  Refusing to delete a writer that" >&2
+                echo "       still holds a durable log — resolve it deliberately." >&2
+                exit 1
+              fi
+              if [ "$ACTION" = "plan" ]; then
+                echo "prune_orphan_shards: PLAN would delete Deployment/$D (0 replicas, ordinal >= $SHARDS)"
+              else
+                echo "prune_orphan_shards: deleting Deployment/$D (0 replicas, ordinal >= $SHARDS)"
+                $K delete deployment "$D" --wait=true
+              fi
+            fi
+
+            # The matching per-shard ClusterIP.  Only ever removed when it has
+            # no endpoints: a Service WITH endpoints means something is serving
+            # behind it, whatever the Deployment says, and that is the "healthy
+            # writer behind a stale selector" shape that has already bitten this
+            # cluster once.
+            if $K get service "$D" >/dev/null 2>&1; then
+              found=1
+              EPS=$($K get endpoints "$D" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
+              if [ -n "$EPS" ]; then
+                echo "ERROR: Service/$D still has endpoints ($EPS) — something is serving behind" >&2
+                echo "       it even though ordinal $i is at or above shard_count=$SHARDS." >&2
+                exit 1
+              fi
+              if [ "$ACTION" = "plan" ]; then
+                echo "prune_orphan_shards: PLAN would delete Service/$D (no endpoints)"
+              else
+                echo "prune_orphan_shards: deleting Service/$D (no endpoints)"
+                $K delete service "$D"
+              fi
+            fi
+
+            i=$((i + 1))
+          done
+
+          # Deliberately NOT deleted: the PVCs.  An orphan shard's durable log
+          # is the one artefact that cannot be re-rendered from this file, and a
+          # PVC costs disk, not correctness.  Removing it is a separate, human
+          # decision after the log is known to be drained.
+          if [ "$found" -eq 0 ]; then
+            echo "prune_orphan_shards: no writer workload at ordinals ${SHARDS}..$((last - 1)) — nothing to prune"
+          else
+            echo "prune_orphan_shards: NOTE any PVCs for the pruned ordinals are left in place on purpose;"
+            echo "                     deleting a durable log is a separate human decision."
           fi
     next:
       arcs:
