@@ -175,3 +175,55 @@ spec:
               drive that cannot route to system/<name>. The startup log reports
               only the count that succeeded, so this is the only signal that
               3-of-4 is not 3-of-3.
+
+        # ── The caller got nothing back ──────────────────────────────────────
+        #
+        # A callback arrived for a receiver that was already gone.  Whatever the
+        # SPA was waiting on never arrives; from the user's side the request
+        # simply hangs.  Distinct from a request that FAILED, which surfaces.
+        - alert: GatewayCallbacksUndelivered
+          expr: sum(rate(noetl_gateway_callback_undelivered_total[10m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "Gateway callbacks are arriving after their receiver is gone"
+            description: >-
+              The waiting caller receives nothing — the request hangs rather than
+              failing. Usually the gateway's own timeout fired first; correlate
+              with noetl_gateway_auth_cancel_failed_total, which counts the
+              executions that timeout then failed to cancel.
+
+        # ── Executions left running with nobody waiting ──────────────────────
+        - alert: GatewayAuthExecutionsNotCancelled
+          expr: sum(rate(noetl_gateway_auth_cancel_failed_total[15m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "Auth executions are not being cancelled after gateway timeout"
+            description: >-
+              The gateway gave up on an auth execution and its cancel call also
+              failed, so the execution keeps running server-side with nobody
+              waiting for it. Accumulates load rather than breaking anything
+              immediately.
+
+        # ── Every request paying full validation cost ────────────────────────
+        #
+        # Not an outage: sessions still validate.  But the cache exists because
+        # the uncached path is the slow one that #168 measured at ~7.9s, so a
+        # sustained rate here is a latency regression that no error rate shows.
+        - alert: GatewaySessionCacheFailing
+          expr: sum(rate(noetl_gateway_session_cache_failed_total[10m])) > 0.1
+          for: 15m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "Gateway is failing to cache validated sessions"
+            description: >-
+              Every subsequent request repeats full session validation. Nothing
+              errors; it just gets slower. Check EHDB KV reachability
+              (NOETL_KV_ADDR).
