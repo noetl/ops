@@ -1,7 +1,7 @@
 # GMP Rules — materializer-lag alerting (the operator gate for the CQRS
 # NOETL_EVENT_INGEST_PUBLISH_ONLY flip, noetl/ai-meta#103).
 # =============================================================================
-# PROD-ONLY (GKE noetl-demo-19700101).  GMP-native translation of the kind
+# PROD-ONLY.  GMP-native translation of the kind
 # VictoriaMetrics rule `ci/manifests/noetl/vmrule-materializer-lag.yaml`
 # (kind: operator.victoriametrics.com/v1beta1/VMRule).  Prod runs Google
 # Managed Prometheus, so the rule object is `monitoring.googleapis.com/v1
@@ -43,11 +43,31 @@ spec:
         # Recording rule: total un-materialized backlog for the materializer
         # consumer, deduped across system-pool pods (each pod's poller reports
         # the same consumer-level value).
+        # REPOINTED 2026-08-05.  This was keyed on
+        #   noetl_worker_nats_consumer_pending{stream="noetl_events",
+        #                                      consumer="noetl_materializer"}
+        # which CANNOT BE SET any more.  Its only writer is
+        # `metrics::record_nats_consumer_lag`, documented as "called by the
+        # periodic lag poller after fetching consumer info from JetStream" —
+        # and that poller went with NATS at T5.  Checked: the function has no
+        # caller outside metrics.rs, and the gauge is absent from a live
+        # system-pool worker's /metrics.  So the recording rule evaluated to
+        # nothing and the three alerts below it could never fire.
+        #
+        # The post-T5 equivalent is the writer's own per-group lag, which does
+        # exist: `ehdb_events_group_lag{group="noetl_materializer"}` on the
+        # writer's `events-lag` port (9106), alongside the result- and
+        # state-materializer groups.
+        #
+        # NOTE it is a single gauge, not pending+ack_pending — EHDB reports
+        # undelivered + unacked as one number, so the old sum has no analogue
+        # and the thresholds below now measure the same quantity by a shorter
+        # path.  9106 is NOT scraped until the events-lag endpoint in
+        # podmonitoring-cmdbus-writer.yaml is applied.
         - record: noetl:materializer_backlog
           expr: |
             max(
-              noetl_worker_nats_consumer_pending{stream="noetl_events", consumer="noetl_materializer"}
-              + noetl_worker_nats_consumer_ack_pending{stream="noetl_events", consumer="noetl_materializer"}
+              ehdb_events_group_lag{group="noetl_materializer"}
             )
 
         # WARNING — the materializer is falling behind.  Sustained backlog
