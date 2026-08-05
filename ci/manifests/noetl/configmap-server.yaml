@@ -31,7 +31,6 @@ data:
   NOETL_EVENT_NATS_SUBJECT_PREFIX: "noetl.events"
   NOETL_EVENT_NATS_SHARD_COUNT: "1"
   # NATS Configuration for command publishing
-  NATS_URL: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
   NATS_USER: "noetl"
   NATS_PASSWORD: "noetl"
   NATS_STREAM: "NOETL_COMMANDS"

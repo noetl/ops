@@ -10,7 +10,7 @@ metadata:
     captures stdout / stderr / exit_code per step, returns the
     standard agent envelope with structured per-step results.
 
-    Designed to run via ``noetl exec --runtime local`` so the bridge
+    Designed to run via ``noetl run --runtime local`` so the bridge
     works without depending on a noetl-server / NATS / postgres
     cluster. Just the Rust CLI binary + Python interpreter; no
     network egress required beyond what the commands themselves
@@ -23,7 +23,7 @@ metadata:
     - Structured workload + return envelope (typed input/output, not
       free-form stdout)
     - Replayability (the same task file can be re-run via
-      ``noetl exec --runtime local <file>``)
+      ``noetl run --runtime local <file>``)
     - Auth-as-playbook gating (if registered in catalog, the existing
       check_playbook_access flow can grant / deny per-user)
     - Composability (other playbooks can invoke this as a sub-flow

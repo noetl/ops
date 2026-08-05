@@ -140,12 +140,6 @@ spec:
             # direct/session-mode Postgres.
             - name: NOETL_PG_STATEMENT_CACHE_CAPACITY
               value: "0"
-            # --- NATS ---------------------------------------------------------
-            # Matches the prod broker used by the Python server + gateway
-            # (configmap noetl-server-config NATS_URL).  Inline-credential
-            # format is what the Rust client expects (resolves prereq 3a).
-            - name: NOETL_NATS_URL
-              value: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
             # Callback URL embedded in NATS command notifications.  Points at
             # the Rust Service DNS — valid both during canary (before the
             # `noetl` selector flip) and after cutover.

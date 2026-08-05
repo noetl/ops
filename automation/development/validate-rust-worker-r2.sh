@@ -182,7 +182,7 @@ echo "==> Sampling /metrics from the Rust worker"
 # inside the container if curl isn't present; tolerates either.
 WORKER_POD=$(kubectl --context kind-noetl -n noetl get pod -l app=noetl-worker-rust -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 if [[ -n "$WORKER_POD" ]]; then
-    kubectl --context kind-noetl -n noetl exec "$WORKER_POD" -- \
+    kubectl --context kind-noetl -n noetl run "$WORKER_POD" -- \
         sh -c 'wget -qO- http://127.0.0.1:9090/metrics 2>/dev/null || curl -sf http://127.0.0.1:9090/metrics 2>/dev/null || echo "(neither wget nor curl available in worker container)"' \
         | grep -E "^noetl_worker_(result_store_put|dispatch|pulls_total)" \
         | head -30
