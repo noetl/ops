@@ -90,8 +90,6 @@ spec:
             # `NATS_CONSUMER=noetl_worker_pool` from the ConfigMap
             # and uses its multi-subscriber loop (PR-2b) to also
             # bind `*_shared` and `*_python` consumers.
-            - name: NATS_URL
-              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
             - name: NATS_STREAM
               value: NOETL_COMMANDS
             - name: NATS_CONSUMER

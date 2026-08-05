@@ -44,8 +44,6 @@ spec:
               name: noetl-internal-api-token
               key: token
         # NATS messaging
-        - name: NATS_URL
-          value: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
         # Must match ``NOETL_EVENT_NATS_SUBJECT_PREFIX`` on the noetl
         # server/worker (``noetl.events`` by default) plus a trailing
         # dot.  The publisher emits subjects

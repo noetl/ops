@@ -84,8 +84,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: NATS_URL
-              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
             # Dedicated Rust-stack stream (subjects noetl.commands.>), same as
             # the shared Rust worker pool.  Includes noetl.commands.system.>.
             - name: NATS_STREAM

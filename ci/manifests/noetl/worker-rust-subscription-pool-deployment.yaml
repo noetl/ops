@@ -66,8 +66,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: NATS_URL
-              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
             - name: NATS_STREAM
               value: NOETL_COMMANDS
             # Dedicated consumer + filter for the subscription segment.

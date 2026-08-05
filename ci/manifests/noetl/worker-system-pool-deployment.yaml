@@ -71,8 +71,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: NATS_URL
-              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
             # kind uses the flat NOETL_COMMANDS stream (subjects
             # noetl.commands.>), so it captures noetl.commands.system.>.
             - name: NATS_STREAM
