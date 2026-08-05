@@ -150,7 +150,7 @@ unnamed statements that are safe behind transaction pooling. The Rust server
 stays behind pgbouncer exactly like Python; **no pgbouncer change needed.**
 
 Operator check (optional — confirm the env made it into the running pod after
-step 4): `kubectl -n noetl exec deploy/noetl-server-rust -- env | grep STATEMENT_CACHE`
+step 4): `kubectl -n noetl run deploy/noetl-server-rust -- env | grep STATEMENT_CACHE`
 → `NOETL_PG_STATEMENT_CACHE_CAPACITY=0`. The real proof is the canary
 (step 5): a query-heavy playbook completing without `prepared statement` errors.
 

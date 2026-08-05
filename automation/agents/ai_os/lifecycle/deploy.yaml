@@ -15,7 +15,7 @@ metadata:
        `ollamaBridge.enabled` to true on the noetl chart.
     4. **Verify reachability** — bridge → Ollama health check.
 
-    After this completes, ``noetl exec tests/spike/spike_e2e_test``
+    After this completes, ``noetl run tests/spike/spike_e2e_test``
     should run GREEN with a real diagnosis attached via Gap 4.1 +
     the troubleshoot agent + the cheap-first Ollama path.
 
@@ -435,7 +435,7 @@ workflow:
           echo
           echo "AI-OS deployment complete. The spike e2e smoke should"
           echo "now run GREEN with a real diagnosis attached. Try:"
-          echo "  noetl exec tests/spike/spike_e2e_test --runtime distributed --json"
+          echo "  noetl run tests/spike/spike_e2e_test --runtime distributed --json"
     next:
       arcs:
         - step: end
