@@ -227,3 +227,43 @@ spec:
               Every subsequent request repeats full session validation. Nothing
               errors; it just gets slower. Check EHDB KV reachability
               (NOETL_KV_ADDR).
+
+        # ── A pool that is failing claims and doing NO work ──────────────────
+        #
+        # noetl/ai-meta#249.  A command whose `noetl.command` row is absent can
+        # never be claimed, is nacked for redelivery forever, and blocks every
+        # message behind it.  Observed live on kind: 30 claim failures and
+        # **zero** successful claims in five minutes, with a freshly-issued
+        # command sitting at `command.issued PENDING`.  Throughput went to zero.
+        #
+        # `ClaimFailureSpin` above does NOT catch this.  It fires at >5/s, and
+        # the wedge retries once per backoff interval (~0.1/s) — the backoff
+        # from noetl/ai-meta#244 working correctly is exactly what makes the
+        # failure quiet.  So the alert built for this class is silent on the
+        # version of it that actually stops work.
+        #
+        # Both series are unlabelled and pinned at 0, which is what makes the
+        # second half of the expression meaningful: a wedged pool has claimed
+        # nothing, and `== 0` must match a real zero rather than an absent
+        # series.
+        #
+        # REQUIRES noetl-worker >= 5.108.0 for `claim_succeeded_total`.
+        - alert: WorkerPoolThroughputStalled
+          expr: |
+            sum(increase(noetl_worker_claim_failed_total[15m])) > 0
+              and
+            sum(increase(noetl_worker_claim_succeeded_total[15m])) == 0
+          for: 10m
+          labels:
+            severity: critical
+            component: worker
+          annotations:
+            summary: "Worker pool is failing claims and completing none"
+            description: >-
+              Claims are failing and not one has succeeded in 15 minutes, so the
+              pool is dispatching nothing. The usual cause is a command whose
+              noetl.command row is absent: it can never be claimed and blocks
+              the feed behind it (noetl/ai-meta#249). Executions will sit at
+              command.issued. Identify the failing command_id in the worker log
+              and clear it; the poison-handling fix is tracked separately.
+            runbook_url: "https://github.com/noetl/ai-meta/issues/249"
