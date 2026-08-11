@@ -1,5 +1,5 @@
 # noetl-worker-system-pool — PRODUCTION Rust system worker pool
-# (GKE noetl-demo-19700101).  noetl/ai-meta#96.
+# (GKE shastaratech-noetl-prod).  noetl/ai-meta#96.
 # =============================================================================
 # Privileged worker pool that runs platform-internal `system/*` playbooks.
 # First job: `system/scheduled_cleanup` (retention/purge of transient noetl.*
@@ -71,7 +71,19 @@ spec:
           # push 2026-06-21T16:57:05Z); the :v5.40.3 / :6dd3449 tags resolve to
           # it.  This is the LIVE prod image as of the 2026-06-21 off-server
           # cutover.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:5e80493bc496c8921d6dbf54f62abd7a732cc04bfadb951d39420d396f18170a
+          #
+          # ⚠ THIS FILE DOES NOT DRIVE PROD.  The live image is set imperatively
+          # (`kubectl set image` by digest, after a `crane` GHCR->AR copy);
+          # nothing applies this manifest.  It had drifted to the PRE-MIGRATION
+          # project `noetl-demo-19700101` and a digest months older than what
+          # runs, so applying it as written would have pointed prod at a
+          # repository it cannot pull from (ai-meta#234 — still open for the
+          # server / gui / GMP files, which this change does not touch).
+          #
+          # Now: v5.115.3, linux/amd64 (verified with `crane config` on this
+          # digest — prod is Autopilot amd64, and worker images are multi-arch
+          # so the wrong leg is a real possibility).
+          image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:c50eff5579af1f3baedaa58d739f4284e8c8c943d89a286d1874e5a838d95a18
           imagePullPolicy: IfNotPresent
           ports:
             - name: metrics
