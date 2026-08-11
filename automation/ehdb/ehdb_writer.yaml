@@ -5,7 +5,30 @@
 #   9100 cmdbus ingest   9103 events ingest    9106 events lag/metrics
 #   9101 cmdbus claim    9104 events claim     9107 KV
 #   9102 cmdbus lag      9105 events SSE       9108 WAL fan-out
-#   9090 worker metrics
+#   9090 worker metrics  9110 EHDB tier service (OFF by default — see below)
+#
+# ── THE TIER-SERVICE FACE (:9110) ────────────────────────────────────────────
+# ai-meta#257 PR 6.  The writer is the process that owns the durable volumes,
+# so it is where the EHDB storage tiers get a single authoritative store that
+# workers can reach — the missing piece that makes a tier `primary` mean
+# anything (today every worker mirrors into its OWN pod-local log, so promoting
+# one would promote a fragment).
+#
+# It is rendered in TWO halves, deliberately:
+#
+#   * the PORT + Service entries are UNCONDITIONAL.  A `containerPort` opens no
+#     socket — it is documentation the API server stores — and a Service port
+#     whose target has no listener yields connection-refused.  Declaring them
+#     costs nothing and means the flip does not have to re-render addressing.
+#   * the BIND + DIR env vars are gated on `tier_service_enabled`, DEFAULT
+#     FALSE.  The listener does not exist unless the flag is set
+#     (`TierServiceConfig::from_env` returns None), so a converge with the
+#     default is byte-identical to one from before this change.
+#
+# ⚠ Inert is not free: any change to the pod template ROLLS THE WRITER, and the
+# writer is `replicas: 1` hosting BOTH buses.  Adding the port costs one
+# restart even though it changes no behaviour.  Do it inside a window, not as a
+# drive-by.
 #
 # ── WHY THIS FILE EXISTS ─────────────────────────────────────────────────────
 # Until now there was no EHDB-only IaC anywhere.  `origin/main` carried zero
@@ -111,6 +134,21 @@ workload:
   claim_kv: noetl-eventbus-kv-0-data
 
   server_url: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
+
+  # ── EHDB tier service (ai-meta#257 PR 6) ───────────────────────────────────
+  # "true" renders NOETL_EHDB_TIER_SERVICE_BIND/_DIR and the writer opens :9110.
+  # Anything else renders neither, and the binary opens no socket.
+  #
+  # A listener alone still serves no traffic: workers reach it only when THEY
+  # carry NOETL_EHDB_TIER_SERVICE_ADDR (ehdb_runtime.yaml, also default-off),
+  # and a tier answers from it only when that tier is `primary` AND the service
+  # has been REACHED on a real operation AND parity held.  Three independent
+  # gates after this one.
+  tier_service_enabled: "false"
+  # Under /data/eventbus, so it lands on the writer's existing eventbus RWO PVC
+  # rather than pod-local ephemeral storage.  A tier store on emptyDir would be
+  # exactly the pod-local fragment this face exists to eliminate.
+  tier_service_dir: /data/eventbus/ehdb-tier
 
   # Prod's live writer, measured on shastaratech-noetl-prod 2026-08-03:
   # requests 250m / 512Mi, limits 2 CPU / 4Gi.  These defaults are those values.
@@ -381,7 +419,7 @@ workflow:
           YAML
             for p in "cmdbus-ingest 9100" "cmdbus-claim 9101" "cmdbus-lag 9102" "metrics 9090" \
                      "events-ingest 9103" "events-claim 9104" "events-sse 9105" "events-lag 9106" \
-                     "events-kv 9107" "events-wal 9108"; do
+                     "events-kv 9107" "events-wal 9108" "tier-service 9110"; do
               set -- $p
               printf '    - { name: %s, port: %s, targetPort: %s }\n' "$1" "$2" "$1"
             done
@@ -412,7 +450,7 @@ workflow:
           YAML
               for p in "cmdbus-ingest 9100" "cmdbus-claim 9101" "cmdbus-lag 9102" "metrics 9090" \
                        "events-ingest 9103" "events-claim 9104" "events-sse 9105" "events-lag 9106" \
-                       "events-kv 9107" "events-wal 9108"; do
+                       "events-kv 9107" "events-wal 9108" "tier-service 9110"; do
                 set -- $p
                 printf '    - { name: %s, port: %s, targetPort: %s }\n' "$1" "$2" "$1"
               done
@@ -471,7 +509,7 @@ workflow:
           YAML
             for p in "cmdbus-ingest 9100" "cmdbus-claim 9101" "cmdbus-lag 9102" "metrics 9090" \
                      "events-ingest 9103" "events-claim 9104" "events-sse 9105" "events-lag 9106" \
-                     "events-kv 9107" "events-wal 9108"; do
+                     "events-kv 9107" "events-wal 9108" "tier-service 9110"; do
               set -- $p
               # Twelve spaces: this is a literal inside the printf format, so the
               # YAML block scalar's own indent strip does not apply to it.  The
@@ -512,6 +550,19 @@ workflow:
                       - { name: NOETL_EVENT_BUS_ACK_WAIT_SECS, value: "{{ workload.event_ack_wait_secs }}" }
                       - { name: NOETL_EVENT_BUS_CURSOR_PERSIST_SECS, value: "{{ workload.cursor_persist_secs }}" }
                       - { name: NOETL_EVENT_BUS_CURSOR_FALLBACK, value: "{{ workload.cursor_fallback }}" }
+          YAML
+
+            # -- EHDB tier service: rendered ONLY when enabled ----------------
+            # Absent by default, which is what keeps this whole change a no-op:
+            # with no BIND the worker binary opens no listener at all.
+            if [ "{{ workload.tier_service_enabled }}" = "true" ]; then
+              cat <<YAML
+                      - { name: NOETL_EHDB_TIER_SERVICE_BIND, value: "0.0.0.0:9110" }
+                      - { name: NOETL_EHDB_TIER_SERVICE_DIR, value: "{{ workload.tier_service_dir }}" }
+          YAML
+            fi
+
+            cat <<YAML
                     resources:
                       requests: { cpu: "{{ workload.cpu_request }}", memory: "{{ workload.memory_request }}" }
                       limits:   { cpu: "{{ workload.cpu_limit }}",   memory: "{{ workload.memory_limit }}" }
