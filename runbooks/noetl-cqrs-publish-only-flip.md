@@ -274,6 +274,46 @@ Publishing under the gate but **no** materializer metrics are scraped — the
 system-pool worker is not running. The log is not being written. **Execute the
 revert** and restore the system pool.
 
+### `EventPublishNoTransport` (critical / page)
+The gate is on but the server has **no usable event transport**, so every event
+falls back to a synchronous `noetl.event` INSERT and the EHDB events feed stops
+advancing. Post-T5 that feed is the sole writer of the durable log.
+
+This is the one failure on this path that none of the six rules above can see.
+Both `*UnderGate` rules are guarded on the publish counter advancing — correctly,
+since there is nothing to materialize when nothing publishes — so when publishing
+*itself* stops, both guards go false and the four backlog rules watch a queue
+that is no longer being fed. Nothing errors; executions keep completing. This is
+noetl/ai-meta#212, which was found by inspection because no alert could fire.
+
+Triage, in order:
+
+```bash
+# 1. Is the publisher configured at all?  0 = writer addresses resolved to no routes.
+kubectl -n noetl exec deploy/noetl-server-rust -- \
+  curl -s localhost:8082/metrics | grep noetl_ehdb_event_publisher_configured
+
+# 2. What do the bus settings say?
+kubectl -n noetl get deploy noetl-server-rust \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep -E 'EVENT_BUS|PUBLISH_ONLY'
+
+# 3. Is the writer reachable on the events port?
+kubectl -n noetl get svc,endpoints | grep cmdbus-writer
+```
+
+`NOETL_EVENT_BUS` must select EHDB and `NOETL_EVENT_BUS_WRITER_ADDRS` must
+resolve; a stale `NOETL_EVENT_BUS=nats` is deliberately a loud "no transport"
+rather than a silent fall-through. If the transport cannot be restored quickly,
+**execute the revert** — synchronous INSERTs are the safe state, and the alert
+exists to make that a decision rather than a discovery weeks later.
+
+**Do not** page on the sibling reasons. `noetl_event_ingest_publish_skipped_total`
+also counts `gate_off` (deliberate) and `system_execution` (system-pool playbooks
+are exempt by design). A production server carrying only system traffic reports a
+rising `system_execution` count and zero publishes, and is entirely healthy —
+that is exactly what prod reads today.
+
 ---
 
 ## Pre-flip — green-baseline check (REQUIRED before flipping)
@@ -373,6 +413,29 @@ kind: add a receiver under `alertmanager.config.receivers`, a route matching
 visible in the VMAlert UI/API — routing only governs delivery, not evaluation.
 
 ### Production (GKE / Google Managed Prometheus) — OPERATOR-GATED
+
+#### Pre-apply validation (already run, 2026-08-05)
+
+Both halves were checked so the apply is not the first place a mistake shows up.
+They are independent — the first cannot catch a bad expression, the second
+cannot catch a bad object.
+
+| check | what it proves | result |
+| :-- | :-- | :-- |
+| `kubectl apply --dry-run=server` on all 6 manifests under `ci/manifests/noetl/gmp/` | the objects are valid against the live CRD schemas | all 6 valid; nothing persisted (re-confirmed afterwards: 0 `Rules`, only the pre-existing `noetl-cmdbus-writer` PodMonitoring) |
+| `promtool check rules` on the extracted `spec.groups` of all 4 rule files | every PromQL expression parses | **34 rules**: ehdb-platform 10, materializer-lag 8, oq5-retirement 9, vmrule-materializer-lag 7 |
+
+The second was run by extracting `spec.groups` into a plain Prometheus rules
+file and passing it to `promtool` in a `prom/prometheus` container, because a
+GMP `Rules` object is not a rules file and the CRD schema treats `expr` as an
+opaque string — a PromQL syntax error passes the dry-run and fails only at
+evaluation, silently.
+
+Neither check says an alert will *fire*. A rule whose metric has no series
+evaluates cleanly forever; that is the failure this runbook's
+`EventPublishNoTransport` section exists to describe, and it is why the
+underlying series are pinned at 0 rather than left absent.
+
 
 Prod does NOT use the vmstack Alertmanager. The GMP managed rule-evaluator
 sends alerts to the **GMP managedAlertmanager**, configured by OperatorConfig

@@ -42,6 +42,21 @@ spec:
     matchLabels:
       component: cmdbus-writer
   endpoints:
+    # noetl/ai-meta#238 — the EVENTS bus face was never scraped.
+    #
+    # The writer hosts BOTH buses.  `cmdbus-lag` (9102) carries the command-bus
+    # series; the events bus publishes its own on `events-lag` (9106), and
+    # nothing collected it — so `ehdb_events_group_lag` and
+    # `ehdb_events_cursor_errors` do not exist in Cloud Monitoring at all.
+    #
+    # Those are precisely the signals that would have caught the 3h24m
+    # consumer wedge, where all three materializer groups sat frozen behind a
+    # green dashboard.  Post-T5 the events feed is the SOLE writer of the
+    # durable `noetl.event` log, so it is the least observable and most
+    # load-bearing surface in the platform.
+    - port: events-lag
+      path: /metrics
+      interval: 10s
     - port: cmdbus-lag
       path: /metrics
       interval: 10s

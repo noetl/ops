@@ -91,12 +91,11 @@ data:
         },
         {
           "type": "timeseries",
-          "title": "Consumer backlog over time (pending + ack_pending)",
+          "title": "Consumer backlog over time",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
           "datasource": "VictoriaMetrics",
           "targets": [
-            { "expr": "max(noetl_worker_nats_consumer_pending{stream=\"noetl_events\", consumer=\"noetl_materializer\"})", "legendFormat": "pending (undelivered)" },
-            { "expr": "max(noetl_worker_nats_consumer_ack_pending{stream=\"noetl_events\", consumer=\"noetl_materializer\"})", "legendFormat": "ack_pending (in-flight)" },
+            { "expr": "max(ehdb_events_group_lag{group=\"noetl_materializer\"})", "legendFormat": "group lag" },
             { "expr": "noetl:materializer_backlog", "legendFormat": "total backlog" }
           ]
         },
