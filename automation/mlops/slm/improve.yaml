@@ -1,0 +1,257 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: slm_improve
+  path: automation/mlops/slm/improve
+  description: |
+    SLM continuous-improvement loop — the data-flywheel operator
+    (noetl/ai-meta#150, umbrella #139; operationalizes the shadow-rollout
+    flywheel #153). ONE gated NoETL orchestration that ties the already-shipped
+    stages together so the domain SLM stays "constantly improved" with no human
+    in the inner loop. Domain-agnostic — every knob comes from the org
+    `slm.config.yaml` (the SAME file dataset_build / finetune / eval read), so
+    any domain runs this identical playbook by pointing `config` at its own.
+
+    Five stages run as five NoETL steps sharing one `run_dir`
+    (`run_state.json`), each individually inspectable, with two gates:
+
+      1. HARVEST          — ingest NEW shadow records since the last run
+                            (`slm_replay --shadow`, read-only event-log) +
+                            optional oracle-labeled synthetic top-up → assemble +
+                            REGISTER a candidate dataset in G3 (leak-free split,
+                            100% schema validity). Engine: slm_improve.harvest.
+      2. THRESHOLD GATE   — proceed to train only if the candidate carries
+                            >= `min_new_real_turns` NEW real turns OR the
+                            cadence elapsed; else the loop no-ops + reports
+                            "insufficient new data". Stops pointless retrains.
+      3. TRAIN            — finetune a candidate model on the new dataset (the
+                            validated recipe: qwen2.5-1.5B LoRA, balanced extract
+                            distribution, NO envelope-first serialization — the
+                            v4 negative-result learnings) → REGISTER a G3 model
+                            (lineage → dataset). `mode=local` stub for kind/CI;
+                            `mode=mlx` real local LoRA; `mode=container` GPU Job.
+                            No-op when the gate said don't proceed.
+      4. EVAL + PROMOTION — eval the candidate under constrained decoding on the
+         GATE               holdout (schema validity + per-field match vs the
+                            oracle floor AND vs the current CHAMPION). Promote to
+                            champion only if it does NOT regress any field vs the
+                            champion AND meets every configured per-field
+                            threshold; else keep the champion + record the
+                            candidate rejected (with reason). Promotion =
+                            register a G3 `release` (lineage → [model, eval]).
+      5. REPORT           — emit run_summary.json: dataset delta, candidate-vs-
+                            champion per-field table, promote/reject + reason,
+                            all lineage URNs.
+
+    The champion is the latest G3 `release` for `<domain>_slm_multitask`; on the
+    first run the loop bootstraps it from the configured incumbent
+    (`improvement.champion` in the config, or `champion_eval_ref` /
+    `champion_model_ref` here) — travel's is v3.
+
+    Scheduling: this playbook is written to be runnable on a cadence (e.g. the
+    config `improvement.schedule` cron) OR on a data-threshold trigger — see the
+    § SCHEDULE / TRIGGER HOOK block at the bottom. It does NOT schedule itself;
+    an operator wires the trigger.
+
+    Registry writes are server-mediated (data-access-boundary.md). Offline /
+    kind smoke: NOETL_REGISTRY_BACKEND=local. Real run: leave it unset (server)
+    with NOETL_SERVER_URL + NOETL_INTERNAL_API_TOKEN against a server with
+    NOETL_REGISTRY_ENABLED=true. Reproducible assertion harness:
+    `lib/slm_improve_smoke.py`.
+
+    Tracks noetl/ai-meta#150, umbrella #139 / #153.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # ── shared ──
+  config: repos/travel/automation/mlops/slm/travel/slm.config.yaml
+  slm_lib: repos/ops/automation/mlops/slm/lib
+  # shared state dir for the loop's five steps (run_state.json + artifacts)
+  run_dir: /tmp/slm_improve_run
+  tenant: muno
+  project: travel
+
+  # ── HARVEST sources (priority: live replay > shadow file; anchor + top-up) ──
+  base_url: ""                # set => pull NEW shadow records live (read-only); "" => offline
+  replay_path: ""             # "" => config data.event_log_replay.path
+  shadow_corpus: ""           # a pre-harvested slm_replay --shadow corpus file (offline/CI)
+  base_corpus: ""             # an anchor corpus (e.g. the seed) so a thin delta still trains
+  synthetic_topup: "0"        # N oracle-labeled synthetic turns for thin slices (0 => off)
+  candidate_version: ""       # "" => engine assigns improve_cand_NNN
+
+  # ── THRESHOLD GATE ──
+  min_new_real_turns: "25"    # retrain only when >= this many NEW real turns arrived
+  force: ""                   # set to "1" to bypass the threshold (manual kick)
+  cadence_days: ""            # set => also proceed if this many days elapsed since last run
+  last_run_unix: ""           # last successful run epoch (the trigger supplies it)
+
+  # ── TRAIN ──
+  mode: stub                  # stub (kind/CI) | mlx (real local LoRA) | peft (GPU image)
+  augment_teacher: "true"
+
+  # ── EVAL + PROMOTION GATE ──
+  constrained_decode: "true"
+  # first-run champion bootstrap (used only when no release exists yet)
+  champion_eval_ref: ""       # e.g. registry://muno/travel/eval/travel_slm_multitask/3 (v3)
+  champion_model_ref: ""      # e.g. registry://muno/travel/model/travel_slm_multitask/3
+
+workflow:
+  - step: start
+    desc: Entry point
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: harvest
+
+  # ── stage 1: HARVEST ──────────────────────────────────────────────────────
+  - step: harvest
+    desc: Ingest new shadow traffic + top-up → register a candidate dataset (G3)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          ARGS="harvest --config {{ workload.config }} --run-dir {{ workload.run_dir }}"
+          ARGS="${ARGS} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          [ -n '{{ workload.base_url }}' ]          && ARGS="${ARGS} --base-url {{ workload.base_url }}"
+          [ -n '{{ workload.replay_path }}' ]       && ARGS="${ARGS} --replay-path {{ workload.replay_path }}"
+          [ -n '{{ workload.shadow_corpus }}' ]     && ARGS="${ARGS} --shadow-corpus {{ workload.shadow_corpus }}"
+          [ -n '{{ workload.base_corpus }}' ]       && ARGS="${ARGS} --base-corpus {{ workload.base_corpus }}"
+          [ -n '{{ workload.candidate_version }}' ] && ARGS="${ARGS} --candidate-version {{ workload.candidate_version }}"
+          [ '{{ workload.synthetic_topup }}' != '0' ] && ARGS="${ARGS} --synthetic-topup {{ workload.synthetic_topup }}"
+          echo "SLM improve :: HARVEST"
+          python3 "${LIB}/slm_improve.py" ${ARGS}
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: threshold_gate
+
+  # ── stage 2: THRESHOLD GATE ───────────────────────────────────────────────
+  - step: threshold_gate
+    desc: Proceed to train only on enough new data (or cadence / force)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          ARGS="gate --config {{ workload.config }} --run-dir {{ workload.run_dir }}"
+          ARGS="${ARGS} --min-new-real-turns {{ workload.min_new_real_turns }}"
+          [ -n '{{ workload.force }}' ]         && ARGS="${ARGS} --force"
+          [ -n '{{ workload.cadence_days }}' ]  && ARGS="${ARGS} --cadence-days {{ workload.cadence_days }}"
+          [ -n '{{ workload.last_run_unix }}' ] && ARGS="${ARGS} --last-run-unix {{ workload.last_run_unix }}"
+          echo "SLM improve :: THRESHOLD GATE"
+          python3 "${LIB}/slm_improve.py" ${ARGS}
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: train
+
+  # ── stage 3: TRAIN (no-ops internally when the gate is closed) ────────────
+  - step: train
+    desc: Finetune a candidate model on the new dataset → register a G3 model
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          ARGS="train --config {{ workload.config }} --run-dir {{ workload.run_dir }}"
+          ARGS="${ARGS} --backend {{ workload.mode }}"
+          ARGS="${ARGS} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          [ '{{ workload.augment_teacher }}' != 'true' ] && ARGS="${ARGS} --no-augment-teacher"
+          echo "SLM improve :: TRAIN (backend={{ workload.mode }})"
+          python3 "${LIB}/slm_improve.py" ${ARGS}
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: eval_promote
+
+  # ── stage 4: EVAL + PROMOTION GATE (no-ops internally when gate closed) ───
+  - step: eval_promote
+    desc: Eval candidate (constrained) + promote over champion only if it wins
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          ARGS="eval-promote --config {{ workload.config }} --run-dir {{ workload.run_dir }}"
+          ARGS="${ARGS} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          [ '{{ workload.constrained_decode }}' != 'true' ] && ARGS="${ARGS} --no-constrained-decode"
+          [ -n '{{ workload.champion_eval_ref }}' ]  && ARGS="${ARGS} --champion-eval-ref {{ workload.champion_eval_ref }}"
+          [ -n '{{ workload.champion_model_ref }}' ] && ARGS="${ARGS} --champion-model-ref {{ workload.champion_model_ref }}"
+          echo "SLM improve :: EVAL + PROMOTION GATE"
+          python3 "${LIB}/slm_improve.py" ${ARGS}
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: report
+
+  # ── stage 5: REPORT ───────────────────────────────────────────────────────
+  - step: report
+    desc: Emit the run summary (dataset delta, decision, lineage URNs)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          LIB='{{ workload.slm_lib }}'
+          echo "SLM improve :: REPORT"
+          python3 "${LIB}/slm_improve.py" report \
+            --config '{{ workload.config }}' --run-dir '{{ workload.run_dir }}'
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
+
+# ── SCHEDULE / TRIGGER HOOK (documented — NOT scheduled by this work) ─────────
+#
+# This playbook is built to run on a cadence or on a data-threshold; an operator
+# wires the trigger.  Two supported shapes:
+#
+# 1. CADENCE (cron) — the config `improvement.schedule` (travel: "0 3 * * 0",
+#    Sundays 03:00) is the intended cadence.  A Kubernetes CronJob (or any
+#    scheduler) invokes the distributed form on the worker pool:
+#
+#      noetl exec automation/mlops/slm/improve.yaml -r distributed \
+#        --set config=<org slm.config.yaml> \
+#        --set base_url=http://noetl-server-rust:8082 \
+#        --set min_new_real_turns=200 \
+#        --set cadence_days=7 --set last_run_unix=$(cat /state/last_run) \
+#        --set mode=container
+#
+#    The threshold gate makes a cadence run cheap when no new traffic arrived:
+#    it harvests, sees < N new turns AND (if cadence not elapsed) no-ops before
+#    training.  Persist the run's `generated_unix` to /state/last_run for the
+#    next run's `last_run_unix`.
+#
+# 2. DATA-THRESHOLD — a lighter trigger that only fires a full run once enough
+#    new shadow turns have accrued.  A cheap probe runs HARVEST + GATE only and
+#    exits if the gate is closed; a scheduler runs it every hour:
+#
+#      noetl exec automation/mlops/slm/improve.yaml -r distributed \
+#        --set base_url=... --set min_new_real_turns=200
+#      # if run_summary.proceeded == false, nothing trained — near-zero cost.
+#
+# Neither is applied to prod here (review-only).  The kind/local validation runs
+# the offline shape:
+#
+#   NOETL_REGISTRY_BACKEND=local NOETL_REGISTRY_LOCAL_DIR=/tmp/slm_reg \
+#   noetl exec repos/ops/automation/mlops/slm/improve.yaml -r local \
+#     --set config=/abs/repos/travel/automation/mlops/slm/travel/slm.config.yaml \
+#     --set shadow_corpus=<harvested shadow corpus> \
+#     --set base_corpus=<seed corpus> \
+#     --set champion_eval_ref=registry://muno/travel/eval/travel_slm_multitask/3
