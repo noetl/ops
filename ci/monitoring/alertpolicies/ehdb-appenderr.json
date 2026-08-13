@@ -1,0 +1,23 @@
+{
+ "displayName": "NoETL EHDB: tier-store appends are failing (log-corruption guard)",
+ "combiner": "OR",
+ "conditions": [
+  {
+   "displayName": "NoETL EHDB: tier-store appends are failing (log-corruption guard)",
+   "conditionPrometheusQueryLanguage": {
+    "query": "sum(increase(noetl_ehdb_dataplane_ops_total{operation=\"tier_service.append\",outcome=~\"error|invalid\"}[5m])) > 0",
+    "duration": "60s",
+    "evaluationInterval": "60s"
+   }
+  }
+ ],
+ "documentation": {
+  "content": "Appends to the EHDB tier store are failing. This store is what the event-log tier serves FROM while it is `primary`. Append failures preceded the 2026-08-12 log corruption (noetl/ai-meta#261): concurrent writers tore the transaction log, 302 of 348 appends failed, and one torn record made EVERY read fail. Fixed in worker#276 (v5.118.1); steady state is 0, so any increase is actionable. Check the writer's disk and /data/eventbus/ehdb-tier/eventlog.jsonl. Ref noetl/ai-meta#261.",
+  "mimeType": "text/markdown"
+ },
+ "notificationChannels": [
+  "projects/shastaratech-noetl-prod/notificationChannels/6930211842535753236",
+  "projects/shastaratech-noetl-prod/notificationChannels/8780236184765331124"
+ ],
+ "enabled": true
+}

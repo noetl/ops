@@ -1,0 +1,23 @@
+{
+ "displayName": "NoETL EHDB: event-log tier DEMOTED \u2014 it is no longer serving",
+ "combiner": "OR",
+ "conditions": [
+  {
+   "displayName": "NoETL EHDB: event-log tier DEMOTED \u2014 it is no longer serving",
+   "conditionPrometheusQueryLanguage": {
+    "query": "sum(increase(noetl_ehdb_eventlog_ops_total{operation=\"mirror\",outcome=~\"primary_unavailable|primary_divergence|parity_mismatch|rejected|unavailable\"}[5m])) > 0",
+    "duration": "300s",
+    "evaluationInterval": "60s"
+   }
+  }
+ ],
+ "documentation": {
+  "content": "The EHDB event-log tier is configured `primary` but a serve decision returned ServedByIncumbent. Callers still get correct answers from the incumbent store, which is why nothing else fails and no dashboard turns red \u2014 the demotion is SILENT. Check the writer's tier-service listener (:9110), the writer PVC, and `noetl_ehdb_dataplane_ops_total{operation=~\"tier_service.*\"}`. Instant mitigation is to set the tier back to shadow: `kubectl -n noetl set env deploy/noetl-worker-rust deploy/noetl-worker-system-pool deploy/noetl-worker-system-pool-shard1 NOETL_EHDB_EVENTLOG=shadow` \u2014 no image change. NOTE: served_primary is per-pod; this query sums across replicas deliberately. Ref noetl/ai-meta#257.",
+  "mimeType": "text/markdown"
+ },
+ "notificationChannels": [
+  "projects/shastaratech-noetl-prod/notificationChannels/6930211842535753236",
+  "projects/shastaratech-noetl-prod/notificationChannels/8780236184765331124"
+ ],
+ "enabled": true
+}
