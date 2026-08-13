@@ -1,0 +1,201 @@
+# GMP Rules — EHDB event-log tier SERVE/DEMOTE alerting (noetl/ai-meta#257).
+# =============================================================================
+# PROD (GKE shastaratech-noetl-prod).  Added 2026-08-13, the day the event-log
+# tier was flipped to `primary` and began serving — the first EHDB tier ever
+# promoted.
+#
+# ── WHAT THIS FILE IS FOR ────────────────────────────────────────────────────
+# `primary_serve::decide` is deliberately fail-safe: if the tier cannot serve
+# honestly it returns `ServedByIncumbent` and the caller gets a correct answer
+# from the incumbent store.  Nothing breaks.  That is the right behaviour and
+# it is also the problem — **a demotion is silent**.  The platform stays green,
+# executions keep completing, and the tier everyone believes is authoritative
+# has quietly stopped answering.
+#
+# These rules make that transition loud.
+#
+# ── THE SIGNAL ───────────────────────────────────────────────────────────────
+# `noetl_ehdb_eventlog_ops_total{operation="mirror",outcome=...}` carries the
+# serve decision's outcome.  Exactly one outcome means "served":
+#
+#   served_primary        the tier answered authoritatively
+#
+# every other outcome means the tier did NOT serve:
+#
+#   primary_unavailable   is_primary, but the durable service was unreachable
+#   primary_divergence    the tier disagreed with the incumbent
+#   parity_mismatch       the parity check did not hold
+#   rejected              the append was refused
+#   unavailable           no store available at all
+#
+# Steady state for all six is a flat 0, so ANY increase is actionable and there
+# is no threshold to tune.
+#
+# ── ⚠ served_primary IS PER-POD — ALWAYS SUM ACROSS REPLICAS ────────────────
+# The server's mirror relay targets the `noetl-worker-rust-metrics` Service, so
+# appends land on whichever `app=noetl-worker-rust` pod that Service routes to,
+# and the system pools receive none at all.  On the 2026-08-13 go-live all 232
+# `served_primary` increments landed on ONE of two replicas; the other read 0.
+#
+# A per-pod rule would therefore fire constantly on the idle replicas and mean
+# nothing.  Every expression below uses `sum(...)` with no `by (pod)` for this
+# reason.  If you add a rule here, do the same — and never read a single pod's
+# `served_primary` as evidence the tier stopped serving.
+#
+# ── APPLYING THIS ALONE DOES NOT PRODUCE ALERTS ──────────────────────────────
+# As of 2026-08-13 the cluster still has ZERO notificationChannels
+# (noetl/ai-meta#238).  A firing rule with nowhere to route is still invisible.
+# Creating channels and choosing who pages is NOT part of this file.
+#
+# ── SCRAPE PREREQUISITE ──────────────────────────────────────────────────────
+# These series live on the worker pods' `:9090` metrics port, collected by the
+# `noetl-workers` PodMonitoring (selector `worker-pool: Exists`, verified
+# 2026-08-13 to match all four worker pods).  No new scrape is needed.
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: noetl-ehdb-eventlog-serve
+  namespace: noetl
+  labels:
+    app: noetl
+    component: ehdb
+spec:
+  groups:
+    - name: noetl-ehdb-eventlog-serve
+      interval: 30s
+      rules:
+        # ── The tier stopped serving (noetl/ai-meta#257) ─────────────────────
+        # Any demote outcome advancing means `decide` returned
+        # `ServedByIncumbent` on a live append.  Callers are still correct —
+        # the incumbent answered — so nothing else will tell you.
+        #
+        # Would have caught: a tier-service outage, a diverged store, or the
+        # writer losing its PVC, any of which silently reverts the tier to
+        # shadow-in-effect while it still reads `primary` in the config.
+        - alert: EhdbEventLogDemoted
+          expr: |
+            sum(increase(noetl_ehdb_eventlog_ops_total{
+              operation="mirror",
+              outcome=~"primary_unavailable|primary_divergence|parity_mismatch|rejected|unavailable"
+            }[5m])) > 0
+          for: 2m
+          labels:
+            severity: critical
+            component: ehdb
+          annotations:
+            summary: "EHDB event-log tier demoted to the incumbent — it is no longer serving"
+            description: >-
+              One or more serve decisions returned ServedByIncumbent in the last
+              5 minutes. The tier is configured `primary` but is not answering
+              authoritatively. Callers are still getting correct answers from the
+              incumbent, which is why nothing else is failing. Check the
+              tier-service listener on the writer (:9110), the writer PVC, and
+              `noetl_ehdb_dataplane_ops_total{operation=~"tier_service.*"}`.
+              Runbook: https://github.com/noetl/ai-meta/issues/257
+
+        # ── Which demotion, specifically ─────────────────────────────────────
+        # Same condition, split by reason, as a warning so the paging alert
+        # stays single while the reason is still visible in the alert list.
+        - alert: EhdbEventLogDemoteReason
+          expr: |
+            sum by (outcome) (increase(noetl_ehdb_eventlog_ops_total{
+              operation="mirror",
+              outcome=~"primary_unavailable|primary_divergence|parity_mismatch|rejected|unavailable"
+            }[5m])) > 0
+          for: 2m
+          labels:
+            severity: warning
+            component: ehdb
+          annotations:
+            summary: "EHDB event-log demote reason: {{ $labels.outcome }}"
+            description: >-
+              primary_unavailable = the durable tier service was unreachable.
+              primary_divergence / parity_mismatch = the tier disagreed with the
+              incumbent, which is a data-integrity signal, not an availability
+              one — do NOT simply restart into it. rejected / unavailable = the
+              append was refused or no store was available.
+
+        # ── The append path that corrupted the log (noetl/ai-meta#261) ───────
+        # Concurrent writers tore the tier-store transaction log on 2026-08-12:
+        # 302 of 348 appends failed and one record was spliced inside another's
+        # payload byte array. Fixed in worker#276 (v5.118.1); steady state is 0.
+        # This is the regression guard.
+        - alert: EhdbTierServiceAppendErrors
+          expr: |
+            sum(increase(noetl_ehdb_dataplane_ops_total{
+              operation="tier_service.append",
+              outcome=~"error|invalid"
+            }[5m])) > 0
+          for: 1m
+          labels:
+            severity: critical
+            component: ehdb
+          annotations:
+            summary: "EHDB tier-service appends are failing — the serving store may be corrupting"
+            description: >-
+              The tier store is the store the event-log tier serves FROM while
+              it is `primary`. Append failures here preceded the 2026-08-12 log
+              corruption (noetl/ai-meta#261), where a torn record made every
+              read fail. Check the writer's disk and
+              `/data/eventbus/ehdb-tier/eventlog.jsonl`.
+
+        # ── Reads failing against the serving store ──────────────────────────
+        # A read error means the tier cannot answer even when it is willing to.
+        # On 2026-08-12 a single torn record made ALL reads fail, so this is not
+        # necessarily proportional to the damage — one bad record can zero the
+        # tier (see noetl/ai-meta#262, which is deciding that posture).
+        - alert: EhdbTierServiceReadErrors
+          expr: |
+            sum(increase(noetl_ehdb_dataplane_ops_total{
+              operation="tier_service.read_execution",
+              outcome=~"error|unavailable"
+            }[5m])) > 0
+          for: 2m
+          labels:
+            severity: warning
+            component: ehdb
+          annotations:
+            summary: "EHDB tier-service reads are failing"
+            description: >-
+              One unreadable record currently fails an entire scan, so a small
+              number here can mean the whole tier is unreadable rather than a
+              proportional fault. See noetl/ai-meta#262.
+
+        # ── Cross-store divergence (noetl/ai-meta#258) ───────────────────────
+        # The comparator checks the tier against the authoritative noetl.event
+        # log. Divergence while the tier is `primary` means the store being
+        # served has drifted from the source of truth.
+        - alert: EhdbCrossStoreDivergence
+          expr: |
+            sum(increase(noetl_ehdb_crossstore_divergence_total[10m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+            component: ehdb
+          annotations:
+            summary: "EHDB tier diverged from the authoritative event log"
+            description: >-
+              The cross-store comparator found a divergence. While the tier is
+              `primary` this is a correctness signal about a store that is being
+              served. Consider reverting the tier to `shadow`
+              (`NOETL_EHDB_EVENTLOG=shadow` on the worker pools) while
+              investigating — that is instant and needs no image change.
+
+        # ── The connection face itself ───────────────────────────────────────
+        - alert: EhdbTierServiceConnectionErrors
+          expr: |
+            sum(increase(noetl_ehdb_dataplane_ops_total{
+              operation="tier_service.conn",
+              outcome=~"accept_error|protocol_error|write_error"
+            }[5m])) > 0
+          for: 2m
+          labels:
+            severity: warning
+            component: ehdb
+          annotations:
+            summary: "EHDB tier-service connection errors on the writer"
+            description: >-
+              The writer's :9110 face is failing connections. Workers that
+              cannot reach it demote to the incumbent, which surfaces as
+              EhdbEventLogDemoted with outcome=primary_unavailable.
