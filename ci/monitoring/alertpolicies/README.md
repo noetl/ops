@@ -28,14 +28,15 @@ configured.
 
 Two email channels exist in the project, both enabled:
 
-| id | display name | destination |
+| id | display name | note |
 | :-- | :-- | :-- |
-| `6930211842535753236` | NoETL prod alerts (default) | the platform owner's address |
-| `8780236184765331124` | email-shastaratech-alerts | the GCP account address |
+| `8780236184765331124` | email-shastaratech-alerts | **the delivery target.** Its own description reads *"Primary alert email (project owner). Replaces akuksin@gmail.com."* |
+| `6930211842535753236` | NoETL prod alerts (default) | the address the one above replaces; still enabled, no longer used by these policies |
 
 Addresses are not repeated here; read them with the command below. The three
-EHDB policies route to **both**, because a tier that has stopped serving
-authoritatively should not depend on one inbox being watched.
+EHDB policies route to `8780236184765331124` **only**, matching the owner's
+instruction and the five pre-existing `NoETL:` policies, which all use that
+same single channel.
 
 ```bash
 gcloud --account=<owner> auth print-access-token   # then:
@@ -43,10 +44,49 @@ curl -s -H "Authorization: Bearer $TOK" \
   "https://monitoring.googleapis.com/v3/projects/shastaratech-noetl-prod/notificationChannels" | jq .
 ```
 
-⚠ Neither channel reports a `verificationStatus`. They are `enabled: true` and
-one of them already backs five live policies, but **email delivery has not been
-positively confirmed by this repo**. If an expected alert never arrives, verify
-the channel before assuming the rule is wrong.
+### ⚠ Delivery is NOT confirmed, and this project cannot confirm it via API
+
+Neither channel returns a `verificationStatus` field at all. In proto3 JSON an
+absent enum means the zero value — here `VERIFICATION_STATUS_UNSPECIFIED`,
+which the API defines as *"the state is unknown, omitted, or is not
+applicable"*. It is **not** the same as `VERIFIED`, and it is not proof of
+`UNVERIFIED` either. The API simply does not answer the question.
+
+Nor is there any delivery telemetry to fall back on in this project:
+
+| source | result |
+| :-- | :-- |
+| Cloud Logging `resource.type="alert_policy"` | **0 entries** (positive control: other logs return fine) |
+| metric descriptors matching `alert`/`notification`/`incident` | **0 of 17** `monitoring.googleapis.com/*` descriptors |
+
+So there is no API-visible record of an attempted or dropped notification.
+**The inbox is the only oracle.** If an expected alert does not arrive, verify
+the channel before assuming the rule is wrong — and see "Resending
+verification" below.
+
+### Alert policies notify on incident OPEN, not continuously
+
+Worth knowing before concluding that delivery is broken: a policy whose
+condition stays true does **not** re-send on every evaluation. It opens one
+incident and notifies once. A continuously-firing condition therefore produces
+one email at open time, not a stream — so "I don't see recent alert mail" is
+consistent with a *working* channel that fired hours earlier.
+
+### Resending verification (owner action — do not automate)
+
+If mail never arrives, the channel likely needs verification. This sends a code
+to the destination inbox and must be actioned by whoever reads it:
+
+```bash
+# Console (preferred): Monitoring -> Alerting -> Edit notification channels
+#   -> the email row -> "Send verification email", then click the link in the inbox.
+
+# API equivalent (the code goes to the inbox, never to the caller):
+curl -s -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" -d '{}' \
+  "https://monitoring.googleapis.com/v3/$CHANNEL_NAME:sendVerificationCode"
+```
+
+Never paste a verification code into automation or a repo.
 
 ## The policies here
 
