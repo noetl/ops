@@ -96,15 +96,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # Dedicated Rust-stack stream (subjects noetl.commands.>), same as
-            # the shared Rust worker pool.  Includes noetl.commands.system.>.
-            - name: NATS_STREAM
-              value: NOETL_COMMANDS_RUST
-            # Distinct durable consumer for the system segment.
-            - name: NATS_CONSUMER
-              value: noetl_worker_system_rust
-            - name: NATS_FILTER_SUBJECT
+            # The command transport.  REQUIRED with no default since
+            # noetl/ai-meta#243.  See the shared-pool manifest for the
+            # reasoning; the live Deployment carried this out-of-band.
+            - name: NOETL_COMMAND_BUS
+              value: ehdb
+            # The pool this worker claims for — renamed from the legacy
+            # `NATS_FILTER_SUBJECT`, whose fallback no longer exists in
+            # repos/worker/src/config.rs (noetl/ai-meta#218).
+            - name: NOETL_FEED_FILTER_SUBJECT
               value: noetl.commands.system.>
+            # NATS_STREAM / NATS_CONSUMER removed: NATS was deleted at T5
+            # (noetl/ai-meta#212) and neither name is read by the worker.
             - name: NOETL_SERVER_URL
               value: http://noetl-server-rust.noetl.svc.cluster.local:8082
             - name: WORKER_HEARTBEAT_INTERVAL
@@ -114,8 +117,8 @@ spec:
               value: "2"
             - name: WORKER_METRICS_BIND
               value: "0.0.0.0:9090"
-            - name: WORKER_NATS_LAG_POLL_INTERVAL
-              value: "5"
+            # WORKER_NATS_LAG_POLL_INTERVAL removed: no reader in
+            # repos/worker/src (the NATS lag poller went with T5).
             # Bearer token for the system playbooks' tool: http calls to
             # /api/internal/*.  Secret already present in prod.
             - name: NOETL_INTERNAL_API_TOKEN

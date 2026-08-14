@@ -9,23 +9,18 @@ data:
 {{- range $key, $value := .Values.config.server }}
   {{ $key }}: {{ $value | quote }}
 {{- end }}
-  # ``NOETL_EVENT_MIRROR_ENABLED`` lives in ``config.server`` (see
-  # ``automation/helm/noetl/values.yaml``) so operators can override it
-  # the same way they override every other server env var.  An earlier
-  # shape hardcoded this to ``ternary "true" "false" .Values.projector.enabled``
-  # which silently overrode any ``--set config.server.NOETL_EVENT_MIRROR_ENABLED=true``
-  # the operator passed.  The override applies AFTER the ``range`` above
-  # only when the value is NOT already present in ``config.server`` — fall
-  # back to ``.Values.projector.enabled`` for chart-version compat.  Once
-  # ``config.server.NOETL_EVENT_MIRROR_ENABLED`` is in the values file
-  # (PR #121) the fallback is dead code; it stays here for older
-  # deploy values that may omit the key.
-{{- if not (hasKey .Values.config.server "NOETL_EVENT_MIRROR_ENABLED") }}
-  NOETL_EVENT_MIRROR_ENABLED: {{ ternary "true" "false" .Values.projector.enabled | quote }}
-{{- end }}
-  NOETL_EVENT_NATS_STREAM: {{ .Values.config.projector.NOETL_PROJECTOR_NATS_STREAM | quote }}
-  NOETL_EVENT_NATS_SUBJECT_PREFIX: "noetl.events"
-  NOETL_EVENT_NATS_SHARD_COUNT: {{ .Values.projector.replicas | quote }}
+  # NOETL_EVENT_MIRROR_ENABLED / NOETL_EVENT_NATS_{STREAM,SUBJECT_PREFIX,SHARD_COUNT}
+  # were removed here along with the Python projector they configured.
+  #
+  # The server reads its config through `envy::prefixed("NOETL_")` over
+  # `AppConfig` (repos/server/src/config/app.rs).  `AppConfig` has no field for
+  # any of them — and no `env::var` reads them either — so every one of these
+  # keys was rendered into the ConfigMap and then read by nothing.  They
+  # described the JetStream stream the projector drained; the projector is gone
+  # and the Rust materializer (`NOETL_MATERIALIZER_SOURCE=ehdb`) replaced it.
+  #
+  # Keeping them "corrected" rather than deleted would have made a dead
+  # component more convincing, not less (noetl/ai-meta#243).
 {{- if and .Values.ehdb .Values.ehdb.enabled }}
   # EHDB control-plane-only env (server role) — see templates/_ehdb.tpl.
 {{- include "noetl.ehdb.configmapEnv" (dict "clientRole" "server" "roleKey" "server" "root" $) | nindent 2 }}

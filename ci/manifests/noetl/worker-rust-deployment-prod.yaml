@@ -92,20 +92,25 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # Dedicated Rust-stack stream (subjects noetl.commands.>).
-            # Disjoint from Python's NOETL_COMMANDS (flat noetl.commands),
-            # so Python's stream is never touched.
-            - name: NATS_STREAM
-              value: NOETL_COMMANDS_RUST
-            # DISTINCT durable consumer — must not collide with the Python
-            # pool's `noetl_worker_pool` / `*_shared` consumers.
-            - name: NATS_CONSUMER
-              value: noetl_worker_rust_shared
-            # Consume the shared-segment hierarchical commands the Rust server
-            # publishes (noetl.commands.shared.<execution_id>).  Python workers
-            # consume only the flat `noetl.commands`, so no clash.
-            - name: NATS_FILTER_SUBJECT
+            # The command transport.  REQUIRED with no default since
+            # noetl/ai-meta#243 — an unset value is a startup error, not a
+            # guess at the deleted NATS transport.  Absent from this file
+            # until now, so applying it produced a worker that refused to
+            # start; the live Deployment carried the value out-of-band.
+            - name: NOETL_COMMAND_BUS
+              value: ehdb
+            # The pool this worker claims for.  `segment_from_filter` derives
+            # `commands.shared.>` from it; with neither this nor NATS_SUBJECT
+            # set the worker refuses to start rather than silently joining
+            # `shared` (noetl/ai-meta#218).
+            #
+            # Renamed from the legacy `NATS_FILTER_SUBJECT`, whose fallback was
+            # removed from repos/worker/src/config.rs on the claim that "every
+            # manifest carries the EHDB-native name" — this file did not.
+            - name: NOETL_FEED_FILTER_SUBJECT
               value: noetl.commands.shared.>
+            # NATS_STREAM / NATS_CONSUMER removed: NATS was deleted at T5
+            # (noetl/ai-meta#212) and neither name is read by the worker.
             # Talk to the Rust server directly — valid during the canary (while
             # Python still owns the `noetl` Service) AND after cutover (the Rust
             # server keeps its own Service).
