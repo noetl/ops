@@ -66,12 +66,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: NATS_STREAM
-              value: NOETL_COMMANDS
-            # Dedicated consumer + filter for the subscription segment.
-            - name: NATS_CONSUMER
-              value: noetl_worker_pool_subscription
-            - name: NATS_FILTER_SUBJECT
+            # The command transport + pool filter.  Both are REQUIRED with no
+            # default (noetl/ai-meta#243, noetl/ai-meta#218); neither was in this
+            # file, so the live kind Deployment carried them out-of-band.
+            - name: NOETL_COMMAND_BUS
+              value: ehdb
+            - name: NOETL_FEED_FILTER_SUBJECT
               value: noetl.commands.subscription.>
             - name: NOETL_SERVER_URL
               value: http://noetl.noetl.svc.cluster.local:8082
@@ -81,8 +81,6 @@ spec:
               value: "8"
             - name: WORKER_METRICS_BIND
               value: "0.0.0.0:9090"
-            - name: WORKER_NATS_LAG_POLL_INTERVAL
-              value: "5"
             - name: RUST_LOG
               value: "info,noetl_worker=debug,noetl_executor=debug"
             # Arrow IPC shared-memory cache budget (noetl-arrow-cache).

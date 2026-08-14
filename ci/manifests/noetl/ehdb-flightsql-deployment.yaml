@@ -78,11 +78,12 @@ spec:
             # Distinct NATS consumer + a filter subject that carries no traffic:
             # this pod hosts the Flight SQL endpoint, it does not compete for
             # real commands with the user / system pools.
-            - name: NATS_STREAM
-              value: NOETL_COMMANDS
-            - name: NATS_CONSUMER
-              value: noetl_ehdb_flightsql
-            - name: NATS_FILTER_SUBJECT
+            # The command transport + pool filter.  Both are REQUIRED with no
+            # default (noetl/ai-meta#243, noetl/ai-meta#218); neither was in this
+            # file, so the live kind Deployment carried them out-of-band.
+            - name: NOETL_COMMAND_BUS
+              value: ehdb
+            - name: NOETL_FEED_FILTER_SUBJECT
               value: noetl.commands.flightsql.>
             - name: NOETL_SERVER_URL
               value: http://noetl.noetl.svc.cluster.local:8082

@@ -90,14 +90,12 @@ spec:
             # `NATS_CONSUMER=noetl_worker_pool` from the ConfigMap
             # and uses its multi-subscriber loop (PR-2b) to also
             # bind `*_shared` and `*_python` consumers.
-            - name: NATS_STREAM
-              value: NOETL_COMMANDS
-            - name: NATS_CONSUMER
-              value: noetl_worker_pool_shared
-            # Restricts the Rust pool to the shared-segment branch
-            # of the routing scheme.  See noetl/ai-meta#42 PR-3 for
-            # the worker-side env contract.
-            - name: NATS_FILTER_SUBJECT
+            # The command transport + pool filter.  Both are REQUIRED with no
+            # default (noetl/ai-meta#243, noetl/ai-meta#218); neither was in this
+            # file, so the live kind Deployment carried them out-of-band.
+            - name: NOETL_COMMAND_BUS
+              value: ehdb
+            - name: NOETL_FEED_FILTER_SUBJECT
               value: noetl.commands.shared.>
             - name: NOETL_SERVER_URL
               value: http://noetl.noetl.svc.cluster.local:8082
@@ -109,9 +107,6 @@ spec:
               value: "0.0.0.0:9090"
             # Default 5s; override for validation so the lag
             # gauges populate visibly fast.
-            - name: WORKER_NATS_LAG_POLL_INTERVAL
-              value: "5"
-            # Verbose tracing for the validation run.
             - name: RUST_LOG
               value: "info,noetl_worker=debug,noetl_executor=debug"
             # Arrow IPC shared-memory cache budget (noetl-arrow-cache).
