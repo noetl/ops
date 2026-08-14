@@ -24,9 +24,9 @@ image:
 #       env: NOETL_EHDB_MODE=local_reference plus NOETL_EHDB_LOCAL_REFERENCE_LOG
 #       pointing at a pod-local JSONL log under NOETL_DATA_DIR.
 #
-# `roles.<key>` maps a chart deployment (server/worker/workerPool/projector/
+# `roles.<key>` maps a chart deployment (server/worker/workerPool/
 # outboxPublisher) to its NoETL client role.  worker + workerPool are worker
-# data-plane; projector + outboxPublisher are system data-plane; server is
+# data-plane; outboxPublisher is system data-plane; server is
 # control-plane.  The gateway (a separate chart, automation/helm/gateway) is
 # control-plane.  Set a role's `enabled: false` to withhold EHDB env from just
 # that role while leaving the master switch on.
@@ -45,7 +45,7 @@ ehdb:
   localReferenceLog: "/opt/noetl/data/ehdb/local-reference.jsonl"
   # Optional per-role opt-out.  Each chart deployment maps to a fixed NoETL
   # client role (server=control-plane; worker + workerPool=worker data-plane;
-  # projector + outboxPublisher=system data-plane) — that mapping is hardcoded
+  # outboxPublisher=system data-plane) — that mapping is hardcoded
   # in `templates/_ehdb.tpl` and cannot be overridden here (the boundary is not
   # values-configurable).  Every role defaults to enabled when the master
   # switch above is on; set a role's `enabled: false` to withhold EHDB env
@@ -56,8 +56,6 @@ ehdb:
     worker:
       enabled: true
     workerPool:
-      enabled: true
-    projector:
       enabled: true
     outboxPublisher:
       enabled: true
@@ -131,25 +129,6 @@ worker:
     limits:
       cpu: "1000m"
       memory: "2Gi"
-
-projector:
-  enabled: false
-  replicas: 1
-  serviceName: noetl-projector
-  podManagementPolicy: Parallel
-  updateStrategy:
-    type: RollingUpdate
-  image:
-    repository: ""
-    tag: ""
-    pullPolicy: ""
-  resources:
-    requests:
-      cpu: "100m"
-      memory: "256Mi"
-    limits:
-      cpu: "1000m"
-      memory: "1Gi"
 
 outboxPublisher:
   enabled: false
@@ -501,32 +480,6 @@ config:
     NOETL_STORAGE_LOCAL_CACHE_INSERT_RATE_MB: "200"
     # Quiet = re-index cache on worker restart for warm replay performance.
     NOETL_STORAGE_LOCAL_CACHE_RECOVER_MODE: "Quiet"
-  projector:
-    TZ: "UTC"
-    LOG_LEVEL: "INFO"
-    PYTHONPATH: "/opt/noetl"
-    NOETL_RUN_MODE: "projector"
-    NOETL_LOG_FORMAT: "json"
-    NOETL_SERVER_URL: "http://noetl.noetl.svc.cluster.local:8082"
-    NOETL_SERVER: "uvicorn"
-    NOETL_SERVER_WORKERS: "1"
-    NOETL_SERVER_RELOAD: "false"
-    NOETL_PROJECTOR_NATS_STREAM: "NOETL_EVENTS"
-    NOETL_PROJECTOR_NATS_SUBJECT: "noetl.events.>"
-    NOETL_PROJECTOR_MAX_INFLIGHT: "8"
-    NOETL_PROJECTOR_NATS_MAX_ACK_PENDING: "64"
-    NOETL_PROJECTOR_NATS_FETCH_TIMEOUT_SECONDS: "30"
-    NOETL_PROJECTOR_NATS_FETCH_HEARTBEAT_SECONDS: "5"
-    NOETL_PROJECTOR_METRICS_PORT: "9090"
-    POSTGRES_HOST: "postgres.postgres.svc.cluster.local"
-    POSTGRES_PORT: "5432"
-    NOETL_POSTGRES_DB: "noetl"
-    NOETL_USER: "noetl"
-    NOETL_SCHEMA: "noetl"
-    NOETL_POSTGRES_POOL_MIN_SIZE: "1"
-    NOETL_POSTGRES_POOL_MAX_SIZE: "4"
-    NOETL_POSTGRES_POOL_MAX_WAITING: "50"
-    NOETL_POSTGRES_POOL_TIMEOUT_SECONDS: "30"
   outboxPublisher:
     TZ: "UTC"
     LOG_LEVEL: "INFO"

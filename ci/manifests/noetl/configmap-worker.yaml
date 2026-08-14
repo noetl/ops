@@ -23,20 +23,15 @@ data:
   NOETL_WORKER_METRICS_PORT: "9091"
   NOETL_VICTORIALOGS_URL: "http://vmlogs-single-server.vmlogs.svc.cluster.local:9428"
   NOETL_LOG_FORMAT: ""
-  # Mirror executor events to the event outbox for local projector validation.
-  NOETL_EVENT_MIRROR_ENABLED: "true"
-  # JetStream event stream name. The Rust stack hardcodes the lowercase
-  # `noetl_events` (worker materializer default, server EVENT_STREAM const); the
-  # legacy uppercase `NOETL_EVENTS` was the removed Python stack's stream and
-  # collided on subject `noetl.events.>`. Aligned to the live lowercase stream.
-  NOETL_EVENT_NATS_STREAM: "noetl_events"
-  NOETL_EVENT_NATS_SUBJECT_PREFIX: "noetl.events"
-  NOETL_EVENT_NATS_SHARD_COUNT: "1"
-  # NATS Configuration for worker command distribution
-  NATS_USER: "noetl"
-  NATS_PASSWORD: "noetl"
-  NATS_STREAM: "NOETL_COMMANDS"
-  NATS_CONSUMER: "noetl_worker_pool"
+  # Removed with the NATS deletion (noetl/ai-meta#212 T5) — none of these has a
+  # reader.  The server config is `envy::prefixed("NOETL_")` over `AppConfig`,
+  # which has no NATS field; the worker reads only NATS_SUBJECT (kept below,
+  # value equals its code default).  NOETL_EVENT_NATS_{STREAM,SUBJECT_PREFIX,
+  # SHARD_COUNT} + NOETL_EVENT_MIRROR_ENABLED configured the retired Python
+  # projector, deleted in this change set:
+  #   NOETL_EVENT_MIRROR_ENABLED, NOETL_EVENT_NATS_STREAM,
+  #   NOETL_EVENT_NATS_SUBJECT_PREFIX, NOETL_EVENT_NATS_SHARD_COUNT,
+  #   NATS_USER, NATS_PASSWORD, NATS_STREAM, NATS_CONSUMER
   NATS_SUBJECT: "noetl.commands"
   # Keychain cache refresh threshold (15 minutes - prevents expiration during long loops)
   NOETL_KEYCHAIN_REFRESH_THRESHOLD: "900"
