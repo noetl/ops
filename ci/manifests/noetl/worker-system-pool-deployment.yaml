@@ -73,21 +73,12 @@ spec:
                   fieldPath: metadata.name
             # kind uses the flat NOETL_COMMANDS stream (subjects
             # noetl.commands.>), so it captures noetl.commands.system.>.
-            - name: NATS_STREAM
-              value: NOETL_COMMANDS
-            # Consumer name follows the per-pool convention
-            # `noetl_worker_pool_<segment>` (shared / subscription / system) and
-            # MUST equal the consumer the system-pool KEDA scaler reads
-            # (`scaledobject-worker-system-pool.yaml`).  When the two drift, the
-            # scaler watches a consumer the worker never creates and the pool
-            # never scales on its backlog — the worker-driven orchestrate drive
-            # (noetl/ai-meta#108) publishes to `noetl.commands.system.<eid>` and
-            # is drained here.  The filter_subject below is what isolates this
-            # consumer to the system segment; the shared pool's consumer
-            # (`noetl.commands.shared.>`) cannot see these subjects.
-            - name: NATS_CONSUMER
-              value: noetl_worker_pool_system
-            - name: NATS_FILTER_SUBJECT
+            # The command transport + pool filter.  Both are REQUIRED with no
+            # default (noetl/ai-meta#243, noetl/ai-meta#218); neither was in this
+            # file, so the live kind Deployment carried them out-of-band.
+            - name: NOETL_COMMAND_BUS
+              value: ehdb
+            - name: NOETL_FEED_FILTER_SUBJECT
               value: noetl.commands.system.>
             - name: NOETL_SERVER_URL
               value: http://noetl-server-rust.noetl.svc.cluster.local:8082
@@ -97,8 +88,6 @@ spec:
               value: "2"
             - name: WORKER_METRICS_BIND
               value: "0.0.0.0:9090"
-            - name: WORKER_NATS_LAG_POLL_INTERVAL
-              value: "5"
             - name: NOETL_INTERNAL_API_TOKEN
               valueFrom:
                 secretKeyRef:
