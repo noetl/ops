@@ -27,7 +27,11 @@ metadata:
 
 workload:
   # Standard MCP chat_completion surface.
-  model: "gemini-2.0-flash"
+  # Override slot, intentionally EMPTY.  A non-empty default here SHADOWED
+  # vertex_model, because resolution is `model or vertex_model or <fallback>`
+  # -- so passing vertex_model was silently ignored.  Nothing downstream reads
+  # workload.model directly; every use goes through the resolved `model_name`.
+  model: ""
   messages: []
   system: ""
   temperature: 0.1
@@ -36,10 +40,26 @@ workload:
   # callers may pass either `vertex_model` or the MCP `model` argument.
   vertex_project: ""
   vertex_region: "us-central1"
-  vertex_model: "gemini-2.0-flash"
+  # gemini-2.5-flash, not 2.0: the entire 2.0 and 1.5 generation returns HTTP
+  # 404 for noetl-demo-19700101 in BOTH us-central1 and global.  Only 2.5-flash
+  # and 2.5-pro resolve.  Flash matches the itinerary planner's verified
+  # config; callers needing headroom pass model: gemini-2.5-pro.
+  vertex_model: "gemini-2.5-flash"
   vertex_credential: ""
 
 workflow:
+  # noetl/ai-meta#252 — the `kind: playbook` tool requires the child to have
+  # a step named `start` (422 'Workflow must have a step named start' otherwise),
+  # which is why this provider could not be called as a child playbook.
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`; routes to vertex_generate_content
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: vertex_generate_content
+
   - step: vertex_generate_content
     desc: Call Vertex AI GenerateContent and return MCP chat_completion shape
     tool:
@@ -240,7 +260,7 @@ workflow:
 
         project = str(vertex_project or "").strip()
         region = str(vertex_region or "us-central1").strip()
-        model_name = str(model or vertex_model or "gemini-2.0-flash").strip()
+        model_name = str(model or vertex_model or "gemini-2.5-flash").strip()
         service_account = str(vertex_credential or "").strip()
 
         if not project:
