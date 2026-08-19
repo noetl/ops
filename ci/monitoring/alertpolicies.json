@@ -1,0 +1,140 @@
+{
+  "_comment": [
+    "Cloud Monitoring alert policies for the NoETL prod project, as code.",
+    "",
+    "WHY THIS FILE EXISTS (noetl/ai-meta#238).",
+    "Prod's alerting was entirely UNDECLARED: eight alert policies and two",
+    "notification channels existed only in the live project, in no repository.",
+    "A project rebuild would have lost every one of them silently -- the same",
+    "shape as noetl/ai-meta#267, where the deployment manifests omit 84 live",
+    "env vars. The eight below were exported from the running project on",
+    "2026-08-19 and are now declared; the six `noetl/ai-meta#155` ones are new.",
+    "",
+    "WHICH ALERTING PATH THIS IS, AND WHY.",
+    "Prod has TWO paths and only one of them delivers:",
+    "  * Cloud Monitoring alertPolicies -> notificationChannels. WORKING. Every",
+    "    policy here is attached to a channel and pages.",
+    "  * GMP `Rules` objects -> managed Alertmanager. INERT. The OperatorConfig",
+    "    references configSecret `alertmanager` in namespace gmp-public, and",
+    "    that namespace contains NO SECRETS AT ALL -- so all five applied Rules",
+    "    objects fire into the void.",
+    "The `ci/manifests/noetl/gmp/rules-*.yaml` files are therefore documentation",
+    "and kind-parity, not a production paging surface. Anything that must page",
+    "belongs HERE until the Alertmanager receiver is configured (which needs an",
+    "SMTP/Slack/PagerDuty credential nobody has yet).",
+    "",
+    "APPLY:  ./ci/monitoring/apply-alertpolicies.sh",
+    "Idempotent: matches on displayName, PATCHes when present, POSTs when not."
+  ],
+  "project": "shastaratech-noetl-prod",
+  "notificationChannels": [
+    "projects/shastaratech-noetl-prod/notificationChannels/8780236184765331124"
+  ],
+  "_notificationChannels_comment": [
+    "8780236184765331124 = email shastaratech@gmail.com, the channel all eight",
+    "pre-existing policies already use. A second channel exists",
+    "(6930211842535753236 = akuksin@gmail.com) and is deliberately NOT wired",
+    "here -- adding it is a one-line change, but it is a routing decision the",
+    "owner should make explicitly rather than one inherited from a script."
+  ],
+  "policies": [
+    {
+      "displayName": "NoETL EHDB: tier diverged from the authoritative event log",
+      "query": "sum(increase(noetl_ehdb_crossstore_divergence_total[10m])) > 0",
+      "duration": "300s",
+      "evaluationInterval": "60s",
+      "documentation": "The cross-store comparator found the EHDB event-log tier disagreeing with the authoritative `noetl.event` log. While the tier is `primary` this is a correctness signal about a store that is actively being served. KNOWN OPEN AT CREATION (2026-08-13): every hourly `system/scheduled_cleanup` execution mirrors 11 of 13 events \u2014 the two missing are both `command.claimed`. User-pool executions are clean (29/29). So this alert is EXPECTED to be firing until that is fixed; do not treat an initial firing as a false positive. Ref noetl/ai-meta#257, noetl/ai-meta#258."
+    },
+    {
+      "displayName": "NoETL: commands not reaching the EHDB bus",
+      "query": "sum(rate(noetl_ehdb_command_publish_failed_total{reason=~\"no_writers|gave_up\"}[5m])) > 0",
+      "duration": "120s",
+      "evaluationInterval": "60s",
+      "documentation": "no_writers means NOETL_COMMAND_BUS=ehdb with no writer routes: the publish is not attempted and every affected execution stalls. Check NOETL_COMMAND_BUS_WRITER_ADDRS. Ref noetl/ai-meta#238."
+    },
+    {
+      "displayName": "NoETL: worker spinning on claim failures",
+      "query": "sum(rate(noetl_worker_claim_failed_total[5m])) > 5",
+      "duration": "300s",
+      "evaluationInterval": "60s",
+      "documentation": "Claim failures retry with NO backoff (noetl/ai-meta#244). Measured at ~1000 iterations/second. Threshold is well above any plausible transient rate."
+    },
+    {
+      "displayName": "NoETL: gateway authentication is DISABLED",
+      "query": "noetl_gateway_auth_bypass_enabled{mode=\"bypass\"} == 1",
+      "duration": "0s",
+      "evaluationInterval": "60s",
+      "documentation": "GATEWAY_AUTH_BYPASS is enabled: the gateway accepts ANY session token and runs requests as a synthetic user_id 0. Unset it and restart the gateway. There is no duration of this worth tolerating, hence a 0s duration. Ref noetl/ai-meta#238."
+    },
+    {
+      "displayName": "NoETL: worker pool failing claims and completing none",
+      "query": "sum(increase(noetl_worker_claim_failed_total[15m])) > 0 and sum(increase(noetl_worker_claim_succeeded_total[15m])) == 0",
+      "duration": "600s",
+      "evaluationInterval": "60s",
+      "documentation": "A command whose noetl.command row is absent can never be claimed, is nacked for redelivery forever, and blocks the feed behind it (noetl/ai-meta#249). Observed on kind: 30 claim failures and ZERO successful claims in five minutes; throughput went to zero. The ClaimFailureSpin policy does NOT catch this - it fires above 5/s, while the wedge retries once per backoff interval (~0.1/s), so the backoff working correctly is what makes the failure quiet. Executions will sit at command.issued. Find the failing command_id in the worker log; the poison-handling fix is tracked on noetl/ai-meta#249. Requires noetl-worker >= 5.108.0."
+    },
+    {
+      "displayName": "NoETL: materializer is DROPPING events",
+      "query": "sum(rate(noetl_worker_materializer_skipped_total[5m])) > 0",
+      "duration": "300s",
+      "evaluationInterval": "60s",
+      "documentation": "A drained message had no event_id: never projected AND acked anyway. Under the publish-only gate the materializer is the sole writer of noetl.event, so these events are permanently gone. Ref noetl/ai-meta#238."
+    },
+    {
+      "displayName": "NoETL EHDB: tier-store appends are failing (log-corruption guard)",
+      "query": "sum(increase(noetl_ehdb_dataplane_ops_total{operation=\"tier_service.append\",outcome=~\"error|invalid\"}[5m])) > 0",
+      "duration": "60s",
+      "evaluationInterval": "60s",
+      "documentation": "Appends to the EHDB tier store are failing. This store is what the event-log tier serves FROM while it is `primary`. Append failures preceded the 2026-08-12 log corruption (noetl/ai-meta#261): concurrent writers tore the transaction log, 302 of 348 appends failed, and one torn record made EVERY read fail. Fixed in worker#276 (v5.118.1); steady state is 0, so any increase is actionable. Check the writer's disk and /data/eventbus/ehdb-tier/eventlog.jsonl. Ref noetl/ai-meta#261."
+    },
+    {
+      "displayName": "NoETL EHDB: event-log tier DEMOTED \u2014 it is no longer serving",
+      "query": "sum(increase(noetl_ehdb_eventlog_ops_total{operation=\"mirror\",outcome=~\"primary_unavailable|primary_divergence|parity_mismatch|rejected|unavailable\"}[5m])) > 0",
+      "duration": "300s",
+      "evaluationInterval": "60s",
+      "documentation": "The EHDB event-log tier is configured `primary` but a serve decision returned ServedByIncumbent. Callers still get correct answers from the incumbent store, which is why nothing else fails and no dashboard turns red \u2014 the demotion is SILENT. Check the writer's tier-service listener (:9110), the writer PVC, and `noetl_ehdb_dataplane_ops_total{operation=~\"tier_service.*\"}`. Instant mitigation is to set the tier back to shadow: `kubectl -n noetl set env deploy/noetl-worker-rust deploy/noetl-worker-system-pool deploy/noetl-worker-system-pool-shard1 NOETL_EHDB_EVENTLOG=shadow` \u2014 no image change. NOTE: served_primary is per-pod; this query sums across replicas deliberately. Ref noetl/ai-meta#257."
+    },
+    {
+      "displayName": "NoETL EHDB: mirror lag exceeds the parity tolerance window",
+      "query": "histogram_quantile(0.99, sum by (le) (rate(noetl_ehdb_eventlog_mirror_lag_seconds_bucket[10m]))) > on() max(noetl_ehdb_crossstore_parity_lag_tolerance_seconds) and on() (max(noetl_ehdb_crossstore_parity_lag_tolerance_seconds) > 0)",
+      "duration": "600s",
+      "evaluationInterval": "60s",
+      "documentation": "The async event-log mirror's p99 enqueue-to-durable lag has been above NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS for 10m. The comparator only forgives absences younger than that window, so events are aging out of it while still queued -- they will be reported as missing_event divergence against a tier that is actually healthy. THE WINDOW IS READ, NOT HARDCODED: this compares against the gauge the server publishes from its own config, so the two cannot drift. Measured baseline at cutover (2026-08-19): p99 699ms, max <1s, window 30s. Check noetl_ehdb_eventlog_mirror_pending_events and the tier service. Immediate revert: kubectl -n noetl set env deploy/noetl-server-rust NOETL_EHDB_EVENTLOG_MIRROR_ASYNC=false (restores the inline mirror; also set the tolerance back to 0). Runbook: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorlagexceedsparitywindow  Ref noetl/ai-meta#155."
+    },
+    {
+      "displayName": "NoETL EHDB: mirror queue STALLED",
+      "query": "(max(noetl_ehdb_eventlog_mirror_pending_events) > 0) and on() (sum(rate(noetl_ehdb_eventlog_mirror_queue_total{outcome=\"drained\"}[10m])) == 0)",
+      "duration": "300s",
+      "evaluationInterval": "60s",
+      "documentation": "Events are queued for the event-log tier and the drain task has delivered nothing for 10m. Every one is absent from a primary-serving tier and will age past the parity window. THIS WATCHES A GAUGE, NOT THE LAG HISTOGRAM, AND THAT IS THE POINT: mirror_lag_seconds only records events that MADE it, so a fully stalled queue publishes no observations at all and its histogram reads exactly like an idle healthy system. noetl_ehdb_eventlog_mirror_pending_events is the only signal that separates them. Check the relay (NOETL_EHDB_WORKER_QUERY_URL) and server logs for 'event-log tier mirror relay failed'. If the drain task itself died, restart the server -- the queue is per-process and re-arms at startup. Runbook: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorqueuestalled  Ref noetl/ai-meta#155."
+    },
+    {
+      "displayName": "NoETL EHDB: mirror queue full, falling back to inline delivery",
+      "query": "sum(rate(noetl_ehdb_eventlog_mirror_queue_total{outcome=\"queue_full_inline\"}[10m])) > 0",
+      "duration": "600s",
+      "evaluationInterval": "60s",
+      "documentation": "The mirror queue stayed full past its enqueue timeout, so batches are being delivered on the event-write path. NOTHING IS LOST -- the backpressure ladder has no drop rung -- but two things follow: the event-write latency this change removed is back, and this is the ONLY path that can deliver OUT OF ORDER relative to batches still queued for the same execution, which reports as an `order` divergence and demotes the tier. Either the tier is slow or NOETL_EHDB_EVENTLOG_MIRROR_QUEUE_CAPACITY (default 512 batches) is too small for the load. Steady state is a flat 0; at the 2026-08-19 cutover this never fired and backpressure never even engaged. Runbook: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorinlinefallback  Ref noetl/ai-meta#155."
+    },
+    {
+      "displayName": "NoETL EHDB: authoritative events abandoned on shutdown, never mirrored",
+      "query": "sum(increase(noetl_ehdb_eventlog_mirror_queue_total{outcome=\"shutdown_abandoned\"}[1h])) > 0",
+      "duration": "0s",
+      "evaluationInterval": "60s",
+      "documentation": "A server process exited with events still queued for the event-log tier and the flush deadline passed before they drained. Those events are PERMANENTLY absent -- nothing retries a mirror -- and WILL report as missing_event divergence once they age past the parity window. THIS ALERT EXISTS SO THAT FUTURE DIVERGENCE IS ATTRIBUTABLE TO A RESTART rather than investigated as tier corruption. Consider raising NOETL_EHDB_EVENTLOG_MIRROR_FLUSH_TIMEOUT_MS (default 10000). Verified 0 across a real rolling restart on 2026-08-19. Runbook: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorshutdownabandoned  Ref noetl/ai-meta#155."
+    },
+    {
+      "displayName": "NoETL EHDB: parity comparator is comparing nothing",
+      "query": "(sum(rate(noetl_ehdb_crossstore_parity_total{outcome=\"pending_mirror\"}[30m])) / clamp_min(sum(rate(noetl_ehdb_crossstore_parity_total[30m])), 0.0001)) > 0.5",
+      "duration": "1800s",
+      "evaluationInterval": "60s",
+      "documentation": "Over 30m the majority of cross-store parity samples returned pending_mirror -- every event in them was inside the lag tolerance window, so NO COMPARISON HAPPENED. This is the anti-vacuity check on the window itself: a tolerance wide enough to forgive everything is indistinguishable from a comparator that was deleted, and divergence_total == 0 under this condition is evidence of nothing. Either narrow NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS toward the observed lag p99, or lengthen NOETL_EHDB_CROSSSTORE_PARITY_SETTLE_SECS so sampled executions have outlived the window. By design the window (30s) is smaller than the settle (120s), so the background sampler should never contribute to this. Runbook: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbparitycomparesnothing  Ref noetl/ai-meta#155."
+    },
+    {
+      "displayName": "NoETL EHDB: parity self-control FAILED",
+      "query": "sum(increase(noetl_ehdb_crossstore_control_total{result=\"unexpected\"}[30m])) > 0",
+      "duration": "0s",
+      "evaluationInterval": "60s",
+      "documentation": "An in-binary parity control returned `unexpected`. The controls drive synthetic fixtures through the SAME comparator the live path uses, so a failure voids every verdict it has published -- including every divergence_total == 0. Identify which: kubectl -n noetl exec deploy/noetl-server-rust -- wget -qO- 127.0.0.1:8082/api/ehdb/parity/self-test | jq '.controls[] | select(.expected == false)'. IF THE FAILING CONTROL IS lag_beyond_window, the lag tolerance is swallowing a real divergence: set NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS=0 IMMEDIATELY -- the comparator is the tier's only protection and it is currently not providing it. Runbook: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbparitycontrolfailed  Ref noetl/ai-meta#155."
+    }
+  ]
+}
