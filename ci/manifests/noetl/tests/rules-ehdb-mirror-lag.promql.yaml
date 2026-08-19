@@ -1,0 +1,75 @@
+groups:
+- name: noetl-ehdb-mirror-lag
+  interval: 30s
+  rules:
+  - record: noetl:ehdb_mirror_lag_p99
+    expr: "histogram_quantile(\n  0.99,\n  sum by (le) (rate(noetl_ehdb_eventlog_mirror_lag_seconds_bucket[10m]))\n)\n"
+  - alert: EhdbMirrorLagExceedsParityWindow
+    expr: "noetl:ehdb_mirror_lag_p99\n  > on() max(noetl_ehdb_crossstore_parity_lag_tolerance_seconds)\nand on()\n(max(noetl_ehdb_crossstore_parity_lag_tolerance_seconds) > 0)\n"
+    for: 10m
+    labels:
+      severity: critical
+      component: ehdb-eventlog-mirror
+      noetl_io_flip_guardrail: eventlog-mirror-async
+    annotations:
+      summary: EHDB mirror lag ({{ $value }}s p99) exceeds the parity tolerance window
+      description: "The async event-log mirror's p99 enqueue-to-durable lag has been above NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS for 10m. The comparator only forgives absences younger than that window, so events are aging out of it while still queued \u2014 they will be reported as missing_event divergence and the serve policy will demote a tier that is actually healthy. Check noetl_ehdb_eventlog_mirror_pending_events and the tier service; the immediate revert is NOETL_EHDB_EVENTLOG_MIRROR_ASYNC=false, which restores the inline mirror and makes the window unnecessary."
+      runbook_url: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorlagexceedsparitywindow
+  - alert: EhdbMirrorQueueStalled
+    expr: '(max(noetl_ehdb_eventlog_mirror_pending_events) > 0)
+
+      and on()
+
+      (sum(rate(noetl_ehdb_eventlog_mirror_queue_total{outcome="drained"}[10m])) == 0)
+
+      '
+    for: 5m
+    labels:
+      severity: critical
+      component: ehdb-eventlog-mirror
+      noetl_io_flip_guardrail: eventlog-mirror-async
+    annotations:
+      summary: "EHDB mirror queue STALLED \u2014 {{ $value }} events pending, nothing draining"
+      description: "Events are queued for the event-log tier and the drain task has delivered nothing for 10m. Every one of those events is absent from a primary-serving tier and will age past the parity window. A stalled queue emits no lag observations, so the lag histogram looks healthy \u2014 this gauge is the only signal. Check the tier service relay (NOETL_EHDB_WORKER_QUERY_URL) and the server logs for `event-log tier mirror relay failed`."
+      runbook_url: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorqueuestalled
+  - alert: EhdbMirrorInlineFallback
+    expr: sum(rate(noetl_ehdb_eventlog_mirror_queue_total{outcome="queue_full_inline"}[10m])) > 0
+    for: 10m
+    labels:
+      severity: warning
+      component: ehdb-eventlog-mirror
+      noetl_io_flip_guardrail: eventlog-mirror-async
+    annotations:
+      summary: "EHDB mirror queue full \u2014 falling back to inline delivery"
+      description: "The mirror queue has been full past its enqueue timeout, so batches are being delivered on the event-write path. Nothing is lost, but the event-write latency this change exists to remove is back, and this path can deliver out of order for an execution that still has queued batches \u2014 which reports as an `order` divergence and demotes the tier. Either the tier is slow or NOETL_EHDB_EVENTLOG_MIRROR_QUEUE_CAPACITY is too small for the load."
+      runbook_url: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorinlinefallback
+  - alert: EhdbMirrorShutdownAbandoned
+    expr: sum(increase(noetl_ehdb_eventlog_mirror_queue_total{outcome="shutdown_abandoned"}[1h])) > 0
+    labels:
+      severity: critical
+      component: ehdb-eventlog-mirror
+      noetl_io_flip_guardrail: eventlog-mirror-async
+    annotations:
+      summary: '{{ $value }} authoritative events abandoned on shutdown, never mirrored'
+      description: "A server process exited with events still queued for the event-log tier and the flush deadline passed before they drained. Those events are permanently absent from a primary-serving tier and WILL report as missing_event divergence once they age past the parity window. This is the cause of that future divergence \u2014 record it against the restart rather than investigating the tier. Consider raising NOETL_EHDB_EVENTLOG_MIRROR_FLUSH_TIMEOUT_MS."
+      runbook_url: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorshutdownabandoned
+  - alert: EhdbParityComparesNothing
+    expr: "(\n  sum(rate(noetl_ehdb_crossstore_parity_total{outcome=\"pending_mirror\"}[30m]))\n  /\n  clamp_min(sum(rate(noetl_ehdb_crossstore_parity_total[30m])), 0.0001)\n) > 0.5\n"
+    for: 30m
+    labels:
+      severity: critical
+      component: ehdb-eventlog-mirror
+      noetl_io_flip_guardrail: eventlog-mirror-async
+    annotations:
+      summary: More than half of parity samples compared nothing ({{ $value }} pending_mirror share)
+      description: "Over 30m the majority of cross-store parity samples returned pending_mirror \u2014 every event in them was inside the lag tolerance window, so no comparison happened. A clean divergence count under this condition is evidence of nothing. Either the window is far wider than the mirror actually needs (narrow NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS toward the observed noetl:ehdb_mirror_lag_p99) or the sampler's settle window is too short to outlast it."
+      runbook_url: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbparitycomparesnothing
+  - alert: EhdbParityControlFailed
+    expr: sum(increase(noetl_ehdb_crossstore_control_total{result="unexpected"}[30m])) > 0
+    labels:
+      severity: critical
+      component: ehdb-eventlog-mirror
+    annotations:
+      summary: "EHDB parity self-control FAILED \u2014 the comparator is not measuring what it claims"
+      description: At least one in-binary parity control returned `unexpected`. The controls drive synthetic inputs through the same comparator the live path uses; a failure means its verdicts are void, including every divergence_total == 0 it has published. If the failing control is lag_beyond_window, the lag tolerance is hiding a real divergence and NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS must go to 0 immediately. Check the /api/ehdb/parity/self-test endpoint for which control failed.
+      runbook_url: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbparitycontrolfailed
