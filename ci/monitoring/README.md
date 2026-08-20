@@ -69,9 +69,31 @@ The second channel is deliberately **not** wired. Adding it is a one-line change
 to `notificationChannels` in the JSON, but routing is an owner decision and
 should be made explicitly rather than inherited from whoever ran the script.
 
-⚠ **Channel verification could not be confirmed from the API** —
-`verificationStatus` is absent from the `notificationChannels.get` response and
-the field is not selectable. An unverified email channel accepts configuration
-and silently fails to deliver, which is #238 one layer deeper. The only
-conclusive test is to make a policy fire and confirm the mail arrives; do that
-after any channel change rather than assuming attachment implies delivery.
+### Delivery is VERIFIED, and how it was verified
+
+**Channel `8780236184765331124` genuinely delivers** — confirmed 2026-08-19 by
+firing a temporary policy at it and receiving the mail. The test policy was
+deleted immediately afterwards (`404 NOT_FOUND` on a direct get); the only
+artefact left behind is this paragraph.
+
+That test was necessary, not ceremonial. **`verificationStatus` is absent from
+the `notificationChannels.get` response and the field is not selectable**, so
+the API cannot tell you whether an email channel is verified — and an unverified
+channel accepts configuration, reports `enabled: true`, attaches to policies
+happily, and silently fails to deliver. Every readable signal looks identical in
+both cases.
+
+So: **attachment is not delivery, and `0 policies without a channel` is not
+evidence that anyone will be told.** After any channel change, or when adding a
+channel, repeat the test rather than inferring:
+
+```bash
+# 1. create a policy whose condition is true now (the parity controls always are)
+#    query: sum(increase(noetl_ehdb_crossstore_control_total{result="expected"}[10m])) > 0
+#    duration: 0s, attached to the channel under test
+# 2. confirm the mail arrives
+# 3. DELETE the policy   (curl -X DELETE .../alertPolicies/<id>)
+```
+
+Cloud Monitoring does not log incidents to Cloud Logging by default, so the
+mailbox is the only signal — there is nothing to grep for.
