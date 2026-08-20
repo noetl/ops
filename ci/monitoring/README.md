@@ -65,9 +65,15 @@ produces a confusing permission error here
 | `8780236184765331124` | email | `shastaratech@gmail.com` | every policy in this file |
 | `6930211842535753236` | email | `akuksin@gmail.com` | nothing |
 
-The second channel is deliberately **not** wired. Adding it is a one-line change
-to `notificationChannels` in the JSON, but routing is an owner decision and
-should be made explicitly rather than inherited from whoever ran the script.
+**Routing is decided: `shastaratech@gmail.com` only.** The owner settled this on
+2026-08-19 — `akuksin@gmail.com` stays registered but wired to nothing.
+
+That is a decision, not an oversight, and it is written here so it is not
+re-raised as an open question every time someone notices an unused channel. If
+it ever changes, add the channel id to `notificationChannels` in
+`alertpolicies.json`, re-apply, **and re-run the delivery test below** — a
+newly-added channel has never been proven to deliver, and the API will not tell
+you.
 
 ### Delivery is VERIFIED, and how it was verified
 
