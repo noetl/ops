@@ -211,6 +211,69 @@ spec:
             # on both the server and the system pool.
             - name: NOETL_STATE_BUILDER
               value: "offserver"
+            # The worker data-plane query base the server relays tier reads
+            # AND the projection mirror's appends to (noetl/ai-meta#178, #265).
+            # Both halves go through this one URL on purpose: writing where the
+            # comparator reads is then true by construction rather than by two
+            # variables agreeing.
+            - name: NOETL_EHDB_WORKER_QUERY_URL
+              value: "http://noetl-worker-rust-metrics.noetl.svc.cluster.local:9090"
+            # ---------------------------------------------------------------
+            # EHDB tiers (noetl/ai-meta#155, #257, #265).
+            #
+            # ⚠ THESE WERE UNDECLARED UNTIL noetl/ai-meta#265 G5, AND FIVE OF
+            # THEM ARE LIVE ON PROD.  Applying this file without them would
+            # strip `NOETL_EHDB_EVENTLOG_MIRROR_ASYNC=true` and the parity
+            # window from the server — silently disarming the async mirror and
+            # the comparator on the tier that is SERVING PRIMARY.  That is
+            # ai-meta#267 ("a re-apply would silently unconfigure prod"),
+            # measured here rather than inferred.
+            #
+            # The event-log values below are PROD'S LIVE VALUES, read off the
+            # cluster on 2026-08-25, so applying this is a no-op for tier 1.
+            # Do not "tidy" them; they are a capture, not a preference.
+            # ---------------------------------------------------------------
+            #
+            # -- tier 1: the event log.  PRIMARY and serving.  Do not change. --
+            - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+              value: "server"
+            - name: NOETL_EHDB_EVENTLOG_MIRROR_ASYNC
+              value: "true"
+            - name: NOETL_EHDB_CROSSSTORE_PARITY_ENABLED
+              value: "true"
+            # Paired with MIRROR_ASYNC above: set both or neither.  Async on
+            # with this at 0 makes the comparator judge a healthy tier on its
+            # own liveness (noetl/ai-meta#155).
+            - name: NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS
+              value: "30"
+            #
+            # -- tier 2: the projection tier.  BUILT, GATED, NOT SERVING. -----
+            #
+            # Declared at their OFF values rather than omitted, deliberately:
+            # a shadow cutover is then a value edit on a line that already
+            # exists, the off state is visible in `kubectl get -o yaml`, and
+            # nothing has to remember that these variables exist.  Turning any
+            # of them on is a per-step decision recorded in
+            # ai-meta:playbooks/265-projection-tier/CUTOVER.md and needs an
+            # explicit go from the owner.
+            #
+            # `""` is OFF for the mirror source: it arms only on the exact
+            # string `server`.
+            - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+              value: ""
+            - name: NOETL_EHDB_PROJECTION_PARITY_ENABLED
+              value: "false"
+            # C1 (shadow) sets MIRROR_SOURCE=server + PARITY_ENABLED=true.
+            # C3 moves READ_SOURCE postgres -> verify.  C5 -> tier, and only
+            # after a soak; see CUTOVER.md §2 for why `verify` is not optional.
+            - name: NOETL_EHDB_PROJECTION_READ_SOURCE
+              value: "postgres"
+            # G3's pair.  The queue REFUSES to arm if ASYNC is on while the
+            # window is 0, and stays inline — loudly, with async_enabled=0.
+            - name: NOETL_EHDB_PROJECTION_MIRROR_ASYNC
+              value: "false"
+            - name: NOETL_EHDB_PROJECTION_PARITY_LAG_TOLERANCE_SECS
+              value: "0"
           resources:
             requests:
               cpu: "250m"
