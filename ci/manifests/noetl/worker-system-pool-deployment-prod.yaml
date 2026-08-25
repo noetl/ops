@@ -249,6 +249,46 @@ spec:
               value: "true"
             - name: NOETL_STATE_INDEX_SWEEP_SECS
               value: "30"
+            # --- EHDB durable event-log SHADOW (noetl/ehdb#254 Stage B′) -------
+            # GATED enablement. Alesha signed off "GO to prod durable-SHADOW"
+            # 2026-07-12 (ehdb-wiki Runbook-Durable-EventLog-Prod-Signoff §6);
+            # the prod team flips this on their explicit go, this PR is NOT to be
+            # merged/applied until then. SHADOW is behaviour-neutral to the
+            # authoritative log: the durable engine dual-writes CRC-framed
+            # segments to the PVC below but never SERVES (D8). Removing this
+            # block (or NOETL_EHDB_ENABLED-) restores byte-identical incumbent
+            # behaviour with no redeploy — fail-safe: only the exact
+            # `durable_segment` token opts the backend in.
+            #
+            # PREREQUISITE (Stage A′): the `image:` above must first be the
+            # durable-capable worker line (v5.70.0+ carries the slice-4 wiring;
+            # current released = v5.74.1). The digest pinned above is v5.40.3 and
+            # predates durable wiring — bump it to the durable-capable prod
+            # digest in the SAME change before enabling this block. See the PR
+            # body + runbook §5 Stage A′.
+            - name: NOETL_EHDB_ENABLED
+              value: "true"
+            - name: NOETL_EHDB_CLIENT_ROLE
+              value: "system"
+            - name: NOETL_EHDB_EVENTLOG
+              value: "shadow" # shadow ⇒ dual-write only, never serves; rollback = "off"
+            - name: NOETL_EHDB_EVENTLOG_BACKEND
+              value: "durable_segment" # unset ⇒ local_reference (byte-identical incumbent)
+            - name: NOETL_EHDB_EVENTLOG_DURABLE_DIR
+              value: "/ehdb-durable" # per-shard local segment stores (PVC-backed, below)
+            - name: NOETL_EHDB_EVENTLOG_SHARED_DIR
+              value: "/ehdb-durable/shared" # shared cold-load medium (same PVC for RWO single-owner)
+            # Recommended: bound the SHADOW store so segments do not accumulate
+            # across the ≥24 h window (a shadow store has no downstream consumer,
+            # so keep-last-N limits-based retention is what bounds it). Sized to
+            # the PVC in the same PR; N/interval below are conservative starters.
+            - name: NOETL_EHDB_EVENTLOG_GC
+              value: "consumer_ack"
+            - name: NOETL_EHDB_EVENTLOG_GC_MAX_RETAINED_SEGMENTS
+              value: "64" # ~512 MiB at the default 8 MiB segment cap; tune with PVC size
+            - name: NOETL_EHDB_EVENTLOG_GC_INTERVAL_SECS
+              value: "300"
+            # --- end EHDB durable event-log SHADOW ----------------------------
           volumeMounts:
             # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
             # container-runtime default /dev/shm is a 64 MiB tmpfs; the
@@ -256,6 +296,12 @@ spec:
             # and overruns 64 MiB, page-faulting into SIGBUS (exit 135).
             - name: dshm
               mountPath: /dev/shm
+            # EHDB durable event-log SHADOW segments (noetl/ehdb#254 Stage B′).
+            # PVC-backed so CRC-framed segments survive pod delete + reschedule
+            # (the D3 restart-durability item the prod shadow soak closes).
+            # Mounted only while the durable-shadow env block above is present.
+            - name: ehdb-durable
+              mountPath: /ehdb-durable
           resources:
             requests:
               # noetl/ai-meta#127 — raised 100m -> 250m (matches the shared
@@ -320,6 +366,15 @@ spec:
             # against the container memory limit above (2Gi, noetl/ai-meta#163),
             # which covers this plus the worker RSS (state_builder index).
             sizeLimit: 320Mi
+        # EHDB durable event-log SHADOW store (noetl/ehdb#254 Stage B′).
+        # Bound to the PVC in pvc-worker-system-pool-ehdb-durable.yaml. RWO =
+        # single-owner (the event-writer pool runs 1 replica; if it scales to N,
+        # R3 — per-shard ownership — must be verified, see the runbook/PR body).
+        # Storage class is the prod default here; confirm the CSI fsync/reattach
+        # semantics with the user (risk R2) before enabling.
+        - name: ehdb-durable
+          persistentVolumeClaim:
+            claimName: noetl-worker-system-pool-ehdb-durable
 ---
 apiVersion: v1
 kind: Service
