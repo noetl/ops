@@ -97,6 +97,58 @@ spec:
             # guess at the deleted NATS transport.  Absent from this file
             # until now, so applying it produced a worker that refused to
             # start; the live Deployment carried the value out-of-band.
+            # ---------------------------------------------------------------
+            # EHDB tiers (noetl/ai-meta#155, #257, #265).
+            #
+            # ⚠ UNDECLARED UNTIL noetl/ai-meta#265 G5, AND ELEVEN OF THESE ARE
+            # LIVE ON PROD.  Applying this file without them would strip
+            # `NOETL_EHDB_EVENTLOG=primary` and the tier-service address from
+            # the worker pool — taking the tier that is SERVING PRIMARY off its
+            # store, silently.  ai-meta#267, measured.
+            #
+            # Every value below is PROD'S LIVE VALUE, read off the cluster on
+            # 2026-08-25.  This block is a capture, not a preference.
+            # ---------------------------------------------------------------
+            - name: NOETL_EHDB_ENABLED
+              value: "true"
+            - name: NOETL_EHDB_MODE
+              value: "local_reference"
+            - name: NOETL_EHDB_CLIENT_ROLE
+              value: "worker"
+            - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
+              value: "/tmp/ehdb/ref.jsonl"
+            #
+            # -- per-tier mode.  eventlog is PRIMARY AND SERVING.  Do not change.
+            - name: NOETL_EHDB_EVENTLOG
+              value: "primary"
+            # Tier 2.  `shadow` here is PRE-EXISTING and long-standing — it is
+            # NOT part of #265's cutover, and the 2026-08-14 gate note claiming
+            # no NOETL_EHDB_PROJECTION* variable existed on prod was wrong.
+            # Under #265 this same value additionally reaches the tier-generic
+            # store and the write-path serve decision; it still resolves to
+            # "the incumbent is authoritative" and writes nothing without
+            # NOETL_EHDB_PROJECTION_MIRROR_SOURCE=server on the SERVER.
+            - name: NOETL_EHDB_PROJECTION
+              value: "shadow"
+            - name: NOETL_EHDB_KV
+              value: "shadow"
+            - name: NOETL_EHDB_OBJECT
+              value: "shadow"
+            #
+            # -- where tier reads and server-authored appends resolve ---------
+            # `service` is a hard prerequisite for any event-log flip: tier
+            # reads are POD-LOCAL otherwise, so at 3 replicas 2 of 3 read the
+            # tier as EMPTY (ai-meta#257 PR4).  It is equally a prerequisite for
+            # the projection tier, which has NO pod-local write path at all and
+            # refuses one with 503 by design.
+            - name: NOETL_EHDB_TIER_QUERY_SOURCE
+              value: "service"
+            # Stable per-pod DNS.  MUST resolve to ONE process: the headless
+            # Service would round-robin, and the tier service is a single store.
+            - name: NOETL_EHDB_TIER_SERVICE_ADDR
+              value: "noetl-cmdbus-writer-0.noetl.svc.cluster.local:9110"
+            - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+              value: "server"
             - name: NOETL_COMMAND_BUS
               value: ehdb
             # The pool this worker claims for.  `segment_from_filter` derives
