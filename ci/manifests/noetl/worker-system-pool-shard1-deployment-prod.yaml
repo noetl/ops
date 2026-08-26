@@ -16,22 +16,19 @@
 # manifest whose apply is a no-op has to declare what the webhooks wrote.
 #
 # Proof:  kubectl --context <prod> -n noetl diff -f <this file>   ->  no-op.
+#
+# ⚠ DECLARED NOWHERE before this file.  Live in prod since #166 Phase 5 — a DR
+# re-apply would not have reverted its config, it would not have CREATED IT.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  annotations:
-    autopilot.gke.io/resource-adjustment: '{"input":{"initContainers":[{"limits":{"ephemeral-storage":"1Gi"},"requests":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"wait-for-api"}],"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"768Mi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"noetl-worker"}]},"output":{"initContainers":[{"limits":{"ephemeral-storage":"1Gi"},"requests":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"wait-for-api"}],"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"768Mi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"256Mi"},"name":"noetl-worker"}]},"computeClassAtAdmission":"Default","modified":true}'
-    autopilot.gke.io/warden-version: 35.26.4-gke.2
-    kubernetes.io/change-cause: '#166 Phase3 step4.2: enable SHARD_READ+READ_VERIFY on system-pool 2026-07-03'
-    noetl.io/watchdog-last-reason: 'state_builder wedged: healthy=0 sustained over 3 probes'
-    noetl.io/watchdog-last-remediation: '1786397942'
-    noetl.io/watchdog-remediations: '1786397942'
   labels:
-    app: noetl-worker-system-pool
+    app: noetl-worker-system-pool-shard1
     component: system-worker
     runtime: rust
+    shard-index: '1'
     worker-pool: worker-system-pool
-  name: noetl-worker-system-pool
+  name: noetl-worker-system-pool-shard1
   namespace: noetl
 spec:
   progressDeadlineSeconds: 600
@@ -39,7 +36,7 @@ spec:
   revisionHistoryLimit: 10
   selector:
     matchLabels:
-      app: noetl-worker-system-pool
+      app: noetl-worker-system-pool-shard1
       worker-pool: worker-system-pool
   strategy:
     rollingUpdate:
@@ -49,25 +46,19 @@ spec:
   template:
     metadata:
       annotations:
-        kubectl.kubernetes.io/restartedAt: '2026-08-10T21:39:10Z'
+        kubectl.kubernetes.io/restartedAt: '2026-08-04T01:24:03-07:00'
         prometheus.io/path: /metrics
         prometheus.io/port: '9090'
         prometheus.io/scrape: 'true'
       labels:
-        app: noetl-worker-system-pool
+        app: noetl-worker-system-pool-shard1
         component: system-worker
         runtime: rust
-        shard-index: '0'
+        shard-index: '1'
         worker-pool: worker-system-pool
     spec:
       containers:
       - env:
-        - name: NOETL_SHARD_INDEX
-          value: '0'
-        - name: NOETL_SHARD_COUNT
-          value: '2'
-        - name: NOETL_STATE_AFFINITY_ROUTE
-          value: 'true'
         - name: WORKER_POOL_NAME
           value: worker-system-pool
         - name: WORKER_ID
@@ -124,6 +115,12 @@ spec:
           value: 'true'
         - name: NOETL_STATE_SHARD_READ_VERIFY
           value: 'false'
+        - name: NOETL_SHARD_INDEX
+          value: '1'
+        - name: NOETL_SHARD_COUNT
+          value: '2'
+        - name: NOETL_STATE_AFFINITY_ROUTE
+          value: 'true'
         - name: NOETL_COMMAND_BUS
           value: ehdb
         - name: NOETL_COMMAND_BUS_HOST
@@ -342,30 +339,3 @@ spec:
           medium: Memory
           sizeLimit: 320Mi
         name: dshm
----
-apiVersion: v1
-kind: Service
-metadata:
-  annotations:
-    cloud.google.com/neg: '{"ingress":true}'
-  labels:
-    app: noetl-worker-system-pool
-  name: noetl-worker-system-pool-metrics
-  namespace: noetl
-spec:
-  clusterIP: None
-  clusterIPs:
-  - None
-  internalTrafficPolicy: Cluster
-  ipFamilies:
-  - IPv4
-  ipFamilyPolicy: SingleStack
-  ports:
-  - name: metrics
-    port: 9090
-    protocol: TCP
-    targetPort: 9090
-  selector:
-    app: noetl-worker-system-pool
-  sessionAffinity: None
-  type: ClusterIP
