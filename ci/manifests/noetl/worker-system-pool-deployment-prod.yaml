@@ -198,15 +198,32 @@ spec:
               # off-server orchestrate drive AND the sole-writer CQRS
               # materializer for the whole prod system, so it pegs CPU under a
               # large batch the same way the step workers do.
-              cpu: "250m"
-              # noetl/ai-meta#163 — raised 128Mi -> 1Gi.  The state_builder
-              # WAL chain-index RSS grows with prod event volume and sits at
-              # ~748Mi steady (vs 9Mi on the step-worker pool that has no
-              # drive/materializer).  The old 128Mi request was far below
-              # actual usage, making this pod a top eviction candidate under
-              # node memory pressure; set the request at/above steady RSS so
-              # the scheduler guarantees the memory it always needs.
-              memory: "1Gi"
+              # noetl/ai-meta#298 — raised 250m -> 1500m.  Not a CPU need:
+              # GKE Autopilot enforces a 1:6.5 CPU:memory ratio, so the 8Gi
+              # below is not admissible at 250m.  Ratio here is 1:5.5.
+              cpu: "1500m"
+              # noetl/ai-meta#298 — raised 1Gi -> 8Gi, and the reason changed.
+              #
+              # The #163 sizing below was built on a STEADY-RSS model: put the
+              # request at/above the resting index so the scheduler guarantees
+              # it.  Measurement on 2026-08-26 shows that model does not
+              # describe what kills this pod.  Read from cgroup v2
+              # `memory.peak` on a pod given deliberate headroom:
+              #
+              #   peak    = 3473883136 B = 3313 MiB   <-- boot transient
+              #   current =  117022720 B =  112 MiB   <-- resting index
+              #
+              # ...while replaying 29,608 events / 78 executions in 24s.  The
+              # replay-from-0 drain allocates ~0.108 MiB per event transiently
+              # and produces a 112 MiB index — a ~30x spike over the result.
+              # So the binding constraint is a boot transient proportional to
+              # the WHOLE log, not resting RSS.
+              #
+              # Request == limit so the scheduler reserves the spike; a pod
+              # that cannot get it should fail to schedule, loudly, rather
+              # than OOM 20s into every boot for 12 days (which is what
+              # happened).
+              memory: "8Gi"
             limits:
               # noetl/ai-meta#127 — raised 1 -> 2 alongside the shared pool.
               # Raising the limit only lifts the burst ceiling for this single
@@ -214,14 +231,24 @@ spec:
               # materialize throughput under load so the off-server cutover
               # stays healthy.  Nodes are 16-CPU and ~98% idle; pure upside.
               cpu: "2"
-              # noetl/ai-meta#163 — raised 768Mi -> 2Gi.  At 768Mi the pod ran
-              # at ~748Mi steady (97% of limit); an execution burst that grew
-              # the state_builder WAL chain-index tipped it over -> exitCode
-              # 137 OOMKilled -> off-server drive wedged (commands=0) -> Muno
-              # turns + login stopped completing.  2Gi = ~1.3Gi headroom over
-              # steady for index growth under load, plus the 320Mi /dev/shm
-              # tmpfs (Arrow IPC cache) which is also charged to this cgroup.
-              memory: "2Gi"
+              # noetl/ai-meta#298 — raised 2Gi -> 8Gi.  This is the SECOND
+              # raise for the same mechanism (#163 took it 768Mi -> 2Gi), and
+              # that is the argument for stopping: raising the ceiling is a
+              # treadmill while boot cost stays proportional to the log.
+              #
+              # #163's "~1.3Gi headroom over steady" never existed for the
+              # case that actually kills the pod.  The transient is 3313 MiB;
+              # 2Gi was under it, so every boot died ~16-50s in.
+              #
+              # ⚠ THIS LIMIT HAS AN EXPIRY.  At 0.108 MiB of transient per
+              # event, 8192 MiB is exhausted at ~74,700 events — roughly 2.5x
+              # the 29,608 present on 2026-08-26.  The real fix is bounded-boot
+              # rehydration (snapshot + tail replay) tracked on #298; until it
+              # lands, this number is a deadline, not a solution.
+              #
+              # Includes the 320Mi /dev/shm tmpfs (Arrow IPC cache), which is
+              # charged to this cgroup.
+              memory: "8Gi"
           livenessProbe:
             tcpSocket:
               port: 9090
@@ -240,7 +267,7 @@ spec:
             medium: Memory
             # >= NOETL_IPC_CACHE_BUDGET_BYTES (256Mi) + 64Mi headroom for
             # tmpfs page rounding / fragmentation.  tmpfs usage counts
-            # against the container memory limit above (2Gi, noetl/ai-meta#163),
+            # against the container memory limit above (8Gi, noetl/ai-meta#298),
             # which covers this plus the worker RSS (state_builder index).
             sizeLimit: 320Mi
 ---
