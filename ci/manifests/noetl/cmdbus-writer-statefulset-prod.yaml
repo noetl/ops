@@ -1,0 +1,376 @@
+# noetl/ai-meta#267 — RECONCILED AGAINST LIVE PROD 2026-08-26.
+#
+# Captured from the running cluster, not hand-written.  Before this, applying
+# this file would have DELETED live environment variables from the running
+# workload — including NOETL_COMMAND_BUS, the internal API token secretKeyRef,
+# and the off-server state-builder topology.  A DR re-apply would have silently
+# unconfigured prod (noetl/ai-meta#267).
+#
+# Secrets are REFERENCED (valueFrom.secretKeyRef), never resolved.  The capture
+# tool fails closed on any credential-shaped or high-entropy literal:
+# playbooks/267-iac-reconcile/capture.py in noetl/ai-meta.
+#
+# Cluster-authored annotations (autopilot.gke.io/*, cloud.google.com/*) are kept
+# deliberately: stripping them makes an apply MUTATE live state, and the whole
+# point here is that it must not.
+#
+# Proof:  kubectl --context <prod> -n noetl diff -f <this file>   ->  no-op.
+#
+# ⚠ DECLARED NOWHERE before this file, and the most consequential omission of
+# the set: ONE writer process hosts BOTH buses (command bus 9100-02, events
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
+  labels:
+    app: noetl-cmdbus-writer
+    command-bus: ehdb
+    component: cmdbus-writer
+    managed-by: noetl
+    shard: '0'
+  name: noetl-cmdbus-writer-0
+  namespace: noetl
+spec:
+  clusterIP: 34.118.233.220
+  clusterIPs:
+  - 34.118.233.220
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: tier-service
+    port: 9110
+    protocol: TCP
+    targetPort: tier-service
+  - name: cmdbus-ingest
+    port: 9100
+    protocol: TCP
+    targetPort: cmdbus-ingest
+  - name: cmdbus-claim
+    port: 9101
+    protocol: TCP
+    targetPort: cmdbus-claim
+  - name: cmdbus-lag
+    port: 9102
+    protocol: TCP
+    targetPort: cmdbus-lag
+  - name: metrics
+    port: 9090
+    protocol: TCP
+    targetPort: metrics
+  - name: events-ingest
+    port: 9103
+    protocol: TCP
+    targetPort: events-ingest
+  - name: events-claim
+    port: 9104
+    protocol: TCP
+    targetPort: events-claim
+  - name: events-sse
+    port: 9105
+    protocol: TCP
+    targetPort: events-sse
+  - name: events-lag
+    port: 9106
+    protocol: TCP
+    targetPort: events-lag
+  - name: events-kv
+    port: 9107
+    protocol: TCP
+    targetPort: events-kv
+  - name: events-wal
+    port: 9108
+    protocol: TCP
+    targetPort: events-wal
+  selector:
+    statefulset.kubernetes.io/pod-name: noetl-cmdbus-writer-0
+  sessionAffinity: None
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
+  labels:
+    app: noetl-cmdbus-writer
+    command-bus: ehdb
+    component: cmdbus-writer
+    managed-by: noetl
+  name: noetl-cmdbus-writer-headless
+  namespace: noetl
+spec:
+  clusterIP: None
+  clusterIPs:
+  - None
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: tier-service
+    port: 9110
+    protocol: TCP
+    targetPort: tier-service
+  - name: cmdbus-ingest
+    port: 9100
+    protocol: TCP
+    targetPort: cmdbus-ingest
+  - name: cmdbus-claim
+    port: 9101
+    protocol: TCP
+    targetPort: cmdbus-claim
+  - name: cmdbus-lag
+    port: 9102
+    protocol: TCP
+    targetPort: cmdbus-lag
+  - name: metrics
+    port: 9090
+    protocol: TCP
+    targetPort: metrics
+  - name: events-ingest
+    port: 9103
+    protocol: TCP
+    targetPort: events-ingest
+  - name: events-claim
+    port: 9104
+    protocol: TCP
+    targetPort: events-claim
+  - name: events-sse
+    port: 9105
+    protocol: TCP
+    targetPort: events-sse
+  - name: events-lag
+    port: 9106
+    protocol: TCP
+    targetPort: events-lag
+  - name: events-kv
+    port: 9107
+    protocol: TCP
+    targetPort: events-kv
+  - name: events-wal
+    port: 9108
+    protocol: TCP
+    targetPort: events-wal
+  selector:
+    app: noetl-cmdbus-writer
+  sessionAffinity: None
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  annotations:
+    autopilot.gke.io/resource-adjustment: '{"input":{"containers":[{"limits":{"cpu":"2","memory":"4Gi"},"requests":{"cpu":"250m","memory":"512Mi"},"name":"noetl-worker"}]},"output":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"4Gi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"512Mi"},"name":"noetl-worker"}]},"computeClassAtAdmission":"Default","modified":true}'
+    autopilot.gke.io/warden-version: 35.26.5-gke.2
+  labels:
+    app: noetl-cmdbus-writer
+    command-bus: ehdb
+    component: cmdbus-writer
+    managed-by: noetl
+  name: noetl-cmdbus-writer
+  namespace: noetl
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  podManagementPolicy: Parallel
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: noetl-cmdbus-writer
+  serviceName: noetl-cmdbus-writer-headless
+  template:
+    metadata:
+      labels:
+        app: noetl-cmdbus-writer
+        command-bus: ehdb
+        component: cmdbus-writer
+        managed-by: noetl
+    spec:
+      containers:
+      - args:
+        - 'set -e
+
+          ORD="${HOSTNAME##*-}"
+
+          case "$ORD" in ''''|*[!0-9]*) echo "cannot derive shard from HOSTNAME=$HOSTNAME" >&2; exit 1
+          ;; esac
+
+          export NOETL_COMMAND_BUS_SHARD="$ORD"
+
+          export NOETL_EVENT_BUS_SHARD="$ORD"
+
+          echo "writer shard $ORD (host $HOSTNAME)"
+
+          exec ./noetl-worker
+
+          '
+        command:
+        - /bin/sh
+        - -c
+        env:
+        - name: NOETL_EHDB_TIER_SERVICE_BIND
+          value: 0.0.0.0:9110
+        - name: NOETL_EHDB_TIER_SERVICE_DIR
+          value: /data/eventbus/ehdb-tier
+        - name: WORKER_POOL_NAME
+          value: cmdbus-writer
+        - name: NOETL_SERVER_URL
+          value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+        - name: WORKER_MAX_CONCURRENT
+          value: '1'
+        - name: WORKER_METRICS_BIND
+          value: 0.0.0.0:9090
+        - name: RUST_LOG
+          value: info,noetl_worker=info,ehdb_feed=info
+        - name: NOETL_COMMAND_BUS
+          value: ehdb
+        - name: NOETL_COMMAND_BUS_HOST
+          value: 'true'
+        - name: NOETL_COMMAND_SHARD_COUNT
+          value: '1'
+        - name: NOETL_COMMAND_BUS_WRITER_DIR
+          value: /data/cmdbus
+        - name: NOETL_COMMAND_BUS_INGEST_BIND
+          value: 0.0.0.0:9100
+        - name: NOETL_COMMAND_BUS_CLAIM_BIND
+          value: 0.0.0.0:9101
+        - name: NOETL_COMMAND_BUS_METRICS_BIND
+          value: 0.0.0.0:9102
+        - name: NOETL_COMMAND_BUS_ACK_WAIT_SECS
+          value: '30'
+        - name: NOETL_COMMAND_BUS_CLAIM_ADDR
+          value: 127.0.0.1:9101
+        - name: NOETL_FEED_FILTER_SUBJECT
+          value: noetl.commands.cmdbus.>
+        - name: NOETL_EVENT_BUS_HOST
+          value: 'true'
+        - name: NOETL_EVENT_SHARD_COUNT
+          value: '1'
+        - name: NOETL_EVENT_BUS_WRITER_DIR
+          value: /data/eventbus
+        - name: NOETL_EVENT_BUS_KV_DIR
+          value: /data/eventkv
+        - name: NOETL_EVENT_BUS_INGEST_BIND
+          value: 0.0.0.0:9103
+        - name: NOETL_EVENT_BUS_CLAIM_BIND
+          value: 0.0.0.0:9104
+        - name: NOETL_EVENT_BUS_SSE_BIND
+          value: 0.0.0.0:9105
+        - name: NOETL_EVENT_BUS_METRICS_BIND
+          value: 0.0.0.0:9106
+        - name: NOETL_EVENT_BUS_KV_BIND
+          value: 0.0.0.0:9107
+        - name: NOETL_EVENT_BUS_WAL_BIND
+          value: 0.0.0.0:9108
+        - name: NOETL_EVENT_BUS_ACK_WAIT_SECS
+          value: '30'
+        - name: NOETL_EVENT_BUS_CURSOR_PERSIST_SECS
+          value: '5'
+        - name: NOETL_EVENT_BUS_CURSOR_FALLBACK
+          value: tail
+        - name: NOETL_EHDB_REFERENCE_RUNTIME_CACHE
+          value: 'true'
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:8b7948a8203547d7b5916766833f3b19c78503e7fa24e3fe2d0b773ed04ad418
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          successThreshold: 1
+          tcpSocket:
+            port: cmdbus-claim
+          timeoutSeconds: 1
+        name: noetl-worker
+        ports:
+        - containerPort: 9110
+          name: tier-service
+          protocol: TCP
+        - containerPort: 9100
+          name: cmdbus-ingest
+          protocol: TCP
+        - containerPort: 9101
+          name: cmdbus-claim
+          protocol: TCP
+        - containerPort: 9102
+          name: cmdbus-lag
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        - containerPort: 9103
+          name: events-ingest
+          protocol: TCP
+        - containerPort: 9104
+          name: events-claim
+          protocol: TCP
+        - containerPort: 9105
+          name: events-sse
+          protocol: TCP
+        - containerPort: 9106
+          name: events-lag
+          protocol: TCP
+        - containerPort: 9107
+          name: events-kv
+          protocol: TCP
+        - containerPort: 9108
+          name: events-wal
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          successThreshold: 1
+          tcpSocket:
+            port: cmdbus-claim
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: '2'
+            ephemeral-storage: 1Gi
+            memory: 4Gi
+          requests:
+            cpu: 250m
+            ephemeral-storage: 1Gi
+            memory: 512Mi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /data/cmdbus
+          name: cmdbus-data
+        - mountPath: /data/eventbus
+          name: eventbus-data
+        - mountPath: /data/eventkv
+          name: eventbus-kv
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      tolerations:
+      - effect: NoSchedule
+        key: kubernetes.io/arch
+        operator: Equal
+        value: amd64
+      volumes:
+      - name: cmdbus-data
+        persistentVolumeClaim:
+          claimName: noetl-cmdbus-writer-0-data
+      - name: eventbus-data
+        persistentVolumeClaim:
+          claimName: noetl-eventbus-writer-0-data
+      - name: eventbus-kv
+        persistentVolumeClaim:
+          claimName: noetl-eventbus-kv-0-data
+  updateStrategy:
+    type: RollingUpdate

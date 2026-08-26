@@ -1,53 +1,51 @@
-# noetl-worker-rust — PRODUCTION Rust worker pool (GKE noetl-demo-19700101)
-# =============================================================================
-# Phase F R5 of noetl/ai-meta#49 — the Rust worker half of the full-stack
-# cutover.  The server-only flip (attempt 1, 2026-06-13) failed because the
-# Rust server publishes commands to the hierarchical subject
-# `noetl.commands.{pool}.{execution_id}` which the Python workers + the prod
-# NATS stream (flat `noetl.commands`) don't consume.  The Rust worker is what
-# consumes the hierarchical subjects — so the cutover is the FULL Rust stack.
+# noetl/ai-meta#267 — RECONCILED AGAINST LIVE PROD 2026-08-26.
 #
-# *** This is applied as a CANARY first (off the public traffic path) ***:
-# while Python still serves the `noetl` Service, this Rust worker subscribes to
-# `noetl.commands.shared.>` on the (widened) NOETL_COMMANDS stream and talks to
-# the Rust server canary directly (NOETL_SERVER_URL below).  Prod Python
-# workers consume only the flat `noetl.commands`, so there is no consumer clash.
+# Captured from the running cluster, not hand-written.  Before this, applying
+# this file would have DELETED live environment variables from the running
+# workload — including NOETL_COMMAND_BUS, the internal API token secretKeyRef,
+# and the off-server state-builder topology.  A DR re-apply would have silently
+# unconfigured prod (noetl/ai-meta#267).
 #
-# Prereqs before this becomes useful:
-#   1. A SEPARATE stream `NOETL_COMMANDS_RUST` owning `noetl.commands.>`
-#      (disjoint from Python's flat `noetl.commands`; the two coexist —
-#      Python's NOETL_COMMANDS stream is untouched):
-#        nats stream add NOETL_COMMANDS_RUST --subjects "noetl.commands.>" \
-#          --storage memory --retention limits --discard old --max-msgs=-1 \
-#          --max-bytes=-1 --max-age=0 --dupe-window=2m --replicas 1
-#   2. noetl-server-rust Deployment running (the canary server).
+# Secrets are REFERENCED (valueFrom.secretKeyRef), never resolved.  The capture
+# tool fails closed on any credential-shaped or high-entropy literal:
+# playbooks/267-iac-reconcile/capture.py in noetl/ai-meta.
 #
-# Image: built by automation/gcp_gke/assets/... from noetl/worker 7b8a09a
-# (v5.20.0).  Pinned by digest below.
----
+# Cluster-authored annotations (autopilot.gke.io/*, cloud.google.com/*) are kept
+# deliberately: stripping them makes an apply MUTATE live state, and the whole
+# point here is that it must not.
+#
+# Proof:  kubectl --context <prod> -n noetl diff -f <this file>   ->  no-op.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: noetl-worker-rust
-  namespace: noetl
+  annotations:
+    autopilot.gke.io/resource-adjustment: '{"input":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"768Mi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"noetl-worker"}]},"output":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"768Mi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"256Mi"},"name":"noetl-worker"}]},"computeClassAtAdmission":"Default","modified":true}'
+    autopilot.gke.io/warden-version: 35.26.4-gke.2
+    kubernetes.io/change-cause: roll to 5.51.0 (#166 Phase3 read path, flags OFF) 2026-07-03
   labels:
     app: noetl-worker-rust
     component: worker
     runtime: rust
     worker-pool: worker-rust-pool
+  name: noetl-worker-rust
+  namespace: noetl
 spec:
-  # KEDA owns the replica count at runtime (ScaledObject `noetl-worker-rust`,
-  # min 2 / max 20, nats-jetstream consumer-lag trigger).  This value is only
-  # the bootstrap floor before the HPA reconciles; set to 2 (the KEDA min +
-  # live prod capacity) so a `kubectl apply` never momentarily scales the pool
-  # down and fights the HPA.
+  progressDeadlineSeconds: 600
   replicas: 2
+  revisionHistoryLimit: 10
   selector:
     matchLabels:
       app: noetl-worker-rust
       worker-pool: worker-rust-pool
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
   template:
     metadata:
+      annotations:
+        kubectl.kubernetes.io/restartedAt: '2026-07-27T00:38:16-07:00'
       labels:
         app: noetl-worker-rust
         component: worker
@@ -55,130 +53,148 @@ spec:
         worker-pool: worker-rust-pool
     spec:
       containers:
-        - name: noetl-worker
-          # Pinned by immutable digest (AR push 2026-06-21T16:57:05Z).
-          # tags :v5.40.3 / :6dd3449 resolve to this digest (linux/amd64).
-          # v5.40.3 = the worker shipped alongside the #121 system-exec
-          # off-server drive wedge fix (server-side fix; worker is a version
-          # bump carrying #117 off-server spine causal-order + #119 WAL-index
-          # restart-rehydration).  This is the LIVE prod image as of the
-          # 2026-06-21 off-server cutover.  Same binary as the system pool; only
-          # the NATS consumer + filter subject differ.  This step-worker pool
-          # carries NO off-server flags (the drive plug-in runs on the system
-          # pool, not here).
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:5e80493bc496c8921d6dbf54f62abd7a732cc04bfadb951d39420d396f18170a
-          imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: 9090
-              name: metrics
-          env:
-            # Distinct pool name so Rust heartbeats don't collide with the
-            # Python pool's register/deregister.
-            - name: WORKER_POOL_NAME
-              value: worker-rust-pool
-            - name: WORKER_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: NATS_URL
-              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
-            # Dedicated Rust-stack stream (subjects noetl.commands.>).
-            # Disjoint from Python's NOETL_COMMANDS (flat noetl.commands),
-            # so Python's stream is never touched.
-            - name: NATS_STREAM
-              value: NOETL_COMMANDS_RUST
-            # DISTINCT durable consumer — must not collide with the Python
-            # pool's `noetl_worker_pool` / `*_shared` consumers.
-            - name: NATS_CONSUMER
-              value: noetl_worker_rust_shared
-            # Consume the shared-segment hierarchical commands the Rust server
-            # publishes (noetl.commands.shared.<execution_id>).  Python workers
-            # consume only the flat `noetl.commands`, so no clash.
-            - name: NATS_FILTER_SUBJECT
-              value: noetl.commands.shared.>
-            # Talk to the Rust server directly — valid during the canary (while
-            # Python still owns the `noetl` Service) AND after cutover (the Rust
-            # server keeps its own Service).
-            - name: NOETL_SERVER_URL
-              value: http://noetl-server-rust.noetl.svc.cluster.local:8082
-            - name: WORKER_HEARTBEAT_INTERVAL
-              value: "15"
-            - name: WORKER_MAX_CONCURRENT
-              value: "4"
-            - name: WORKER_METRICS_BIND
-              value: "0.0.0.0:9090"
-            - name: RUST_LOG
-              value: "info,noetl_worker=info,noetl_executor=info"
-            # Arrow IPC shared-memory cache budget (noetl-arrow-cache).
-            # Pinned here next to the /dev/shm sizeLimit below so the two
-            # stay coherent: sizeLimit (320Mi) MUST exceed this budget
-            # (256Mi) or the worker SIGBUSes (exit 135) when the cache
-            # fills past the tmpfs.  worker.rs:91 / arrow-cache cache.rs:12.
-            - name: NOETL_IPC_CACHE_BUDGET_BYTES
-              value: "268435456" # 256 MiB
-          volumeMounts:
-            # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
-            # container-runtime default /dev/shm is a 64 MiB tmpfs; the
-            # cache writes shm regions up to NOETL_IPC_CACHE_BUDGET_BYTES
-            # and overruns 64 MiB, page-faulting into SIGBUS (exit 135).
-            - name: dshm
-              mountPath: /dev/shm
-          resources:
-            requests:
-              # noetl/ai-meta#127 — raised 100m -> 250m to give the busy
-              # batch worker a real guaranteed floor (matches server-rust's
-              # 250m request; still a low-request/high-limit bursting shape).
-              cpu: "250m"
-              memory: "128Mi"
-            limits:
-              # noetl/ai-meta#127 — raised 1 -> 2.  Profiling a 10k PFT batch
-              # showed the worker pegs one CPU and burns 38-47% of its time
-              # CPU-THROTTLED at the 1-CPU limit (the per-sub-task
-              # running_ctx.clone() + to_template_context() is the hot path).
-              # Lifting the limit to 2 removed the throttle and cut the run
-              # ~166-172s -> ~137.6s (~20%), zero patient loss.  The throttle
-              # ceiling is the limit, not the request; nodes are 16-CPU and
-              # ~98% idle, so the burst headroom is freely available (KEDA max
-              # 20 pods x 2 = 40 CPU still fits across the 4x ek-standard-16
-              # nodes, ~63.5 CPU allocatable).
-              cpu: "2"
-              # 320Mi (/dev/shm tmpfs, charged to the cgroup) + worker RSS.
-              memory: "768Mi"
-          livenessProbe:
-            tcpSocket:
-              port: 9090
-            initialDelaySeconds: 20
-            periodSeconds: 15
-            failureThreshold: 6
-          readinessProbe:
-            tcpSocket:
-              port: 9090
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            failureThreshold: 6
+      - env:
+        - name: WORKER_POOL_NAME
+          value: worker-rust-pool
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: NOETL_SERVER_URL
+          value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+        - name: WORKER_HEARTBEAT_INTERVAL
+          value: '15'
+        - name: WORKER_MAX_CONCURRENT
+          value: '4'
+        - name: WORKER_METRICS_BIND
+          value: 0.0.0.0:9090
+        - name: RUST_LOG
+          value: info,noetl_worker=info,noetl_executor=info
+        - name: NOETL_IPC_CACHE_BUDGET_BYTES
+          value: '268435456'
+        - name: NOETL_RESULT_URI_RESOLVE
+          value: 'true'
+        - name: NOETL_RESULT_PRODUCER_STAGE
+          value: 'true'
+        - name: NOETL_COMMAND_BUS
+          value: ehdb
+        - name: NOETL_COMMAND_BUS_HOST
+          value: 'false'
+        - name: NOETL_COMMAND_SHARD_COUNT
+          value: '1'
+        - name: NOETL_COMMAND_BUS_CLAIM_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9101
+        - name: NOETL_FEED_FILTER_SUBJECT
+          value: noetl.commands.shared.>
+        - name: NOETL_EHDB_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_MODE
+          value: local_reference
+        - name: NOETL_EHDB_CLIENT_ROLE
+          value: worker
+        - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
+          value: /tmp/ehdb/ref.jsonl
+        - name: NOETL_EHDB_EVENTLOG
+          value: primary
+        - name: NOETL_EHDB_PROJECTION
+          value: shadow
+        - name: NOETL_EHDB_KV
+          value: shadow
+        - name: NOETL_EHDB_OBJECT
+          value: shadow
+        - name: NOETL_EHDB_TIER_QUERY_SOURCE
+          value: service
+        - name: NOETL_EHDB_TIER_SERVICE_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9110
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:8b7948a8203547d7b5916766833f3b19c78503e7fa24e3fe2d0b773ed04ad418
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          successThreshold: 1
+          tcpSocket:
+            port: 9090
+          timeoutSeconds: 1
+        name: noetl-worker
+        ports:
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 6
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 9090
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: '2'
+            ephemeral-storage: 1Gi
+            memory: 768Mi
+          requests:
+            cpu: 250m
+            ephemeral-storage: 1Gi
+            memory: 256Mi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: noetl-worker
+      serviceAccountName: noetl-worker
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: kubernetes.io/arch
+        operator: Equal
+        value: amd64
       volumes:
-        - name: dshm
-          emptyDir:
-            medium: Memory
-            # >= NOETL_IPC_CACHE_BUDGET_BYTES (256Mi) + 64Mi headroom for
-            # tmpfs page rounding / fragmentation.  tmpfs usage counts
-            # against the container memory limit above (768Mi), which
-            # covers this plus the worker RSS.
-            sizeLimit: 320Mi
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 320Mi
+        name: dshm
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: noetl-worker-rust-metrics
-  namespace: noetl
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
   labels:
     app: noetl-worker-rust
+  name: noetl-worker-rust-metrics
+  namespace: noetl
 spec:
   clusterIP: None
+  clusterIPs:
+  - None
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: metrics
+    port: 9090
+    protocol: TCP
+    targetPort: 9090
   selector:
     app: noetl-worker-rust
-  ports:
-    - name: metrics
-      port: 9090
-      targetPort: 9090
-      protocol: TCP
+  sessionAffinity: None
+  type: ClusterIP
