@@ -29,6 +29,71 @@ context explicitly. A command here without `--context` is a bug in this file.
 | P4 | `noetl_ehdb_projection_*` series exist at 0 on `/metrics` | §2 below | ⬜ |
 | P5 | rollback rehearsed — each flag off restores prior behaviour in one rollout | kind `restore` arm | ✅ in kind |
 
+
+## 1b. The spine relay must target the pool that RUNS the state-builder drain
+
+Found 2026-08-26 while running ai-meta#265 Phase 3 in kind, and it applies to
+any environment where the projection read model folds from the WAL spine.
+
+`NOETL_EHDB_WORKER_QUERY_URL` is the relay the server uses for **both** EHDB
+tier reads/appends **and** the WAL state-spine read. Those have different
+requirements:
+
+| read | needs on the target pool |
+| :-- | :-- |
+| `GET /ehdb/tiers/{tier}` | `NOETL_EHDB_ENABLED` + `TIER_QUERY_SOURCE=service` + a tier-service address |
+| `GET /ehdb/state-spine` | the **off-server state-builder drain** (`NOETL_STATE_BUILDER=offserver`, `SOURCE=ehdb`, `NOETL_EVENT_BUS_WAL_ADDR`) |
+
+**Only the system pool runs the drain.** Pointing the relay at the user pool
+makes every spine read return `incomplete` — silently, because a pool with an
+empty index answers `incomplete` and not `unavailable` (`worker.rs` always
+passes `Some(index)`, so the `unavailable` branch is unreachable in the normal
+worker shape).
+
+Measured two-sided on one live execution, same instant:
+
+```
+system pool = [ok n=6]        user pool = [incomplete n=0]
+```
+
+In kind the fix is one variable:
+
+```bash
+kubectl --context kind-noetl -n noetl set env deploy/noetl-server-rust \
+  NOETL_EHDB_WORKER_QUERY_URL=http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090
+```
+
+Verified afterwards that tier reads still resolve through the writer
+(`tier_query_source: service`), so tier 1 does not regress — the system pool
+carries `TIER_QUERY_SOURCE=service` and the writer address, which is what makes
+repointing safe rather than a trade.
+
+⚠ **Not applied to prod, and not to be applied casually.** On prod the same
+variable feeds the live event-log mirror and comparator. Repointing it there is
+a change to tier 1's relay path and needs its own verification; the projection
+tier is not serving on prod, so nothing requires it yet. If the spine read is
+ever wanted on prod, prefer giving it its **own** variable over repurposing this
+one — two reads with different pool requirements sharing one address is exactly
+how this was mis-wired in the first place.
+
+## 1c. The WAL spine is a LIVE-execution structure
+
+The state-builder index **evicts an execution's chain on a terminal event**
+(`playbook.completed` / `.failed` / `.cancelled`) — by design, to free memory:
+a terminal execution never needs driving again.
+
+So a completed execution has **no spine**, and a spine read for one correctly
+returns `incomplete`. Any projection materialised from the spine must be folded
+**while the execution is in flight**.
+
+That is the right shape for control flow rather than a limitation: control flow
+reads state to decide the *next* step, and a completed execution has no next
+step.
+
+Practical consequence for anyone gating this: `tests/gate_fast_probe` completes
+in **under 3 seconds**, so its in-flight window is too short to probe reliably.
+Use `tests/227/slow_step`.
+
 ## 2. Pre-flight — read-only, safe to run now
 
 ```bash
