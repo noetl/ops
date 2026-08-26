@@ -1,323 +1,253 @@
-# noetl-server-rust — PRODUCTION Deployment + Service (GKE noetl-demo-19700101)
-# =============================================================================
-# The Rust control plane ("noetl-control-plane" binary) for the production GKE
-# stack.  Originally the noetl/ai-meta#49 Python→Rust cutover candidate; that
-# cutover is DONE (prod's `noetl` Service already selects app=noetl-server-rust
-# and there is no Python deployment).  This manifest is now the ROLL-FORWARD
-# artifact for the post-#115/#116/#117/#118/#119/#121 image (CQRS PUBLISH_ONLY
-# gate + cancel/finalize chokepoint + one-level prev_event_id event chain +
-# off-server state builder + FinalizedGuard + WAL-index restart-rehydration +
-# system-exec off-server drive wedge fix, server v3.39.5).
+# noetl/ai-meta#267 — RECONCILED AGAINST LIVE PROD 2026-08-26.
 #
-# *** This manifest PINS THE LIVE PROD CUTOVER STATE (2026-06-21). ***  Prod was
-# cut over to the full off-server CQRS stack via `kubectl set image` / `set env`
-# (server v3.39.5, NOETL_EVENT_INGEST_PUBLISH_ONLY=true, NOETL_STATE_BUILDER=
-# offserver — the materializer on the system pool is the sole noetl.event
-# writer).  This file now describes that running state so a future `kubectl
-# apply` is a NO-OP instead of silently reverting the cutover.  The gate env
-# values below are the LIVE values, not the pre-cutover defaults.
+# Captured from the running cluster, not hand-written.  Applying the previous
+# version would have DELETED live configuration; a DR re-apply would have
+# silently unconfigured prod.
 #
-# PREREQUISITE (one-time, owner-applied) for this image: the v3.39.1 write path
-# binds `prev_event_id` on every noetl.event / noetl.command INSERT.  The runtime
-# `noetl` role is NOT the table owner (owner=postgres), so the server's startup
-# `ensure_columns` best-effort ADD COLUMN is swallowed with a harmless
-# "event-chain DDL skipped (server role likely not table owner)" WARN — that line
-# PERSISTS by design even after the columns exist (Postgres checks ownership
-# before the IF-NOT-EXISTS skip).  The columns + idx_event_prev_event_id were
-# provisioned ONCE by the DB owner (`postgres`) on 2026-06-20; see
-# runbooks/noetl-cqrs-publish-only-flip.md "prev_event_id migration" record.
+# Secrets are REFERENCED (valueFrom.secretKeyRef), never resolved:
+# NOETL_ENCRYPTION_KEY, POSTGRES_PASSWORD and NOETL_INTERNAL_API_TOKEN all
+# resolve from Secret objects.  The capture tool fails closed on any
+# credential-shaped or high-entropy literal:
+# playbooks/267-iac-reconcile/capture.py in noetl/ai-meta.
 #
-# This is the PRODUCTION-shaped manifest (distinct from the kind-only
-# `server-rust-deployment.yaml` in this directory, which uses a local
-# `localhost/...:dev` image with `imagePullPolicy: Never`).
+# ⚠ NOETL_AUTH0_AUDIENCE is a literal ON PURPOSE.  It holds the Auth0 CLIENT ID,
+# which is public by construction — the identical value is served to browsers in
+# ci/manifests/gateway/configmap-ui-files.yaml, compiled into the GUI bundle as
+# VITE_AUTH0_CLIENT_ID, hard-coded as DEFAULT_AUTH0_CLIENT_ID in travel, and
+# committed as a plaintext default in the get_auth0_token playbook.  The Auth0
+# client SECRET is a different value and lives in the NoETL keychain as
+# `auth0_client`.  See docs/rfc/secret-manager-retrieval.md §1.4.
 #
-# *** DO NOT `kubectl apply` THIS BLINDLY. ***  The Deployment name
-# `noetl-server-rust` IS the live, traffic-serving deployment, so applying this
-# ROLLS the live server (zero-downtime rolling update: maxUnavailable=0,
-# maxSurge=1).  Treat it as a normal prod server release, gated on the
-# operator.  The CQRS gate `NOETL_EVENT_INGEST_PUBLISH_ONLY` is pinned `true`
-# below to MATCH the live cutover (it is already true on the running pods), so
-# applying this does NOT change the gate — it keeps it on.  Follow the
-# "Production (GKE)" section of `repos/ops/runbooks/noetl-cqrs-publish-only-flip.md`.
+# Cluster-authored annotations (autopilot.gke.io/*, cloud.google.com/*) are kept
+# DELIBERATELY — stripping them leaves a diff that still mutates live state.
 #
-# Image: built by `automation/gcp_gke/assets/server/cloudbuild.yaml` from
-# noetl/server v3.39.5 (the #121 system-exec off-server drive wedge fix).
-# Pinned below by the immutable @sha256 digest (NOT a mutable tag) so a
-# re-pushed tag can never silently change what prod runs.
-#
-# Prereqs the operator MUST satisfy (ALL ALREADY PRESENT in prod as of
-# 2026-06-19 — created when the Rust cutover landed; verify before apply):
-#   1. Secret `noetl-secret` carries key `NOETL_ENCRYPTION_KEY` (base64 32-byte).
-#      The Rust server FAILS CLOSED without it (no insecure default —
-#      noetl/ai-meta#61).  Credentials were re-entered under the Rust AES-GCM
-#      scheme at cutover; this roll-forward does NOT re-touch them.
-#   2. Secret `noetl-internal-api-token` (key `token`) — referenced
-#      non-optionally below; absent → pod CreateContainerConfigError.
-#   3. Prod pgbouncer runs `pool_mode=transaction`; this manifest sets
-#      NOETL_PG_STATEMENT_CACHE_CAPACITY=0 so sqlx is safe behind it.
-#      No pgbouncer change needed.
----
+# Proof:  kubectl --context <prod> -n noetl diff -f <this file>   ->  no-op.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: noetl-server-rust
-  namespace: noetl
+  annotations:
+    autopilot.gke.io/resource-adjustment: '{"input":{"containers":[{"limits":{"cpu":"2","memory":"1Gi"},"requests":{"cpu":"250m","memory":"256Mi"},"name":"noetl-server"}]},"output":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"1Gi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"256Mi"},"name":"noetl-server"}]},"computeClassAtAdmission":"Default","modified":true}'
+    autopilot.gke.io/warden-version: 35.26.4-gke.2
   labels:
     app: noetl-server-rust
     component: server
     runtime: rust
+  name: noetl-server-rust
+  namespace: noetl
 spec:
+  progressDeadlineSeconds: 600
   replicas: 1
+  revisionHistoryLimit: 10
   selector:
     matchLabels:
       app: noetl-server-rust
   strategy:
-    type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 0
       maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
   template:
     metadata:
+      annotations:
+        kubectl.kubernetes.io/restartedAt: '2026-08-14T22:03:31-07:00'
       labels:
         app: noetl-server-rust
         component: server
         runtime: rust
     spec:
       containers:
-        - name: noetl-server
-          # Pinned by immutable digest (AR push 2026-06-21T19:54:08Z) so a
-          # re-pushed tag can never silently change what prod runs.  The
-          # :v3.39.5 tag resolves to this same digest and is shown for human
-          # traceability.  This is the LIVE prod image as of the 2026-06-21
-          # off-server cutover.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/server-rust@sha256:feaac0c56ff08a70569dd2e0d7bf5b29486934076a67ff86f09c5c2926248179
-          imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: 8082
-              name: http
-          env:
-            - name: NOETL_HOST
-              value: "0.0.0.0"
-            - name: NOETL_PORT
-              value: "8082"
-            - name: RUST_LOG
-              value: "info,noetl_server=info,sqlx=warn"
-            # --- Database -----------------------------------------------------
-            # Prod has NO direct postgres Service — DB is Cloud SQL
-            # (noetl-shared-pg) reached through `pgbouncer` (pool_mode=
-            # transaction, via cloud-sql-proxy).  sqlx is made safe behind
-            # transaction pooling by NOETL_PG_STATEMENT_CACHE_CAPACITY=0
-            # below.  Same endpoint the Python server uses.
-            - name: POSTGRES_HOST
-              value: "pgbouncer.postgres.svc.cluster.local"
-            - name: POSTGRES_PORT
-              value: "5432"
-            - name: POSTGRES_USER
-              value: "noetl"
-            # The CLIENT password pgbouncer expects for user `noetl` is the
-            # value Python authenticates with — stored under the `NOETL_PASSWORD`
-            # key of `noetl-secret` (the separate `POSTGRES_PASSWORD` key is a
-            # different value and makes pgbouncer SASL-auth fail).  The Rust
-            # server reads it from the POSTGRES_PASSWORD *env var* (envy prefix),
-            # so the env name stays POSTGRES_PASSWORD but the secret key is
-            # NOETL_PASSWORD.
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: noetl-secret
-                  key: NOETL_PASSWORD
-            - name: POSTGRES_DATABASE
-              value: "noetl"
-            - name: NOETL_SCHEMA
-              value: "noetl"
-            # REQUIRED for the pgbouncer path above.  Prod pgbouncer runs
-            # `pool_mode=transaction` (in front of Cloud SQL via cloud-sql-
-            # proxy).  sqlx's default named prepared-statement cache collides
-            # across pooled backend connections under transaction pooling
-            # ("prepared statement \"sqlx_s_N\" does not exist").  Setting the
-            # cache capacity to 0 makes sqlx use one-shot unnamed statements,
-            # which are safe.  (noetl/server e7df366+.)  Leave UNSET for a
-            # direct/session-mode Postgres.
-            - name: NOETL_PG_STATEMENT_CACHE_CAPACITY
-              value: "0"
-            # Callback URL embedded in NATS command notifications.  Points at
-            # the Rust Service DNS — valid both during canary (before the
-            # `noetl` selector flip) and after cutover.
-            - name: NOETL_PUBLIC_SERVER_URL
-              value: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
-            # 10-bit snowflake machine id.  Set to a value DISTINCT from the
-            # Python server's so the two can run concurrently during canary
-            # without minting colliding execution/command/event IDs.
-            - name: NOETL_SERVER_MACHINE_ID
-              value: "2"
-            # --- Internal-API bearer token (REQUIRED) -------------------------
-            # Gate for /api/internal/* (system worker pool).  Secret must be
-            # created before apply (runbook step 2b); referenced non-optionally
-            # so a missing secret fails loudly rather than silently disabling
-            # the gate.
-            - name: NOETL_INTERNAL_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: noetl-internal-api-token
-                  key: token
-            # --- Credential encryption key (REQUIRED, fail-closed) ------------
-            # NOT `optional: true` (unlike the kind manifest).  The Rust server
-            # refuses to start without a real key (noetl/ai-meta#61); making it
-            # required here surfaces a missing key as a clear CreateContainer
-            # error at apply time instead of a CrashLoop with a buried log.
-            - name: NOETL_ENCRYPTION_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: noetl-secret
-                  key: NOETL_ENCRYPTION_KEY
-            # --- CQRS write-path gate (noetl/ai-meta#103) --------------------
-            # Pinned "true" to MATCH THE LIVE PROD CUTOVER (2026-06-21).  When
-            # true the server stops INSERTing into noetl.event and instead
-            # publishes to the noetl_events JetStream stream; the system-pool
-            # materializer (NOETL_MATERIALIZER_ENABLED=true) becomes the sole
-            # noetl.event writer.  The flip was performed live behind the
-            # materializer-lag alerts (GMP Rules `noetl-materializer-lag`) and
-            # has been LEFT ON.  This manifest now records that state so apply is
-            # a no-op.  Revert is one command: set this back to "false" (and the
-            # system pool's NOETL_MATERIALIZER_ENABLED to "false").  See the
-            # "Production (GKE)" section of
-            # runbooks/noetl-cqrs-publish-only-flip.md.
-            - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
-              value: "true"
-            # RFC noetl/ai-meta#115 Phase 6 — how the execution-lifecycle hot path
-            # reads noetl.event.  Pinned EXPLICITLY "event_scan" so this roll-
-            # forward does NOT change read behavior.  The flip to "audit_only" —
-            # the hot-path readers (get_catalog_id, inherit_parent_trace, the
-            # subscription dedup-audit + container-callback catalog/existence
-            # reads) are served from the in-memory execute-time ExecDescriptor and
-            # noetl.event becomes audit-only (still written by the materializer,
-            # read by operator/status/replay APIs, never scanned by the lifecycle)
-            # — is a SEPARATE, staged operator action taken WITH
-            # NOETL_STATE_BUILDER=offserver so the drive + ingest/callback paths
-            # are both scan-free.  Cold-descriptor reads fall back to the scan, so
-            # correctness never regresses.  Revert is one command: set back to
-            # "event_scan".  Default is already "event_scan" in the binary; naming
-            # it here makes the read-path mode visible in the manifest.
-            - name: NOETL_EVENT_READ_PATH
-              value: "event_scan"
-            # Off-server state builder (noetl/ai-meta#115 Phase 4 / #107).
-            # Pinned "offserver" to MATCH THE LIVE PROD CUTOVER (2026-06-21):
-            # the orchestrator drive builds its WorkflowState OFF the server
-            # from the noetl_events WAL spine instead of in-process on the
-            # server.  The server + the system-pool worker BOTH carry this flag
-            # set to "offserver" in prod (the drive plug-in runs on the system
-            # pool).  Default in the binary is "server"; naming it here records
-            # the live value so apply is a no-op.  Revert: set back to "server"
-            # on both the server and the system pool.
-            - name: NOETL_STATE_BUILDER
-              value: "offserver"
-            # The worker data-plane query base the server relays tier reads
-            # AND the projection mirror's appends to (noetl/ai-meta#178, #265).
-            # Both halves go through this one URL on purpose: writing where the
-            # comparator reads is then true by construction rather than by two
-            # variables agreeing.
-            - name: NOETL_EHDB_WORKER_QUERY_URL
-              value: "http://noetl-worker-rust-metrics.noetl.svc.cluster.local:9090"
-            # ---------------------------------------------------------------
-            # EHDB tiers (noetl/ai-meta#155, #257, #265).
-            #
-            # ⚠ THESE WERE UNDECLARED UNTIL noetl/ai-meta#265 G5, AND FIVE OF
-            # THEM ARE LIVE ON PROD.  Applying this file without them would
-            # strip `NOETL_EHDB_EVENTLOG_MIRROR_ASYNC=true` and the parity
-            # window from the server — silently disarming the async mirror and
-            # the comparator on the tier that is SERVING PRIMARY.  That is
-            # ai-meta#267 ("a re-apply would silently unconfigure prod"),
-            # measured here rather than inferred.
-            #
-            # The event-log values below are PROD'S LIVE VALUES, read off the
-            # cluster on 2026-08-25, so applying this is a no-op for tier 1.
-            # Do not "tidy" them; they are a capture, not a preference.
-            # ---------------------------------------------------------------
-            #
-            # -- tier 1: the event log.  PRIMARY and serving.  Do not change. --
-            - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
-              value: "server"
-            - name: NOETL_EHDB_EVENTLOG_MIRROR_ASYNC
-              value: "true"
-            - name: NOETL_EHDB_CROSSSTORE_PARITY_ENABLED
-              value: "true"
-            # Paired with MIRROR_ASYNC above: set both or neither.  Async on
-            # with this at 0 makes the comparator judge a healthy tier on its
-            # own liveness (noetl/ai-meta#155).
-            - name: NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS
-              value: "30"
-            #
-            # -- tier 2: the projection tier.  BUILT, GATED, NOT SERVING. -----
-            #
-            # Declared at their OFF values rather than omitted, deliberately:
-            # a shadow cutover is then a value edit on a line that already
-            # exists, the off state is visible in `kubectl get -o yaml`, and
-            # nothing has to remember that these variables exist.  Turning any
-            # of them on is a per-step decision recorded in
-            # ai-meta:playbooks/265-projection-tier/CUTOVER.md and needs an
-            # explicit go from the owner.
-            #
-            # `""` is OFF for the mirror source: it arms only on the exact
-            # string `server`.
-            - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
-              value: ""
-            - name: NOETL_EHDB_PROJECTION_PARITY_ENABLED
-              value: "false"
-            # C1 (shadow) sets MIRROR_SOURCE=server + PARITY_ENABLED=true.
-            # C3 moves READ_SOURCE postgres -> verify.  C5 -> tier, and only
-            # after a soak; see CUTOVER.md §2 for why `verify` is not optional.
-            - name: NOETL_EHDB_PROJECTION_READ_SOURCE
-              value: "postgres"
-            # G3's pair.  The queue REFUSES to arm if ASYNC is on while the
-            # window is 0, and stays inline — loudly, with async_enabled=0.
-            - name: NOETL_EHDB_PROJECTION_MIRROR_ASYNC
-              value: "false"
-            - name: NOETL_EHDB_PROJECTION_PARITY_LAG_TOLERANCE_SECS
-              value: "0"
-          resources:
-            requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
-              cpu: "2"
-              memory: "1Gi"
-          # /api/health returns DB + NATS connectivity, so readiness gates the
-          # pod on both being live — exactly the canary signal we want.
-          livenessProbe:
-            httpGet:
-              path: /api/health
-              port: 8082
-            initialDelaySeconds: 30
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 6
-          readinessProbe:
-            httpGet:
-              path: /api/health
-              port: 8082
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 12
+      - env:
+        - name: NOETL_OBJECT_STORE_BACKEND
+          value: gcs
+        - name: NOETL_OBJECT_STORE_GCS_BUCKET
+          value: shastaratech-noetl-prod-results
+        - name: NOETL_OBJECT_STORE_GCS_ENDPOINT
+          value: https://storage.googleapis.com
+        - name: NOETL_OBJECT_STORE_GCS_AUTH
+          value: auto
+        - name: NOETL_RESULT_CELL_ENV
+          value: prod
+        - name: NOETL_RESULT_CELL_REGION
+          value: usc1
+        - name: NOETL_RESULT_CELL
+          value: usc1-a
+        - name: NOETL_RESULT_SHARD_COUNT
+          value: '256'
+        - name: NOETL_HOST
+          value: 0.0.0.0
+        - name: NOETL_PORT
+          value: '8082'
+        - name: RUST_LOG
+          value: info,noetl_server=info,sqlx=warn
+        - name: POSTGRES_HOST
+          value: pgbouncer.postgres.svc.cluster.local
+        - name: POSTGRES_PORT
+          value: '5432'
+        - name: POSTGRES_USER
+          value: noetl
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: NOETL_PASSWORD
+              name: noetl-secret
+        - name: POSTGRES_DATABASE
+          value: noetl
+        - name: NOETL_SCHEMA
+          value: noetl
+        - name: NOETL_PG_STATEMENT_CACHE_CAPACITY
+          value: '0'
+        - name: NOETL_PUBLIC_SERVER_URL
+          value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+        - name: NOETL_SERVER_MACHINE_ID
+          value: '2'
+        - name: NOETL_INTERNAL_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: token
+              name: noetl-internal-api-token
+        - name: NOETL_ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              key: NOETL_ENCRYPTION_KEY
+              name: noetl-secret
+        - name: NOETL_EVENT_READ_PATH
+          value: event_scan
+        - name: NOETL_RESULT_MINT_AUTHORITATIVE
+          value: 'true'
+        - name: NOETL_RESULT_STORE_DUAL_WRITE
+          value: 'false'
+        - name: NOETL_OFFSERVER_ATTACH_TAIL
+          value: 'false'
+        - name: NOETL_OFFSERVER_TAIL_PLAYBOOK_PREFIXES
+          value: muno/playbooks/itinerary-planner,automation/agents/mcp/
+        - name: NOETL_ORPHAN_SWEEP_ENABLED
+          value: 'true'
+        - name: NOETL_AUTH_VERIFY_SIGNATURE
+          value: shadow
+        - name: NOETL_AUTH0_DOMAIN
+          value: mestumre-development.us.auth0.com
+        - name: NOETL_AUTH0_AUDIENCE
+          value: Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN
+        - name: NOETL_SHARD_SUBJECT_ROUTE
+          value: 'true'
+        - name: NOETL_COMMAND_BUS
+          value: ehdb
+        - name: NOETL_EVENT_BUS
+          value: ehdb
+        - name: NOETL_COMMAND_SHARD_COUNT
+          value: '1'
+        - name: NOETL_COMMAND_BUS_INGEST_ADDRS
+          value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9100
+        - name: NOETL_COMMAND_BUS_WRITER_ADDRS
+          value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9100
+        - name: NOETL_EVENT_BUS_WRITER_ADDRS
+          value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9103
+        - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
+          value: 'true'
+        - name: NOETL_STATE_BUILDER
+          value: offserver
+        - name: NOETL_EVENT_SHARD_COUNT
+          value: '1'
+        - name: NOETL_PERMANENT_LOG_LEAN
+          value: 'true'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_WORKER_QUERY_URL
+          value: http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_ENABLED
+          value: 'true'
+        - name: NOETL_ORCH_RETRIGGER_ON_CLEAR
+          value: 'true'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_ASYNC
+          value: 'true'
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS
+          value: '30'
+        - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_PROJECTION_PARITY_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_PROJECTION_READ_SOURCE
+          value: wal
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:ca2c3e3bfbb5eda11098ea81fd3efcf17885effdcc96900fbd018bde8eab734d
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /api/health
+            port: 8082
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: noetl-server
+        ports:
+        - containerPort: 8082
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 12
+          httpGet:
+            path: /api/health
+            port: 8082
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: '2'
+            ephemeral-storage: 1Gi
+            memory: 1Gi
+          requests:
+            cpu: 250m
+            ephemeral-storage: 1Gi
+            memory: 256Mi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: noetl-server-rust
+      serviceAccountName: noetl-server-rust
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: kubernetes.io/arch
+        operator: Equal
+        value: amd64
 ---
-# Dedicated `noetl-server-rust` Service (already present in prod; apply is
-# idempotent).  The production `noetl` Service ALREADY selects
-# app=noetl-server-rust (the Python→Rust cutover is done), so both this Service
-# and the `noetl` Service resolve to the same pods.  This manifest does not
-# change the `noetl` Service.
 apiVersion: v1
 kind: Service
 metadata:
-  name: noetl-server-rust
-  namespace: noetl
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
   labels:
     app: noetl-server-rust
+  name: noetl-server-rust
+  namespace: noetl
 spec:
+  clusterIP: 34.118.232.85
+  clusterIPs:
+  - 34.118.232.85
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: http
+    port: 8082
+    protocol: TCP
+    targetPort: 8082
   selector:
     app: noetl-server-rust
-  ports:
-    - name: http
-      port: 8082
-      targetPort: 8082
-      protocol: TCP
+  sessionAffinity: None
   type: ClusterIP
