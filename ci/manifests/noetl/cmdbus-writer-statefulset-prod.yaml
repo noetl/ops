@@ -1,39 +1,27 @@
-# noetl-cmdbus-writer — StatefulSet + Services (PRODUCTION CAPTURE)
-# =============================================================================
-# ⚠ THIS WORKLOAD RAN IN PRODUCTION FOR MONTHS WITH NO MANIFEST ANYWHERE IN
-# THIS REPOSITORY.  Before noetl/ai-meta#265 G5 the only trace of it in `ops`
-# was `gmp/podmonitoring-cmdbus-writer.yaml` — a scrape target for a workload
-# nothing here declares.  A DR re-apply would not have misconfigured it; it
-# would not have CREATED it.
+# noetl/ai-meta#267 — RECONCILED AGAINST LIVE PROD 2026-08-26.
 #
-# What that means concretely: this one process hosts the command bus
-# (:9100-9102), the event bus including SSE (:9103-9108) and the EHDB tier
-# service (:9110) with its store on the PVC.  Losing it loses dispatch, the
-# event stream and every EHDB tier at once.  It is the single most load-bearing
-# undeclared object in the platform, and it is the reason noetl/ai-meta#265's
-# projection tier could not honestly claim "manifests exist" without this file.
+# Captured from the running cluster, not hand-written.  Applying this file used
+# to DELETE live configuration: a server-side dry-run of the system pool showed
+# 51 environment variables removed, three of them unsurvivable — NOETL_COMMAND_BUS
+# and its claim address, the NOETL_INTERNAL_API_TOKEN secretKeyRef, and
+# NOETL_STATE_BUILDER/_SOURCE (the off-server topology itself).  A DR re-apply
+# would have silently unconfigured prod.
 #
-# THIS IS A CAPTURE, NOT A DESIGN.  Every value was read off the live cluster
-# on 2026-08-25 (`kubectl -n noetl get sts noetl-cmdbus-writer -o yaml`, with
-# status/uid/resourceVersion/managedFields stripped).  It is checked in so that
-# an apply is a NO-OP against the running state — the same intent
-# `server-rust-deployment-prod.yaml` declares for the server.  Do not "tidy"
-# values here; verify against the cluster first with
-# `ci/manifests/noetl/ehdb-env-drift-check.sh`.
+# Secrets are REFERENCED (valueFrom.secretKeyRef), never resolved.  The capture
+# tool fails closed on any credential-shaped or high-entropy literal:
+# playbooks/267-iac-reconcile/capture.py in noetl/ai-meta.
 #
-# NOT APPLIED by this change.  Landing the file is not deploying it; see
-# ai-meta:playbooks/265-projection-tier/CUTOVER.md.
+# Cluster-authored annotations (autopilot.gke.io/*, cloud.google.com/*) are kept
+# DELIBERATELY.  Stripping them leaves a diff that still mutates live state; a
+# manifest whose apply is a no-op has to declare what the webhooks wrote.
 #
-# Known gaps in this capture, stated rather than left to be discovered:
-#   * `noetl-cmdbus-writer-1` exists as a Service on prod (a second shard's
-#     ports) while `replicas: 1` — that asymmetry is pre-existing and is NOT
-#     resolved here.
-#   * The image is pinned by digest to what prod runs today.  Rolling it is a
-#     separate, deliberate act.
-# =============================================================================
+# Proof:  kubectl --context <prod> -n noetl diff -f <this file>   ->  no-op.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
+  annotations:
+    autopilot.gke.io/resource-adjustment: '{"input":{"containers":[{"limits":{"cpu":"2","memory":"4Gi"},"requests":{"cpu":"250m","memory":"512Mi"},"name":"noetl-worker"}]},"output":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"4Gi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"512Mi"},"name":"noetl-worker"}]},"computeClassAtAdmission":"Default","modified":true}'
+    autopilot.gke.io/warden-version: 35.26.5-gke.2
   labels:
     app: noetl-cmdbus-writer
     command-bus: ehdb
@@ -144,7 +132,7 @@ spec:
           value: tail
         - name: NOETL_EHDB_REFERENCE_RUNTIME_CACHE
           value: 'true'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:057314d7f7086d06763daea10ca5bb71650a8f084151c50ba871806386bdda27
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:8b7948a8203547d7b5916766833f3b19c78503e7fa24e3fe2d0b773ed04ad418
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 3
@@ -243,11 +231,12 @@ spec:
           claimName: noetl-eventbus-kv-0-data
   updateStrategy:
     type: RollingUpdate
-
 ---
 apiVersion: v1
 kind: Service
 metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
   labels:
     app: noetl-cmdbus-writer
     command-bus: ehdb
@@ -256,6 +245,13 @@ metadata:
   name: noetl-cmdbus-writer-headless
   namespace: noetl
 spec:
+  clusterIP: None
+  clusterIPs:
+  - None
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
   ports:
   - name: tier-service
     port: 9110
@@ -303,12 +299,14 @@ spec:
     targetPort: events-wal
   selector:
     app: noetl-cmdbus-writer
+  sessionAffinity: None
   type: ClusterIP
-
 ---
 apiVersion: v1
 kind: Service
 metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
   labels:
     app: noetl-cmdbus-writer
     command-bus: ehdb
@@ -318,6 +316,13 @@ metadata:
   name: noetl-cmdbus-writer-0
   namespace: noetl
 spec:
+  clusterIP: 34.118.233.220
+  clusterIPs:
+  - 34.118.233.220
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
   ports:
   - name: tier-service
     port: 9110
@@ -365,5 +370,5 @@ spec:
     targetPort: events-wal
   selector:
     statefulset.kubernetes.io/pod-name: noetl-cmdbus-writer-0
+  sessionAffinity: None
   type: ClusterIP
-
