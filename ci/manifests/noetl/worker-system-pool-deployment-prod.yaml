@@ -209,11 +209,11 @@ spec:
           limits:
             cpu: '2'
             ephemeral-storage: 1Gi
-            memory: 8Gi
+            memory: 3Gi
           requests:
-            cpu: 1500m
+            cpu: 750m
             ephemeral-storage: 1Gi
-            memory: 8Gi
+            memory: 3Gi
         securityContext:
           capabilities:
             drop:
