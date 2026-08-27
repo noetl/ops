@@ -36,7 +36,7 @@ metadata:
     Operator prerequisites (until these land, backend calls return a clear
     auth/permission error — NOT a missing-library or parse error):
     - GSM secret `duffel-api-test` exists with the credential JSON loaded.
-    - The worker pod's GSA `noetl-worker-mcp@noetl-demo-19700101.iam.gserviceaccount.com`
+    - The worker pod's GSA `noetl-worker-mcp@shastaratech-noetl-prod.iam.gserviceaccount.com`
       holds roles/secretmanager.secretAccessor on `duffel-api-test`.
   agent: true
   exposes_as_mcp: true
@@ -52,7 +52,7 @@ workload:
   duffel_env: test
   duffel_api_base: https://api.duffel.com
   duffel_api_version: v2
-  google_project: "noetl-demo-19700101"
+  google_project: "shastaratech-noetl-prod"
   # GSM secret holding the Duffel credential file (bearer at `.data.token`).
   # The value is loaded out-of-band by the operator; this playbook only
   # references the name. Rotation is a plain
@@ -84,7 +84,7 @@ workflow:
         duffel_env: "{{ workload.duffel_env | default('test') }}"
         duffel_api_base: "{{ workload.duffel_api_base | default('https://api.duffel.com') }}"
         duffel_api_version: "{{ workload.duffel_api_version | default('v2') }}"
-        google_project: "{{ workload.google_project | default('noetl-demo-19700101') }}"
+        google_project: "{{ workload.google_project | default('shastaratech-noetl-prod') }}"
         duffel_secret_name: "{{ workload.duffel_secret_name | default('duffel-api-test') }}"
       code: |
         import base64
@@ -795,7 +795,7 @@ workflow:
         method_name = _text(method, "tools/list").lower()
         tool_name = _text(tool).lower()
         args = _as_dict(arguments)
-        project = _text(google_project, "noetl-demo-19700101")
+        project = _text(google_project, "shastaratech-noetl-prod")
         secret_name = _text(duffel_secret_name, "duffel-api-test")
 
         if method_name == "tools/list":
