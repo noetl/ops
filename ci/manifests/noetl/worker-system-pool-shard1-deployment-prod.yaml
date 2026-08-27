@@ -1,24 +1,13 @@
-# noetl/ai-meta#267 — RECONCILED AGAINST LIVE PROD 2026-08-26.
+# NoETL system worker pool — PROD.  Captured from the live cluster (noetl/ai-meta#267).
 #
-# Captured from the running cluster, not hand-written.  Applying this file used
-# to DELETE live configuration: a server-side dry-run of the system pool showed
-# 51 environment variables removed, three of them unsurvivable — NOETL_COMMAND_BUS
-# and its claim address, the NOETL_INTERNAL_API_TOKEN secretKeyRef, and
-# NOETL_STATE_BUILDER/_SOURCE (the off-server topology itself).  A DR re-apply
-# would have silently unconfigured prod.
+# noetl/ai-meta#267 Tier 2 STAGE 5: the NOETL_INTERNAL_API_TOKEN secretKeyRef is
+# GONE.  Secret Manager, via the CSI-projected file at NOETL_INTERNAL_API_TOKEN_FILE,
+# is now the SOLE source — there is no env fallback left.
 #
-# Secrets are REFERENCED (valueFrom.secretKeyRef), never resolved.  The capture
-# tool fails closed on any credential-shaped or high-entropy literal:
-# playbooks/267-iac-reconcile/capture.py in noetl/ai-meta.
-#
-# Cluster-authored annotations (autopilot.gke.io/*, cloud.google.com/*) are kept
-# DELIBERATELY.  Stripping them leaves a diff that still mutates live state; a
-# manifest whose apply is a no-op has to declare what the webhooks wrote.
-#
-# Proof:  kubectl --context <prod> -n noetl diff -f <this file>   ->  no-op.
-#
-# ⚠ DECLARED NOWHERE before this file.  Live in prod since #166 Phase 5 — a DR
-# re-apply would not have reverted its config, it would not have CREATED IT.
+# ⚠ A broken mount therefore has nothing to fall back to.  The worker reports
+# `secret_source_total{source="file_unusable"}` rather than degrading silently,
+# and the k8s Secret `noetl-internal-api-token` is deliberately NOT deleted so the
+# re-add rollback in ai-meta playbooks/secret-manager/STAGE5-ROLLBACK.md works.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -76,11 +65,6 @@ spec:
           value: '2'
         - name: WORKER_METRICS_BIND
           value: 0.0.0.0:9090
-        - name: NOETL_INTERNAL_API_TOKEN
-          valueFrom:
-            secretKeyRef:
-              key: token
-              name: noetl-internal-api-token
         - name: NOETL_KEYCHAIN_ENV_VARS
           value: NOETL_INTERNAL_API_TOKEN
         - name: RUST_LOG

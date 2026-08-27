@@ -1,13 +1,18 @@
 # NoETL control plane — PROD.  Captured from the live cluster (noetl/ai-meta#267)
 # so that `kubectl apply` is a no-op rather than a mass deletion of live config.
 #
-# noetl/ai-meta#267 Tier 2: the three bootstrap secrets are projected from GCP
-# Secret Manager as files by the CSI driver, and read via <VAR>_FILE.  The
-# secretKeyRefs below are STILL PRESENT and still work — removing them is a
-# separate, irreversible stage with its own approval.
+# noetl/ai-meta#267 Tier 2 STAGE 5 — COMPLETE.  All three secretKeyRefs are GONE.
+# NOETL_ENCRYPTION_KEY, POSTGRES_PASSWORD and NOETL_INTERNAL_API_TOKEN now come
+# ONLY from the CSI-projected Secret Manager files named by the matching
+# <VAR>_FILE variables.  There is no env fallback left.
 #
-# ⚠ csi.driver is `secrets-store-gke.csi.k8s.io` (the GKE add-on's own name), NOT
-# the upstream `secrets-store.csi.k8s.io`.
+# ⚠ A broken mount therefore has nothing to fall back to.  The binary reports
+# `secret_source_total{source="file_unusable"}` rather than degrading silently,
+# and the k8s Secrets `noetl-secret` / `noetl-internal-api-token` are deliberately
+# NOT deleted — they are the re-add source for the rollback in ai-meta
+# playbooks/secret-manager/STAGE5-ROLLBACK.md.
+#
+# ⚠ csi.driver is `secrets-store-gke.csi.k8s.io` (the GKE add-on's own name).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -77,11 +82,6 @@ spec:
           value: '5432'
         - name: POSTGRES_USER
           value: noetl
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              key: NOETL_PASSWORD
-              name: noetl-secret
         - name: POSTGRES_DATABASE
           value: noetl
         - name: NOETL_SCHEMA
@@ -92,16 +92,6 @@ spec:
           value: http://noetl-server-rust.noetl.svc.cluster.local:8082
         - name: NOETL_SERVER_MACHINE_ID
           value: '2'
-        - name: NOETL_INTERNAL_API_TOKEN
-          valueFrom:
-            secretKeyRef:
-              key: token
-              name: noetl-internal-api-token
-        - name: NOETL_ENCRYPTION_KEY
-          valueFrom:
-            secretKeyRef:
-              key: NOETL_ENCRYPTION_KEY
-              name: noetl-secret
         - name: NOETL_EVENT_READ_PATH
           value: event_scan
         - name: NOETL_RESULT_MINT_AUTHORITATIVE
