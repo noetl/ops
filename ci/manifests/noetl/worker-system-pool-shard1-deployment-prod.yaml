@@ -59,6 +59,8 @@ spec:
     spec:
       containers:
       - env:
+        - name: NOETL_INTERNAL_API_TOKEN_FILE
+          value: /var/secrets/sm/token
         - name: WORKER_POOL_NAME
           value: worker-system-pool
         - name: WORKER_ID
@@ -177,7 +179,7 @@ spec:
           value: server
         - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
           value: server
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:8b7948a8203547d7b5916766833f3b19c78503e7fa24e3fe2d0b773ed04ad418
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:4f1570b8de1f0cbd3f82801880e3cc5c57411e448c06fae2e14ec44fc1f34be0
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
@@ -218,6 +220,9 @@ spec:
         terminationMessagePath: /dev/termination-log
         terminationMessagePolicy: File
         volumeMounts:
+        - mountPath: /var/secrets/sm
+          name: sm-token
+          readOnly: true
         - mountPath: /dev/shm
           name: dshm
       dnsPolicy: ClusterFirst
@@ -335,6 +340,12 @@ spec:
         operator: Equal
         value: amd64
       volumes:
+      - csi:
+          driver: secrets-store-gke.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: noetl-internal-api-token
+        name: sm-token
       - emptyDir:
           medium: Memory
           sizeLimit: 320Mi
