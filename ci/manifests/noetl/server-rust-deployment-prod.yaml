@@ -1,27 +1,13 @@
-# noetl/ai-meta#267 — RECONCILED AGAINST LIVE PROD 2026-08-26.
+# NoETL control plane — PROD.  Captured from the live cluster (noetl/ai-meta#267)
+# so that `kubectl apply` is a no-op rather than a mass deletion of live config.
 #
-# Captured from the running cluster, not hand-written.  Applying the previous
-# version would have DELETED live configuration; a DR re-apply would have
-# silently unconfigured prod.
+# noetl/ai-meta#267 Tier 2: the three bootstrap secrets are projected from GCP
+# Secret Manager as files by the CSI driver, and read via <VAR>_FILE.  The
+# secretKeyRefs below are STILL PRESENT and still work — removing them is a
+# separate, irreversible stage with its own approval.
 #
-# Secrets are REFERENCED (valueFrom.secretKeyRef), never resolved:
-# NOETL_ENCRYPTION_KEY, POSTGRES_PASSWORD and NOETL_INTERNAL_API_TOKEN all
-# resolve from Secret objects.  The capture tool fails closed on any
-# credential-shaped or high-entropy literal:
-# playbooks/267-iac-reconcile/capture.py in noetl/ai-meta.
-#
-# ⚠ NOETL_AUTH0_AUDIENCE is a literal ON PURPOSE.  It holds the Auth0 CLIENT ID,
-# which is public by construction — the identical value is served to browsers in
-# ci/manifests/gateway/configmap-ui-files.yaml, compiled into the GUI bundle as
-# VITE_AUTH0_CLIENT_ID, hard-coded as DEFAULT_AUTH0_CLIENT_ID in travel, and
-# committed as a plaintext default in the get_auth0_token playbook.  The Auth0
-# client SECRET is a different value and lives in the NoETL keychain as
-# `auth0_client`.  See docs/rfc/secret-manager-retrieval.md §1.4.
-#
-# Cluster-authored annotations (autopilot.gke.io/*, cloud.google.com/*) are kept
-# DELIBERATELY — stripping them leaves a diff that still mutates live state.
-#
-# Proof:  kubectl --context <prod> -n noetl diff -f <this file>   ->  no-op.
+# ⚠ csi.driver is `secrets-store-gke.csi.k8s.io` (the GKE add-on's own name), NOT
+# the upstream `secrets-store.csi.k8s.io`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -57,6 +43,12 @@ spec:
     spec:
       containers:
       - env:
+        - name: NOETL_ENCRYPTION_KEY_FILE
+          value: /var/secrets/sm/encryption-key
+        - name: POSTGRES_PASSWORD_FILE
+          value: /var/secrets/sm/postgres-password
+        - name: NOETL_INTERNAL_API_TOKEN_FILE
+          value: /var/secrets/sm/token
         - name: NOETL_OBJECT_STORE_BACKEND
           value: gcs
         - name: NOETL_OBJECT_STORE_GCS_BUCKET
@@ -168,7 +160,7 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_PROJECTION_READ_SOURCE
           value: wal
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:ca2c3e3bfbb5eda11098ea81fd3efcf17885effdcc96900fbd018bde8eab734d
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:e911e375bda9ab43b5d8c6a72dfb58f63842f1dc69ebdac6c6157ba7dccfdd06
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
@@ -210,6 +202,10 @@ spec:
             - NET_RAW
         terminationMessagePath: /dev/termination-log
         terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/secrets/sm
+          name: sm-secrets
+          readOnly: true
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler
@@ -224,6 +220,13 @@ spec:
         key: kubernetes.io/arch
         operator: Equal
         value: amd64
+      volumes:
+      - csi:
+          driver: secrets-store-gke.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: noetl-server-secrets
+        name: sm-secrets
 ---
 apiVersion: v1
 kind: Service
