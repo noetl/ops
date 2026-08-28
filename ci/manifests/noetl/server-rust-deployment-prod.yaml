@@ -1,18 +1,16 @@
 # NoETL control plane — PROD.  Captured from the live cluster (noetl/ai-meta#267)
-# so that `kubectl apply` is a no-op rather than a mass deletion of live config.
+# so that `kubectl apply` of THIS FILE is a no-op rather than a mass deletion.
 #
-# noetl/ai-meta#267 Tier 2 STAGE 5 — COMPLETE.  All three secretKeyRefs are GONE.
-# NOETL_ENCRYPTION_KEY, POSTGRES_PASSWORD and NOETL_INTERNAL_API_TOKEN now come
-# ONLY from the CSI-projected Secret Manager files named by the matching
-# <VAR>_FILE variables.  There is no env fallback left.
+# ⚠ Do NOT `kubectl apply -f ci/manifests/noetl/` against prod.  A directory apply
+# also picks up server-rust-deployment.yaml, which declares the SAME Deployment and
+# sorts AFTER this file — so the dev variant wins.  See noetl/ai-meta#309.
 #
-# ⚠ A broken mount therefore has nothing to fall back to.  The binary reports
-# `secret_source_total{source="file_unusable"}` rather than degrading silently,
-# and the k8s Secrets `noetl-secret` / `noetl-internal-api-token` are deliberately
-# NOT deleted — they are the re-add source for the rollback in ai-meta
-# playbooks/secret-manager/STAGE5-ROLLBACK.md.
+# noetl/ai-meta#267 Tier 2: the three bootstrap secrets come from CSI-projected
+# Secret Manager files; the secretKeyRefs were removed at stage 5.
 #
-# ⚠ csi.driver is `secrets-store-gke.csi.k8s.io` (the GKE add-on's own name).
+# noetl/ai-meta#253: NOETL_COMMAND_BUS_INGEST_ADDRS is GONE, from here and from the
+# cluster, in one deploy.  It was read by nothing (0 hits across all six Rust repos)
+# and duplicated NOETL_COMMAND_BUS_WRITER_ADDRS byte-for-byte.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -118,26 +116,6 @@ spec:
           value: ehdb
         - name: NOETL_COMMAND_SHARD_COUNT
           value: '1'
-        # ⚠ UNREAD — noetl/ai-meta#253.  Nothing reads this variable: 0 hits across
-        # server, worker, tools, cli, gateway and doctor (positive control: the
-        # same grep finds 19 hits for NOETL_COMMAND_BUS and 2 for
-        # NOETL_COMMAND_BUS_CLAIM_ADDR, so the zero is a measurement).
-        #
-        # Its value is byte-identical to NOETL_COMMAND_BUS_WRITER_ADDRS below,
-        # which IS the variable the server dials the writer with
-        # (src/command_bus.rs:101).  Two names for one target, one of them inert.
-        #
-        # ⚠ NOT the whole family: NOETL_COMMAND_BUS_INGEST_BIND on the writer IS
-        # read (worker/src/command_bus.rs).  Only this ADDRS half is dead.
-        #
-        # DELIBERATELY NOT DELETED YET.  Deleting it here while the live
-        # Deployment still carries it makes `kubectl diff` report a REMOVAL rather
-        # than a no-op, which breaks the noetl/ai-meta#267 invariant; and
-        # reconciling that removal means rolling the control plane, which is a
-        # pod restart for an unread variable.  Drop it from BOTH at the next
-        # server deploy that is happening for another reason.
-        - name: NOETL_COMMAND_BUS_INGEST_ADDRS
-          value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9100
         - name: NOETL_COMMAND_BUS_WRITER_ADDRS
           value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9100
         - name: NOETL_EVENT_BUS_WRITER_ADDRS
