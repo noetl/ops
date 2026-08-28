@@ -48,7 +48,7 @@ workload:
   postgres_size: 20Gi
   postgres_database: noetl
   postgres_user: noetl
-  postgres_password: demo
+  postgres_password: REPLACE_ME_LOCAL_DEV_ONLY
   postgres_image_registry: ""  # e.g., us-central1-docker.pkg.dev
   postgres_image_repository: ""  # e.g., {project_id}/noetl/bitnami-postgresql
   postgres_image_tag: ""  # e.g., multiarch or 16
@@ -59,7 +59,7 @@ workload:
 
   nats_namespace: nats
   nats_user: noetl
-  nats_password: noetl
+  nats_password: REPLACE_ME_LOCAL_DEV_ONLY
   nats_jetstream_file_size: 5Gi
   nats_jetstream_mem_size: 1Gi
 
@@ -82,7 +82,7 @@ workload:
   noetl_data_size: 10Gi
   noetl_logs_storage_class: standard
   noetl_logs_size: 5Gi
-  noetl_password: noetl
+  noetl_password: REPLACE_ME_LOCAL_DEV_ONLY
   noetl_persistence_data_enabled: false
   noetl_persistence_logs_enabled: false
   noetl_worker_pool_enabled: false

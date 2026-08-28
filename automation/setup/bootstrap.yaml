@@ -392,13 +392,18 @@ workflow:
       fi\nIMAGE_TAG=$(cat .noetl_last_build_tag.txt)\nIMAGE=\"{{ workload.registry\
       \ }}/{{ workload.image_name }}:$IMAGE_TAG\"\necho \"Using image: $IMAGE\"\n\n\
       # Apply namespace and non-deployment manifests first\nkubectl apply -f ci/manifests/noetl/namespace/\n\
-      kubectl apply -f ci/manifests/noetl/secret.yaml\nkubectl apply -f ci/manifests/noetl/configmap-server.yaml\n\
+      # noetl/ai-meta#310 — this file is a SHAPE TEMPLATE with placeholder values.
+      # It moved out of the applied manifest directory because it is a Secret in a
+      # PUBLIC repo, and because applying it against a real cluster would overwrite
+      # live credentials — including the encryption key the credential store is
+      # encrypted with.  Supply your own values before applying it locally.
+      kubectl apply -f ci/manifests/templates/secret.yaml\nkubectl apply -f ci/manifests/noetl/configmap-server.yaml\n\
       kubectl apply -f ci/manifests/noetl/configmap-worker.yaml\nkubectl apply -f\
       \ ci/manifests/noetl/service.yaml\nkubectl apply -f ci/manifests/noetl/service-external.yaml\n\
       kubectl apply -f ci/manifests/noetl/rbac.yaml\nkubectl apply -f ci/manifests/noetl/persistent-volume.yaml\n\
       kubectl apply -f ci/manifests/noetl/pvc-noetl-data.yaml\n\n# Apply deployments\
-      \ with image substitution\nsed \"s|image_name:image_tag|$IMAGE|g\" ci/manifests/noetl/server-deployment.yaml\
-      \ | kubectl apply -f -\nsed \"s|image_name:image_tag|$IMAGE|g\" ci/manifests/noetl/worker-deployment.yaml\
+      \ with image substitution\nsed \"s|image_name:image_tag|$IMAGE|g\" ci/manifests/dev/server-deployment.yaml\
+      \ | kubectl apply -f -\nsed \"s|image_name:image_tag|$IMAGE|g\" ci/manifests/dev/worker-deployment.yaml\
       \ | kubectl apply -f -\n\necho \"NoETL deployed with image: $IMAGE\"\n"
   next:
   - step: wait_for_services

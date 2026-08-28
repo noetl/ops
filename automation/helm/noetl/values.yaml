@@ -598,4 +598,4 @@ ollama:
 
 secrets:
   postgresPassword: "demo"
-  noetlPassword: "noetl"
+  noetlPassword: "REPLACE_ME_LOCAL_DEV_ONLY"

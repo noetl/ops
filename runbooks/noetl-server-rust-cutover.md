@@ -365,7 +365,7 @@ kubectl --context $PROD -n noetl scale deploy noetl-server --replicas=0
 
 ## Post-cutover follow-ups (not part of the flip)
 
-- Update [`ci/manifests/noetl/server-rust-deployment.yaml`](../ci/manifests/noetl/server-rust-deployment.yaml)
+- Update [`ci/manifests/dev/server-rust-deployment.yaml`](../ci/manifests/dev/server-rust-deployment.yaml) (moved out of the applied directory — noetl/ai-meta#309)
   header note (it still says "kind validation only").
 - Decide the fate of port 8083 (Flight) — implement in Rust or retire from the
   `noetl` Service.
