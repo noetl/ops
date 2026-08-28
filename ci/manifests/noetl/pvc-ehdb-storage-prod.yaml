@@ -1,0 +1,88 @@
+# EHDB durable storage — PROD.  noetl/ai-meta#267.
+#
+# ⚠ THESE WERE DECLARED NOWHERE.  The cmdbus-writer StatefulSet does NOT use
+# volumeClaimTemplates -- it mounts these PVCs by static claimName -- so a
+# disaster-recovery `kubectl apply` would have created a StatefulSet whose pods
+# could never schedule, with no error anywhere saying why.  These volumes hold the
+# command-bus WAL, the event-bus WAL and the event-bus KV: the durable side of
+# EHDB.
+#
+# ⚠ `volumeName` is deliberately OMITTED.  It binds a claim to one specific
+# PersistentVolume; carrying it here would make a DR apply into a fresh cluster
+# reference a PV that does not exist.  Omitting it lets the storage class
+# provision, and is still a no-op against the running cluster because three-way
+# merge only removes fields present in `last-applied` -- and these were never
+# applied.
+#
+# ⚠ DELIBERATELY NOT DECLARED HERE: `noetl-cmdbus-writer-1-data`.  It is bound and
+# billed, but its only consumer is Deployment/noetl-cmdbus-writer-1, which is
+# itself declared nowhere, has been scaled to 0 since 2026-07-27, whose Service
+# has had no endpoints for a month, which nothing references, and which still
+# carries NOETL_COMMAND_BUS=nats -- a transport deleted in T5.  Declaring it would
+# write abandoned state into the recovery path.  Disposition is
+# noetl/ai-meta#305; if that issue resolves as "keep", add the PVC back here.
+#
+# ⚠ PVC specs are largely immutable once bound.  Do not edit size or storageClass
+# here expecting an apply to resize; that is a separate, deliberate operation.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: noetl-cmdbus-writer-0-data
+  namespace: noetl
+  annotations:
+    volume.kubernetes.io/selected-node: gk3-noetl-prod-autopilot-pool-3-0e057c22-489h
+  labels:
+    app: noetl-cmdbus-writer-0
+    component: cmdbus-writer
+    managed-by: noetl
+    shard: '0'
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: premium-rwo
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: noetl-eventbus-writer-0-data
+  namespace: noetl
+  annotations:
+    volume.kubernetes.io/selected-node: gk3-noetl-prod-autopilot-pool-3-0e057c22-489h
+  labels:
+    app: noetl-cmdbus-writer-0
+    component: eventbus-writer
+    managed-by: noetl
+    shard: '0'
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: premium-rwo
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: noetl-eventbus-kv-0-data
+  namespace: noetl
+  annotations:
+    volume.kubernetes.io/selected-node: gk3-noetl-prod-autopilot-pool-3-0e057c22-489h
+  labels:
+    app: noetl-cmdbus-writer-0
+    component: eventbus-kv
+    managed-by: noetl
+    shard: '0'
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: premium-rwo
+  volumeMode: Filesystem
