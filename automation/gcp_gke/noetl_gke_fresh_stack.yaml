@@ -67,7 +67,7 @@ workload:
   postgres_password: REPLACE_ME_LOCAL_DEV_ONLY
   noetl_password: REPLACE_ME_LOCAL_DEV_ONLY
   demo_password: REPLACE_ME_LOCAL_DEV_ONLY
-  auth_password: auth
+  auth_password: REPLACE_ME_LOCAL_DEV_ONLY
   nats_user: noetl
   nats_password: REPLACE_ME_LOCAL_DEV_ONLY
   deploy_clickhouse: false
