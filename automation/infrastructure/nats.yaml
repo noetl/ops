@@ -135,7 +135,7 @@ workflow:
         - |
           POD=$(kubectl get pod -n nats -l app=nats -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
           if [ -n "$POD" ]; then
-            kubectl exec -n nats $POD -- nats stream list --user=noetl --password=noetl
+            kubectl exec -n nats $POD -- nats stream list --user=noetl --password=REPLACE_ME_LOCAL_DEV_ONLY
           else
             echo "No NATS pod found"
           fi
@@ -172,7 +172,7 @@ workflow:
           POD=$(kubectl get pod -n nats -l app=nats -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
           if [ -n "$POD" ]; then
             echo "Testing connection to nats.nats.svc.cluster.local:4222"
-            kubectl exec -n nats $POD -- nats server check connection --user=noetl --password=noetl
+            kubectl exec -n nats $POD -- nats server check connection --user=noetl --password=REPLACE_ME_LOCAL_DEV_ONLY
             echo "✓ Connection successful"
           else
             echo "No NATS pod found"
@@ -194,11 +194,11 @@ workflow:
           POD=$(kubectl get pod -n nats -l app=nats -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
           if [ -n "$POD" ]; then
             echo "1. Testing pub/sub..."
-            kubectl exec -n nats $POD -- nats pub test.subject "Hello NATS" --user=noetl --password=noetl
+            kubectl exec -n nats $POD -- nats pub test.subject "Hello NATS" --user=noetl --password=REPLACE_ME_LOCAL_DEV_ONLY
             echo "2. Testing KV store..."
-            kubectl exec -n nats $POD -- nats kv add test_bucket --user=noetl --password=noetl || echo "Bucket may exist"
-            kubectl exec -n nats $POD -- nats kv put test_bucket key1 value1 --user=noetl --password=noetl
-            kubectl exec -n nats $POD -- nats kv get test_bucket key1 --user=noetl --password=noetl
+            kubectl exec -n nats $POD -- nats kv add test_bucket --user=noetl --password=REPLACE_ME_LOCAL_DEV_ONLY || echo "Bucket may exist"
+            kubectl exec -n nats $POD -- nats kv put test_bucket key1 value1 --user=noetl --password=REPLACE_ME_LOCAL_DEV_ONLY
+            kubectl exec -n nats $POD -- nats kv get test_bucket key1 --user=noetl --password=REPLACE_ME_LOCAL_DEV_ONLY
             echo "✓ Tests completed"
           else
             echo "No NATS pod found"

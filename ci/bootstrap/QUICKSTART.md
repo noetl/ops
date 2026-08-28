@@ -176,7 +176,7 @@ open http://localhost:3000
 ```bash
 noetl run automation/infrastructure/postgres.yaml --set action=port-forward
 psql -h localhost -U noetl -d noetl
-# Password: noetl
+# Password: REPLACE_ME_LOCAL_DEV_ONLY
 ```
 
 ## Project Structure

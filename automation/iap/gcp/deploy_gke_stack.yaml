@@ -618,9 +618,9 @@ workflow:
             --namespace postgres \
             --create-namespace \
             --set fullnameOverride=postgres \
-            --set auth.postgresPassword=demo \
+            --set auth.postgresPassword=REPLACE_ME_LOCAL_DEV_ONLY \
             --set auth.username=noetl \
-            --set auth.password=noetl \
+            --set auth.password=REPLACE_ME_LOCAL_DEV_ONLY \
             --set auth.database=noetl \
             --set primary.persistence.size={{ workload.postgres_size }} \
             --set primary.persistence.storageClass=standard \
@@ -694,7 +694,7 @@ workflow:
           MAX_RETRIES=30
           RETRY_COUNT=0
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=demo psql -U postgres -d noetl -c 'SELECT 1'" 2>/dev/null; then
+            if kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -c 'SELECT 1'" 2>/dev/null; then
               echo "PostgreSQL is accepting connections"
               break
             fi
@@ -709,29 +709,29 @@ workflow:
           fi
 
           # Check if schema already exists
-          TABLE_EXISTS=$(kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=demo psql -U postgres -d noetl -tAc \"SELECT 1 FROM information_schema.tables WHERE table_schema='noetl' AND table_name='event'\"" 2>/dev/null || echo "")
+          TABLE_EXISTS=$(kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -tAc \"SELECT 1 FROM information_schema.tables WHERE table_schema='noetl' AND table_name='event'\"" 2>/dev/null || echo "")
           echo "Table check result: '$TABLE_EXISTS'"
 
           if [ "$TABLE_EXISTS" = "1" ]; then
             echo "NoETL schema already present (event table exists). Skipping DDL."
           else
             echo "Schema not found. Creating noetl schema..."
-            kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=demo psql -U postgres -d noetl -c \"CREATE SCHEMA IF NOT EXISTS noetl\""
+            kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -c \"CREATE SCHEMA IF NOT EXISTS noetl\""
 
             echo "Running DDL from $SCHEMA_FILE via kubectl exec..."
             # Use kubectl exec with stdin to pipe the schema file
-            cat "$SCHEMA_FILE" | kubectl exec -i -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=demo psql -U postgres -d noetl"
+            cat "$SCHEMA_FILE" | kubectl exec -i -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl"
 
             echo "Granting permissions to noetl user..."
-            kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=demo psql -U postgres -d noetl -c \"GRANT ALL ON SCHEMA noetl TO noetl; GRANT ALL ON ALL TABLES IN SCHEMA noetl TO noetl; GRANT ALL ON ALL SEQUENCES IN SCHEMA noetl TO noetl; ALTER DEFAULT PRIVILEGES IN SCHEMA noetl GRANT ALL ON TABLES TO noetl; ALTER DEFAULT PRIVILEGES IN SCHEMA noetl GRANT ALL ON SEQUENCES TO noetl;\""
+            kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -c \"GRANT ALL ON SCHEMA noetl TO noetl; GRANT ALL ON ALL TABLES IN SCHEMA noetl TO noetl; GRANT ALL ON ALL SEQUENCES IN SCHEMA noetl TO noetl; ALTER DEFAULT PRIVILEGES IN SCHEMA noetl GRANT ALL ON TABLES TO noetl; ALTER DEFAULT PRIVILEGES IN SCHEMA noetl GRANT ALL ON SEQUENCES TO noetl;\""
 
             # Also grant on auth schema if it exists (for Gateway auth)
             echo "Creating and granting permissions on auth schema (if not exists)..."
-            kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=demo psql -U postgres -d noetl -c \"CREATE SCHEMA IF NOT EXISTS auth\""
-            kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=demo psql -U postgres -d noetl -c \"GRANT ALL ON SCHEMA auth TO noetl; GRANT ALL ON ALL TABLES IN SCHEMA auth TO noetl; GRANT ALL ON ALL SEQUENCES IN SCHEMA auth TO noetl; ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT ALL ON TABLES TO noetl; ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT ALL ON SEQUENCES TO noetl;\""
+            kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -c \"CREATE SCHEMA IF NOT EXISTS auth\""
+            kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -c \"GRANT ALL ON SCHEMA auth TO noetl; GRANT ALL ON ALL TABLES IN SCHEMA auth TO noetl; GRANT ALL ON ALL SEQUENCES IN SCHEMA auth TO noetl; ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT ALL ON TABLES TO noetl; ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT ALL ON SEQUENCES TO noetl;\""
 
             # Verify schema was created
-            VERIFY=$(kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=demo psql -U postgres -d noetl -tAc \"SELECT count(*) FROM information_schema.tables WHERE table_schema='noetl'\"" 2>/dev/null || echo "0")
+            VERIFY=$(kubectl exec -n postgres "$POSTGRES_POD" -- /bin/sh -c "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -tAc \"SELECT count(*) FROM information_schema.tables WHERE table_schema='noetl'\"" 2>/dev/null || echo "0")
             echo "Tables created in noetl schema: $VERIFY"
 
             if [ "$VERIFY" -gt "0" ]; then
@@ -981,8 +981,8 @@ workflow:
             --set persistence.logs.enabled=false \
             --set workerPool.enabled=false \
             --set ingress.enabled=false \
-            --set-string secrets.postgresPassword=demo \
-            --set-string secrets.noetlPassword=noetl
+            --set-string secrets.postgresPassword=REPLACE_ME_LOCAL_DEV_ONLY \
+            --set-string secrets.noetlPassword=REPLACE_ME_LOCAL_DEV_ONLY
           kubectl wait --for=condition=ready pod -l app=noetl-server -n noetl --timeout=300s || true
           kubectl wait --for=condition=ready pod -l app=noetl-worker -n noetl --timeout=300s || true
     next:

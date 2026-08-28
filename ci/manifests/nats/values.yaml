@@ -169,7 +169,7 @@ config:
         jetstream: enabled
         users:
           - user: noetl
-            password: noetl
+            password: REPLACE_ME_LOCAL_DEV_ONLY
   patch: []
 
 ############################################################
@@ -409,7 +409,7 @@ natsBox:
     sys:
       merge: {user: sys, password: sys}
     noetl:
-      merge: {user: noetl, password: noetl}
+      merge: {user: noetl, password: REPLACE_ME_LOCAL_DEV_ONLY}
 
   # name of context to select by default
   defaultContextName: noetl

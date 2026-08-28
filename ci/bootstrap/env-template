@@ -11,7 +11,7 @@ POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
 POSTGRES_DB=noetl
 POSTGRES_USER=noetl
-POSTGRES_PASSWORD=noetl
+POSTGRES_PASSWORD=REPLACE_ME_LOCAL_DEV_ONLY
 
 # Connection string (auto-generated from above if not set)
 # POSTGRES_CONNSTR=postgresql://noetl:noetl@localhost:5432/noetl
