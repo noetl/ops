@@ -4,7 +4,8 @@
 # kind VMServiceScrape; the VictoriaMetrics CRDs do not exist on this cluster.
 # Sibling of podmonitoring-noetl.yaml, which selects the worker pools by `app`
 # and so does not cover the writer (its `app` is per-shard:
-# `noetl-cmdbus-writer-0`, `noetl-cmdbus-writer-1`, …).  This one selects the
+# `noetl-cmdbus-writer-0`, `noetl-cmdbus-writer-1`, …; only -0 exists
+  # today -- the writer-1 debris was deleted 2026-08-28, noetl/ai-meta#305).  This one selects the
 # stable `component: cmdbus-writer` label instead, so a new shard's writer is
 # scraped the moment it exists without editing this file.
 #

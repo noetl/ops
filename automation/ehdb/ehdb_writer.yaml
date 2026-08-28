@@ -154,6 +154,10 @@ workload:
   # 0..shard_count-1 by construction, so an ordinal ABOVE the count is outside
   # its loop forever.
   #
+  # RESOLVED 2026-08-28 (noetl/ai-meta#305): the writer-1 Deployment, its
+  # Service and its PVC were deleted from prod.  Kept as history because the
+  # shape recurs -- a scaled-to-0 workload with no IaC is invisible to both a
+  # manifest diff and a running-pod check.
   # Found on prod 2026-08-04: a `noetl-cmdbus-writer-1` Deployment at 0 replicas
   # on an image 8 days older than the running writer — predating the #203 feed
   # ordering fix and the #208 writer-restart fixes — plus its ClusterIP with no

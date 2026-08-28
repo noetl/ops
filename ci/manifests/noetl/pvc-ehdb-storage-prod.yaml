@@ -14,13 +14,16 @@
 # merge only removes fields present in `last-applied` -- and these were never
 # applied.
 #
-# ⚠ DELIBERATELY NOT DECLARED HERE: `noetl-cmdbus-writer-1-data`.  It is bound and
-# billed, but its only consumer is Deployment/noetl-cmdbus-writer-1, which is
-# itself declared nowhere, has been scaled to 0 since 2026-07-27, whose Service
-# has had no endpoints for a month, which nothing references, and which still
-# carries NOETL_COMMAND_BUS=nats -- a transport deleted in T5.  Declaring it would
-# write abandoned state into the recovery path.  Disposition is
-# noetl/ai-meta#305; if that issue resolves as "keep", add the PVC back here.
+# `noetl-cmdbus-writer-1-data` used to be called out here as deliberately
+# undeclared, pending a disposition decision.  That is settled: the whole
+# writer-1 debris set -- Deployment, Service and PVC -- was DELETED from prod on
+# 2026-08-28 (noetl/ai-meta#305), so there is nothing left to declare or exclude.
+#
+# It was the shard-1 half of an abandoned 2-shard command-bus experiment: 0
+# replicas since 2026-07-27, a Service with no endpoints for a month, referenced
+# by nothing, and still carrying NOETL_COMMAND_BUS=nats -- a transport deleted at
+# T5.  The volume held one 30KB unsealed part written in a two-minute window on
+# the day it was created; the owner accepted losing it.
 #
 # ⚠ PVC specs are largely immutable once bound.  Do not edit size or storageClass
 # here expecting an apply to resize; that is a separate, deliberate operation.
