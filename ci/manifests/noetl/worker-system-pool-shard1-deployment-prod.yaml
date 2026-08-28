@@ -1,13 +1,17 @@
 # NoETL system worker pool — PROD.  Captured from the live cluster (noetl/ai-meta#267).
 #
-# noetl/ai-meta#267 Tier 2 STAGE 5: the NOETL_INTERNAL_API_TOKEN secretKeyRef is
-# GONE.  Secret Manager, via the CSI-projected file at NOETL_INTERNAL_API_TOKEN_FILE,
-# is now the SOLE source — there is no env fallback left.
+# ⚠ Do NOT `kubectl apply -f ci/manifests/noetl/` against prod — a directory apply
+# also picks up worker-system-pool-deployment.yaml, which declares the SAME
+# Deployment and sorts BEFORE this one.  See noetl/ai-meta#309.
 #
-# ⚠ A broken mount therefore has nothing to fall back to.  The worker reports
-# `secret_source_total{source="file_unusable"}` rather than degrading silently,
-# and the k8s Secret `noetl-internal-api-token` is deliberately NOT deleted so the
-# re-add rollback in ai-meta playbooks/secret-manager/STAGE5-ROLLBACK.md works.
+# noetl/ai-meta#267 Tier 2 stage 5: NOETL_INTERNAL_API_TOKEN comes only from the
+# CSI-projected Secret Manager file; the secretKeyRef is gone.
+#
+# noetl/ai-meta#266: NOETL_STATE_AFFINITY_ROUTE is GONE, from here and from the
+# cluster, in one deploy.  Its only reader was AffinityConfig::from_env, which has
+# had no callers since T5 deleted the steering block — the flag was `true` in prod
+# and steered nothing.  The TYPE is deliberately retained in the worker as the
+# written spec for shard-ownership selection, and is now tested against.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -105,8 +109,6 @@ spec:
           value: '1'
         - name: NOETL_SHARD_COUNT
           value: '2'
-        - name: NOETL_STATE_AFFINITY_ROUTE
-          value: 'true'
         - name: NOETL_COMMAND_BUS
           value: ehdb
         - name: NOETL_COMMAND_BUS_HOST
@@ -245,8 +247,6 @@ spec:
           value: 'true'
         - name: NOETL_STATE_SHARD_READ_VERIFY
           value: 'false'
-        - name: NOETL_STATE_AFFINITY_ROUTE
-          value: 'true'
         - name: NOETL_COMMAND_BUS
           value: ehdb
         - name: NOETL_COMMAND_SHARD_COUNT
