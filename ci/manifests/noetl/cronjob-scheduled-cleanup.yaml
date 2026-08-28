@@ -1,67 +1,74 @@
-# CronJob — triggers system/scheduled_cleanup on a cadence.
-# noetl/ai-meta#96.
-# =============================================================================
-# Fires the retention/cleanup system playbook by POSTing to the Rust server's
-# /api/execute.  The server routes the `system/` path to
-# noetl.commands.system.<eid>, which only the system worker pool consumes; the
-# pool runs the playbook's http step against /api/internal/cleanup/purge.
+# Scheduled cleanup CronJob — PROD.  Captured from the live cluster (noetl/ai-meta#267).
 #
-# The CronJob only TRIGGERS the execution — it carries no DB access and no
-# internal token.  /api/execute is reachable on the cluster network; the
-# privileged purge work happens inside the system pool under the internal-API
-# token, per data-access-boundary.md.
-#
-# Schedule: hourly.  Each run purges terminal commands (>7d) + dead worker
-# registrations (>60m), and DROPs event partitions older than 365d
-# (event_retention_days=365 in the payload).  Drop-based event retention needs
-# the app DB role to own the noetl.event partitions — run
-# `sql/event-partition-ownership.sql` once as a superuser; until then the
-# cleanup logs a WARN and drops nothing (a 365d window drops nothing on a
-# cluster younger than a year anyway, so enabling it now is safe + forward-ready).
+# ⚠ The `autopilot.gke.io/*` annotations below are CLUSTER-AUTHORED and change
+# when GKE upgrades its warden (this file drifted from 35.26.4 to 35.26.5).  They
+# are kept rather than stripped, because stripping a field that is present in
+# `last-applied` makes the next apply DELETE it — a mutating apply, which is the
+# opposite of what #267 wants.  The cost is that this file needs a re-capture
+# after a warden upgrade; a diff limited to these keys is drift in the cluster's
+# own bookkeeping, not in NoETL config.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: noetl-scheduled-cleanup
-  namespace: noetl
+  annotations:
+    autopilot.gke.io/resource-adjustment: '{"input":{"containers":[{"limits":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"64Mi"},"requests":{"cpu":"10m","ephemeral-storage":"1Gi","memory":"32Mi"},"name":"trigger"}]},"output":{"containers":[{"limits":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"64Mi"},"requests":{"cpu":"50m","ephemeral-storage":"1Gi","memory":"52Mi"},"name":"trigger"}]},"computeClassAtAdmission":"Default","modified":true}'
+    autopilot.gke.io/warden-version: 35.26.4-gke.2
   labels:
     app: noetl-scheduled-cleanup
     component: system-cron
+  name: noetl-scheduled-cleanup
+  namespace: noetl
 spec:
-  schedule: "0 * * * *"
   concurrencyPolicy: Forbid
-  startingDeadlineSeconds: 120
-  successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   jobTemplate:
+    metadata: {}
     spec:
-      backoffLimit: 2
       activeDeadlineSeconds: 120
+      backoffLimit: 2
       template:
         metadata:
           labels:
             app: noetl-scheduled-cleanup
         spec:
-          restartPolicy: Never
           containers:
-            - name: trigger
-              image: curlimages/curl:8.7.1
-              imagePullPolicy: IfNotPresent
-              command:
-                - sh
-                - -c
-                - |
-                  set -e
-                  echo "Triggering system/scheduled_cleanup ..."
-                  curl -fsS -X POST \
-                    http://noetl-server-rust.noetl.svc.cluster.local:8082/api/execute \
-                    -H 'Content-Type: application/json' \
-                    -d '{"path": "system/scheduled_cleanup", "payload": {"event_retention_days": 365}}'
-                  echo
-                  echo "Triggered."
-              resources:
-                requests:
-                  cpu: "10m"
-                  memory: "32Mi"
-                limits:
-                  cpu: "100m"
-                  memory: "64Mi"
+          - command:
+            - sh
+            - -c
+            - "set -e\necho \"Triggering system/scheduled_cleanup ...\"\ncurl -fsS -X POST \\\n  http://noetl-server-rust.noetl.svc.cluster.local:8082/api/execute\
+              \ \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"path\": \"system/scheduled_cleanup\"\
+              , \"payload\": {\"event_retention_days\": 365}}'\necho\necho \"Triggered.\"\n"
+            image: curlimages/curl:8.7.1
+            imagePullPolicy: IfNotPresent
+            name: trigger
+            resources:
+              limits:
+                cpu: 100m
+                ephemeral-storage: 1Gi
+                memory: 64Mi
+              requests:
+                cpu: 50m
+                ephemeral-storage: 1Gi
+                memory: 52Mi
+            securityContext:
+              capabilities:
+                drop:
+                - NET_RAW
+            terminationMessagePath: /dev/termination-log
+            terminationMessagePolicy: File
+          dnsPolicy: ClusterFirst
+          restartPolicy: Never
+          schedulerName: default-scheduler
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          terminationGracePeriodSeconds: 30
+          tolerations:
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Equal
+            value: amd64
+  schedule: 0 * * * *
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  suspend: false
