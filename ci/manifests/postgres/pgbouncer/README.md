@@ -34,6 +34,22 @@ non-secret env values, and the Autopilot-adjusted resources.
 
 Everything else is byte-for-byte the live spec.
 
+## ⚠ Scope: this seeds `noetl` only
+
+`demo`, `auth` and `postgres` still take their userlist entries from the inline
+`DATABASE_URLS`, so **their** reload remains ephemeral and a reschedule reverts
+it — the #311 failure mode, still live for three users.
+
+The entrypoint wrapper already seeds all four **conditionally on the mount
+existing**, so extending it is a matter of provisioning three secrets and
+switching to `secretproviderclass-all-users.yaml` (staged here, deliberately
+unapplied). Owner-run prerequisites and the kind evidence are in
+`noetl/ai-meta` → `playbooks/311-pgbouncer-durable-fix/README-ALL-USERS.md`.
+
+⚠ That extension should land **before** the weak-credential rotation, not after:
+those three are only safe today because their stale inline value still happens to
+be correct, and rotating them starts the clock.
+
 ## Prerequisite 1 — IAM (owner)
 
 pgbouncer's SA `cloudsql-proxy` maps to GSA `noetl-cloudsql-proxy@…`, which today
