@@ -1,0 +1,134 @@
+# pgbouncer — the connection pooler in front of Cloud SQL.
+#
+# ⚠⚠ THIS MANIFEST IS NOT YET APPLIED, AND MUST NOT BE APPLIED BLIND.
+# See README.md in this directory: two prerequisites must exist first, and
+# applying without them takes the pooler down. Captured from the live prod
+# Deployment on 2026-08-29 so that a DR apply reproduces what is running rather
+# than a guess — the object was previously declared NOWHERE
+# (noetl/ai-meta#267 class).
+#
+# It also carries the noetl/ai-meta#311 fix: the userlist is seeded from a
+# Secret Manager CSI mount, so a pod reschedule can no longer reinstate a stale
+# password. That outage is what surfaced this file's absence.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: postgres
+  labels:
+    app: pgbouncer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+    spec:
+      serviceAccountName: cloudsql-proxy
+      containers:
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.18.3
+          args:
+            - --structured-logs
+            - --address=127.0.0.1
+            - --port=6432
+            - --private-ip
+            - shastaratech-noetl-prod:us-central1:noetl-shared-pg
+          resources:
+            requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 1Gi}
+            limits: {cpu: 500m, memory: 512Mi, ephemeral-storage: 1Gi}
+        - name: pgbouncer
+          image: edoburu/pgbouncer:v1.24.1-p1
+          # noetl/ai-meta#311 — seed the userlist from the CSI mount BEFORE the
+          # image's own entrypoint runs.
+          #
+          # The entrypoint's `generate_userlist_if_needed` only appends a user
+          # that is not already in the auth file, so this entry is never
+          # overwritten by whatever DATABASE_URLS holds — which is what lets the
+          # stale password in that variable stop mattering without editing it.
+          #
+          # ⚠ The image CMD is discarded by a `command:` override and
+          # /entrypoint.sh ends in `exec "$@"`, so the original argv must be
+          # passed explicitly or the container exits 0 with no pgbouncer.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /etc/pgbouncer
+              printf '"%s" "%s"\n' "noetl" "$(cat /mnt/db-secrets/postgres-password)" \
+                > /etc/pgbouncer/userlist.txt
+              chmod 600 /etc/pgbouncer/userlist.txt
+              echo "userlist seeded from CSI mount: $(wc -l < /etc/pgbouncer/userlist.txt) line(s)"
+              exec /entrypoint.sh /usr/bin/pgbouncer /etc/pgbouncer/pgbouncer.ini
+          ports:
+            - containerPort: 5432
+          env:
+            - name: AUTH_TYPE
+              value: scram-sha-256
+            - name: AUTH_FILE
+              value: /etc/pgbouncer/userlist.txt
+            # ⚠ By reference, never inline. The live Deployment carries this as a
+            # plaintext literal containing four users' passwords; committing that
+            # shape is what noetl/ai-meta#310 is about. The Secret must exist
+            # before this is applied — see README.md.
+            - name: DATABASE_URLS
+              valueFrom:
+                secretKeyRef:
+                  name: pgbouncer-database-urls
+                  key: DATABASE_URLS
+            - name: POOL_MODE
+              value: transaction
+            - name: IGNORE_STARTUP_PARAMETERS
+              value: extra_float_digits,options
+            - name: MAX_CLIENT_CONN
+              value: "600"
+            - name: DEFAULT_POOL_SIZE
+              value: "12"
+            - name: MIN_POOL_SIZE
+              value: "1"
+            - name: RESERVE_POOL_SIZE
+              value: "4"
+            - name: RESERVE_POOL_TIMEOUT
+              value: "5"
+            - name: MAX_DB_CONNECTIONS
+              value: "16"
+            - name: SERVER_LIFETIME
+              value: "21600"
+            - name: SERVER_IDLE_TIMEOUT
+              value: "300"
+          livenessProbe:
+            tcpSocket: {port: 5432}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket: {port: 5432}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 1Gi}
+            limits: {cpu: 500m, memory: 512Mi, ephemeral-storage: 1Gi}
+          volumeMounts:
+            - name: db-secrets
+              mountPath: /mnt/db-secrets
+              readOnly: true
+            - name: pgbouncer-conf
+              mountPath: /etc/pgbouncer
+      volumes:
+        - name: db-secrets
+          csi:
+            # The GKE add-on driver, NOT the upstream `secrets-store.csi.k8s.io`.
+            # Read off the live noetl-server pod; the upstream name fails the
+            # mount at schedule time.
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: pgbouncer-db-secrets
+        - name: pgbouncer-conf
+          emptyDir: {}
