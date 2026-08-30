@@ -45,10 +45,20 @@ workload:
   auth_playbooks_dir: "../e2e/fixtures/playbooks/api_integration/auth0"
 
   # Image repositories.
-  # NoETL defaults to published GHCR release images.
   # Gateway/GUI can be set explicitly; if empty they default to Artifact Registry:
   # {region}-docker.pkg.dev/{project_id}/{repository_id}/{image-name}
-  noetl_image_repository: ghcr.io/noetl/noetl
+  #
+  # ⚠ noetl_image_repository is now EMPTY and the steps that use it refuse to
+  # run.  It used to default to ghcr.io/noetl/noetl -- the legacy PYTHON image
+  # (docker/noetl/dev/Dockerfile, CMD python -m noetl.server).  The helm chart
+  # under automation/helm/noetl renders that image as `command: ["python"]`,
+  # so a fresh-stack apply installed the retired Python platform into the
+  # `noetl` namespace, whose live workloads are all Rust and have different
+  # names -- they would not have been replaced, they would have been JOINED.
+  # The image is no longer built (noetl/noetl retired build_on_release).
+  # The Rust stack deploys from ci/manifests/noetl/*-prod.yaml, not this chart.
+  # See noetl/ai-meta#201.
+  noetl_image_repository: ""
   gateway_image_repository: ""
   gui_image_repository: ""
 
@@ -325,9 +335,10 @@ workflow:
           echo "  noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \\"
           echo "    --set action=deploy \\"
           echo "    --set project_id=my-gcp-project \\"
-          echo "    --set build_images=false \\"
-          echo "    --set noetl_image_repository=ghcr.io/noetl/noetl \\"
-          echo "    --set noetl_image_tag=v2.8.9"
+          echo "    --set build_images=false"
+          echo ""
+          echo "  # NOTE: noetl_image_repository is retired and must stay empty."
+          echo "  # The Rust stack deploys from ci/manifests/noetl/*-prod.yaml."
           echo ""
           echo "  # Destroy stack (and optionally cluster)"
           echo "  noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \\"
@@ -560,6 +571,14 @@ workflow:
           [ -z "$GUI_IMAGE" ] && GUI_IMAGE="$REGISTRY/noetl-gui"
 
           if [ "{{ workload.build_noetl_image }}" = "true" ]; then
+            echo "ERROR: the NoETL Python image is retired and can no longer be built."
+            echo "  docker/noetl/dev/Dockerfile packaged the legacy Python platform;"
+            echo "  noetl/noetl no longer builds or publishes ghcr.io/noetl/noetl."
+            echo "  The Rust stack is deployed from ci/manifests/noetl/*-prod.yaml."
+            echo "  See noetl/ai-meta#201."
+            exit 1
+          fi
+          if false; then
             echo "Building NoETL image -> $NOETL_IMAGE:{{ workload.noetl_image_tag }}"
             gcloud builds submit \
               "$NOETL_REPO" \
@@ -1465,6 +1484,24 @@ workflow:
       cmds:
         - |
           set -e
+          # ⚠ RETIRED PATH -- refuses to run.  noetl/ai-meta#201.
+          #
+          # This step helm-installs automation/helm/noetl, whose server and
+          # worker Deployments render `command: ["python"]` with
+          # `args: ["-m", "noetl.server", ...]`.  That is the legacy Python
+          # platform.  Production in namespace `noetl` is entirely Rust, under
+          # DIFFERENT Deployment names (noetl-server-rust, noetl-worker-rust,
+          # noetl-worker-system-pool[+shard1], noetl-cmdbus-writer), so this
+          # would not have replaced anything -- it would have added a second,
+          # Python stack beside the live one.
+          #
+          # The image it wanted is no longer built or published.  Deploy the
+          # Rust stack from ci/manifests/noetl/*-prod.yaml instead.
+          echo "ERROR: deploy_noetl installs the retired PYTHON helm chart and is disabled."
+          echo "  Chart automation/helm/noetl renders: command: [python] -m noetl.server"
+          echo "  Production is Rust-only; deploy ci/manifests/noetl/*-prod.yaml."
+          echo "  See noetl/ai-meta#201."
+          exit 1
           REGISTRY="{{ workload.region }}-docker.pkg.dev/{{ workload.project_id }}/{{ workload.repository_id }}"
           NOETL_IMAGE="{{ workload.noetl_image_repository }}"
           [ -z "$NOETL_IMAGE" ] && NOETL_IMAGE="$REGISTRY/noetl"
