@@ -24,7 +24,16 @@
     "SMTP/Slack/PagerDuty credential nobody has yet).",
     "",
     "APPLY:  ./ci/monitoring/apply-alertpolicies.sh",
-    "Idempotent: matches on displayName, PATCHes when present, POSTs when not."
+    "Idempotent: matches on displayName, PATCHes when present, POSTs when not.",
+    "",
+    "DURABILITY WINDOW (noetl/ehdb#322 SLO D-3, added 2026-08-30).",
+    "The last four policies read the D1 durability window -- how long an",
+    "acknowledged record has sat on one disk without reaching the substrate.",
+    "\u26a0\u26a0 THREE OF THE FOUR ARE GATED ON noetl/ehdb#329, not merely on approval.",
+    "Until NOETL_EHDB_SEAL_MAX_AGE is set there is no age-based seal trigger, so",
+    "a quiet shard's window is unbounded BY DESIGN and those three would page for",
+    "an accepted condition.  The sample-ok policy is safe to enable immediately.",
+    "None of the four is applied."
   ],
   "project": "shastaratech-noetl-prod",
   "notificationChannels": [
@@ -135,6 +144,34 @@
       "duration": "0s",
       "evaluationInterval": "60s",
       "documentation": "An in-binary parity control returned `unexpected`. The controls drive synthetic fixtures through the SAME comparator the live path uses, so a failure voids every verdict it has published -- including every divergence_total == 0. Identify which: kubectl -n noetl exec deploy/noetl-server-rust -- wget -qO- 127.0.0.1:8082/api/ehdb/parity/self-test | jq '.controls[] | select(.expected == false)'. IF THE FAILING CONTROL IS lag_beyond_window, the lag tolerance is swallowing a real divergence: set NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS=0 IMMEDIATELY -- the comparator is the tier's only protection and it is currently not providing it. Runbook: https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbparitycontrolfailed  Ref noetl/ai-meta#155."
+    },
+    {
+      "displayName": "NoETL EHDB: acknowledged records unreplicated beyond the window",
+      "query": "max(ehdb_l0_unreplicated_age_seconds) > 30",
+      "duration": "120s",
+      "evaluationInterval": "60s",
+      "documentation": "An acknowledged record has been durable on ONE DISK for more than 30s without reaching the substrate. This is the D1 durability window (noetl/ehdb#322 SLO D-3), measured from the APPEND. ** DO NOT diagnose with upload_lag_micros_total ** -- it is measured from the SEAL and is structurally blind to a record waiting in an unsealed active part, which is the dominant term here; it will read healthy. ehdb_feed_shard_lag is CONSUMER BACKLOG, not replication lag, despite the adjacent name. Check: kubectl -n noetl exec noetl-cmdbus-writer-0 -c noetl-worker -- wget -qO- 127.0.0.1:9106 | grep -E 'unreplicated|durability_sample_ok'. Port 9106 is the EVENT log (the primary tier); 9102 is the command bus -- the pod hosts two independent L0 engines. \u26a0 PRECONDITION: this policy is only meaningful once NOETL_EHDB_SEAL_MAX_AGE is set (noetl/ehdb#329). With no age trigger the window is unbounded BY DESIGN on a quiet shard and this will page for an accepted condition. Ref noetl/ehdb#322, noetl/ehdb#328."
+    },
+    {
+      "displayName": "NoETL EHDB: replication to the durable substrate has stalled",
+      "query": "max(ehdb_l0_unreplicated_age_seconds) > 300",
+      "duration": "300s",
+      "evaluationInterval": "60s",
+      "documentation": "Acknowledged records have been on one disk for over five minutes. Treat as an OUTAGE OF DURABILITY, not a latency blip: the writer's node dying now loses them. \u26a0 Note the substrate does not currently buy an independent failure domain -- NOETL_EHDB_TIER_SERVICE_DIR is inside NOETL_EVENT_BUS_WRITER_DIR on one PVC (noetl/ehdb#332) -- so even a healthy window is one disk today. Check ehdb_l0_unreplicated_records for how many, and ehdb_l0_replicated_lag_seconds_count: a count that never increments means nothing has EVER replicated since process start. \u26a0 PRECONDITION: as above, only meaningful once NOETL_EHDB_SEAL_MAX_AGE is set. Ref noetl/ehdb#322, noetl/ehdb#329."
+    },
+    {
+      "displayName": "NoETL EHDB: the age-based seal trigger is configured but not firing",
+      "query": "max(ehdb_l0_unreplicated_age_seconds) > 60",
+      "duration": "600s",
+      "evaluationInterval": "60s",
+      "documentation": "THE POSITIVE CONTROL for noetl/ehdb#329. seal_max_age defaults to 5s, so a window sustained above 60s for ten minutes means the trigger is configured and NOT FIRING. The most likely cause is that nothing drives it: should_seal() is only consulted on APPEND, and the shard the age trigger protects is by definition the one taking no appends -- so a timer must call L0Engine::seal_aged_parts(). Without this policy a broken age trigger and a perfectly idle system produce an identical reading, and a check that can only pass is not a check. \u26a0 Enable this ONLY together with NOETL_EHDB_SEAL_MAX_AGE; before that it duplicates the window alert. Ref noetl/ehdb#329."
+    },
+    {
+      "displayName": "NoETL EHDB: the durability window could not be sampled",
+      "query": "min(ehdb_l0_durability_sample_ok) < 1",
+      "duration": "300s",
+      "evaluationInterval": "60s",
+      "documentation": "The writer served a scrape but could not acquire the engine lock to sample the durability window, so the per-shard unreplicated series are ABSENT from that scrape. This exists because absence would otherwise be indistinguishable from a binary too old to carry the metric -- the failure mode the window metrics were added to close. Sustained 0 means the window is unobserved, so treat every unreplicated_age reading in that period as unknown rather than healthy. \u26a0 This policy is safe to enable NOW: it does not depend on NOETL_EHDB_SEAL_MAX_AGE. Ref noetl/ehdb#328."
     }
   ]
 }
