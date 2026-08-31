@@ -36,7 +36,11 @@ workload:
 
   # Build control - which images to build (only relevant when build_images=true)
   # Python images:
-  build_noetl: true          # Python NoETL (docker/noetl/pip) - same image for server AND worker
+  build_noetl: false         # ⚠ RETIRED -- the Python image (docker/noetl/pip) is no longer
+                             # built or published anywhere.  Setting this true now fails the
+                             # build step instead of producing a deployable image.
+                             # The Rust stack deploys from ci/manifests/noetl/*-prod.yaml.
+                             # See noetl/ai-meta#201.
   # Rust images (all disabled by default - slow to compile):
   build_cli: false      # Rust CLI binary (crates/cli) - builds 'noetl' command
   build_gateway: false       # Rust Gateway (crates/gateway) - API gateway
@@ -151,7 +155,7 @@ workflow:
           echo ""
           echo "Build toggles (controls which images to build when build_images=true):"
           echo "  Python images:"
-          echo "    build_noetl           - Build Python NoETL (server+worker, same image) (default: true)"
+          echo "    build_noetl           - RETIRED, must stay false (Python image; ai-meta#201)"
           echo "  Rust images (all default to false - slow to compile):"
           echo "    build_cli        - Build Rust CLI binary (default: false)"
           echo "    build_gateway         - Build Rust Gateway (default: false)"
@@ -282,8 +286,13 @@ workflow:
             # Enable Cloud Build API
             gcloud services enable cloudbuild.googleapis.com --project {{ workload.project_id }}
 
-            # Build NoETL server (Python - fast) - only if build_noetl is true
+            # Build NoETL server (Python) -- RETIRED, refuses to run.  ai-meta#201.
             if [ "{{ workload.build_noetl }}" = "true" ]; then
+              echo "ERROR: build_noetl is retired.  The Python platform image is no longer built."
+              echo "  Deploy the Rust stack from ci/manifests/noetl/*-prod.yaml instead."
+              exit 1
+            fi
+            if false; then
               echo ""
               echo "=== Building NoETL Server (Python) via Cloud Build ==="
               if [ -f "docker/noetl/dev/Dockerfile" ]; then
@@ -428,8 +437,13 @@ workflow:
             # Configure Docker for Artifact Registry
             gcloud auth configure-docker {{ workload.region }}-docker.pkg.dev --quiet
 
-            # Build and push NoETL server image - only if build_noetl is true
+            # Build and push NoETL server image -- RETIRED, refuses to run.  ai-meta#201.
             if [ "{{ workload.build_noetl }}" = "true" ]; then
+              echo "ERROR: build_noetl is retired.  The Python platform image is no longer built."
+              echo "  Deploy the Rust stack from ci/manifests/noetl/*-prod.yaml instead."
+              exit 1
+            fi
+            if false; then
               echo ""
               echo "=== Building NoETL Server (Python) ==="
               if [ -f "docker/noetl/dev/Dockerfile" ]; then

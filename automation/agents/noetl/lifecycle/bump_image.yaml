@@ -59,10 +59,14 @@ workload:
   # Example: "v2.35.2"
   target_tag: ""
 
-  # Image registry + repository. The Deployments in the chart use
-  # the same image for server / worker / bridge so we can bump them
-  # all to the same tag in one playbook.
-  image_repository: "ghcr.io/noetl/noetl"
+  # ⚠ RETIRED default.  This was ghcr.io/noetl/noetl -- the legacy Python image,
+  # which is no longer built or published (noetl/ai-meta#201).  The `components`
+  # below are Python-era Deployment names too: production runs
+  # noetl-server-rust, noetl-worker-rust, noetl-worker-system-pool(+shard1) and
+  # noetl-cmdbus-writer, none of which this playbook has ever matched.  Left
+  # empty so a run fails loudly instead of bumping a phantom Deployment to a tag
+  # of an image nobody builds.
+  image_repository: ""
 
   # Namespace where the Deployments live.
   namespace: "noetl"

@@ -41,7 +41,9 @@ If you use submodules, override these with `--set ..._repo_dir=<submodule-path>`
 `noetl_gke_fresh_stack.yaml` now deploys using published images by default:
 
 - `build_images=false` (no on-the-fly image build)
-- `noetl_image_repository=ghcr.io/noetl/noetl`
+- `noetl_image_repository` — ⚠ leave EMPTY. The legacy Python image
+  `ghcr.io/noetl/noetl` is retired and no longer built (noetl/ai-meta#201);
+  the Rust stack deploys from `ci/manifests/noetl/*-prod.yaml`.
 - `noetl_image_tag=v2.8.9`
 - conservative rollout strategy for NoETL deployments on constrained clusters:
   - `noetl_server_rollout_max_surge=0`
@@ -61,7 +63,6 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set region=us-central1 \
   --set cluster_name=noetl-cluster \
   --set build_images=false \
-  --set noetl_image_repository=ghcr.io/noetl/noetl \
   --set noetl_image_tag=v2.8.9 \
   --set gateway_service_type=LoadBalancer \
   --set gateway_load_balancer_ip=34.71.6.63 \
@@ -87,7 +88,6 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set project_id=noetl-demo-19700101 \
   --set cluster_name=noetl-cluster \
   --set build_images=false \
-  --set noetl_image_repository=ghcr.io/noetl/noetl \
   --set noetl_image_tag=v2.29.0 \
   --set gateway_image_repository=ghcr.io/noetl/gateway \
   --set gateway_image_tag=v2.10.0 \

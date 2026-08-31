@@ -99,7 +99,6 @@ noetl run automation/gcp_gke/noetl_gke_fresh_stack.yaml \
   --set region=us-central1 \
   --set cluster_name=noetl-cluster \
   --set build_images=false \
-  --set noetl_image_repository=ghcr.io/noetl/noetl \
   --set noetl_image_tag=v2.8.9 \
   --set deploy_ingress=false \
   --set gateway_service_type=LoadBalancer \
