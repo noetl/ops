@@ -757,7 +757,7 @@ main() {
     echo "  noetl run automation/infrastructure/gateway.yaml --set action=status"
     echo ""
     echo "Execute Playbooks:"
-    echo "  noetl execute playbook <name> --host ${lan_host} --port 8082"
+    echo "  noetl --host ${lan_host} --port 8082 run <name> -r distributed"
     echo ""
     echo "Documentation:"
     echo "  - CI Setup: documentation/docs/operations/ci-setup.md"

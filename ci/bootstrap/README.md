@@ -258,12 +258,12 @@ noetl register credentials/my_service.json \
 
 ```bash
 # Register from your project
-noetl register playbooks/my_workflow.yaml \
-  --host localhost --port 8083
+noetl --host localhost --port 8083 \
+  register playbook -f playbooks/my_workflow.yaml
 
-# Execute
-noetl execute playbook my_workflow \
-  --host localhost --port 8083
+# Run
+noetl --host localhost --port 8083 \
+  run my_workflow -r distributed
 ```
 
 ### 4. Access Services
