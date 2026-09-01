@@ -172,6 +172,27 @@
       "duration": "300s",
       "evaluationInterval": "60s",
       "documentation": "The writer served a scrape but could not acquire the engine lock to sample the durability window, so the per-shard unreplicated series are ABSENT from that scrape. This exists because absence would otherwise be indistinguishable from a binary too old to carry the metric -- the failure mode the window metrics were added to close. Sustained 0 means the window is unobserved, so treat every unreplicated_age reading in that period as unknown rather than healthy. \u26a0 This policy is safe to enable NOW: it does not depend on NOETL_EHDB_SEAL_MAX_AGE. Ref noetl/ehdb#328."
+    },
+    {
+      "displayName": "NoETL EHDB: writer is REFUSING every append",
+      "query": "sum(rate(ehdb_l0_ingest_append_failed[5m])) > 0",
+      "duration": "120s",
+      "evaluationInterval": "60s",
+      "documentation": "The writer accepted the connection and then refused the append, so the publisher sees only 'connection closed before ack' and every affected execution stalls. CHECK FREE SPACE FIRST: `kubectl exec -n noetl noetl-cmdbus-writer-0 -- df -h /data/cmdbus /data/eventbus /data/eventkv`. On 2026-09-01 this exact condition ran for hours with NO alert, NO log and NO metric: /data/cmdbus was 100% full, every POST /api/execute returned 500 platform-wide, and the writer pod still reported Ready with zero WARN lines. This policy is the thing that was missing. Ref noetl/ehdb#345."
+    },
+    {
+      "displayName": "NoETL EHDB: publisher and writer disagree on the record shape",
+      "query": "sum(rate(ehdb_l0_ingest_decode_failed[5m])) > 0",
+      "duration": "300s",
+      "evaluationInterval": "60s",
+      "documentation": "A publish frame did not deserialize into the writer's record type. This is NOT a disk problem -- it is version skew between a publisher (server/worker) and this writer, typically a partial rollout. Compare the *_build_info version on the publisher and the writer. Deliberately a SEPARATE policy from the append-failure one: before ehdb#345 both produced byte-identical symptoms, so the symptom could not point at a remedy and an operator would check disk space on a healthy disk. Ref noetl/ehdb#345."
+    },
+    {
+      "displayName": "NoETL EHDB: manifest retention is not being enforced",
+      "query": "max(ehdb_l0_manifest_versions_retained) > 64",
+      "duration": "1800s",
+      "evaluationInterval": "300s",
+      "documentation": "Versioned manifest snapshots are accumulating past the retention bound (default 32, so 64 is two bounds' headroom). This is the LEADING indicator for the 2026-09-01 outage: unbounded snapshots filled /data/cmdbus -- 19.4 GB of manifest behind 71.8 MB of real data -- which made every append fail. Firing here means pruning has stopped while there is still time to act, rather than after the volume is full. The gauge reports the bound being ENFORCED, not the one configured. Ref noetl/ehdb#344."
     }
   ]
 }
