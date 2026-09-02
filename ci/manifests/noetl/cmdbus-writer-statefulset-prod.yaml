@@ -207,6 +207,10 @@ spec:
           name: eventbus-data
         - mountPath: /data/eventkv
           name: eventbus-kv
+        # noetl/ehdb#332 — mounted but NOT yet used. The tier still writes to
+        # /data/eventbus/ehdb-tier until NOETL_EHDB_TIER_SERVICE_DIR is repointed.
+        - mountPath: /data/ehdb-tier
+          name: ehdb-tier-data
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler
@@ -229,6 +233,9 @@ spec:
       - name: eventbus-kv
         persistentVolumeClaim:
           claimName: noetl-eventbus-kv-0-data
+      - name: ehdb-tier-data
+        persistentVolumeClaim:
+          claimName: noetl-ehdb-tier-0-data
   updateStrategy:
     type: RollingUpdate
 ---
