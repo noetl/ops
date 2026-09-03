@@ -49,14 +49,22 @@ metadata:
 spec:
   scaleTargetRef:
     name: noetl-worker-system-pool
-  # min 1 preserves today's baseline, so applying this changes nothing until
-  # backlog appears. max 10 bounds the blast radius: the writer is replicas:1 and
-  # every drive still funnels through its command bus, so unbounded fan-out would
-  # only move the queue.
-  minReplicaCount: 1
+  # ⚠ min 3, not 1, and a long cooldown -- both measured, not guessed.
+  #
+  # The first validation run proved the scaler works (1 -> 9 replicas, system lag
+  # 69 -> 6). But it also showed the cost of starting cold: Autopilot takes
+  # ~60-90s to provision nodes for new replicas, and with min 1 + a 30s cooldown
+  # the pool descaled between bursts and paid that latency again every time. A
+  # second run at concurrency 10 against a descaled pool managed 2 successes to
+  # 48 timeouts -- the autoscaler was working and still ramping.
+  #
+  # So the floor carries the burst and the autoscaler carries the sustained load.
+  # 3 replicas is ~3x the old fixed ceiling at rest; 600s cooldown keeps that
+  # capacity through a gap between bursts rather than re-paying provisioning.
+  minReplicaCount: 3
   maxReplicaCount: 10
   pollingInterval: 10
-  cooldownPeriod: 30
+  cooldownPeriod: 600
   triggers:
     - type: metrics-api
       metadata:
