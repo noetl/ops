@@ -146,6 +146,29 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_PROJECTION_READ_SOURCE
           value: wal
+        # --- noetl/ai-meta#320: the event-log mirror's delivery posture ----
+        # These were live on prod and declared NOWHERE, so a DR re-apply would
+        # have silently removed them.  DRAIN_CONCURRENCY is the dangerous one:
+        # dropping it reverts to the code default of 8, which is the config that
+        # produced ~99% relay delivery failures under load.
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_DRAIN_CONCURRENCY
+          value: '1'
+        # The retry window.  Both EQUAL the server's code defaults as of
+        # v3.101.3 and are declared anyway, so the deployed behaviour is readable
+        # here rather than inferred from the binary.  They were raised to these
+        # values because 4 retries / 250ms still dropped 11 events at realistic
+        # load -- every one the worker's tier append returning 502 "timed out
+        # after 2s" while the durable writer was slow.  At 7/500 the same load
+        # moved 1350 events with zero dropped.  `0` restores pre-fix delivery
+        # (one attempt, then drop) and is the no-redeploy rollback.
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_MAX_RETRIES
+          value: '7'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_RETRY_BACKOFF_MS
+          value: '500'
+        # --- noetl/ai-meta#307: recovery folds from the durable tier ----------
+        # Live on prod since v3.92.0, never declared.
+        - name: NOETL_EHDB_RECOVERY_SOURCE
+          value: verify
         image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:e911e375bda9ab43b5d8c6a72dfb58f63842f1dc69ebdac6c6157ba7dccfdd06
         imagePullPolicy: IfNotPresent
         livenessProbe:

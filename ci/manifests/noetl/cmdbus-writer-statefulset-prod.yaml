@@ -74,6 +74,15 @@ spec:
           value: 0.0.0.0:9110
         - name: NOETL_EHDB_TIER_SERVICE_DIR
           value: /data/eventbus/ehdb-tier
+        # --- noetl/ai-meta#267: live on prod, declared nowhere --------------
+        # A re-apply would have removed both.
+        - name: NOETL_EHDB_CATALOG_MIRROR_SOURCE
+          value: server
+        # The age-based seal trigger.  There is an alert on this NOT firing, so
+        # losing the value would silently disarm the thing the alert watches as
+        # well as the behaviour it watches for.
+        - name: NOETL_EHDB_SEAL_MAX_AGE_MS
+          value: '5000'
         - name: WORKER_POOL_NAME
           value: cmdbus-writer
         - name: NOETL_SERVER_URL
