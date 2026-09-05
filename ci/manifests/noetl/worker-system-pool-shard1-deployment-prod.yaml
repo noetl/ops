@@ -87,8 +87,6 @@ spec:
           value: 'true'
         - name: NOETL_RESULT_PRODUCER_STAGE
           value: 'true'
-        - name: NOETL_OFFSERVER_ATTACH_TAIL
-          value: 'false'
         - name: NOETL_STATE_INDEX_SLIM
           value: 'true'
         - name: NOETL_STATE_INDEX_TTL_SECS
@@ -227,8 +225,6 @@ spec:
           value: 'true'
         - name: NOETL_RESULT_PRODUCER_STAGE
           value: 'true'
-        - name: NOETL_OFFSERVER_ATTACH_TAIL
-          value: 'false'
         - name: NOETL_STATE_INDEX_SLIM
           value: 'true'
         - name: NOETL_STATE_INDEX_TTL_SECS
