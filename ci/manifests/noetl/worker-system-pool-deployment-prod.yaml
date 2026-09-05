@@ -151,6 +151,9 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_MODE
           value: local_reference
+        # noetl/ai-meta#267: live on prod, previously declared nowhere.
+        - name: NOETL_EHDB_CATALOG_MIRROR_SOURCE
+          value: server
         - name: NOETL_EHDB_CLIENT_ROLE
           value: worker
         - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
