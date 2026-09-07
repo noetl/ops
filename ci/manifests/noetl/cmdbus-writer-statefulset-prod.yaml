@@ -141,7 +141,15 @@ spec:
           value: tail
         - name: NOETL_EHDB_REFERENCE_RUNTIME_CACHE
           value: 'true'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:8b7948a8203547d7b5916766833f3b19c78503e7fa24e3fe2d0b773ed04ad418
+        # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
+        # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
+        # digest back here, so every pin in this directory was BEHIND live: a
+        # re-apply rolled prod back past shipped incident fixes.  Rather than
+        # keep a copy true, the copy is removed: this file declares SHAPE.
+        # Server-side apply leaves a field this manifest does not claim, which
+        # is what makes the omission safe on an EXISTING object (proved by
+        # server-side dry-run against live).  Creating from nothing still needs
+        # a digest: that comes from the release ledger, not from here.
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 3

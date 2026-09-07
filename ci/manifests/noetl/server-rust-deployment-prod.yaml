@@ -38,7 +38,10 @@ spec:
   template:
     metadata:
       annotations:
-        kubectl.kubernetes.io/restartedAt: '2026-08-14T22:03:31-07:00'
+        # kubectl.kubernetes.io/restartedAt: NOT DECLARED — a runtime annotation
+        # written by `kubectl rollout restart`.  Declaring it made this manifest
+        # fight the operator for ownership of a timestamp, and it was the ONLY
+        # server-side-apply conflict once the image pin was gone.
       labels:
         app: noetl-server-rust
         component: server
@@ -169,7 +172,15 @@ spec:
         # Live on prod since v3.92.0, never declared.
         - name: NOETL_EHDB_RECOVERY_SOURCE
           value: verify
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:e911e375bda9ab43b5d8c6a72dfb58f63842f1dc69ebdac6c6157ba7dccfdd06
+        # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
+        # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
+        # digest back here, so every pin in this directory was BEHIND live: a
+        # re-apply rolled prod back past shipped incident fixes.  Rather than
+        # keep a copy true, the copy is removed: this file declares SHAPE.
+        # Server-side apply leaves a field this manifest does not claim, which
+        # is what makes the omission safe on an EXISTING object (proved by
+        # server-side dry-run against live).  Creating from nothing still needs
+        # a digest: that comes from the release ledger, not from here.
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
