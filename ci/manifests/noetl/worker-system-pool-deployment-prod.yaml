@@ -19,9 +19,10 @@ metadata:
     autopilot.gke.io/resource-adjustment: '{"input":{"initContainers":[{"limits":{"ephemeral-storage":"1Gi"},"requests":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"wait-for-api"}],"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"768Mi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"noetl-worker"}]},"output":{"initContainers":[{"limits":{"ephemeral-storage":"1Gi"},"requests":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"wait-for-api"}],"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"768Mi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"256Mi"},"name":"noetl-worker"}]},"computeClassAtAdmission":"Default","modified":true}'
     autopilot.gke.io/warden-version: 35.26.4-gke.2
     kubernetes.io/change-cause: '#166 Phase3 step4.2: enable SHARD_READ+READ_VERIFY on system-pool 2026-07-03'
-    noetl.io/watchdog-last-reason: 'state_builder wedged: healthy=0 sustained over 3 probes'
-    noetl.io/watchdog-last-remediation: '1786397942'
-    noetl.io/watchdog-remediations: '1786397942'
+    # noetl.io/watchdog-* : NOT DECLARED — runtime counters written by the
+    # state-builder watchdog via `kubectl annotate`.  Same class as
+    # restartedAt: a manifest that declares them fights the writer for
+    # ownership, and server-side apply refuses rather than clobbering.
   labels:
     app: noetl-worker-system-pool
     component: system-worker
@@ -45,7 +46,10 @@ spec:
   template:
     metadata:
       annotations:
-        kubectl.kubernetes.io/restartedAt: '2026-08-27T07:20:05-07:00'
+        # kubectl.kubernetes.io/restartedAt: NOT DECLARED — a runtime annotation
+        # written by `kubectl rollout restart`.  Declaring it made this manifest
+        # fight the operator for ownership of a timestamp, and it was the ONLY
+        # server-side-apply conflict once the image pin was gone.
         prometheus.io/path: /metrics
         prometheus.io/port: '9090'
         prometheus.io/scrape: 'true'
@@ -172,7 +176,15 @@ spec:
           value: server
         - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
           value: server
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:4f1570b8de1f0cbd3f82801880e3cc5c57411e448c06fae2e14ec44fc1f34be0
+        # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
+        # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
+        # digest back here, so every pin in this directory was BEHIND live: a
+        # re-apply rolled prod back past shipped incident fixes.  Rather than
+        # keep a copy true, the copy is removed: this file declares SHAPE.
+        # Server-side apply leaves a field this manifest does not claim, which
+        # is what makes the omission safe on an EXISTING object (proved by
+        # server-side dry-run against live).  Creating from nothing still needs
+        # a digest: that comes from the release ledger, not from here.
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
