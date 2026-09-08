@@ -224,10 +224,23 @@ spec:
           name: eventbus-data
         - mountPath: /data/eventkv
           name: eventbus-kv
-        # noetl/ehdb#332 — mounted but NOT yet used. The tier still writes to
-        # /data/eventbus/ehdb-tier until NOETL_EHDB_TIER_SERVICE_DIR is repointed.
-        - mountPath: /data/ehdb-tier
-          name: ehdb-tier-data
+        # ⚠⚠ ehdb-tier-data mount REMOVED — 2026-09-08 incident, noetl/ai-meta#323.
+        #
+        # This declared a mount for PVC `noetl-ehdb-tier-0-data`, which HAS NEVER
+        # EXISTED in prod.  The live StatefulSet had three volumes; this file had
+        # four.  Applying it left `noetl-cmdbus-writer-0` unschedulable
+        # (`FailedScheduling: persistentvolumeclaim "noetl-ehdb-tier-0-data" not
+        # found`) and took the bus down — the writer hosts both cmdbus and
+        # eventbus, so every worker pool sat in `EHDB claim connect failed`.
+        #
+        # The lesson is not "the volume was wrong".  It is that the manifest
+        # diverged from prod in MORE ways than the image pin, and the pre-apply
+        # proof only compared the image field.  A server-side dry-run answers the
+        # question you ask it; `kubectl diff` against live would have shown the
+        # added volume outright.
+        #
+        # Re-adding this needs the PVC created first (noetl/ehdb#332), applied as
+        # its own change with its own verification.
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler
@@ -250,9 +263,10 @@ spec:
       - name: eventbus-kv
         persistentVolumeClaim:
           claimName: noetl-eventbus-kv-0-data
-      - name: ehdb-tier-data
-        persistentVolumeClaim:
-          claimName: noetl-ehdb-tier-0-data
+      # ⚠⚠ ehdb-tier-data volume REMOVED — see the matching note on the
+      # volumeMounts above.  PVC `noetl-ehdb-tier-0-data` does not exist in prod;
+      # declaring it here made the pod unschedulable and took the bus down.
+      # The three PVCs above are the ones prod actually has, all Bound.
   updateStrategy:
     type: RollingUpdate
 ---
