@@ -256,6 +256,56 @@ workflow:
                 return "request"
             return "transient"
 
+        def _child_ages(args, children):
+            """Ages for the occupancy `paxes`, or a reason they cannot be used.
+
+            HotelBeds rejects an availability request outright when children >= 1
+            and no `paxes` element is supplied per child (`INVALID_DATA: Error at
+            property occupancies: If children >= 1 it is mandatory that you
+            specify a paxes element per child`), so every search for a family
+            failed before this existed — noetl/ai-meta#341.
+
+            ⚠ An age is NOT a formality here: HotelBeds prices a child by age, so
+            a guessed age changes the price the user is quoted.  When ages are
+            missing we therefore REFUSE and say so, rather than defaulting to a
+            plausible number — the same rule that removed fabricated inventory
+            in noetl/ai-meta#290.  (The flight branch's `age or 8` fallback is
+            the shape being avoided.)
+
+            Accepts `children_ages` (the name the Activities tool already uses),
+            `child_ages`, or their camelCase spellings, as a list of ints or of
+            `{"age": N}` objects — the latter being how the planner's `party`
+            slot carries children.
+            """
+            if children <= 0:
+                return [], ""
+            raw = None
+            for key in ("children_ages", "child_ages", "childrenAges", "childAges"):
+                if args.get(key) is not None:
+                    raw = args.get(key)
+                    break
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except Exception:
+                    raw = [part for part in _text(raw).replace(",", " ").split() if part]
+            if not isinstance(raw, list):
+                return [], (f"children={children} needs one age per child; pass "
+                            f"children_ages, e.g. [8, 11]")
+            ages = []
+            for entry in raw:
+                value = entry.get("age") if isinstance(entry, dict) else entry
+                try:
+                    ages.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            if len(ages) != children:
+                return [], (f"children={children} but {len(ages)} usable age(s) given; "
+                            f"pass one age per child in children_ages")
+            if any(age < 0 or age > 17 for age in ages):
+                return [], f"child ages must be between 0 and 17, got {ages}"
+            return ages, ""
+
         def _stay_error(check_in, check_out):
             # HotelBeds rejects a check-in before today with
             # `INVALID_DATA: The check-in must be in the future.`  Catching that
@@ -613,6 +663,8 @@ workflow:
                             "adults": {"type": "integer", "minimum": 1, "default": 2},
                             "rooms": {"type": "integer", "minimum": 1, "default": 1},
                             "children": {"type": "integer", "minimum": 0, "default": 0},
+                            "children_ages": {"type": "array", "items": {"type": "integer"},
+                                              "description": "One age per child, e.g. [8, 11]. REQUIRED when children >= 1 - HotelBeds prices a child by age and rejects the request without it."},
                         },
                     },
                 },
@@ -677,9 +729,20 @@ workflow:
                 radius = max(1, min(int(args.get("radius") or 20), 100))
             except (TypeError, ValueError):
                 radius = 20
+            child_ages, age_problem = _child_ages(args, children)
+            if age_problem:
+                return _error("search_hotels", age_problem, code="validation_error",
+                              user_message=f"Those guests cannot be searched: {age_problem}.")
+            occupancy = {"rooms": rooms, "adults": adults, "children": children}
+            if children:
+                # One paxes entry per occupant. Adults carry no age (HotelBeds
+                # does not price them by it); each child carries its own, which
+                # is what the API is asking for — noetl/ai-meta#341.
+                occupancy["paxes"] = ([{"type": "AD"} for _ in range(adults)]
+                                      + [{"type": "CH", "age": age} for age in child_ages])
             payload = {
                 "stay": {"checkIn": check_in, "checkOut": check_out},
-                "occupancies": [{"rooms": rooms, "adults": adults, "children": children}],
+                "occupancies": [occupancy],
                 "geolocation": {"latitude": lat, "longitude": lng, "radius": radius, "unit": "km"},
             }
             ok, status_code, body = _request("POST", base + AVAILABILITY_PATH, apikey, secret, payload=payload)
@@ -971,6 +1034,7 @@ workflow:
             "_hb_detail": _hb_detail,
             "_failure_class": _failure_class,
             "_stay_error": _stay_error,
+            "_child_ages": _child_ages,
             "BOOKING_UNAVAILABLE_MSG": BOOKING_UNAVAILABLE_MSG,
         })
 
