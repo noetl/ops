@@ -106,10 +106,33 @@ metadata:
 
     Tools: search_hotels (availability), book_hotel (TEST/SANDBOX
     checkRate+booking), list_destinations (debug).
+
+    search_hotels detail level (adiona/frontend#22). The summary used to collapse
+    each hotel to its cheapest rate and six photos; it now carries the rows
+    HotelBeds already returned and this provider discarded. All ADDITIVE —
+    every previously emitted field keeps its name and meaning:
+    - `rates[]` — EVERY bookable rate from `rooms[].rates[]`, flattened,
+      cheapest first, each with its room code/name, board, rateClass,
+      cancellation policies, occupancy and allotment. Capped at
+      MAX_RATES_PER_HOTEL (60) purely so one hotel cannot blow up the payload.
+      The single-rate fields (`rateKey`, `boardName`, `rateClass`, `rateType`,
+      `roomName`) still carry the cheapest rate, unchanged, because the
+      itinerary planner reads them.
+    - `images[]` is now UNCAPPED (was max_per=6, which silently threw away
+      every photo past the sixth).
+    - `room_images` — {roomCode: [url]}, built from Content API photos that
+      name a roomCode. `fields` now requests `images,rooms`. A hotel whose
+      photos carry no room attribution gets an empty map; hotel photos are
+      never relabelled as room photos.
+    - `max_hotels` is accepted as a TOOL ARGUMENT and overrides the workload
+      default. It could previously only be set on the child playbook's own
+      workload, so a parent passing `arguments` only (hotel-cards did exactly
+      that) always got the default 10. The workload default is now 20; the
+      provider ceiling stays 25.
   agent: true
   exposes_as_mcp: true
   exposed_in_ui: false
-  version: "1.2"
+  version: "1.3"
   tags: [mcp, hotelbeds, apitude, travel, hotels]
   terminal:
     visible: true
@@ -126,7 +149,8 @@ workload:
   # GSM secret holding {"apikey": "...", "secret": "..."}. The value is loaded
   # out-of-band by the operator; this playbook only references the name.
   hotelbeds_secret_name: "hotelbeds-hotels-test"
-  max_hotels: 10
+  # adiona/frontend#22 — 10 -> 20. The provider ceiling stays 25.
+  max_hotels: 20
 
 workflow:
   - step: start
@@ -150,7 +174,7 @@ workflow:
         hotelbeds_api_base: "{{ workload.hotelbeds_api_base | default('https://api.test.hotelbeds.com') }}"
         google_project: "{{ workload.google_project | default('shastaratech-noetl-prod') }}"
         hotelbeds_secret_name: "{{ workload.hotelbeds_secret_name | default('hotelbeds-api-test') }}"
-        max_hotels: "{{ workload.max_hotels | default(10) }}"
+        max_hotels: "{{ workload.max_hotels | default(20) }}"
         # book_hotel tolerance (%). HotelBeds default is 2.0; in TEST/SANDBOX the
         # price drifts between checkRate and bookings, so a generous default lets
         # the re-priced test booking complete (no real money). Override per call.
@@ -195,6 +219,15 @@ workflow:
             "bos": {"latitude": 42.3601, "longitude": -71.0589},
             "lon": {"latitude": 51.5074, "longitude": -0.1278},
         }
+
+        # adiona/frontend#22 — bounds for the additive detail below. These are
+        # TRUNCATION guards on real provider rows, not product caps: a hotel
+        # with 200 rates would otherwise make the payload unusable. The
+        # caller picks which of these rows to show.
+        MAX_RATES_PER_HOTEL = 60
+        # 0 == no cap. Content API images were truncated at 6 per hotel,
+        # which threw away every room photo after the first few.
+        MAX_IMAGES_PER_HOTEL = 0
 
         def _as_dict(value):
             return value if isinstance(value, dict) else {}
@@ -431,6 +464,59 @@ workflow:
                         best_net = net
             return best or {}
 
+        # adiona/frontend#22 — the FULL bookable rate list.
+        # `_first_bookable_rate` above returns the single cheapest rate, which
+        # is all `_hotel_summary` ever surfaced; HotelBeds availability returns
+        # `rooms[].rates[]` with every rate for every room type and the rest was
+        # discarded here.  This keeps them, flattened, cheapest first, with the
+        # room they belong to attached — no invented inventory, just the rows
+        # the response already carried.
+        def _bookable_rates(hotel, cap=MAX_RATES_PER_HOTEL):
+            rates = []
+            for room in _as_list(hotel.get("rooms")):
+                if not isinstance(room, dict):
+                    continue
+                room_code = _text(room.get("code"))
+                room_name = _text(room.get("name"))
+                for rate in _as_list(room.get("rates")):
+                    if not isinstance(rate, dict):
+                        continue
+                    key = _text(rate.get("rateKey"))
+                    if not key:
+                        continue
+                    try:
+                        net = float(rate.get("net")) if rate.get("net") is not None else None
+                    except (TypeError, ValueError):
+                        net = None
+                    rates.append({
+                        "rateKey": key,
+                        "net": rate.get("net"),
+                        "net_value": net,
+                        "sellingRate": rate.get("sellingRate"),
+                        "rateClass": rate.get("rateClass"),
+                        "rateType": rate.get("rateType"),
+                        "boardCode": rate.get("boardCode"),
+                        "boardName": rate.get("boardName") or rate.get("boardCode"),
+                        "roomCode": room_code,
+                        "roomName": room_name,
+                        "rooms": rate.get("rooms"),
+                        "adults": rate.get("adults"),
+                        "children": rate.get("children"),
+                        "allotment": rate.get("allotment"),
+                        "paymentType": rate.get("paymentType"),
+                        "packaging": rate.get("packaging"),
+                        "cancellationPolicies": _as_list(rate.get("cancellationPolicies")),
+                        "offers": _as_list(rate.get("offers")),
+                        "promotions": _as_list(rate.get("promotions")),
+                        "rateComments": rate.get("rateComments"),
+                    })
+            # Cheapest first; rates with no net sort last rather than being
+            # dropped — a rate without a price is still bookable.
+            rates.sort(key=lambda r: (r["net_value"] is None, r["net_value"] if r["net_value"] is not None else 0.0))
+            if cap and cap > 0:
+                rates = rates[:cap]
+            return rates
+
         def _hotel_summary(hotel):
             hotel = _as_dict(hotel)
             rates = _as_list(hotel.get("rooms"))
@@ -450,6 +536,8 @@ workflow:
                 "maxRate": hotel.get("maxRate"),
                 "currency": currency,
                 "rooms_count": len(rates),
+                # adiona/frontend#22 — every bookable rate, not just the cheapest.
+                "rates": _bookable_rates(hotel),
                 "reviews": _as_list(hotel.get("reviews")),
                 "address": hotel.get("address"),
                 # Bookable rate token (short-lived) + its board/class so the
@@ -462,6 +550,11 @@ workflow:
                 # Photo URLs, filled from the Content API after availability
                 # (availability itself carries no images). Empty until enriched.
                 "images": [],
+                # adiona/frontend#22 — Content API images that name a roomCode,
+                # grouped by that code: {roomCode: [url, ...]}. Empty until
+                # enriched, and empty for a hotel whose photos carry no room
+                # attribution at all (which is common on the test key).
+                "room_images": {},
             }
 
         # HotelBeds AVAILABILITY responses carry no photos — hotel images live
@@ -484,18 +577,28 @@ workflow:
             except (TypeError, ValueError):
                 return 9999
 
-        def _hotel_images(base, apikey, secret, codes, max_per=6):
+        def _hotel_images(base, apikey, secret, codes, max_per=MAX_IMAGES_PER_HOTEL):
             # Fetch images for ALL availability hotel codes in ONE Content API
             # call and map code -> [CDN url]. Fully graceful: any failure (no
             # content entitlement on the test key, network, parse) returns {} so
             # search still returns hotels with the prior empty-photos behaviour
             # — the availability path is never broken by a content hiccup.
+            #
+            # adiona/frontend#22 — TWO changes here:
+            #  1. `max_per` now defaults to 0 (no cap). It was 6, so a hotel with
+            #     40 photos returned 6 and the other 34 were discarded before any
+            #     caller could see them.
+            #  2. `fields` now asks for `rooms` alongside `images`, and images
+            #     that name a `roomCode` are ALSO grouped under that room. That
+            #     is the only room-level photo HotelBeds offers; a hotel whose
+            #     photos carry no room attribution simply gets an empty map
+            #     rather than hotel photos relabelled as room photos.
             code_list = [str(c) for c in codes if _text(c)]
             if not code_list:
-                return {}, None
+                return {}, {}, None
             window = max(1, min(len(code_list), 50))
             params = {
-                "fields": "images",
+                "fields": "images,rooms",
                 "codes": ",".join(code_list[:50]),
                 "language": "ENG",
                 "from": 1,
@@ -505,25 +608,37 @@ workflow:
             try:
                 ok, status_code, body = _request("GET", base + CONTENT_IMAGES_PATH, apikey, secret, params=params)
             except Exception as exc:  # noqa: BLE001 — never break search on content
-                return {}, f"{type(exc).__name__}: {exc}"
+                return {}, {}, f"{type(exc).__name__}: {exc}"
             if not ok:
-                return {}, f"content images HTTP {status_code}"
+                return {}, {}, f"content images HTTP {status_code}"
             out = {}
+            rooms_out = {}
             for hotel in _as_list(_as_dict(body).get("hotels")):
                 hotel = _as_dict(hotel)
                 code = str(hotel.get("code") or "")
                 if not code:
                     continue
                 urls = []
+                by_room = {}
                 for img in sorted(_as_list(hotel.get("images")), key=_image_order):
-                    url = _image_url(_as_dict(img).get("path"))
-                    if url and url not in urls:
+                    img = _as_dict(img)
+                    url = _image_url(img.get("path"))
+                    if not url:
+                        continue
+                    if url not in urls:
+                        if max_per and len(urls) >= max_per:
+                            break
                         urls.append(url)
-                    if len(urls) >= max_per:
-                        break
+                    room_code = _text(img.get("roomCode"))
+                    if room_code:
+                        bucket = by_room.setdefault(room_code, [])
+                        if url not in bucket:
+                            bucket.append(url)
                 if urls:
                     out[code] = urls
-            return out, None
+                if by_room:
+                    rooms_out[code] = by_room
+            return out, rooms_out, None
 
         def _tools_list():
             tools = [
@@ -544,6 +659,7 @@ workflow:
                             "adults": {"type": "integer", "minimum": 1, "default": 2},
                             "rooms": {"type": "integer", "minimum": 1, "default": 1},
                             "children": {"type": "integer", "minimum": 0, "default": 0},
+                            "max_hotels": {"type": "integer", "minimum": 1, "maximum": 25, "description": "Hotels to return. Overrides the workload default; 25 is the provider ceiling."},
                         },
                     },
                 },
@@ -581,6 +697,13 @@ workflow:
             return _ok("tools/list", {"tools": tools, "tool_count": len(tools)}, f"HotelBeds MCP — {len(tools)} tools available", {"tool_count": len(tools)})
 
         def _search_hotels(args, base, apikey, secret, limit):
+            # adiona/frontend#22 — a caller-supplied cap wins over the workload
+            # default. hotel-cards passes `arguments` only, so before this the
+            # per-call limit had no way in and every search silently fell back
+            # to the workload's 10.
+            if args.get("max_hotels") is not None or args.get("limit") is not None:
+                limit = _cap(args.get("max_hotels") if args.get("max_hotels") is not None else args.get("limit"),
+                             default=limit, maximum=25)
             lat, lng = _geo_from_args(args)
             if lat is None or lng is None:
                 return _error(
@@ -616,10 +739,12 @@ workflow:
             summarised = [_hotel_summary(hotel) for hotel in hotels[:limit] if isinstance(hotel, dict)]
             # Enrich each hotel with photo URLs from the Content API (one call
             # for all codes). Graceful: on any failure hotels keep empty photos.
-            images_map, images_error = _hotel_images(
+            images_map, room_images_map, images_error = _hotel_images(
                 base, apikey, secret, [h.get("code") for h in summarised])
             for h in summarised:
-                h["images"] = images_map.get(str(h.get("code") or ""), [])
+                _code = str(h.get("code") or "")
+                h["images"] = images_map.get(_code, [])
+                h["room_images"] = room_images_map.get(_code, {})
             images_with_photos = sum(1 for h in summarised if h.get("images"))
             currency = None
             for hotel in summarised:
@@ -640,7 +765,14 @@ workflow:
                     "geolocation": payload["geolocation"],
                     "meta": {"count": len(summarised), "source": "hotelbeds", "currency": currency,
                              "images_source": "hotelbeds-content" if images_with_photos else None,
-                             "images_with_photos": images_with_photos, "images_error": images_error},
+                             "images_with_photos": images_with_photos, "images_error": images_error,
+                             # adiona/frontend#22 diagnostics: prove the additive
+                             # detail actually arrived rather than inferring it
+                             # from an empty list downstream.
+                             "max_hotels": limit,
+                             "images_total": sum(len(h.get("images") or []) for h in summarised),
+                             "rates_total": sum(len(h.get("rates") or []) for h in summarised),
+                             "hotels_with_room_images": sum(1 for h in summarised if h.get("room_images"))},
                 },
                 f"{len(summarised)} HotelBeds hotel(s)",
                 {"status_code": status_code, "hotels_total": len(summarised), "images_with_photos": images_with_photos},
@@ -859,6 +991,9 @@ workflow:
             "_request": _request,
             "_geo_from_args": _geo_from_args,
             "_first_bookable_rate": _first_bookable_rate,
+            "_bookable_rates": _bookable_rates,
+            "MAX_RATES_PER_HOTEL": MAX_RATES_PER_HOTEL,
+            "MAX_IMAGES_PER_HOTEL": MAX_IMAGES_PER_HOTEL,
             "_hotel_summary": _hotel_summary,
             "_image_url": _image_url,
             "_image_order": _image_order,
@@ -886,7 +1021,7 @@ workflow:
         base = _text(hotelbeds_api_base, "https://api.test.hotelbeds.com").rstrip("/")
         project = _text(google_project, "shastaratech-noetl-prod")
         secret_name = _text(hotelbeds_secret_name, "hotelbeds-api-test")
-        limit = _cap(max_hotels, default=10, maximum=25)
+        limit = _cap(max_hotels, default=20, maximum=25)
         try:
             book_tol = float(book_tolerance)
         except (TypeError, ValueError):
