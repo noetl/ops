@@ -1,0 +1,151 @@
+# Off-server drive per-hop latency safety net (noetl/ai-meta#156) — kind twin.
+# =============================================================================
+# The kind-cluster VictoriaMetrics rule.  Its prod (GKE Google Managed
+# Prometheus) twin is `ci/manifests/noetl/gmp/rules-offserver-drive-latency.yaml`
+# (kind: monitoring.googleapis.com/v1 Rules).  The PromQL, thresholds, labels,
+# and annotations are IDENTICAL across the two files — keep them in lockstep
+# when either changes.  VMAlert selects this VMRule (vmstack-values.yaml
+# vmalert.spec.selectAllByDefault: true); the local-dev redeploy applies every
+# top-level YAML in ci/manifests/noetl/.
+#
+# WHAT THIS WATCHES.  The #156 tail-attach fix (server v3.48.0 + worker
+# v5.48.0, NOETL_OFFSERVER_ATTACH_TAIL=true) bounds the off-server drive's
+# per-hop state-build cost to O(execution tail) instead of O(global event
+# log).  Without it each orchestrate hop's drive-state build can fall back to
+# scanning the large prod `noetl.event` — the per-hop latency variance /
+# drain-lag cliff that noetl/ai-meta#130 and #156 document.  These rules are
+# the LATENT SAFETY NET: they catch the fix silently regressing (fallback
+# cliff) or slow drift as the event log grows (p95 creep), even under LOW
+# traffic where a load test would never surface it.
+#
+# All alerts are WARNING — a degradation-of-a-floor signal, not an outage.
+# There is NO one-step mitigation for the alert itself; the real remediation
+# for sustained low-load firing is bounding / GC-ing the noetl_events stream +
+# event log (noetl/ai-meta#104 result-tier-GC direction).  See the runbook.
+#
+# Scrape path: the system-pool worker (which runs the orchestrate `wasm`
+# drive) exposes /metrics on :9090; on kind the noetl-scrape VMServiceScrape /
+# pod annotations cover it.  Metric names + labels match the worker binary
+# (worker/src/metrics.rs): noetl_worker_state_builder_drive_builds_total
+# {outcome=served|fallback_incomplete|fallback_disabled},
+# noetl_worker_state_builder_drive_wait_total{outcome=woken|timeout},
+# noetl_worker_dispatch_duration_seconds{tool_kind="wasm"}.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: noetl-offserver-drive-latency
+  namespace: noetl
+  labels:
+    app: noetl
+    component: offserver-drive
+    # The latent safety net for the #156 tail-attach fix.
+    noetl.io/safety-net: offserver-drive-latency
+spec:
+  groups:
+    - name: noetl-offserver-drive-latency
+      interval: 30s
+      rules:
+        # Recording rule: p95 of the off-server orchestrate-drive per-hop
+        # dispatch latency (tool_kind="wasm" is the orchestrate plugin drive).
+        # 30m bucket-rate window keeps the quantile stable under a low hop
+        # rate; the alert's `for: 10m` requires the drift to persist.
+        - record: noetl:offserver_drive_dispatch_p95_seconds
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (
+                rate(noetl_worker_dispatch_duration_seconds_bucket{tool_kind="wasm"}[30m])
+              )
+            )
+
+        # WARNING — fallback cliff.  >5% of off-server DRIVE builds completing
+        # as fallback_incomplete (dropped to the slow reconcile path) over 10m.
+        # Healthy steady state is 100% outcome="served".  The denominator-rate
+        # traffic guard keeps it quiet when idle.
+        - alert: OffserverDriveFallbackCliff
+          expr: |
+            (
+              sum(rate(noetl_worker_state_builder_drive_builds_total{outcome="fallback_incomplete"}[10m]))
+              /
+              sum(rate(noetl_worker_state_builder_drive_builds_total[10m]))
+            ) > 0.05
+            and
+            sum(rate(noetl_worker_state_builder_drive_builds_total[10m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: offserver-drive
+            noetl_io_safety_net: offserver-drive-latency
+          annotations:
+            summary: "Off-server drive falling back to reconcile ({{ $value | humanizePercentage }} of builds incomplete)"
+            description: >-
+              Over 10m, more than 5% of off-server orchestrate-drive state
+              builds completed as fallback_incomplete instead of served — the
+              per-execution WAL tail isn't reaching the worker in time and hops
+              are dropping to the slow reconcile path. This is the #156
+              tail-attach safety net firing: the per-hop latency win is
+              eroding. There is NOTHING to do for the alert itself (no flag to
+              flip, no revert); planner turns still complete, just slower. The
+              underlying fix is bounding / GC-ing the noetl_events stream and
+              event log so the drive tail stays small (noetl/ai-meta#104
+              result-tier-GC direction). See the runbook.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-offserver-drive-latency.md#offserverdrivefallbackcliff"
+
+        # WARNING — reconcile waits.  >50% of off-server build-retry waits
+        # hitting the per-wait timeout cap (slow reconcile path) rather than
+        # being woken by the drain append signal, over 10m, with a small
+        # absolute floor so a single stray timeout in a near-idle window does
+        # not trip it.  Healthy steady state has zero drive waits.
+        - alert: OffserverDriveReconcileWaits
+          expr: |
+            (
+              sum(rate(noetl_worker_state_builder_drive_wait_total{outcome="timeout"}[10m]))
+              /
+              sum(rate(noetl_worker_state_builder_drive_wait_total[10m]))
+            ) > 0.5
+            and
+            sum(rate(noetl_worker_state_builder_drive_wait_total{outcome="timeout"}[10m])) > 0.01
+          for: 10m
+          labels:
+            severity: warning
+            component: offserver-drive
+            noetl_io_safety_net: offserver-drive-latency
+          annotations:
+            summary: "Off-server drive build-retries timing out to reconcile ({{ $value | humanizePercentage }} of waits)"
+            description: >-
+              Over 10m, more than half of off-server drive build-retry waits
+              hit the per-wait timeout cap (slow reconcile path) instead of
+              being woken instantly by the WAL drain's append signal. The
+              event-signalled drive (noetl/ai-meta#130) is no longer keeping
+              up, which trends the same way the fallback cliff does — hops
+              waiting on WAL data that arrives late. NOTHING is required for
+              the alert itself; the real mitigation is bounding / GC-ing the
+              noetl_events stream so the per-execution tail stays small
+              (noetl/ai-meta#104 result-tier-GC direction). See the runbook.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-offserver-drive-latency.md#offserverdrivereconcilewaits"
+
+        # WARNING — per-hop p95 drift.  Off-server orchestrate-drive dispatch
+        # p95 above 2s for 10m (healthy prod p95 ~0.8s, mean ~0.22s).  Catches
+        # the slow log-growth creep even without a load spike or any fallback.
+        # When there is no drive traffic the quantile is NaN and it stays
+        # silent.
+        - alert: OffserverDriveDispatchLatencyP95High
+          expr: noetl:offserver_drive_dispatch_p95_seconds > 2
+          for: 10m
+          labels:
+            severity: warning
+            component: offserver-drive
+            noetl_io_safety_net: offserver-drive-latency
+          annotations:
+            summary: "Off-server drive per-hop p95 latency high ({{ $value | humanizeDuration }})"
+            description: >-
+              The off-server orchestrate-drive per-hop dispatch p95
+              (tool_kind=wasm) has been above 2s for 10m, well over the healthy
+              ~0.8s baseline. This is the slow-drift signal: per-hop drive cost
+              creeping up as the prod event log grows, independent of load.
+              NOTHING is required for the alert itself (planner turns complete,
+              just slower); the underlying remediation is bounding / GC-ing the
+              noetl_events stream + event log so the drive tail and any cold
+              rebuild stay cheap (noetl/ai-meta#104 result-tier-GC direction).
+              See the runbook.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-offserver-drive-latency.md#offserverdrivedispatchlatencyp95high"
