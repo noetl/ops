@@ -1,0 +1,2 @@
+# version	digest	released_at	git_sha	note
+v3.109.2	sha256:63cec09d7a5af002c405cd2fbc78d53e5aae01f0596404a72dde5991942cc88d	2026-09-15T19:00Z	fc84c28e	observed running on sts/noetl-server-rust-embedded 2026-09-16; ROLLBACK TARGET for the noetl/ai-meta#343 tier-fallback release
