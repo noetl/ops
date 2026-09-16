@@ -1,0 +1,3 @@
+# version	digest	released_at	git_sha	note
+v3.109.2	sha256:63cec09d7a5af002c405cd2fbc78d53e5aae01f0596404a72dde5991942cc88d	2026-09-15T19:00Z	fc84c28e	observed running on sts/noetl-server-rust-embedded 2026-09-16; ROLLBACK TARGET for the noetl/ai-meta#343 tier-fallback release
+v3.109.3	sha256:af84aa1dad9bcebc5645557955a4c200ad387cab344d36a079d16be8b7515379	2026-09-16T07:16Z	8a82f530	noetl/ai-meta#343 FIX 3 — legacy result refs resolve from the #104 tier. Observed running on sts/noetl-server-rust-embedded 2026-09-16T07:16Z; noetl_result_store_tier_fallback_total{served}=45 within the hour
