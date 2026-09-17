@@ -1,0 +1,51 @@
+# Google Managed Prometheus scrape config for the gateway.
+#
+# Namespace `gateway` had NO scrape configuration of any kind — not a stale
+# selector, not a wrong port: nothing (verified 2026-08-05, `kubectl -n gateway
+# get podmonitoring` → no resources).  The gateway is the only component
+# terminating untrusted inbound traffic, and none of it was measured.
+#
+# Why this was easy to leave undone: the gateway's `/metrics` served a **200
+# with a zero-byte body**.  All three ingress counters are labelled by
+# `subscription`, and `Registry::gather` prunes metric families with no
+# children, so before any delivery has arrived there are no series at all.
+# Pointing a scrape at an endpoint that returns nothing looks pointless, and
+# is indistinguishable from the endpoint not existing — the gateway wiki had
+# in fact concluded the gateway "exposes no Prometheus endpoint"
+# (noetl/ai-meta#238).
+#
+# `noetl_gateway_build_info{version}` (noetl/gateway#40, v3.8.0) removes that
+# ambiguity: it is unconditional and needs no traffic, so a scrape always
+# returns at least the running version.  That makes three previously
+# indistinguishable states readable — not scraped, wrong port, and binary too
+# old to carry the metric being looked for.
+#
+# Requires noetl-gateway >= 3.8.0 for a non-empty scrape.  Applying this
+# against an older gateway is harmless but yields nothing.
+#
+# NOT APPLIED — part of the noetl/ai-meta#238 alerting proposal.  Applying it
+# is an operator decision, and note that a scrape without a notification
+# channel still pages nobody.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: noetl-gateway
+  namespace: gateway
+  labels:
+    app.kubernetes.io/part-of: noetl
+spec:
+  # Matched against the live pod set rather than transcribed from a manifest:
+  # `kubectl -n gateway get pods --show-labels` reports exactly `app=gateway`
+  # on the one deployment.  An enumerated selector is itself a representation
+  # of the workload set, and the worker half of podmonitoring-noetl.yaml drifted
+  # that way — it listed four `app` names, two of which never existed, while
+  # omitting a shard that had been live since #166 Phase 5.
+  selector:
+    matchLabels:
+      app: gateway
+  endpoints:
+    # The gateway serves /metrics on its main serving port; it declares no
+    # separate `metrics` port, unlike the workers.
+    - port: http
+      path: /metrics
+      interval: 30s

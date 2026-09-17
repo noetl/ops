@@ -54,13 +54,21 @@ spec:
       interval: 15s
       rules:
         # Recording rule: total un-materialized backlog for the
-        # materializer consumer, deduped across system-pool pods (each
-        # pod's poller reports the same consumer-level value).
+        # materializer consumer.
+        #
+        # Was the sum of two NATS JetStream consumer gauges, reported by a
+        # poller in each system-pool pod (hence the dedup).  T5 deleted
+        # JetStream and the poller with it, so both gauges stopped being
+        # written — this rule kept evaluating and every alert below it went
+        # permanently inert, with no error anywhere (noetl/ai-meta#242).  The
+        # gauges are removed outright in noetl/worker.
+        #
+        # EHDB's per-group lag is the live equivalent, and needs no dedup: the
+        # writer reports it once, not once per consumer pod.
         - record: noetl:materializer_backlog
           expr: |
             max(
-              noetl_worker_nats_consumer_pending{stream="noetl_events", consumer="noetl_materializer"}
-              + noetl_worker_nats_consumer_ack_pending{stream="noetl_events", consumer="noetl_materializer"}
+              ehdb_events_group_lag{group="noetl_materializer"}
             )
 
         # WARNING — the materializer is falling behind.  Sustained backlog
