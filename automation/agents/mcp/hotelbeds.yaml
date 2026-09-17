@@ -251,6 +251,75 @@ workflow:
         HOTELS_UNAVAILABLE_MSG = "Hotels are temporarily unavailable, please try again in a moment."
         BOOKING_UNAVAILABLE_MSG = "Hotel booking is temporarily unavailable — please try again in a moment."
 
+        def _hb_detail(body):
+            # HotelBeds explains a rejection at error.{code,message}, next to an
+            # auditData block; some shapes carry a bare string under `error`.
+            # Returns "CODE: message", or "" when the body explains nothing.
+            payload = _as_dict(body)
+            err = payload.get("error")
+            if isinstance(err, str):
+                return _text(err)[:240]
+            err = _as_dict(err)
+            code = _text(err.get("code"))
+            message = _text(err.get("message"))
+            if code and message:
+                return f"{code}: {message}"[:240]
+            return (message or code)[:240]
+
+        def _failure_class(status_code):
+            # Decides whether "try again in a moment" is an honest thing to say.
+            #   transient -> the call may succeed unchanged; retry advice is true.
+            #   request   -> the request itself is wrong; it will NEVER succeed
+            #                unchanged, so retry advice is a lie that hides the
+            #                real constraint (noetl/ai-meta#338).
+            #   auth      -> an operator problem.  The end user cannot act on it
+            #                and the detail must not reach the UI, so it keeps
+            #                the generic line under its own code.
+            # `_request` returns 0 for transport/timeout.  408/429 are 4xx but
+            # genuinely retryable, so they land in `transient`, not `request`.
+            try:
+                status = int(status_code or 0)
+            except (TypeError, ValueError):
+                return "transient"
+            if status in (401, 403):
+                return "auth"
+            if status == 0 or status in (408, 429) or status >= 500:
+                return "transient"
+            if 400 <= status < 500:
+                return "request"
+            return "transient"
+
+        def _stay_error(check_in, check_out):
+            # HotelBeds rejects a check-in before today with
+            # `INVALID_DATA: The check-in must be in the future.`  Catching that
+            # here costs one comparison and names the offending value; letting it
+            # through costs a round trip and yields a generic HTTP 400 whose real
+            # reason is buried in an auditData blob (noetl/ai-meta#338).
+            #
+            # The bound is strictly `< today`, not `<= today`: a same-day
+            # check-in is ACCEPTED by HotelBeds (verified against the TEST host
+            # 2026-09-11 — returns HTTP 200 with an availability list, empty or
+            # not).  Rejecting today here would refuse searches the provider
+            # honours.
+            from datetime import date
+            today = date.today()
+            try:
+                parsed_in = date.fromisoformat(_text(check_in))
+            except (TypeError, ValueError):
+                return f"check_in must be YYYY-MM-DD, got '{_text(check_in)}'"
+            try:
+                parsed_out = date.fromisoformat(_text(check_out))
+            except (TypeError, ValueError):
+                return f"check_out must be YYYY-MM-DD, got '{_text(check_out)}'"
+            if parsed_in < today:
+                return (f"check_in {parsed_in.isoformat()} is in the past "
+                        f"(today is {today.isoformat()}); HotelBeds requires a "
+                        f"check-in of today or later")
+            if parsed_out <= parsed_in:
+                return (f"check_out {parsed_out.isoformat()} must be after "
+                        f"check_in {parsed_in.isoformat()}")
+            return ""
+
         def _error(tool_name, message, detail=None, status_code=0, code=None, user_message=None):
             # `text` is the full diagnostic (message + the raw HotelBeds body),
             # kept in _meta/data for logs. `display` is what the caller surfaces
@@ -715,6 +784,12 @@ workflow:
             check_out = _text(args.get("check_out") or args.get("checkOut"))
             if not check_in or not check_out:
                 return _error("search_hotels", "check_in and check_out (YYYY-MM-DD) are required", code="validation_error")
+            # Fail fast, with the real reason, before spending a round trip on a
+            # request HotelBeds will refuse anyway (noetl/ai-meta#338).
+            _stay_problem = _stay_error(check_in, check_out)
+            if _stay_problem:
+                return _error("search_hotels", _stay_problem, code="validation_error",
+                              user_message=f"Those dates cannot be searched: {_stay_problem}.")
             adults = _cap(args.get("adults"), default=2, maximum=8)
             rooms = _cap(args.get("rooms"), default=1, maximum=4)
             try:
@@ -732,8 +807,24 @@ workflow:
             }
             ok, status_code, body = _request("POST", base + AVAILABILITY_PATH, apikey, secret, payload=payload)
             if not ok:
+                # A 4xx is permanent: the same request will fail the same way
+                # forever, so "try again in a moment" is false and hides the
+                # constraint.  Surface HotelBeds' own explanation instead, and
+                # keep the retry wording for the failures it is actually true of
+                # (5xx, timeouts, transport, 408/429) — noetl/ai-meta#338.
+                _fail_class = _failure_class(status_code)
+                _fail_detail = _hb_detail(body)
+                if _fail_class == "request" and _fail_detail:
+                    _fail_code = "availability_rejected"
+                    _fail_msg = f"Those hotel dates or filters were rejected: {_fail_detail}"
+                elif _fail_class == "auth":
+                    _fail_code = "availability_auth_failed"
+                    _fail_msg = HOTELS_UNAVAILABLE_MSG
+                else:
+                    _fail_code = "availability_failed"
+                    _fail_msg = HOTELS_UNAVAILABLE_MSG
                 return _error("search_hotels", f"HotelBeds availability failed HTTP {status_code}", body, status_code,
-                              code="availability_failed", user_message=HOTELS_UNAVAILABLE_MSG)
+                              code=_fail_code, user_message=_fail_msg)
             container = _as_dict(body.get("hotels") if isinstance(body, dict) else {})
             hotels = _as_list(container.get("hotels"))
             summarised = [_hotel_summary(hotel) for hotel in hotels[:limit] if isinstance(hotel, dict)]
@@ -1012,6 +1103,9 @@ workflow:
             "PHOTO_CDN": PHOTO_CDN,
             "SANDBOX_HOST_MARKERS": SANDBOX_HOST_MARKERS,
             "HOTELS_UNAVAILABLE_MSG": HOTELS_UNAVAILABLE_MSG,
+            "_hb_detail": _hb_detail,
+            "_failure_class": _failure_class,
+            "_stay_error": _stay_error,
             "BOOKING_UNAVAILABLE_MSG": BOOKING_UNAVAILABLE_MSG,
         })
 
