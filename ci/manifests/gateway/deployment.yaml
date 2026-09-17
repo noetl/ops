@@ -66,7 +66,7 @@ spec:
         - name: RUST_LOG
           value: info,gateway=debug
         - name: CORS_ALLOWED_ORIGINS
-          value: http://localhost:3001,http://localhost:5173,http://127.0.0.1:5173,https://mestumre.dev,https://gateway.mestumre.dev,http://mestumre.dev,http://gateway.mestumre.dev,https://travel.mestumre.dev,http://travel.mestumre.dev
+          value: http://localhost:3001,http://localhost:5173,http://127.0.0.1:5173,https://mestumre.dev,https://gateway.mestumre.dev,http://mestumre.dev,http://gateway.mestumre.dev,https://travel.mestumre.dev,http://travel.mestumre.dev,https://team4.mestumre.dev
         - name: NOETL_TIMEOUT_SECS
           value: '120'
         - name: TRANSPORT_HEARTBEAT_INTERVAL_SECS
