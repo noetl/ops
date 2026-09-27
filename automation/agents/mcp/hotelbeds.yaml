@@ -595,10 +595,22 @@ workflow:
             #     rather than hotel photos relabelled as room photos.
             code_list = [str(c) for c in codes if _text(c)]
             if not code_list:
-                return {}, {}, None
+                return {}, {}, {}, None
             window = max(1, min(len(code_list), 50))
             params = {
-                "fields": "images,rooms",
+                # adiona/frontend#34 — `reviews` too. `_rating()` in
+                # muno/playbooks/hotel-cards reads `reviews[].rate`, which is a
+                # CONTENT field: availability responses never carry it, so
+                # rating was null on every hotel of every search and the card UI
+                # filled the gap with an invented 7.8. Asking for it here is the
+                # only way the field can ever arrive.
+                #
+                # NOTE: verified 2026-09-27 against the TEST key — it returns no
+                # reviews for any of `images,rooms,reviews`, `all`, or `reviews`
+                # alone, so this is a no-op until a key with the HotelBeds review
+                # entitlement is used. Harmless meanwhile: an absent field just
+                # stays absent, and content failures are already non-fatal.
+                "fields": "images,rooms,reviews",
                 "codes": ",".join(code_list[:50]),
                 "language": "ENG",
                 "from": 1,
@@ -608,16 +620,22 @@ workflow:
             try:
                 ok, status_code, body = _request("GET", base + CONTENT_IMAGES_PATH, apikey, secret, params=params)
             except Exception as exc:  # noqa: BLE001 — never break search on content
-                return {}, {}, f"{type(exc).__name__}: {exc}"
+                return {}, {}, {}, f"{type(exc).__name__}: {exc}"
             if not ok:
-                return {}, {}, f"content images HTTP {status_code}"
+                return {}, {}, {}, f"content images HTTP {status_code}"
             out = {}
             rooms_out = {}
+            reviews_out = {}
             for hotel in _as_list(_as_dict(body).get("hotels")):
                 hotel = _as_dict(hotel)
                 code = str(hotel.get("code") or "")
                 if not code:
                     continue
+                # adiona/frontend#34 — carry reviews through untouched; scoring
+                # them is `_rating()`'s job in the consuming playbook.
+                revs = _as_list(hotel.get("reviews"))
+                if revs:
+                    reviews_out[code] = revs
                 urls = []
                 by_room = {}
                 for img in sorted(_as_list(hotel.get("images")), key=_image_order):
@@ -638,7 +656,7 @@ workflow:
                     out[code] = urls
                 if by_room:
                     rooms_out[code] = by_room
-            return out, rooms_out, None
+            return out, rooms_out, reviews_out, None
 
         def _tools_list():
             tools = [
@@ -739,12 +757,15 @@ workflow:
             summarised = [_hotel_summary(hotel) for hotel in hotels[:limit] if isinstance(hotel, dict)]
             # Enrich each hotel with photo URLs from the Content API (one call
             # for all codes). Graceful: on any failure hotels keep empty photos.
-            images_map, room_images_map, images_error = _hotel_images(
+            images_map, room_images_map, reviews_map, images_error = _hotel_images(
                 base, apikey, secret, [h.get("code") for h in summarised])
             for h in summarised:
                 _code = str(h.get("code") or "")
                 h["images"] = images_map.get(_code, [])
                 h["room_images"] = room_images_map.get(_code, {})
+                # Keep whatever availability gave (always empty in practice)
+                # rather than blanking it when content returns nothing.
+                h["reviews"] = reviews_map.get(_code) or _as_list(h.get("reviews"))
             images_with_photos = sum(1 for h in summarised if h.get("images"))
             currency = None
             for hotel in summarised:
@@ -770,6 +791,9 @@ workflow:
                              # detail actually arrived rather than inferring it
                              # from an empty list downstream.
                              "max_hotels": limit,
+                             # adiona/frontend#34 — makes "reviews never arrived"
+                             # observable instead of surfacing as a null rating.
+                             "hotels_with_reviews": sum(1 for h in summarised if h.get("reviews")),
                              "images_total": sum(len(h.get("images") or []) for h in summarised),
                              "rates_total": sum(len(h.get("rates") or []) for h in summarised),
                              "hotels_with_room_images": sum(1 for h in summarised if h.get("room_images"))},
