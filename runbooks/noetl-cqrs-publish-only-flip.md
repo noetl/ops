@@ -81,6 +81,10 @@ CREATE INDEX IF NOT EXISTS idx_event_prev_event_id ON noetl.event (execution_id,
 
 1. Server → **v3.39.1** (`@sha256:197a6d10…`, tag `c5f8cb2`) via
    `kubectl apply -f ci/manifests/noetl/server-rust-deployment-prod.yaml`.
+   ⚠ **Historical.** That Deployment is retired — serving is now
+   `sts/noetl-server-rust-embedded`, and the manifest is pinned at
+   `replicas: 0` so an apply cannot scale a second server sharing
+   `MACHINE_ID=2` (noetl/ai-meta#359). Do not copy this command forward.
    Verified `/api/health` `version=3.39.1`, DB+NATS connected.
 2. Shared worker pool + system pool → **v5.40.2**
    (`@sha256:41713265…`, tag `48b0bde`). The v3.39.1 plug-in drive routes
