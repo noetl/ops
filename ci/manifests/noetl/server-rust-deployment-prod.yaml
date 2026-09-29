@@ -1,5 +1,33 @@
-# NoETL control plane — PROD.  Captured from the live cluster (noetl/ai-meta#267)
-# so that `kubectl apply` of THIS FILE is a no-op rather than a mass deletion.
+# NoETL control plane — PROD.  ⚠⚠ THIS WORKLOAD IS RETIRED AND NON-SERVING.
+#
+# ════════════════════════════════════════════════════════════════════════════
+#  replicas: 0 IS LOAD-BEARING.  DO NOT RAISE IT.
+#
+#  Serving moved to StatefulSet/noetl-server-rust-embedded.  Both svc/noetl and
+#  svc/noetl-server-rust select THAT workload; this Deployment has been 0
+#  replicas in prod since the embedded cutover.
+#
+#  This file still said `replicas: 1` until 2026-09-29, and that made the very
+#  claim in the line below FALSE: `kubectl apply -f` would have scaled this
+#  Deployment 0 -> 1, producing a SECOND server process alongside the
+#  StatefulSet.  Both carry NOETL_SERVER_MACHINE_ID=2, so that is two snowflake
+#  generators on the same machine bits — DUPLICATE event_id on the append-only
+#  event log.  noetl/ai-meta#332 records why a second appending replica is
+#  forbidden; noetl/ai-meta#359 is the report of this manifest carrying the
+#  hazard.  Two runbooks instructed that apply, so it was reachable by someone
+#  following documented steps, not just by accident.
+#
+#  The invariant, stated once: THERE MUST NEVER BE TWO APPENDING SERVER
+#  PROCESSES SHARING MACHINE_ID=2.  `replicas: 0` here enforces it by
+#  construction — an apply of this file cannot create a pod at all.
+#
+#  `ci/manifests/noetl/machine-id-collision-check.sh` flags any second
+#  workload that claims the same MACHINE_ID with a non-zero replica count.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Captured from the live cluster (noetl/ai-meta#267) so that `kubectl apply` of
+# THIS FILE is a no-op rather than a mass deletion.  With replicas: 0 matching
+# the live object, that property holds again.
 #
 # ⚠ Do NOT `kubectl apply -f ci/manifests/noetl/` against prod.  A directory apply
 # also picks up server-rust-deployment.yaml, which declares the SAME Deployment and
@@ -25,7 +53,10 @@ metadata:
   namespace: noetl
 spec:
   progressDeadlineSeconds: 600
-  replicas: 1
+  # ⚠⚠ MUST STAY 0 — see the header.  Raising this creates a second appending
+  # server sharing MACHINE_ID=2 with the serving StatefulSet => duplicate
+  # event_id on the append-only log (noetl/ai-meta#332, #359).
+  replicas: 0
   revisionHistoryLimit: 10
   selector:
     matchLabels:
