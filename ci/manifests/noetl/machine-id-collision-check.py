@@ -26,9 +26,10 @@ see one of them, so restoring `replicas: 1` does NOT make file mode fail:
 verified 2026-09-29, the RED control passed when it should have failed.
 
   * `--live` mode DOES see both and is the effective check today.
-  * File mode becomes effective once the serving StatefulSet is committed
-    (noetl/ai-meta#359 acceptance item), at which point `replicas: 1` on the
-    Deployment will collide with it in the repo as well.
+  * ✅ RESOLVED: `server-rust-embedded-sts-prod.yaml` now commits the serving
+    StatefulSet, so file mode sees both parties.  Verified — restoring
+    `replicas: 1` on the Deployment reports COLLISION and exits 1; `replicas: 0`
+    exits 0.
 
 So the real protection right now is `replicas: 0` itself, which is structural and
 does not depend on anything running this script.  Run `--live` in review.
