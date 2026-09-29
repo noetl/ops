@@ -1,0 +1,360 @@
+# NoETL control plane — PROD SERVING WORKLOAD, as built.
+#
+# ════════════════════════════════════════════════════════════════════════════
+#  ⚠⚠⚠ APPLYING THIS FILE IS OWNER-GATED.  DO NOT `kubectl apply` IT.
+#
+#  This is `sts/noetl-server-rust-embedded` — the SOLE serving control plane.
+#  Both svc/noetl and svc/noetl-server-rust resolve to its single endpoint.
+#
+#  Committed as an AS-BUILT RECORD so prod's serving configuration is
+#  reproducible from the repo (noetl/ai-meta#359).  Until now nothing in ops
+#  described the workload that actually serves traffic.
+#
+#  Applying a slightly-wrong manifest to the only serving workload is the
+#  noetl/ai-meta#323 shape exactly: there, a targeted dry-run proved ONE field
+#  and the apply changed a volume, taking prod dispatch down for 55 minutes.
+#  Before any apply:
+#
+#    kubectl --context <prod> -n noetl diff --server-side -f <this file>
+#
+#  and read EVERY hunk — per `agents/rules/apply-safety.md`, a hunk you cannot
+#  explain is a hunk you have not verified.  Much of a StatefulSet spec is also
+#  IMMUTABLE after creation, so an apply may be rejected rather than reconciled.
+#
+#  ⚠ `replicas` MUST stay 1.  A second replica is a second snowflake generator
+#  on the same NOETL_SERVER_MACHINE_ID=2 bits => duplicate event_id on the
+#  APPEND-ONLY event log (noetl/ai-meta#332).  The retired
+#  Deployment/noetl-server-rust is pinned at replicas: 0 for the same reason,
+#  and `machine-id-collision-check.py --live` checks the pair.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Captured 2026-09-29 13:29Z with
+#   kubectl -n noetl get sts noetl-server-rust-embedded -o json
+# and stripped of server-populated fields ONLY: status, managedFields,
+# resourceVersion, uid, creationTimestamp, generation, and the circular
+# last-applied-configuration annotation.  Cluster-assigned Service fields
+# (clusterIP, ipFamilies, ...) are dropped so the file is portable.  Everything
+# else — all 64 env vars, the 10Gi PVC template, probes, resources, the image
+# digest — is exactly what runs.
+#
+# ⚠⚠ ENV COUNT IS 64, NOT 67, AND THE DIFFERENCE MATTERS.  An earlier capture
+# today held 67 because the three NOETL_CHAIN_* gates were armed for the
+# chain-store ramp (noetl/ai-meta#357).  That ramp was ROLLED BACK at 13:28Z on
+# 6.3% comparator divergence at burst concurrency (noetl/ai-meta#360), so the
+# gates are absent again and this file records the post-rollback truth.  Had I
+# committed the earlier capture it would have described a configuration that no
+# longer exists — an as-built that is not as-built is worse than none.
+#
+# ⚠ The image digest below is v3.117.1 and is a POINT-IN-TIME record.  The
+# release ledger (ci/manifests/noetl/ledger/server-rust.tsv) is the authority
+# for which digest to restore; noetl/ai-meta#323 is why image pins inside
+# manifests are a drift source.  Treat this pin as documentation, not as the
+# deploy mechanism.
+#
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: noetl-server-rust-embedded
+    component: server
+    runtime: rust
+    variant: embedded
+  name: noetl-server-rust-embedded
+  namespace: noetl
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  podManagementPolicy: OrderedReady
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: noetl-server-rust-embedded
+  serviceName: noetl-server-rust-embedded-headless
+  template:
+    metadata:
+      labels:
+        app: noetl-server-rust-embedded
+        component: server
+        runtime: rust
+        variant: embedded
+    spec:
+      containers:
+      - env:
+        - name: NOETL_ENCRYPTION_KEY_FILE
+          value: /var/secrets/sm/encryption-key
+        - name: POSTGRES_PASSWORD_FILE
+          value: /var/secrets/sm/postgres-password
+        - name: NOETL_INTERNAL_API_TOKEN_FILE
+          value: /var/secrets/sm/token
+        - name: NOETL_OBJECT_STORE_BACKEND
+          value: gcs
+        - name: NOETL_OBJECT_STORE_GCS_BUCKET
+          value: shastaratech-noetl-prod-results
+        - name: NOETL_OBJECT_STORE_GCS_ENDPOINT
+          value: https://storage.googleapis.com
+        - name: NOETL_OBJECT_STORE_GCS_AUTH
+          value: auto
+        - name: NOETL_RESULT_CELL_ENV
+          value: prod
+        - name: NOETL_RESULT_CELL_REGION
+          value: usc1
+        - name: NOETL_RESULT_CELL
+          value: usc1-a
+        - name: NOETL_RESULT_SHARD_COUNT
+          value: '256'
+        - name: NOETL_HOST
+          value: 0.0.0.0
+        - name: NOETL_PORT
+          value: '8082'
+        - name: RUST_LOG
+          value: info,noetl_server=info,sqlx=warn
+        - name: POSTGRES_HOST
+          value: pgbouncer.postgres.svc.cluster.local
+        - name: POSTGRES_PORT
+          value: '5432'
+        - name: POSTGRES_USER
+          value: noetl
+        - name: POSTGRES_DATABASE
+          value: noetl
+        - name: NOETL_SCHEMA
+          value: noetl
+        - name: NOETL_PG_STATEMENT_CACHE_CAPACITY
+          value: '0'
+        - name: NOETL_PUBLIC_SERVER_URL
+          value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+        - name: NOETL_SERVER_MACHINE_ID
+          value: '2'
+        - name: NOETL_EVENT_READ_PATH
+          value: event_scan
+        - name: NOETL_RESULT_MINT_AUTHORITATIVE
+          value: 'true'
+        - name: NOETL_RESULT_STORE_DUAL_WRITE
+          value: 'false'
+        - name: NOETL_OFFSERVER_ATTACH_TAIL
+          value: 'false'
+        - name: NOETL_OFFSERVER_TAIL_PLAYBOOK_PREFIXES
+          value: muno/playbooks/itinerary-planner,automation/agents/mcp/
+        - name: NOETL_ORPHAN_SWEEP_ENABLED
+          value: 'true'
+        - name: NOETL_AUTH_VERIFY_SIGNATURE
+          value: shadow
+        - name: NOETL_AUTH0_DOMAIN
+          value: mestumre-development.us.auth0.com
+        - name: NOETL_AUTH0_AUDIENCE
+          value: Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN
+        - name: NOETL_SHARD_SUBJECT_ROUTE
+          value: 'true'
+        - name: NOETL_COMMAND_BUS
+          value: ehdb
+        - name: NOETL_EVENT_BUS
+          value: ehdb
+        - name: NOETL_COMMAND_SHARD_COUNT
+          value: '1'
+        - name: NOETL_COMMAND_BUS_WRITER_ADDRS
+          value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9100
+        - name: NOETL_EVENT_BUS_WRITER_ADDRS
+          value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9103
+        - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
+          value: 'true'
+        - name: NOETL_STATE_BUILDER
+          value: offserver
+        - name: NOETL_EVENT_SHARD_COUNT
+          value: '1'
+        - name: NOETL_PERMANENT_LOG_LEAN
+          value: 'true'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_WORKER_QUERY_URL
+          value: http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_ENABLED
+          value: 'true'
+        - name: NOETL_ORCH_RETRIGGER_ON_CLEAR
+          value: 'true'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_ASYNC
+          value: 'true'
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS
+          value: '30'
+        - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_PROJECTION_PARITY_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_PROJECTION_READ_SOURCE
+          value: wal
+        - name: NOETL_CATALOG_SNAPSHOT
+          value: digest
+        - name: NOETL_CATALOG_LOG
+          value: shadow
+        - name: NOETL_DATABASE_ROUTES_AUTH
+          value: disable_execute
+        - name: NOETL_CATALOG_READ_SOURCE
+          value: postgres
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_DRAIN_CONCURRENCY
+          value: '1'
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_CONTENT
+          value: 'true'
+        - name: NOETL_NONCONVERGENCE_SWEEP_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_MAX_RETRIES
+          value: '7'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_RETRY_BACKOFF_MS
+          value: '500'
+        - name: NOETL_EHDB_RECOVERY_SOURCE
+          value: tier
+        - name: NOETL_EHDB_EMBEDDED
+          value: 'true'
+        - name: NOETL_EHDB_EMBEDDED_DIR
+          value: /data/ehdb-embedded
+        - name: NOETL_EHDB_MIRROR_REPAIR_SWEEP
+          value: 'true'
+        - name: NOETL_EHDB_PROJECTION_SERVE_ON_BEHIND
+          value: 'true'
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:cc5b8542d08cbca79f664af0de5f13ab4bc01b881fb99d760974fc439e9508f2
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /api/health
+            port: 8082
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: noetl-server
+        ports:
+        - containerPort: 8082
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /api/health/ready
+            port: 8082
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: '2'
+            ephemeral-storage: 1Gi
+            memory: 1Gi
+          requests:
+            cpu: 250m
+            ephemeral-storage: 1Gi
+            memory: 256Mi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/secrets/sm
+          name: sm-secrets
+          readOnly: true
+        - mountPath: /data
+          name: ehdb-embedded
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: noetl-server-rust
+      serviceAccountName: noetl-server-rust
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: kubernetes.io/arch
+        operator: Equal
+        value: amd64
+      volumes:
+      - csi:
+          driver: secrets-store-gke.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: noetl-server-secrets
+        name: sm-secrets
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: ehdb-embedded
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+      storageClassName: standard-rwo
+      volumeMode: Filesystem
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
+  labels:
+    app: noetl-server-rust-embedded
+    component: server
+    runtime: rust
+    variant: embedded
+  name: noetl-server-rust-embedded-headless
+  namespace: noetl
+spec:
+  ports:
+  - name: http
+    port: 8082
+    protocol: TCP
+    targetPort: 8082
+  selector:
+    app: noetl-server-rust-embedded
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
+  labels:
+    app: noetl
+    app.kubernetes.io/managed-by: Helm
+  name: noetl
+  namespace: noetl
+spec:
+  ports:
+  - name: noetl
+    port: 8082
+    protocol: TCP
+    targetPort: 8082
+  selector:
+    app: noetl-server-rust-embedded
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
+  labels:
+    app: noetl-server-rust
+  name: noetl-server-rust
+  namespace: noetl
+spec:
+  ports:
+  - name: http
+    port: 8082
+    protocol: TCP
+    targetPort: 8082
+  selector:
+    app: noetl-server-rust-embedded
+  type: ClusterIP
