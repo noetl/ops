@@ -66,11 +66,15 @@
 # caller is behind the source gate.  Setting it by itself measures nothing;
 # verified on prod at 17:25Z, where every chain_populate outcome stayed 0.
 #
-# ⚠ The image digest below is v3.117.2 and is a POINT-IN-TIME record.  The
-# ROLLBACK TARGET is v3.117.1 = sha256:cc5b8542d08cbca79f664af0de5f13ab4bc01b881fb99d760974fc439e9508f2,
-# which is the build WITHOUT the noetl/ai-meta#360 fix — rolling back to it also
-# restores the false-divergence behaviour, so prefer flipping the three gates off
-# (a ~17s env change) over rolling the image.  The
+# ⚠ The image digest below is v3.118.0 and is a POINT-IN-TIME record.  The
+# ROLLBACK TARGET is v3.117.2 = sha256:3adf97b2a4bd334472ad961c7b587d6672a7eb7e012f9e6b9d89d6adf632672f.
+#
+# ⚠⚠ Prefer flipping the three gates off (~17s env change) over rolling the image,
+# and the reason is now stronger than convenience: every build BELOW v3.118.0 orders
+# the chain by `event_id`, which noetl/ai-meta#362 proved is not the chain order — a
+# snowflake id is minted before the insert, so an event can commit into the MIDDLE of
+# an id-ordered read.  Rolling the image back therefore restores a known-wrong
+# ordering, while the env flip just stops using the chain store at all.  The
 # release ledger (ci/manifests/noetl/ledger/server-rust.tsv) is the authority
 # for which digest to restore; noetl/ai-meta#323 is why image pins inside
 # manifests are a drift source.  Treat this pin as documentation, not as the
@@ -243,7 +247,7 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_PROJECTION_SERVE_ON_BEHIND
           value: 'true'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:3adf97b2a4bd334472ad961c7b587d6672a7eb7e012f9e6b9d89d6adf632672f
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:03c1fee683fd1ab8acc89f481c06f1daa01dc176424bbdb2abacdec0a07bae92
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
