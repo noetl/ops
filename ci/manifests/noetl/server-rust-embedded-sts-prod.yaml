@@ -37,15 +37,44 @@
 # else — all 64 env vars, the 10Gi PVC template, probes, resources, the image
 # digest — is exactly what runs.
 #
-# ⚠⚠ ENV COUNT IS 64, NOT 67, AND THE DIFFERENCE MATTERS.  An earlier capture
-# today held 67 because the three NOETL_CHAIN_* gates were armed for the
-# chain-store ramp (noetl/ai-meta#357).  That ramp was ROLLED BACK at 13:28Z on
-# 6.3% comparator divergence at burst concurrency (noetl/ai-meta#360), so the
-# gates are absent again and this file records the post-rollback truth.  Had I
-# committed the earlier capture it would have described a configuration that no
-# longer exists — an as-built that is not as-built is worse than none.
+# ⚠⚠ ENV COUNT IS NOW 67: THE THREE NOETL_CHAIN_* GATES ARE ARMED AGAIN.
 #
-# ⚠ The image digest below is v3.117.1 and is a POINT-IN-TIME record.  The
+# History, because the count has moved three times in one day and each value was
+# briefly the truth:
+#
+#   64  post-rollback.  The first capture held 67 with the gates armed for the
+#       chain-store ramp (noetl/ai-meta#357); that ramp was ROLLED BACK at 13:28Z
+#       on 6.3% comparator divergence (5 in 79) at burst concurrency.  Committing
+#       the 67 capture would have described a configuration that no longer
+#       existed — an as-built that is not as-built is worse than none.
+#   67  re-ramped 2026-09-29 17:30Z on server v3.117.2, after the two defects
+#       behind that divergence were fixed (noetl/ai-meta#360).  Comparator:
+#       772 comparisons, 0 failures, 100.00% agreement, up to 6 concurrent
+#       executions, all 80 driven executions COMPLETED.
+#
+# ⚠⚠⚠ THESE THREE LINES ARE LOAD-BEARING IN BOTH DIRECTIONS.  They are recorded
+# here because the live object has them, and an as-built that omits live config is
+# drift.  But note what applying this file would then mean: with them PRESENT an
+# apply keeps the chain path armed, and with them ABSENT an apply would silently
+# DISARM it.  Either way the apply is a behaviour change, not a no-op — which is
+# the whole reason applying this file is owner-gated.
+#
+# ⚠ All three must move together.  NOETL_CHAIN_SOURCE=chain resolves to OFF
+# without NOETL_CHAIN_POPULATE, deliberately, so that a repoint can never read an
+# unpopulated store.  And since the emit-path call site was removed with
+# noetl/ai-meta#358, NOETL_CHAIN_POPULATE ALONE IS INERT — the populator's only
+# caller is behind the source gate.  Setting it by itself measures nothing;
+# verified on prod at 17:25Z, where every chain_populate outcome stayed 0.
+#
+# ⚠ The image digest below is v3.118.0 and is a POINT-IN-TIME record.  The
+# ROLLBACK TARGET is v3.117.2 = sha256:3adf97b2a4bd334472ad961c7b587d6672a7eb7e012f9e6b9d89d6adf632672f.
+#
+# ⚠⚠ Prefer flipping the three gates off (~17s env change) over rolling the image,
+# and the reason is now stronger than convenience: every build BELOW v3.118.0 orders
+# the chain by `event_id`, which noetl/ai-meta#362 proved is not the chain order — a
+# snowflake id is minted before the insert, so an event can commit into the MIDDLE of
+# an id-ordered read.  Rolling the image back therefore restores a known-wrong
+# ordering, while the env flip just stops using the chain store at all.  The
 # release ledger (ci/manifests/noetl/ledger/server-rust.tsv) is the authority
 # for which digest to restore; noetl/ai-meta#323 is why image pins inside
 # manifests are a drift source.  Treat this pin as documentation, not as the
@@ -126,6 +155,14 @@ spec:
           value: http://noetl-server-rust.noetl.svc.cluster.local:8082
         - name: NOETL_SERVER_MACHINE_ID
           value: '2'
+        # The chain-store gates (noetl/ai-meta#357, #360).  See the header: all
+        # three move together, and NOETL_CHAIN_POPULATE alone is inert.
+        - name: NOETL_CHAIN_POPULATE
+          value: 'true'
+        - name: NOETL_CHAIN_ADVANCE
+          value: 'true'
+        - name: NOETL_CHAIN_SOURCE
+          value: chain
         - name: NOETL_EVENT_READ_PATH
           value: event_scan
         - name: NOETL_RESULT_MINT_AUTHORITATIVE
@@ -210,7 +247,7 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_PROJECTION_SERVE_ON_BEHIND
           value: 'true'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:cc5b8542d08cbca79f664af0de5f13ab4bc01b881fb99d760974fc439e9508f2
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:03c1fee683fd1ab8acc89f481c06f1daa01dc176424bbdb2abacdec0a07bae92
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6

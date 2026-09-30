@@ -1,3 +1,13 @@
 # version	digest	released_at	git_sha	note
 v3.109.2	sha256:63cec09d7a5af002c405cd2fbc78d53e5aae01f0596404a72dde5991942cc88d	2026-09-15T19:00Z	fc84c28e	observed running on sts/noetl-server-rust-embedded 2026-09-16; ROLLBACK TARGET for the noetl/ai-meta#343 tier-fallback release
 v3.109.3	sha256:af84aa1dad9bcebc5645557955a4c200ad387cab344d36a079d16be8b7515379	2026-09-16T07:16Z	8a82f530	noetl/ai-meta#343 FIX 3 — legacy result refs resolve from the #104 tier. Observed running on sts/noetl-server-rust-embedded 2026-09-16T07:16Z; noetl_result_store_tier_fallback_total{served}=45 within the hour
+# ⚠⚠ LEDGER GAP: v3.110.x-v3.116.x are MISSING.  The last entry before this was
+# v3.109.3 (2026-09-16); prod has since run at least v3.112.3, v3.113.0, v3.117.0 and
+# v3.117.1.  Those rows are NOT backfilled here because I cannot verify their
+# released_at or observed-running times after the fact, and a ledger row invented
+# from a tag list is worse than an admitted hole — this file's whole job is to be
+# the authority for which digest to restore.  Recover them from
+# `gcloud artifacts docker images list --include-tags` plus the release runs.
+v3.117.1	sha256:cc5b8542d08cbca79f664af0de5f13ab4bc01b881fb99d760974fc439e9508f2	2026-09-29T11:18Z	a3409590^	observed running on sts/noetl-server-rust-embedded 2026-09-29T11:18Z-17:22Z. ⚠ PREDATES the noetl/ai-meta#360 fix: rolling back to it restores the false-divergence classification that failed the 13:26Z ramp at 5/79
+v3.117.2	sha256:3adf97b2a4bd334472ad961c7b587d6672a7eb7e012f9e6b9d89d6adf632672f	2026-09-29T17:1xZ	f630e9a6	noetl/ai-meta#360 — stale-vs-conflict fix + the #358 re-read escalation. Observed running 2026-09-29T17:22:14Z; re-ramp with all three chain gates armed gave 772 comparisons / 0 failures / 100.00% agreement, 80/80 executions COMPLETED
+v3.118.0	sha256:03c1fee683fd1ab8acc89f481c06f1daa01dc176424bbdb2abacdec0a07bae92	2026-09-30T05:3xZ	7da06cc3	noetl/ai-meta#362 — the chain is ordered by FOLLOWING prev-links, never by event_id; link-tip hydrator; events_materialize stamps the link; one-root invariant endpoint + metric. Rolled 2026-09-30T05:41:15Z, gates armed 05:48:45Z. ⚠ ROLLBACK TARGET v3.117.2, but prefer the three-gate env flip: every build below v3.118.0 orders the chain by event_id, which is not the chain order
