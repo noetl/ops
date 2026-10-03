@@ -1,0 +1,269 @@
+# Alerts on the failure paths that used to log and never count.
+#
+# Every rule here keys on a metric added on 2026-08-05 while closing the
+# warn/error-without-metric triage (noetl/ai-meta#238).  Before those counters
+# existed none of these conditions could be alerted at all — each was visible
+# only as a log line, and in three cases the log line was itself the symptom
+# (a flood).
+#
+# Two properties every rule below relies on, both established in that work:
+#
+#   1. The series are PINNED at 0 at startup, so `rate(...) > 0` is a real
+#      comparison rather than a comparison against an absent series.  An alert
+#      keyed on a metric that only appears when it fires cannot distinguish
+#      "healthy" from "not measuring".
+#   2. Success counterparts are recorded too, so a failure rate is legible
+#      against a total rather than in isolation.
+#
+# REQUIRES: noetl-server >= 3.77.2, noetl-worker >= 5.106.0,
+#           noetl-gateway >= 3.9.0.  Against older binaries these series are
+#           absent and every rule below is silent — which is why
+#           `*_build_info{version}` exists on all three.
+#
+# NOT APPLIED.  Part of the noetl/ai-meta#238 proposal; a firing rule still
+# notifies nobody until a notification channel exists.
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: noetl-silent-failure
+  namespace: noetl
+  labels:
+    app.kubernetes.io/part-of: noetl
+spec:
+  groups:
+    - name: noetl-silent-failure
+      interval: 30s
+      rules:
+        # ── The highest-severity condition in the fleet ──────────────────────
+        #
+        # GATEWAY_AUTH_BYPASS makes the gateway accept ANY session token and
+        # inject a synthetic user_id: 0 context.  It is a development lever; on
+        # a production gateway it means authentication is off.
+        #
+        # Verified NOT set in production on 2026-08-05.  This rule exists so
+        # that if it ever is, it is a page and not an archaeology exercise.
+        - alert: GatewayAuthBypassEnabled
+          expr: noetl_gateway_auth_bypass_enabled{mode="bypass"} == 1
+          for: 0m
+          labels:
+            severity: critical
+            component: gateway
+          annotations:
+            summary: "AUTHENTICATION IS DISABLED on the gateway"
+            description: >-
+              GATEWAY_AUTH_BYPASS is enabled: every session token is accepted and
+              requests run as a synthetic user_id 0. Unset it and restart the
+              gateway. `for: 0m` is deliberate — there is no duration of this
+              worth tolerating.
+            runbook_url: "https://github.com/noetl/gateway/wiki/deployment-specification"
+
+        # ── Data loss ───────────────────────────────────────────────────────
+        #
+        # Under NOETL_EVENT_INGEST_PUBLISH_ONLY the materializer is the SOLE
+        # writer of noetl.event.  A skipped message is never projected AND is
+        # acked anyway, so the event is permanently absent from the durable log.
+        # Any non-zero rate is a real loss.
+        - alert: MaterializerSkippingEvents
+          expr: sum(rate(noetl_worker_materializer_skipped_total[5m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+            component: materializer
+          annotations:
+            summary: "Materializer is DROPPING events ({{ $value }}/s)"
+            description: >-
+              Drained messages with no event_id are being skipped. They are never
+              projected into noetl.event and are acked regardless, so under the
+              publish-only gate these events are gone. Investigate the producer
+              emitting messages without an event_id.
+
+        # ── An execution that will never continue ────────────────────────────
+        - alert: EventEmissionAbandoned
+          expr: sum(rate(noetl_worker_event_emit_failed_total[10m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: "Worker abandoned an event emission after retries"
+            description: >-
+              An event was given up on after its retry window. On the
+              container-poll resume path this means the execution never
+              continues — it stops with no terminal event to notice
+              (noetl/ai-meta#227).
+
+        # ── An unbounded retry spin ─────────────────────────────────────────
+        #
+        # ClaimOutcome::Failed nacks for IMMEDIATE redelivery with no backoff,
+        # so a command that consistently fails to claim spins at full speed —
+        # measured at ~1000 log lines/second from one pod.  The threshold is
+        # deliberately well above any plausible transient rate.
+        - alert: ClaimFailureSpin
+          expr: sum(rate(noetl_worker_claim_failed_total[5m])) > 5
+          for: 5m
+          labels:
+            severity: critical
+            component: worker
+          annotations:
+            summary: "Worker is spinning on claim failures ({{ $value }}/s)"
+            description: >-
+              Claim failures retry with no backoff (noetl/ai-meta#244), so a
+              persistently failing command burns CPU and floods logs
+              indefinitely. Find the failing command; the backoff fix is tracked
+              separately.
+
+        # ── A command that never reaches the bus ────────────────────────────
+        - alert: CommandNotDelivered
+          expr: |
+            sum(rate(noetl_ehdb_command_publish_failed_total{reason=~"no_writers|gave_up"}[5m])) > 0
+          for: 2m
+          labels:
+            severity: critical
+            component: server
+          annotations:
+            summary: "Commands are not reaching the EHDB bus ({{ $value }}/s)"
+            description: >-
+              reason=no_writers means NOETL_COMMAND_BUS=ehdb is set with no
+              writer routes resolved and the publish is not even attempted —
+              every affected execution stalls. reason=gave_up means the retry
+              window was exhausted. Check
+              NOETL_COMMAND_BUS_WRITER_ADDRS on noetl-server-rust.
+
+        # ── A rebuild that silently produced incomplete state ────────────────
+        - alert: StateRebuildIncomplete
+          expr: |
+            sum(rate(noetl_worker_state_builder_replay_end_total{reason="feed_error"}[10m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: "Cold-rebuild replays are ending on feed errors"
+            description: >-
+              The replay feed dropped mid-replay, so the rebuilt state is
+              INCOMPLETE. The other three termination reasons (complete,
+              deadline, max_messages) are ordinary; only this one means the
+              drive may act on partial state.
+
+        # ── A silent single-pool fallback ───────────────────────────────────
+        - alert: ShardingConfigFellBack
+          expr: noetl_sharding_config_parse_failed == 1
+          for: 5m
+          labels:
+            severity: warning
+            component: server
+          annotations:
+            summary: "Sharding config failed to parse; running single-pool"
+            description: >-
+              NOETL_SHARDS / NOETL_CLUSTER_DSN did not parse and the server fell
+              back to single-pool. The fallback is safe, but an operator who
+              configured sharding is not getting it.
+
+        # ── A plug-in that is not in the catalog ─────────────────────────────
+        - alert: SystemPluginNotSeeded
+          expr: |
+            sum(increase(noetl_system_plugin_seed_total{outcome=~"skipped_.*"}[1h])) > 0
+          for: 0m
+          labels:
+            severity: warning
+            component: server
+          annotations:
+            summary: "A built-in plug-in was skipped at startup"
+            description: >-
+              A .wasm plug-in was unreadable or had a non-UTF8 name, so it is
+              absent from the catalog. The failure will surface much later as a
+              drive that cannot route to system/<name>. The startup log reports
+              only the count that succeeded, so this is the only signal that
+              3-of-4 is not 3-of-3.
+
+        # ── The caller got nothing back ──────────────────────────────────────
+        #
+        # A callback arrived for a receiver that was already gone.  Whatever the
+        # SPA was waiting on never arrives; from the user's side the request
+        # simply hangs.  Distinct from a request that FAILED, which surfaces.
+        - alert: GatewayCallbacksUndelivered
+          expr: sum(rate(noetl_gateway_callback_undelivered_total[10m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "Gateway callbacks are arriving after their receiver is gone"
+            description: >-
+              The waiting caller receives nothing — the request hangs rather than
+              failing. Usually the gateway's own timeout fired first; correlate
+              with noetl_gateway_auth_cancel_failed_total, which counts the
+              executions that timeout then failed to cancel.
+
+        # ── Executions left running with nobody waiting ──────────────────────
+        - alert: GatewayAuthExecutionsNotCancelled
+          expr: sum(rate(noetl_gateway_auth_cancel_failed_total[15m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "Auth executions are not being cancelled after gateway timeout"
+            description: >-
+              The gateway gave up on an auth execution and its cancel call also
+              failed, so the execution keeps running server-side with nobody
+              waiting for it. Accumulates load rather than breaking anything
+              immediately.
+
+        # ── Every request paying full validation cost ────────────────────────
+        #
+        # Not an outage: sessions still validate.  But the cache exists because
+        # the uncached path is the slow one that #168 measured at ~7.9s, so a
+        # sustained rate here is a latency regression that no error rate shows.
+        - alert: GatewaySessionCacheFailing
+          expr: sum(rate(noetl_gateway_session_cache_failed_total[10m])) > 0.1
+          for: 15m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "Gateway is failing to cache validated sessions"
+            description: >-
+              Every subsequent request repeats full session validation. Nothing
+              errors; it just gets slower. Check EHDB KV reachability
+              (NOETL_KV_ADDR).
+
+        # ── A pool that is failing claims and doing NO work ──────────────────
+        #
+        # noetl/ai-meta#249.  A command whose `noetl.command` row is absent can
+        # never be claimed, is nacked for redelivery forever, and blocks every
+        # message behind it.  Observed live on kind: 30 claim failures and
+        # **zero** successful claims in five minutes, with a freshly-issued
+        # command sitting at `command.issued PENDING`.  Throughput went to zero.
+        #
+        # `ClaimFailureSpin` above does NOT catch this.  It fires at >5/s, and
+        # the wedge retries once per backoff interval (~0.1/s) — the backoff
+        # from noetl/ai-meta#244 working correctly is exactly what makes the
+        # failure quiet.  So the alert built for this class is silent on the
+        # version of it that actually stops work.
+        #
+        # Both series are unlabelled and pinned at 0, which is what makes the
+        # second half of the expression meaningful: a wedged pool has claimed
+        # nothing, and `== 0` must match a real zero rather than an absent
+        # series.
+        #
+        # REQUIRES noetl-worker >= 5.108.0 for `claim_succeeded_total`.
+        - alert: WorkerPoolThroughputStalled
+          expr: |
+            sum(increase(noetl_worker_claim_failed_total[15m])) > 0
+              and
+            sum(increase(noetl_worker_claim_succeeded_total[15m])) == 0
+          for: 10m
+          labels:
+            severity: critical
+            component: worker
+          annotations:
+            summary: "Worker pool is failing claims and completing none"
+            description: >-
+              Claims are failing and not one has succeeded in 15 minutes, so the
+              pool is dispatching nothing. The usual cause is a command whose
+              noetl.command row is absent: it can never be claimed and blocks
+              the feed behind it (noetl/ai-meta#249). Executions will sit at
+              command.issued. Identify the failing command_id in the worker log
+              and clear it; the poison-handling fix is tracked separately.
+            runbook_url: "https://github.com/noetl/ai-meta/issues/249"

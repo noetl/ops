@@ -1,7 +1,7 @@
 # GMP Rules — materializer-lag alerting (the operator gate for the CQRS
 # NOETL_EVENT_INGEST_PUBLISH_ONLY flip, noetl/ai-meta#103).
 # =============================================================================
-# PROD-ONLY (GKE noetl-demo-19700101).  GMP-native translation of the kind
+# PROD-ONLY.  GMP-native translation of the kind
 # VictoriaMetrics rule `ci/manifests/noetl/vmrule-materializer-lag.yaml`
 # (kind: operator.victoriametrics.com/v1beta1/VMRule).  Prod runs Google
 # Managed Prometheus, so the rule object is `monitoring.googleapis.com/v1
@@ -43,11 +43,31 @@ spec:
         # Recording rule: total un-materialized backlog for the materializer
         # consumer, deduped across system-pool pods (each pod's poller reports
         # the same consumer-level value).
+        # REPOINTED 2026-08-05.  This was keyed on
+        #   noetl_worker_nats_consumer_pending{stream="noetl_events",
+        #                                      consumer="noetl_materializer"}
+        # which CANNOT BE SET any more.  Its only writer is
+        # `metrics::record_nats_consumer_lag`, documented as "called by the
+        # periodic lag poller after fetching consumer info from JetStream" —
+        # and that poller went with NATS at T5.  Checked: the function has no
+        # caller outside metrics.rs, and the gauge is absent from a live
+        # system-pool worker's /metrics.  So the recording rule evaluated to
+        # nothing and the three alerts below it could never fire.
+        #
+        # The post-T5 equivalent is the writer's own per-group lag, which does
+        # exist: `ehdb_events_group_lag{group="noetl_materializer"}` on the
+        # writer's `events-lag` port (9106), alongside the result- and
+        # state-materializer groups.
+        #
+        # NOTE it is a single gauge, not pending+ack_pending — EHDB reports
+        # undelivered + unacked as one number, so the old sum has no analogue
+        # and the thresholds below now measure the same quantity by a shorter
+        # path.  9106 is NOT scraped until the events-lag endpoint in
+        # podmonitoring-cmdbus-writer.yaml is applied.
         - record: noetl:materializer_backlog
           expr: |
             max(
-              noetl_worker_nats_consumer_pending{stream="noetl_events", consumer="noetl_materializer"}
-              + noetl_worker_nats_consumer_ack_pending{stream="noetl_events", consumer="noetl_materializer"}
+              ehdb_events_group_lag{group="noetl_materializer"}
             )
 
         # WARNING — the materializer is falling behind.  Sustained backlog
@@ -183,3 +203,51 @@ spec:
               revert (NOETL_EVENT_INGEST_PUBLISH_ONLY=false) and restore the
               system pool.
             runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-cqrs-publish-only-flip.md#materializerabsentundergate"
+
+        # The gap the six rules above structurally cannot cover.
+        #
+        # Both *UnderGate rules are guarded on
+        # `sum(rate(noetl_event_ingest_published_total[5m])) > 0`, which is the
+        # right semantic — there is nothing to materialise when nothing is being
+        # published.  But it means the case where publishing *itself* has
+        # stopped is invisible to every rule in this file: the publish counter
+        # goes to zero, both guards go false, and the remaining four watch a
+        # backlog that is no longer being fed.
+        #
+        # That state is not hypothetical.  It is noetl/ai-meta#212: the gate is
+        # on, `has_event_transport` returns false, `should_publish` goes false
+        # for every event, and the server quietly resumes writing noetl.event
+        # synchronously.  Nothing errors, executions still complete, and
+        # post-T5 the EHDB events feed — the sole writer of the durable log —
+        # sits at a flat cursor.  It was found by inspection, not by an alert,
+        # because no alert could have fired.
+        #
+        # noetl_event_ingest_publish_skipped_total{reason} (noetl/server#315)
+        # separates the fault from the two healthy ways to publish nothing:
+        # `gate_off` (deliberate) and `system_execution` (system-pool traffic is
+        # exempt by design — this is what production reads today).  Only
+        # `no_transport` is a fault, and it is the only one alerted here.
+        #
+        # Requires noetl-server >= 3.67.0.  Until that is deployed the series is
+        # absent and this rule is silent — which is why the series are pinned at
+        # 0 on startup: once the binary is current, absent means "not deployed"
+        # and 0 means "healthy", instead of both looking the same.
+        - alert: EventPublishNoTransport
+          expr: sum(rate(noetl_event_ingest_publish_skipped_total{reason="no_transport"}[5m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+            component: event-publish
+            noetl_io_flip_guardrail: publish-only
+          annotations:
+            summary: "Event publishing is OFF while the gate is ON — durable log is not growing"
+            description: >-
+              The PUBLISH_ONLY gate is enabled but the server has no usable
+              event transport, so every event is falling back to a synchronous
+              noetl.event INSERT and the EHDB events feed is not advancing.
+              Executions will keep completing normally, which is why this does
+              not surface as an error. Check NOETL_EVENT_BUS and
+              NOETL_EVENT_BUS_WRITER_ADDRS on noetl-server-rust, and the
+              noetl_ehdb_event_publisher_configured gauge — 0 there means the
+              writer addresses resolved to no routes.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-cqrs-publish-only-flip.md#eventpublishnotransport"
