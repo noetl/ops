@@ -262,16 +262,13 @@ noetl run automation/ibkr/test_login.yaml --payload '{"gateway_url":"https://loc
 Or run the helper directly:
 
 ```bash
-# REMOVED -- scripts/ibkr/ no longer exists in noetl/noetl (noetl/ai-meta#382).
-# Recover from git history and vendor into this repo if needed; see noetl/ai-meta#383.
-# python scripts/ibkr/authenticate_gateway.py --gateway-url https://localhost:15000 --manual
+python automation/ibkr/scripts/authenticate_gateway.py --gateway-url https://localhost:15000 --manual
 ```
 
 If you want autofill:
 
 ```bash
-# REMOVED -- see above.
-# IBKR_USERNAME=... IBKR_PASSWORD=... python scripts/ibkr/authenticate_gateway.py --paper
+IBKR_USERNAME=... IBKR_PASSWORD=... python automation/ibkr/scripts/authenticate_gateway.py --paper
 ```
 
 ### Maintain session (tickle/reauth)
