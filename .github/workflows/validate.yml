@@ -1,0 +1,63 @@
+# noetl/ai-meta#375 — this repo had NO CI while holding the prod manifests, the
+# Helm charts and the automation playbooks.  A broken YAML here is not a style
+# problem; it is a deploy that fails at apply time, found by whoever is deploying.
+#
+# The checks live in ci/checks/validate.py rather than inline here, so they can be
+# run locally before pushing:
+#
+#     python3 ci/checks/validate.py
+#
+# Two properties worth preserving if you edit it:
+#
+#   * Populations are DISCOVERED, never enumerated.  A hardcoded file list is a
+#     representation that drifts the moment someone adds a chart, and a check
+#     that silently stops covering half the repo reports the same green as a
+#     healthy one.
+#   * Every check prints its denominator AND fails if that denominator is
+#     implausibly small.  "0 failures" is also what a check that examined
+#     nothing looks like, so a broken glob is a red build rather than a clean
+#     one.  Proven: run from an empty repo, every check fails on its floor.
+#
+# Deliberately NOT here:
+#   * `kubectl --dry-run` against the manifests — it needs a cluster or a
+#     schema bundle, and the useful version of that check is the kind
+#     validation in agents/rules/deployment-validation.md, which runs against
+#     a real cluster rather than in a PR.
+#   * yamllint style rules — the gate is about files that PARSE, not about
+#     indentation preferences.  A style gate on 281 existing files would start
+#     red for reasons no individual PR caused.
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install PyYAML
+        run: pip install --quiet pyyaml
+
+      # helm is preinstalled on ubuntu-latest runners, but assert it rather than
+      # assume: without it the charts check reports "cannot validate" and the
+      # three charts would go unexamined.
+      - name: helm present
+        run: helm version --short
+
+      - name: validate
+        run: python3 ci/checks/validate.py
