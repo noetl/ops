@@ -125,12 +125,25 @@ workflow:
           export IBKR_PASSWORD="$password"
           export IBKR_2FA_CODE="$two_fa_code"
 
-          python /Users/akuksin/projects/noetl/noetl/scripts/ibkr/authenticate_gateway.py \
-            --gateway-url "$gateway_url" \
-            --timeout-seconds "$timeout_seconds" \
-            $paper_arg \
-            $manual_arg \
-            $two_fa_arg
+          # The script this step used to run was REMOVED from noetl/noetl, which is
+          # now a thin wrapper around the Rust CLI and carries no Python
+          # (noetl/ai-meta#382 / noetl/noetl#701). This step cannot work, so it fails
+          # loudly instead of dying on a confusing "No such file or directory" for a
+          # path that only ever existed on one developer's machine:
+          #
+          #   /Users/akuksin/projects/noetl/noetl/scripts/ibkr/authenticate_gateway.py
+          #
+          # It drove an IBKR Gateway browser login via playwright.sync_api. To restore
+          # it, recover the file from git history and vendor it into THIS repo:
+          #   git -C <noetl checkout> show a106d045:scripts/ibkr/authenticate_gateway.py
+          # then point this step at the vendored copy with a repo-relative path.
+          #
+          # Tracked in noetl/ai-meta#383.
+          echo "ERROR: automation/ibkr/test_login.yaml cannot run." >&2
+          echo "  Its login step invoked scripts/ibkr/authenticate_gateway.py from the" >&2
+          echo "  noetl/noetl repo by an absolute local path. That script was removed" >&2
+          echo "  (noetl/ai-meta#382). See noetl/ai-meta#383 to restore or retire this." >&2
+          exit 1
     next:
       spec:
         mode: exclusive
