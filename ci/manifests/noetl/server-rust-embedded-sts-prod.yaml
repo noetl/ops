@@ -155,14 +155,42 @@ spec:
           value: http://noetl-server-rust.noetl.svc.cluster.local:8082
         - name: NOETL_SERVER_MACHINE_ID
           value: '2'
-        # The chain-store gates (noetl/ai-meta#357, #360).  See the header: all
-        # three move together, and NOETL_CHAIN_POPULATE alone is inert.
-        - name: NOETL_CHAIN_POPULATE
-          value: 'true'
-        - name: NOETL_CHAIN_ADVANCE
-          value: 'true'
-        - name: NOETL_CHAIN_SOURCE
-          value: chain
+        # ⚠ THE CHAIN-STORE GATES ARE DISARMED AND DELIBERATELY ABSENT HERE.
+        #
+        # NOETL_CHAIN_POPULATE / NOETL_CHAIN_ADVANCE / NOETL_CHAIN_SOURCE were
+        # removed from the live StatefulSet on 2026-10-06 at 18:36Z (owner-approved),
+        # taking the container's env from 67 vars to 64.  They are absent rather than
+        # set to a falsy value because every one of the three documents its default as
+        # OFF for the UNSET case, and the three off-states are NOT the same shape:
+        #
+        #   NOETL_CHAIN_ADVANCE   matches!("1"|"true"|"yes"|"on")  -> unset is false
+        #   NOETL_CHAIN_POPULATE  same matcher, in ehdb-l0          -> unset is false
+        #   NOETL_CHAIN_SOURCE    match { ... _ => None }           -> unset is off
+        #
+        # A blanket '0' would also read off, but only by landing in the fail-safe
+        # branch of each reader — not by being the declared default.  Absent is the
+        # honest off, and it is also the state a reader of this file can verify
+        # against the live object.
+        #
+        # To RE-ARM, add all three back together (see the header: SOURCE=chain
+        # resolves to OFF without POPULATE, and POPULATE alone is inert):
+        #
+        #   kubectl --context "$PROD" -n noetl patch sts noetl-server-rust-embedded \
+        #     --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_CHAIN_ADVANCE","value":"true"}},
+        #                      {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_CHAIN_POPULATE","value":"true"}},
+        #                      {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NOETL_CHAIN_SOURCE","value":"chain"}}]'
+        #
+        # Disarming was verified empirically rather than assumed: after the roll,
+        # chain_populate_total summed 0 across all 18 outcomes (it read extended=50,
+        # in_sync=1, opened=1 on the armed pod) while parity counters advanced
+        # 0 -> 15 and chain_head_hydrate reached 162 — so the pod was doing real work
+        # while the populator stayed silent, which is what separates "disarmed" from
+        # "no traffic".  Divergence (16 series) and refusals (10 series) stayed 0.
+        #
+        # ⚠ What the three gates do NOT control, and which kept running: the
+        # chain-head hydrator and the root-invariant sampler both read the
+        # authoritative Postgres log, not the chain store.  one_root=1088,
+        # multi_root=0, no_root=0 after the change.
         - name: NOETL_EVENT_READ_PATH
           value: event_scan
         - name: NOETL_RESULT_MINT_AUTHORITATIVE
