@@ -23,7 +23,7 @@ metadata:
 
 workload:
   gcp_auth: google_oauth
-  gcp_project: noetl-demo-19700101
+  gcp_project: shastaratech-noetl-prod
   firestore_database: "(default)"
   firestore_api_base: https://firestore.googleapis.com/v1
   method: "tools/list"
@@ -582,8 +582,15 @@ workflow:
             # list may be empty/omitted; the other still runs.  Ordering within
             # each list is preserved, so callers control set-doc last-writer-wins
             # and event seq ordering by list order.
-            set_items = _as_list(args.get("set_docs") or args.get("docs"))
-            event_items = _as_list(args.get("append_events") or args.get("events"))
+            # Each list is passed as a standalone `{{ expr }}` arg (the proven
+            # NoETL structured-render pattern — `items: "{{ extract_turn.turn_docs }}"`
+            # already relies on it).  `_extra` lets a caller concatenate a SECOND
+            # list per kind without needing minijinja sequence concatenation: the
+            # planner passes turn docs in `set_docs` and render docs in
+            # `set_docs_extra`, concatenated here in order so render's final
+            # slot_state doc is the last writer.
+            set_items = _as_list(args.get("set_docs") or args.get("docs")) + _as_list(args.get("set_docs_extra"))
+            event_items = _as_list(args.get("append_events") or args.get("events")) + _as_list(args.get("append_events_extra"))
             if not set_items and not event_items:
                 return _error("batch_write", "at least one of set_docs / append_events must be a non-empty list")
             set_payload = {}
@@ -876,7 +883,7 @@ workflow:
         method = str(method or "tools/list")
         tool = str(tool or "")
         arguments = _as_dict(arguments)
-        gcp_project = str(gcp_project or "noetl-demo-19700101")
+        gcp_project = str(gcp_project or "shastaratech-noetl-prod")
         firestore_database = str(firestore_database or "(default)")
         firestore_api_base = str(firestore_api_base or "https://firestore.googleapis.com/v1")
 
