@@ -234,7 +234,7 @@ spec:
         - name: NOETL_ORPHAN_SWEEP_ENABLED
           value: 'true'
         - name: NOETL_AUTH_VERIFY_SIGNATURE
-          value: shadow
+          value: enforce
         - name: NOETL_AUTH0_DOMAIN
           value: mestumre-development.us.auth0.com
         - name: NOETL_AUTH0_AUDIENCE
