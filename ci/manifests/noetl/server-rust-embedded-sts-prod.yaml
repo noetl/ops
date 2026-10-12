@@ -305,7 +305,7 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_PROJECTION_SERVE_ON_BEHIND
           value: 'true'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:03c1fee683fd1ab8acc89f481c06f1daa01dc176424bbdb2abacdec0a07bae92
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:b913723308159eff18eb27fcd55bc852e6103d65b9df156f93a6081c0e05f72e
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
