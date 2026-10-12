@@ -355,8 +355,27 @@ workflow:
             path = _clean_path(args.get("path"))
             if not path:
                 return _error("set_doc", "path is required")
-            data = _as_dict(args.get("data"))
+            raw_data = args.get("data")
+            # ⚠ Refuse, do not coerce. `_as_dict` turns a string/list into {}, and an
+            # empty write below is a WIPE — so a profile that reached here as a JSON
+            # string used to blank the document instead of failing.
+            if raw_data is not None and not isinstance(raw_data, dict):
+                return _error("set_doc", f"data must be an object, got {type(raw_data).__name__}")
+            data = _as_dict(raw_data)
             merge = bool(args.get("merge", False))
+            if merge and not data:
+                # ⚠ A merge of nothing changes nothing — so it must not reach Firestore.
+                # `updateMask` is only added for a non-empty `data`, and a PATCH WITHOUT
+                # a mask is a FULL REPLACE: `merge: true, data: {}` overwrote the document
+                # with zero fields. muno/playbooks/profile sent exactly that on every
+                # login read before noetl/travel#133, emptying the user's profile.
+                # Report what the store holds instead, so callers still get a document.
+                current = _get_doc({"path": path})
+                if current.get("isError"):
+                    return current
+                held = _as_dict(current.get("data"))
+                return _ok("set_doc", {"path": path, "document": held.get("document"), "noop": True},
+                           f"set_doc {path} merge of no fields: nothing written")
             params = {}
             if merge and data:
                 params["updateMask.fieldPaths"] = list(data.keys())
