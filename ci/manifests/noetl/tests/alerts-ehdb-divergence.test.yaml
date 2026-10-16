@@ -1,0 +1,118 @@
+# promtool unit tests for the cross-store divergence alert expressions
+# (noetl/ai-meta#471, from the 2026-10-15 incident).
+#
+# Run:
+#   cd ci/manifests/noetl/tests
+#   promtool test rules alerts-ehdb-divergence.test.yaml
+#
+# ## The property under test
+#
+# The counters are CUMULATIVE. A divergence that happened once and stopped
+# leaves the total high forever, so a rule written as `> 0` on the total would
+# page for the rest of the deployment's life and could never recover. Every
+# test here is about the difference between "the total is non-zero" and "the
+# total is still rising".
+#
+# Test 1 is the 2026-10-15 incident reproduced exactly: a counter that reached
+# 35 and then went flat for hours. It MUST stay silent. Live had
+# `duration: 0s`, which is why it paged on the first increment instead.
+#
+# Tests 2 and 3 are the pair with teeth: a sustained climb must fire, and a
+# short burst that stops must not. Without test 3 the settle window is
+# decoration.
+rule_files:
+  - rules-ehdb-divergence.promql.yaml
+evaluation_interval: 30s
+tests:
+  # 1. ⭐ THE INCIDENT. Flat at 35 for 40 minutes -> increase()==0 -> SILENT.
+  - interval: 30s
+    name: a divergence total that stopped climbing must not page
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="count",tier="eventlog"}'
+        values: '35x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: EhdbTierDiverged
+        exp_alerts: []
+
+  # 2. A sustained climb past the settle window MUST fire.
+  - interval: 30s
+    name: divergence still accruing past the settle window pages
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="count",tier="eventlog"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: EhdbTierDiverged
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              displayName: "NoETL EHDB: tier diverged from the authoritative event log"
+
+  # 3. ⚠ THE SETTLE WINDOW'S REASON. A 5-minute burst that then stops must stay
+  #    silent: increase() falls back to 0 within ten minutes, so the 30m `for`
+  #    is never satisfied. This is noetl/ai-meta#264's synthetic-load case.
+  - interval: 30s
+    name: a transient burst that stops does not page
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="count",tier="eventlog"}'
+        values: '0+1x10 11x70'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: EhdbTierDiverged
+        exp_alerts: []
+
+  # 3b. ⭐⭐ THE SETTLE WINDOW ITSELF. A series that IS still climbing, evaluated
+  #     BEFORE 30m have elapsed, must stay silent — `increase()` is already > 0
+  #     here, so this is the only case that distinguishes `for: 30m` from
+  #     `for: 0m`. Test 3 above evaluates at 40m where increase() has fallen back
+  #     to 0, so it passes with or without the window and proves nothing about
+  #     it; this one fails the moment the window is removed. Verified by mutation.
+  - interval: 30s
+    name: a climb shorter than the settle window does not page yet
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="count",tier="eventlog"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: EhdbTierDiverged
+        exp_alerts: []
+
+  # 4. ⚠ Kind routing. A climbing CONTENT series must not fire the main alert —
+  #    it has its own policy. Without this the split is untested and a content
+  #    divergence would page twice.
+  - interval: 30s
+    name: content divergence does not fire the non-content alert
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="content",tier="eventlog"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: EhdbTierDiverged
+        exp_alerts: []
+
+  # 5. The content policy's threshold IS its de-bounce: 2 in the window is
+  #    silent, 3 pages.
+  - interval: 30s
+    name: two content divergences are tolerated
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="content",tier="eventlog"}'
+        values: '0 1 2x70'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EhdbTierContentDiverged
+        exp_alerts: []
+  - interval: 30s
+    name: three content divergences page
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="content",tier="eventlog"}'
+        values: '0 1 2 3x70'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EhdbTierContentDiverged
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              displayName: "NoETL EHDB: tier content diverged from the authoritative event log"
