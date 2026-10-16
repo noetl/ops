@@ -1,5 +1,14 @@
 # NoETL control plane — PROD SERVING WORKLOAD, as built.
 #
+# AS-BUILT AS OF 2026-10-16.  Reconciled against the live StatefulSet in
+# noetl/ai-meta#473: the image pin moved from the stale v3.143.0-auth.1 digest to
+# the running v3.144.2 (sha256:911f8b30…), the 10 EHDB archive / prune / replica /
+# tail-replication env vars that live carried and this file did not were added, and
+# the env list was put in live's order.  `kubectl diff -f` against prod reports
+# ZERO changed fields, so a DR apply reproduces prod rather than rolling it back
+# past the auth enforcement and the parity fix.  Re-verify with the diff below
+# before trusting that sentence — it is true only until prod next changes.
+#
 # ════════════════════════════════════════════════════════════════════════════
 #  ⚠⚠⚠ APPLYING THIS FILE IS OWNER-GATED.  DO NOT `kubectl apply` IT.
 #
@@ -155,72 +164,6 @@ spec:
           value: http://noetl-server-rust.noetl.svc.cluster.local:8082
         - name: NOETL_SERVER_MACHINE_ID
           value: '2'
-        # The chain-store gates (noetl/ai-meta#357, #360, #362).  ARMED.  See the
-        # header: all three move together, and NOETL_CHAIN_POPULATE alone is inert.
-        #
-        # ⚠ These were briefly disarmed on 2026-10-06 18:36Z and RE-ARMED at 19:23Z
-        # within the hour, after the "is it blocking anything?" test was applied and
-        # came back NO.  The evidence, recorded so the question is not reopened from
-        # scratch:
-        #
-        #   * noetl/ai-meta#362 — the mechanism that made arming unsafe (an event
-        #     committing into the MIDDLE of an `ORDER BY event_id` read, because a
-        #     snowflake id is minted before the insert) — is CLOSED.  Fixed in ehdb
-        #     v0.4.5 (`order_by_links`, mutation 5/5) + server#477.
-        #   * The re-ramp verdict on 2026-09-30 was GREEN over 8h 28m spanning ~8
-        #     divergence cycles: coverage 278, divergence 0, refusals 1
-        #     (dangling_prev), multi_root/no_root/fork/unreachable all 0.
-        #   * Measured again on the armed pod 2026-10-06 over 3h55m: extended=50,
-        #     in_sync=1, opened=1, diverged=0, fork=0, multiple_roots=0, stale_log=0,
-        #     one_root=1088, divergence 0 across 16 series, refusals 0 across 10.
-        #   * noetl/ai-meta#360 remains open, but it is about FALSE divergence in the
-        #     comparator — not corruption of the chain.
-        #   * No interaction with the noetl/catalog work: that store owns datasets
-        #     c1-c4 under its own caller-supplied root, and every mention of "chain"
-        #     in its source is a doc comment.
-        #
-        # So the machinery is working and failing safe, and disarming it mid-flight
-        # would have removed a measured-good capability for no stated benefit — the
-        # riskier move of the two.
-        #
-        # ⚠ If they ever DO need disarming: absent is the correct off, not '0'.  The
-        # three off-states are different shapes --
-        #
-        #   NOETL_CHAIN_ADVANCE   matches!("1"|"true"|"yes"|"on")  -> unset is false
-        #   NOETL_CHAIN_POPULATE  same matcher, in ehdb-l0          -> unset is false
-        #   NOETL_CHAIN_SOURCE    match { ... _ => None }           -> unset is off
-        #
-        # -- so a blanket '0' reads off only by landing in each reader's FAIL-SAFE
-        # branch, and for SOURCE it is an UNRECOGNISED value rather than an off one.
-        # And do it with a targeted env patch, never by applying this file: the image
-        # pin below is stale and a server-side apply conflicts on .image with field
-        # manager "kubectl-set", which would roll the image BACKWARD.
-        #
-        #   kubectl --context "$PROD" -n noetl patch sts noetl-server-rust-embedded \
-        #     --type=json -p '[{"op":"test","path":"/spec/template/spec/containers/0/env/66/name","value":"NOETL_CHAIN_SOURCE"},
-        #                      {"op":"remove","path":"/spec/template/spec/containers/0/env/66"},
-        #                      {"op":"test","path":"/spec/template/spec/containers/0/env/65/name","value":"NOETL_CHAIN_ADVANCE"},
-        #                      {"op":"remove","path":"/spec/template/spec/containers/0/env/65"},
-        #                      {"op":"test","path":"/spec/template/spec/containers/0/env/64/name","value":"NOETL_CHAIN_POPULATE"},
-        #                      {"op":"remove","path":"/spec/template/spec/containers/0/env/64"}]'
-        #
-        # (test ops assert each name at its index; remove in DESCENDING index order so
-        # earlier removals do not shift later ones.  Verify the dry run whole-object:
-        # expect exactly 6 changed leaf paths and every survivor byte-identical.)
-        #
-        # ⚠ Verifying either direction needs a POSITIVE CONTROL, because the patch
-        # touches spec.template and the pod rolls, zeroing every counter -- so a 0 on
-        # chain_populate_total is also what an idle new pod shows.  The cleanest
-        # discriminator found: an ARMED boot logs `event-chain DDL skipped` warns as
-        # the chain path initialises, where a DISARMED pod logs ZERO chain lines at
-        # all.  Config alone can also be read straight out of the process:
-        # `kubectl exec ... -- env | grep "^NOETL_CHAIN_"`.
-        - name: NOETL_CHAIN_POPULATE
-          value: 'true'
-        - name: NOETL_CHAIN_ADVANCE
-          value: 'true'
-        - name: NOETL_CHAIN_SOURCE
-          value: chain
         - name: NOETL_EVENT_READ_PATH
           value: event_scan
         - name: NOETL_RESULT_MINT_AUTHORITATIVE
@@ -305,7 +248,98 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_PROJECTION_SERVE_ON_BEHIND
           value: 'true'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:b913723308159eff18eb27fcd55bc852e6103d65b9df156f93a6081c0e05f72e
+        # The chain-store gates (noetl/ai-meta#357, #360, #362).  ARMED.  See the
+        # header: all three move together, and NOETL_CHAIN_POPULATE alone is inert.
+        #
+        # ⚠ These were briefly disarmed on 2026-10-06 18:36Z and RE-ARMED at 19:23Z
+        # within the hour, after the "is it blocking anything?" test was applied and
+        # came back NO.  The evidence, recorded so the question is not reopened from
+        # scratch:
+        #
+        #   * noetl/ai-meta#362 — the mechanism that made arming unsafe (an event
+        #     committing into the MIDDLE of an `ORDER BY event_id` read, because a
+        #     snowflake id is minted before the insert) — is CLOSED.  Fixed in ehdb
+        #     v0.4.5 (`order_by_links`, mutation 5/5) + server#477.
+        #   * The re-ramp verdict on 2026-09-30 was GREEN over 8h 28m spanning ~8
+        #     divergence cycles: coverage 278, divergence 0, refusals 1
+        #     (dangling_prev), multi_root/no_root/fork/unreachable all 0.
+        #   * Measured again on the armed pod 2026-10-06 over 3h55m: extended=50,
+        #     in_sync=1, opened=1, diverged=0, fork=0, multiple_roots=0, stale_log=0,
+        #     one_root=1088, divergence 0 across 16 series, refusals 0 across 10.
+        #   * noetl/ai-meta#360 remains open, but it is about FALSE divergence in the
+        #     comparator — not corruption of the chain.
+        #   * No interaction with the noetl/catalog work: that store owns datasets
+        #     c1-c4 under its own caller-supplied root, and every mention of "chain"
+        #     in its source is a doc comment.
+        #
+        # So the machinery is working and failing safe, and disarming it mid-flight
+        # would have removed a measured-good capability for no stated benefit — the
+        # riskier move of the two.
+        #
+        # ⚠ If they ever DO need disarming: absent is the correct off, not '0'.  The
+        # three off-states are different shapes --
+        #
+        #   NOETL_CHAIN_ADVANCE   matches!("1"|"true"|"yes"|"on")  -> unset is false
+        #   NOETL_CHAIN_POPULATE  same matcher, in ehdb-l0          -> unset is false
+        #   NOETL_CHAIN_SOURCE    match { ... _ => None }           -> unset is off
+        #
+        # -- so a blanket '0' reads off only by landing in each reader's FAIL-SAFE
+        # branch, and for SOURCE it is an UNRECOGNISED value rather than an off one.
+        # Prefer a targeted env patch over applying this file.  ⚠ The reason USED to
+        # be that the image pin below was stale (auth.1) so an apply rolled the image
+        # BACKWARD; that is no longer true — the pin was corrected to the running
+        # digest on 2026-10-16 (noetl/ai-meta#473) and a server-side dry-run of this
+        # whole file now reports ZERO changed fields.  A targeted patch is still the
+        # better tool for a single env flip: it cannot carry an unintended field, and
+        # a server-side apply may still conflict on .image with the field manager that
+        # last set it.
+        #
+        #   kubectl --context "$PROD" -n noetl patch sts noetl-server-rust-embedded \
+        #     --type=json -p '[{"op":"test","path":"/spec/template/spec/containers/0/env/66/name","value":"NOETL_CHAIN_SOURCE"},
+        #                      {"op":"remove","path":"/spec/template/spec/containers/0/env/66"},
+        #                      {"op":"test","path":"/spec/template/spec/containers/0/env/65/name","value":"NOETL_CHAIN_ADVANCE"},
+        #                      {"op":"remove","path":"/spec/template/spec/containers/0/env/65"},
+        #                      {"op":"test","path":"/spec/template/spec/containers/0/env/64/name","value":"NOETL_CHAIN_POPULATE"},
+        #                      {"op":"remove","path":"/spec/template/spec/containers/0/env/64"}]'
+        #
+        # (test ops assert each name at its index; remove in DESCENDING index order so
+        # earlier removals do not shift later ones.  Verify the dry run whole-object:
+        # expect exactly 6 changed leaf paths and every survivor byte-identical.)
+        #
+        # ⚠ Verifying either direction needs a POSITIVE CONTROL, because the patch
+        # touches spec.template and the pod rolls, zeroing every counter -- so a 0 on
+        # chain_populate_total is also what an idle new pod shows.  The cleanest
+        # discriminator found: an ARMED boot logs `event-chain DDL skipped` warns as
+        # the chain path initialises, where a DISARMED pod logs ZERO chain lines at
+        # all.  Config alone can also be read straight out of the process:
+        # `kubectl exec ... -- env | grep "^NOETL_CHAIN_"`.
+        - name: NOETL_CHAIN_ADVANCE
+          value: 'true'
+        - name: NOETL_CHAIN_POPULATE
+          value: 'true'
+        - name: NOETL_CHAIN_SOURCE
+          value: chain
+        - name: NOETL_EHDB_ARCHIVE_BUCKET
+          value: shastaratech-noetl-prod-eventlog-archive-20260831
+        - name: NOETL_EHDB_ARCHIVE_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_ARCHIVE_INTERVAL_SECS
+          value: '300'
+        - name: NOETL_EHDB_ARCHIVE_MAX_PER_PASS
+          value: '500'
+        - name: NOETL_EHDB_SEAL_MAX_AGE_SECS
+          value: '900'
+        - name: NOETL_EHDB_PRUNE_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_REPLICA_GCS_BUCKET
+          value: shastaratech-noetl-prod-eventlog-replica
+        - name: NOETL_EHDB_REPLICA_BACKFILL
+          value: 'true'
+        - name: NOETL_EHDB_TAIL_REPLICATION
+          value: 'true'
+        - name: NOETL_EHDB_TAIL_REPLICATION_TICK_SECS
+          value: '60'
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:911f8b300869fa22f9f6ac7a71db8219849c60f9f681ac554ee30662cd69b4fe
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
