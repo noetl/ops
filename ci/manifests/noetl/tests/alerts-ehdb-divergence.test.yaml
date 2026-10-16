@@ -119,7 +119,7 @@ tests:
 
   # 7. ⭐ `duplicate_event` is EXCLUDED from the data-loss page, the same way
   #    `content` is split out — a duplicate holds every right event and one of
-  #    them twice, so served state is unaffected (noetl/server#536, ehdb#335).
+  #    them twice, so served state is unaffected (noetl/server#536; cause open, noetl/ai-meta#472).
   #    A climbing duplicate series must not fire the page that means data loss.
   - interval: 30s
     name: duplicate_event does not fire the data-loss page
