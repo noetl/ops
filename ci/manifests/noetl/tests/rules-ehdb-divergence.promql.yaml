@@ -3,7 +3,7 @@ groups:
   interval: 30s
   rules:
   - alert: EhdbTierDiverged
-    expr: sum(increase(noetl_ehdb_crossstore_divergence_total{kind!="content"}[10m])) > 0
+    expr: sum(increase(noetl_ehdb_crossstore_divergence_total{kind!~"content|duplicate_event"}[10m])) > 0
     for: 1800s
     labels:
       severity: page
@@ -16,3 +16,10 @@ groups:
       severity: page
     annotations:
       displayName: 'NoETL EHDB: tier content diverged from the authoritative event log'
+  - alert: EhdbMirrorRedeliveringInBulk
+    expr: sum(increase(noetl_ehdb_crossstore_divergence_total{kind="duplicate_event"}[1h])) > 5
+    for: 0s
+    labels:
+      severity: page
+    annotations:
+      displayName: 'NoETL EHDB: the mirror is re-delivering events in bulk'

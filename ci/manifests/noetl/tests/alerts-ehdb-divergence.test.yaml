@@ -116,3 +116,46 @@ tests:
               severity: page
             exp_annotations:
               displayName: "NoETL EHDB: tier content diverged from the authoritative event log"
+
+  # 7. ⭐ `duplicate_event` is EXCLUDED from the data-loss page, the same way
+  #    `content` is split out — a duplicate holds every right event and one of
+  #    them twice, so served state is unaffected (noetl/server#536, ehdb#335).
+  #    A climbing duplicate series must not fire the page that means data loss.
+  - interval: 30s
+    name: duplicate_event does not fire the data-loss page
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="duplicate_event",tier="eventlog"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: EhdbTierDiverged
+        exp_alerts: []
+
+  # 8. The measured prod TRICKLE must not page. Baseline is +2 over 30 HOURS,
+  #    so one duplicate inside an hour is ordinary and `> 5` must swallow it.
+  - interval: 30s
+    name: one duplicate in an hour is the known trickle and does not page
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="duplicate_event",tier="eventlog"}'
+        values: '0x60 1x61'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: EhdbMirrorRedeliveringInBulk
+        exp_alerts: []
+
+  # 9. A STORM does page — the positive control for case 8. Without this, case 8
+  #    is satisfied by an alert that can never fire at all.
+  - interval: 30s
+    name: a storm of duplicates pages
+    input_series:
+      - series: 'noetl_ehdb_crossstore_divergence_total{kind="duplicate_event",tier="eventlog"}'
+        values: '0+1x120'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: EhdbMirrorRedeliveringInBulk
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              displayName: "NoETL EHDB: the mirror is re-delivering events in bulk"
+
