@@ -201,7 +201,7 @@ workflow:
         - step: grant_default_playbook_permissions
 
   - step: grant_default_playbook_permissions
-    desc: Grant wildcard playbook permissions to admin and developer roles
+    desc: Grant wildcard playbook permissions to the admin role (two roles only -- admin and regular user)
     tool:
       kind: shell
       cmds:
@@ -213,11 +213,11 @@ workflow:
               INSERT INTO auth.playbook_permissions (role_id, allow_pattern, can_execute, can_view, can_modify)
               SELECT role_id, '%', true, true, true
               FROM auth.roles
-              WHERE role_name IN ('admin', 'developer')
+              WHERE role_name = 'admin'
               ON CONFLICT DO NOTHING;
             " 2>/dev/null || echo "Note: Could not set default playbook permissions"
 
-          echo "Admin and developer roles granted wildcard playbook permissions"
+          echo "Admin role granted wildcard playbook permissions (regular users hold no role)"
           echo "  Pattern: % (all playbooks)"
           echo "  Permissions: execute, view, modify"
     next:
@@ -296,7 +296,7 @@ workflow:
           echo ""
           echo "Created:"
           echo "  - auth.users (user accounts from Auth0)"
-          echo "  - auth.roles (admin, developer, analyst, viewer)"
+          echo "  - auth.roles (admin; a regular user holds no role)"
           echo "  - auth.permissions (granular permissions)"
           echo "  - auth.user_roles (user-role mapping)"
           echo "  - auth.role_permissions (role-permission mapping)"
@@ -305,7 +305,7 @@ workflow:
           echo "  - auth.audit_log (authentication events)"
           echo ""
           echo "Default Permissions:"
-          echo "  - admin and developer roles: wildcard access (%) to all playbooks"
+          echo "  - admin role: wildcard access (%) to all playbooks"
           echo "  - Permissions: execute, view, modify"
           echo ""
           echo "Next Steps:"
