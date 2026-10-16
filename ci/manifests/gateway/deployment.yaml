@@ -73,6 +73,11 @@ spec:
           value: '15'
         - name: AUTH_PLAYBOOK_TIMEOUT_SECS
           value: '40'
+        # Playbooks a regular (non-admin) user may start (noetl/gateway#57). The
+        # compiled-in default plus muno/playbooks/trip-intake (noetl/travel#154,
+        # adiona/frontend#55). Applied live with `kubectl set env` 2026-10-16.
+        - name: GATEWAY_USER_PLAYBOOKS
+          value: muno/playbooks/itinerary-planner,muno/playbooks/hotel-cards,muno/playbooks/flights-details,muno/playbooks/profile,travel/playbooks/catalog/calendar/list,muno/playbooks/threads,muno/playbooks/trip-intake
         - name: GATEWAY_HEARTBEAT_INTERVAL_SECS
           value: '15'
         - name: GATEWAY_CONNECTION_TIMEOUT_SECS
