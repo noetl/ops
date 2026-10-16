@@ -35,6 +35,8 @@ WANT = {
         "EhdbTierDiverged",
     "NoETL EHDB: tier content diverged from the authoritative event log":
         "EhdbTierContentDiverged",
+    "NoETL EHDB: the mirror is re-delivering events in bulk":
+        "EhdbMirrorRedeliveringInBulk",
 }
 MARKER = "noetl_ehdb_crossstore_divergence_total"
 
