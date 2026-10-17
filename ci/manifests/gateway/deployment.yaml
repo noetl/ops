@@ -1,5 +1,18 @@
 # NoETL gateway — PROD.  Captured from the live cluster (noetl/ai-meta#267).
 #
+# RECONCILED AGAINST LIVE 2026-10-16 (noetl/ai-meta#323).  The capture above was
+# taken in #267 and had drifted again by two things: the image pin was
+# sha256:02756b57… while prod ran sha256:af2f4ce2… (v3.15.0), so an apply would
+# have ROLLED THE GATEWAY BACKWARD; and GATEWAY_USER_PLAYBOOKS sat near the top of
+# the env list where live has it last, which is a pod-template-hash difference and
+# therefore a rollout on apply even though every value agreed.
+#
+# `kubectl -n gateway diff -f` against prod now reports ZERO changed fields, so a
+# DR apply reproduces the gateway instead of mutating it.  ⚠ Re-verify with that
+# diff before trusting this sentence — it is true only until prod next changes,
+# and per the note below NOTHING reconciles this file automatically.  That is why
+# it drifted after #267 and why it will drift again.
+#
 # ⚠ WHAT THIS FILE USED TO SAY WAS DANGEROUS.  Before this capture it described a
 # gateway that has not existed for a long time, and `kubectl apply -f` would have
 # SILENTLY UNCONFIGURED THE LOGIN PATH:
@@ -73,11 +86,6 @@ spec:
           value: '15'
         - name: AUTH_PLAYBOOK_TIMEOUT_SECS
           value: '40'
-        # Playbooks a regular (non-admin) user may start (noetl/gateway#57). The
-        # compiled-in default plus muno/playbooks/trip-intake (noetl/travel#154,
-        # adiona/frontend#55). Applied live with `kubectl set env` 2026-10-16.
-        - name: GATEWAY_USER_PLAYBOOKS
-          value: muno/playbooks/itinerary-planner,muno/playbooks/hotel-cards,muno/playbooks/flights-details,muno/playbooks/profile,travel/playbooks/catalog/calendar/list,muno/playbooks/threads,muno/playbooks/trip-intake
         - name: GATEWAY_HEARTBEAT_INTERVAL_SECS
           value: '15'
         - name: GATEWAY_CONNECTION_TIMEOUT_SECS
@@ -100,7 +108,12 @@ spec:
           value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9107
         - name: NOETL_EVENT_FEED_ADDR
           value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9105
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:02756b57840773e9eb008ad4434f2d33e91551617a7c58694c4ac6385854b7e3
+        # Playbooks a regular (non-admin) user may start (noetl/gateway#57). The
+        # compiled-in default plus muno/playbooks/trip-intake (noetl/travel#154,
+        # adiona/frontend#55). Applied live with `kubectl set env` 2026-10-16.
+        - name: GATEWAY_USER_PLAYBOOKS
+          value: muno/playbooks/itinerary-planner,muno/playbooks/hotel-cards,muno/playbooks/flights-details,muno/playbooks/profile,travel/playbooks/catalog/calendar/list,muno/playbooks/threads,muno/playbooks/trip-intake
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:af2f4ce2c4119682ab97eb0cadc6eb36977d25a2b0faf13f58e3a9c144c45853
         imagePullPolicy: Always
         livenessProbe:
           failureThreshold: 3
