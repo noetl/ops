@@ -1,3 +1,40 @@
+# ⛔⛔ DO NOT APPLY — blocked on noetl/ai-meta#480
+
+**Applying the probe change in this directory will take prod dispatch down for
+5–7.4 minutes per writer restart, and the `startupProbe` budget here would have
+killed the writer outright.**
+
+Measured on prod 2026-10-18 after rolling the #470 image (`v6.7.0`):
+
+| restart | version | boot warmup (`noetl_worker_ready` 0→1) |
+| :-- | :-- | --: |
+| 2026-10-16 | v6.6.2 | **300 s** |
+| 2026-10-18 | v6.7.0 | **435 s** |
+
+`/readyz` returns 200 only once boot warmup completes. So switching
+`readinessProbe` to `httpGet /readyz` holds the writer **NotReady for 5–7.4
+minutes on every restart** instead of ~7 s on `tcpSocket`. A NotReady pod leaves
+**every** Service that selects it, and this pod hosts **both buses** — so that is
+minutes of stopped dispatch, per restart.
+
+And the `startupProbe: failureThreshold: 60` (300 s) recorded below is **too
+small**: today's pod took 435 s to answer 200, so the probe would have killed it;
+2026-10-16's 300 s sat exactly on the boundary. The quantity is variable, so
+sizing to the last sample is not a fix either.
+
+⚠ Warmup is **not** caused by #470 — v6.6.2 took 300 s. The coupling is
+pre-existing and was invisible while nothing probed `/readyz`.
+
+**The image half IS live and safe**: prod runs `v6.7.0`, the serving heartbeats
+are observable and scraped, and the probes are unchanged, so nothing gates on
+`/readyz`. Only the probe half is blocked.
+
+Unblock: [noetl/ai-meta#480](https://github.com/noetl/ai-meta/issues/480) — make
+the warmup condition role-dependent, so a bus host reports ready when the bus
+serves rather than when an orchestration compiler finishes.
+
+---
+
 # Applying the #470 writer readiness probe — the path, and why it is not `kubectl apply`
 
 Staged, **not applied**. noetl/ai-meta#470 step 6 is gated on the owner.
