@@ -151,6 +151,12 @@ spec:
         # server-side dry-run against live).  Creating from nothing still needs
         # a digest: that comes from the release ledger, not from here.
         imagePullPolicy: IfNotPresent
+        # ⚠ LIVENESS STAYS tcpSocket — do not "upgrade" this to match readiness
+        # below.  Gating liveness on bus freshness would let a slow bind KILL the
+        # writer, and this writer has looped fatally on restart before.  A
+        # restart loop on the single-writer host is a worse outcome than a writer
+        # that is up and not serving, because the second state is at least
+        # diagnosable.  The startupProbe is what covers the bind window.
         livenessProbe:
           failureThreshold: 3
           initialDelaySeconds: 30
@@ -194,19 +200,82 @@ spec:
         - containerPort: 9108
           name: events-wal
           protocol: TCP
+        # Readiness reads /readyz, not a TCP handshake (noetl/ai-meta#470).
+        #
+        # A port that accepts a connection and then answers nothing passes a TCP
+        # probe forever.  That is noetl/ai-meta#469: this writer accepted TCP and
+        # never sent HTTP headers for over a day, across two pod generations,
+        # while the pod read Ready, restarts=0, every listener logged "up", and
+        # there were zero ERROR lines.  `tcpSocket: cmdbus-claim` cannot see it,
+        # by construction.
+        #
+        # /readyz returns 200 only when boot warmup is done AND every required
+        # serving face is bound AND each ticked inside the freshness threshold;
+        # otherwise 503 with a body naming the failed check and the face.  The
+        # comparison happens in-process because a probe is stateless — it cannot
+        # diff two scrapes, so it cannot notice a number that stopped moving.
+        #
+        # ⚠ On the metrics port deliberately.  :9090 is one of the ports that
+        # wedged in #469, so a probe that cannot get an HTTP response out of
+        # :9090 SHOULD fail — that is the signal, not a flaw in the target.
+        #
+        # Which faces are required is NOETL_SERVING_REQUIRED on the container
+        # (default: command ingest + command claim).  Measured container-relative
+        # bind times on this pod, 2026-10-16 (startedAt 17:05:13Z, restarts=0):
+        # metrics 1.6 s, command ingest/claim 2.6 s, event ingest 56.0 s, tier
+        # 60.5 s, event claim 308.4 s.  A NotReady pod leaves EVERY Service that
+        # selects it, so requiring a later-binding face makes the faces that are
+        # already up unreachable for the difference: +51 s per restart to require
+        # event ingest, +303 s to require event claim.  The default costs
+        # nothing — it is ready before the old probe's 5 s initialDelay elapsed.
+        # Widening it means raising the startupProbe budget below to match.
         readinessProbe:
           failureThreshold: 3
-          initialDelaySeconds: 5
+          httpGet:
+            path: /readyz
+            port: metrics
           periodSeconds: 5
           successThreshold: 1
-          tcpSocket:
-            port: cmdbus-claim
-          timeoutSeconds: 1
+          timeoutSeconds: 2
+        # The bind window, so startup slowness cannot trip liveness.
+        #
+        # While a startupProbe is running, kubelet suppresses BOTH the readiness
+        # and liveness probes — which is the point: /readyz legitimately answers
+        # 503 until the required faces bind, and that must read as "not started
+        # yet" rather than as a failure.
+        #
+        # 12 x 5 s = 60 s, against a measured 2.6 s for the default required set
+        # — a ~23x margin, deliberately generous because the downside is
+        # asymmetric: an over-generous budget delays nothing (startup ends on the
+        # first success, not at the budget), while an under-generous one kills
+        # the single-writer host.  Raise failureThreshold to >= 70 before setting
+        # NOETL_SERVING_REQUIRED to a set that includes event claim.
+        startupProbe:
+          failureThreshold: 12
+          httpGet:
+            path: /readyz
+            port: metrics
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          successThreshold: 1
+          timeoutSeconds: 2
         resources:
           limits:
             cpu: '2'
             ephemeral-storage: 1Gi
-            memory: 4Gi
+            # ⚠⚠ 12Gi, matching live, and NOT a tuning change — a drift
+            # correction.  This file said 4Gi while live has been 12Gi since the
+            # OOM work (raised live by `kubectl patch`, which nothing wrote
+            # back).  The writer OOMs at 4Gi: ~3 GiB baseline from the unsealed
+            # tier store plus an episodic spike on mass worker reconnect, and
+            # 4Gi -> 8Gi restored dispatch then OOMed again in 81 minutes.
+            #
+            # So applying this file at 4Gi would have OOMed the single-writer
+            # host — from a change whose stated purpose was a readiness probe.
+            # Found by diffing the FULL rendered object against live rather than
+            # the field being changed (agents/rules/apply-safety.md); a targeted
+            # check of the probe fields would have reported clean.
+            memory: 12Gi
           requests:
             cpu: 250m
             ephemeral-storage: 1Gi
