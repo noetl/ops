@@ -200,7 +200,7 @@ spec:
         - containerPort: 9108
           name: events-wal
           protocol: TCP
-        # ⛔⛔ DO NOT APPLY THIS PROBE BLOCK — blocked on noetl/ai-meta#480.
+        # ⛔⛔ DO NOT APPLY THIS PROBE BLOCK — blocked on noetl/ai-meta#481.
         #
         # Measured on prod 2026-10-18: /readyz also gates on boot warmup, and
         # warmup on this writer takes 300 s (2026-10-16, v6.6.2) to 435 s

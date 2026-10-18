@@ -1,4 +1,4 @@
-# ⛔⛔ DO NOT APPLY — blocked on noetl/ai-meta#480
+# ⛔⛔ DO NOT APPLY — blocked on noetl/ai-meta#481
 
 **Applying the probe change in this directory will take prod dispatch down for
 5–7.4 minutes per writer restart, and the `startupProbe` budget here would have
@@ -29,9 +29,23 @@ pre-existing and was invisible while nothing probed `/readyz`.
 are observable and scraped, and the probes are unchanged, so nothing gates on
 `/readyz`. Only the probe half is blocked.
 
-Unblock: [noetl/ai-meta#480](https://github.com/noetl/ai-meta/issues/480) — make
-the warmup condition role-dependent, so a bus host reports ready when the bus
-serves rather than when an orchestration compiler finishes.
+**UPDATE 2026-10-18 — the warmup half is FIXED; a second blocker remains.**
+
+noetl/ai-meta#480 shipped in worker **v6.8.0** (live on prod): `/readyz` is now
+role-aware, so a bus host reports ready at **~bus-bind time (≤14 s measured)**
+instead of waiting 435 s for warmup. The numbers above describe the OLD build.
+
+The swap was then applied to prod on 2026-10-18 and **rolled back within ~7
+minutes**: the writer flapped out of its Service, 8 of 12 samples NotReady with
+the endpoint empty.
+
+⚠ **The predicate was not at fault.** `noetl_worker_serving_ready` stayed **1
+for the whole flap window** — the bus was serving throughout. The pod was
+**CPU-throttled by boot warmup** (110–257 core-seconds/min against a `cpu: '2'`
+limit) and could not answer the probe inside `timeoutSeconds: 2`. Even
+`/healthz`, which only returns `"ok"`, stalled up to 0.788 s.
+
+Unblock: [noetl/ai-meta#481](https://github.com/noetl/ai-meta/issues/481).
 
 ---
 
