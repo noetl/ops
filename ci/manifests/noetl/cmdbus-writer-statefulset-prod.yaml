@@ -244,14 +244,34 @@ spec:
         # 503 until the required faces bind, and that must read as "not started
         # yet" rather than as a failure.
         #
-        # 12 x 5 s = 60 s, against a measured 2.6 s for the default required set
-        # — a ~23x margin, deliberately generous because the downside is
-        # asymmetric: an over-generous budget delays nothing (startup ends on the
-        # first success, not at the budget), while an under-generous one kills
-        # the single-writer host.  Raise failureThreshold to >= 70 before setting
-        # NOETL_SERVING_REQUIRED to a set that includes event claim.
+        # ⚠⚠ 60 x 5 s = 300 s, NOT the 60 s a bind-window reading suggests.
+        #
+        # Sizing this to the 2.6 s bind window was wrong and kind proved it: at
+        # 12 x 5 s the writer CRASH-LOOPED.  The container was SIGTERMed at
+        # exactly 61 s with exitCode 0 — `Startup probe failed: HTTP probe
+        # failed with statuscode: 503`, for the whole 62 s budget, then
+        # `failed startup probe, will be restarted`.
+        #
+        # The cause is that /readyz gates on boot warmup as well as on the bus
+        # faces, and warmup is a separate, much longer thing than binding.  A
+        # budget derived from bind times measures the wrong quantity.
+        #
+        # ⚠ Not fully isolated: the FIRST container on a new image took > 62 s
+        # to answer 200, while every subsequent fresh container answered within
+        # ~16 s, and nothing was logged in the 61 s gap.  No on-disk warmup
+        # cache was found, so the obvious cold-start explanation is unconfirmed.
+        # The budget is sized to absorb it either way.
+        #
+        # 300 s is ~19x the ~16 s a fresh container actually takes.  Generous on
+        # purpose, because the downside is asymmetric: an over-generous budget
+        # delays nothing, since startup ends on the first success rather than at
+        # the budget, while an under-generous one kills the single-writer host —
+        # which is exactly what 60 s did.
+        #
+        # Raise to >= 70 (350 s) before setting NOETL_SERVING_REQUIRED to a set
+        # that includes event claim, which binds at 308 s.
         startupProbe:
-          failureThreshold: 12
+          failureThreshold: 60
           httpGet:
             path: /readyz
             port: metrics

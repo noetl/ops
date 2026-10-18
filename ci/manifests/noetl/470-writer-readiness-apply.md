@@ -53,19 +53,42 @@ revert memory, replicas, or anything else the manifest's copy has drifted on.
 ```bash
 PROD=gke_shastaratech-noetl-prod_us-central1_noetl-prod-autopilot
 kubectl --context "$PROD" -n noetl patch sts noetl-cmdbus-writer \
-  --type=strategic --dry-run=server -o json -p '{"spec":{"template":{"spec":{"containers":[{"name":"noetl-worker","readinessProbe":{"tcpSocket":null,"initialDelaySeconds":null,"httpGet":{"path":"/readyz","port":"metrics"},"timeoutSeconds":2},"startupProbe":{"failureThreshold":12,"httpGet":{"path":"/readyz","port":"metrics"},"initialDelaySeconds":2,"periodSeconds":5,"successThreshold":1,"timeoutSeconds":2}}]}}}}'
+  --type=strategic --dry-run=server -o json -p '{"spec":{"template":{"spec":{"containers":[{"name":"noetl-worker","readinessProbe":{"tcpSocket":null,"initialDelaySeconds":null,"httpGet":{"path":"/readyz","port":"metrics"},"timeoutSeconds":2},"startupProbe":{"failureThreshold":60,"httpGet":{"path":"/readyz","port":"metrics"},"initialDelaySeconds":2,"periodSeconds":5,"successThreshold":1,"timeoutSeconds":2}}]}}}}'
 ```
 
 Verified output — one handler each, liveness untouched, memory preserved:
 
 ```
-startupProbe:   {"failureThreshold":12,"httpGet":{"path":"/readyz","port":"metrics","scheme":"HTTP"},"initialDelaySeconds":2,"periodSeconds":5,"successThreshold":1,"timeoutSeconds":2}
+startupProbe:   {"failureThreshold":60,"httpGet":{"path":"/readyz","port":"metrics","scheme":"HTTP"},"initialDelaySeconds":2,"periodSeconds":5,"successThreshold":1,"timeoutSeconds":2}
 readinessProbe: {"failureThreshold":3,"httpGet":{"path":"/readyz","port":"metrics","scheme":"HTTP"},"periodSeconds":5,"successThreshold":1,"timeoutSeconds":2}
 livenessProbe:  {"failureThreshold":3,"initialDelaySeconds":30,"periodSeconds":20,"successThreshold":1,"tcpSocket":{"port":"cmdbus-claim"},"timeoutSeconds":1}
 resources.limits.memory: 12Gi
 ```
 
 To apply, drop `--dry-run=server -o json`.
+
+## ⚠⚠ The startup budget is 300 s, and 60 s was proven wrong
+
+Sizing the `startupProbe` to the 2.6 s bind window was wrong, and kind validation
+caught it. At `failureThreshold: 12` (62 s) the writer **crash-looped**: the
+container was SIGTERMed at exactly 61 s with `exitCode 0`, and the events read
+
+```
+Warning  Unhealthy  Startup probe failed: HTTP probe failed with statuscode: 503
+Normal   Killing    Container noetl-worker failed startup probe, will be restarted
+```
+
+`/readyz` gates on **boot warmup** as well as on the bus faces, and warmup is a
+separate and much longer thing than binding — so a budget derived from bind
+times measures the wrong quantity entirely.
+
+⚠ Not fully isolated: the **first** container on a new image took > 62 s to
+answer 200, while every subsequent fresh container answered within ~16 s, and
+nothing at all was logged in the 61 s gap. No on-disk warmup cache was found, so
+the obvious cold-start explanation is unconfirmed. The budget absorbs it either
+way: 300 s is ~19x the ~16 s a fresh container actually takes, and startup ends
+on the first success rather than at the budget, so a generous budget delays
+nothing.
 
 ## ⚠⚠⚠ This patch ROLLS the writer
 
