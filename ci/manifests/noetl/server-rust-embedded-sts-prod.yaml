@@ -181,7 +181,7 @@ spec:
         - name: NOETL_AUTH0_DOMAIN
           value: mestumre-development.us.auth0.com
         - name: NOETL_AUTH0_AUDIENCE
-          value: Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN
+          value: Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN,4rgeOzCXS0FLwCPIkfS9wcUdoSVr8XNK
         - name: NOETL_SHARD_SUBJECT_ROUTE
           value: 'true'
         - name: NOETL_COMMAND_BUS
