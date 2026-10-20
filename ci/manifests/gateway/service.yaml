@@ -1,40 +1,42 @@
-# NoETL gateway Service — PROD.  Captured live (noetl/ai-meta#267).
+# NoETL gateway Service — PROD.  Captured live (noetl/ai-meta#267, #487).
 #
-# ⚠ The previous version of this file would have stripped the GKE load-balancer
-# wiring on apply: `cloud.google.com/neg`, `networking.gke.io/target-pool`, the
-# allocated nodePort and the port mapping.  Those are cluster-authored and
-# load-bearing for ingress.
+# ClusterIP only, on purpose (noetl/ai-meta#487).  Public traffic reaches the
+# gateway through the Cloudflare Tunnel (cloudflare/noetl-gke-gateway-tunnel),
+# whose origin is http://gateway.gateway.svc.cluster.local:80, so nothing needs
+# an external IP.  This Service used to be type LoadBalancer (34.132.30.16,
+# open to 0.0.0.0/0).  Anyone could reach the gateway there without Cloudflare
+# and forge `cf-connecting-ip`, the header the per-IP guest-session limits are
+# keyed on (GATEWAY_CLIENT_IP_HEADER).
+#
+# ⚠ Do not switch this back to LoadBalancer or NodePort.  If the gateway ever
+# needs a public entry point other than the tunnel, restrict it to Cloudflare's
+# ranges (https://www.cloudflare.com/ips-v4) with loadBalancerSourceRanges.
+#
+# clusterIP is immutable and must match live.
 apiVersion: v1
 kind: Service
 metadata:
   annotations:
     cloud.google.com/neg: '{"ingress":true}'
-    networking.gke.io/target-pool: ae94654dcffe94eac82e64c96bb407c8
-  finalizers:
-  - gke.networking.io/l4-netlb-v1
-  - service.kubernetes.io/load-balancer-cleanup
   labels:
     app: gateway
     app.kubernetes.io/managed-by: Helm
   name: gateway
   namespace: gateway
 spec:
-  allocateLoadBalancerNodePorts: true
   clusterIP: 34.118.234.255
   clusterIPs:
   - 34.118.234.255
-  externalTrafficPolicy: Cluster
   internalTrafficPolicy: Cluster
   ipFamilies:
   - IPv4
   ipFamilyPolicy: SingleStack
   ports:
   - name: http
-    nodePort: 31731
     port: 80
     protocol: TCP
     targetPort: 8090
   selector:
     app: gateway
   sessionAffinity: None
-  type: LoadBalancer
+  type: ClusterIP
