@@ -1,5 +1,11 @@
 # NoETL gateway — PROD.  Captured from the live cluster (noetl/ai-meta#267).
 #
+# RECONCILED AGAINST LIVE 2026-10-20 (noetl/ai-meta#484): v3.16.0
+# (sha256:8e111f6a…) with guest sessions on for shastaranch/concierge/turn —
+# GATEWAY_GUEST_* env, the guest-token-key CSI volume
+# (secretproviderclass-guest-token-key-prod.yaml), cf-connecting-ip.  Applied
+# from this file; `kubectl -n gateway diff -f` reported zero changes after.
+#
 # RECONCILED AGAINST LIVE 2026-10-16 (noetl/ai-meta#323).  The capture above was
 # taken in #267 and had drifted again by two things: the image pin was
 # sha256:02756b57… while prod ran sha256:af2f4ce2… (v3.15.0), so an apply would
@@ -113,7 +119,19 @@ spec:
         # adiona/frontend#55). Applied live with `kubectl set env` 2026-10-16.
         - name: GATEWAY_USER_PLAYBOOKS
           value: muno/playbooks/itinerary-planner,muno/playbooks/hotel-cards,muno/playbooks/flights-details,muno/playbooks/profile,travel/playbooks/catalog/calendar/list,muno/playbooks/threads,muno/playbooks/trip-intake,shastaranch/concierge/turn
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:af2f4ce2c4119682ab97eb0cadc6eb36977d25a2b0faf13f58e3a9c144c45853
+        # Guest sessions (noetl/ai-meta#484, gateway docs/guest-sessions.md):
+        # signed-out visitors may run only these playbooks, rate-limited per
+        # guest (20/h), per client IP (60/h; 20 mints/h) and in total (600/h).
+        # The client IP is Cloudflare's header; the LB still accepts direct
+        # traffic, so per-IP limits are best effort until it is restricted to
+        # Cloudflare ranges (the per-guest and total caps hold regardless).
+        - name: GATEWAY_GUEST_PLAYBOOKS
+          value: shastaranch/concierge/turn
+        - name: GATEWAY_GUEST_TOKEN_KEY_FILE
+          value: /var/secrets/guest/key
+        - name: GATEWAY_CLIENT_IP_HEADER
+          value: cf-connecting-ip
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:8e111f6aa9761146ffdcfe44c9b500b850323517ccd5a51463ae557531d4b02f
         imagePullPolicy: Always
         livenessProbe:
           failureThreshold: 3
@@ -155,6 +173,10 @@ spec:
             - NET_RAW
         terminationMessagePath: /dev/termination-log
         terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/secrets/guest
+          name: guest-token-key
+          readOnly: true
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler
@@ -167,3 +189,10 @@ spec:
         key: kubernetes.io/arch
         operator: Equal
         value: amd64
+      volumes:
+      - csi:
+          driver: secrets-store-gke.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: gateway-guest-token-key
+        name: guest-token-key
