@@ -7,6 +7,7 @@ Kubernetes manifests for deploying the NoETL Gateway (Rust API + Static UI) to k
 ### Gateway API (Rust)
 - **Deployment**: `deployment.yaml` - Rust gateway service
 - **Service**: `service.yaml` - ClusterIP (prod shape). Public traffic arrives through the Cloudflare Tunnel; no external IP (noetl/ai-meta#487)
+- **NetworkPolicy**: `networkpolicy.yaml` - prod only. Allows ingress to the gateway pods only from the `cloudflare`, `noetl`, `gke-gmp-system` and `gateway` namespaces (noetl/ai-meta#488)
 - **Image**: `noetl-gateway:latest` (built from ../gateway/Dockerfile)
 
 ### Gateway UI (Nginx)
