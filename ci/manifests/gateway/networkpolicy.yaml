@@ -1,0 +1,41 @@
+# NoETL gateway ingress policy — PROD (noetl/ai-meta#488).
+#
+# Only these sources may reach the gateway pods.  Everyone else is refused, so
+# no pod can call the gateway with its own `cf-connecting-ip`, the header the
+# per-IP guest-session limits are keyed on (GATEWAY_CLIENT_IP_HEADER):
+#   cloudflare      Cloudflare Tunnel (noetl-gke-gateway-tunnel), the only
+#                   public path; Cloudflare sets cf-connecting-ip
+#   noetl           worker callbacks to /api/internal/callback/async via
+#                   GATEWAY_PUBLIC_URL, plus the server
+#   gke-gmp-system  Managed Prometheus scrape (PodMonitoring noetl-gateway)
+#   gateway         same namespace
+# Kubelet probes come from the node, and Dataplane V2 always allows them.
+#
+# A new in-cluster caller needs a rule here.  Rollback:
+#   kubectl -n gateway delete networkpolicy gateway-ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: cloudflare
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: noetl
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gke-gmp-system
+    - podSelector: {}
+    ports:
+    - port: 8090
+      protocol: TCP
