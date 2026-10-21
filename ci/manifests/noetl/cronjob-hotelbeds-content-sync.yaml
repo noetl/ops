@@ -1,0 +1,79 @@
+# HotelBeds hotel-content sync CronJob — PROD (noetl/travel#166).
+#
+# HotelBeds' Content API must not be called live per search; their guide says to
+# load the hotel portfolio once, keep it, and refresh it daily. The playbook
+# muno/playbooks/hotelbeds-content-sync (noetl/travel) does that in bounded,
+# resumable slices into Firestore `hotelbeds_content`; hotel search reads that
+# copy. This job only triggers it: it holds no HotelBeds credential (the
+# playbook reads its GSM secret through the worker's Workload Identity).
+#
+# Hourly on purpose: mode `auto` continues the first full load each hour until
+# it has covered every hotel (about 173k, 10k per run by default), then fetches
+# changes at most once a day — later runs that day return without calling
+# HotelBeds.
+#
+# Not applied by merging. Apply only with an explicit go, after the playbook is
+# registered, per agents/rules/apply-safety.md:
+#   kubectl --context <prod> -n noetl diff --server-side -f <this file>
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  labels:
+    app: noetl-hotelbeds-content-sync
+    component: system-cron
+  name: noetl-hotelbeds-content-sync
+  namespace: noetl
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 120
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: noetl-hotelbeds-content-sync
+        spec:
+          containers:
+          - command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "Triggering muno/playbooks/hotelbeds-content-sync (mode auto) ..."
+              curl -fsS -X POST \
+                http://noetl-server-rust.noetl.svc.cluster.local:8082/api/execute \
+                -H 'Content-Type: application/json' \
+                -d '{"path": "muno/playbooks/hotelbeds-content-sync", "payload": {"mode": "auto"}}'
+              echo
+              echo "Triggered."
+            image: curlimages/curl:8.7.1
+            imagePullPolicy: IfNotPresent
+            name: trigger
+            resources:
+              limits:
+                cpu: 100m
+                ephemeral-storage: 1Gi
+                memory: 64Mi
+              requests:
+                cpu: 50m
+                ephemeral-storage: 1Gi
+                memory: 52Mi
+            securityContext:
+              capabilities:
+                drop:
+                - NET_RAW
+          restartPolicy: Never
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          tolerations:
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Equal
+            value: amd64
+  schedule: 17 * * * *
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  suspend: false
