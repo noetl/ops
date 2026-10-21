@@ -22,7 +22,10 @@ cd "$(dirname "$0")"
 # ⚠ An explicit context is not optional in this repo: the DEFAULT kubectl
 # context is PRODUCTION. This script only reads, but say which cluster the
 # answer is about.
-echo "context: $($K config current-context 2>/dev/null)  namespace: $NS"
+# ⚠ Print the context QUERIED, not `config current-context`: with --context X
+# that still prints the kubeconfig's current context, so this header used to
+# say `kind-noetl` above a report read from production (2026-10-21).
+echo "context: ${CTX:-$(kubectl config current-context 2>/dev/null) (current)}  namespace: $NS"
 echo
 
 pairs() {  # pairs <file> <workload-kind/name>
@@ -58,7 +61,10 @@ for c in d['spec']['template']['spec'].get('containers',[]):
     echo "  agree ($(printf '%s\n' "$live" | grep -c .) EHDB variables)"
   fi
   # LIVE-ONLY is the ai-meta#267 defect: a re-apply would remove it.
-  [ -n "$only_live" ] && { echo "  LIVE but NOT declared (a re-apply would REMOVE these):"; printf '%s\n' "$only_live" | sed 's/^/    - /'; }
+  # Whether a plain re-apply removes them depends on how they were set (a
+  # `kubectl set env` value is outside last-applied); a cluster REBUILT from
+  # these manifests certainly lacks them, and that is the case they exist for.
+  [ -n "$only_live" ] && { echo "  LIVE but NOT declared (a rebuild from these manifests would LACK these):"; printf '%s\n' "$only_live" | sed 's/^/    - /'; }
   # MANIFEST-ONLY is usually fine — a default-off declaration the cluster has
   # never been given. It is still reported, because "usually" is not "always".
   [ -n "$only_man" ] && { echo "  declared but NOT live (default-off declarations, or drift):"; printf '%s\n' "$only_man" | sed 's/^/    + /'; }
@@ -68,6 +74,7 @@ for row in \
   "server-rust-deployment-prod.yaml|deploy/noetl-server-rust" \
   "worker-rust-deployment-prod.yaml|deploy/noetl-worker-rust" \
   "worker-system-pool-deployment-prod.yaml|deploy/noetl-worker-system-pool" \
+  "worker-system-pool-shard1-deployment-prod.yaml|deploy/noetl-worker-system-pool-shard1" \
   "cmdbus-writer-statefulset-prod.yaml|sts/noetl-cmdbus-writer" ; do
   f="${row%%|*}"; o="${row##*|}"
   echo "== $f  vs  $o"
