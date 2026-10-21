@@ -187,6 +187,8 @@ spec:
         # produced ~99% relay delivery failures under load.
         - name: NOETL_EHDB_EVENTLOG_MIRROR_DRAIN_CONCURRENCY
           value: '1'
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_CONTENT
+          value: 'true'
         # The retry window.  Both EQUAL the server's code defaults as of
         # v3.101.3 and are declared anyway, so the deployed behaviour is readable
         # here rather than inferred from the binary.  They were raised to these
@@ -203,6 +205,8 @@ spec:
         # Live on prod since v3.92.0, never declared.
         - name: NOETL_EHDB_RECOVERY_SOURCE
           value: verify
+        - name: NOETL_EHDB_EMBEDDED
+          value: 'true'
         # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
         # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
         # digest back here, so every pin in this directory was BEHIND live: a
