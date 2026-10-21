@@ -207,6 +207,13 @@
       "duration": "1800s",
       "evaluationInterval": "300s",
       "documentation": "Versioned manifest snapshots are accumulating past the retention bound (default 32, so 64 is two bounds' headroom). This is the LEADING indicator for the 2026-09-01 outage: unbounded snapshots filled /data/cmdbus -- 19.4 GB of manifest behind 71.8 MB of real data -- which made every append fail. Firing here means pruning has stopped while there is still time to act, rather than after the volume is full. The gauge reports the bound being ENFORCED, not the one configured. Ref noetl/ehdb#344."
+    },
+    {
+      "displayName": "NoETL storage: a persistent volume is over 70% full",
+      "query": "max by (namespace_name, pod_name, volume_name) (kubernetes_io:pod_volume_utilization{monitored_resource=\"k8s_pod\", namespace_name=~\"noetl|signal-mesh|postgres\", volume_name!~\"kube-api-access.*|dshm|token.*\"}) > 0.70",
+      "duration": "900s",
+      "evaluationInterval": "60s",
+      "documentation": "A volume mounted by a NoETL pod is over 70% full (noetl/ai-meta#466).\n\nWHY 70%: weeks of warning, not hours. A full volume does not degrade, it stops: when /data/cmdbus filled on 2026-09-01 every POST /api/execute returned 500 for hours while the writer stayed Ready with zero ERROR lines (noetl/ehdb#345). The component that knows is the one that goes quiet.\n\nCOVERAGE (checked, not assumed, 2026-10-20): prod has 5 PVCs (noetl-cmdbus-writer-0-data, noetl-eventbus-writer-0-data, noetl-eventbus-kv-0-data, ehdb-embedded-noetl-server-rust-embedded-0, signal-mesh-store) and this query returned exactly 5 PVC-backed series for them (cmdbus-data, eventbus-data, eventbus-kv, ehdb-embedded, store), plus emptyDir/config volumes at ~0 that cannot trip it. Re-count when a PVC is added.\n\nSETTLE: 900s. Utilisation moves in GiB/day, not seconds; the duration only filters a sampling blip.\n\n\u26a0 EXPECT THIS TO FIRE ON APPLY. On 2026-10-20 eventbus-data (writer /data/eventbus, PVC noetl-eventbus-writer-0-data) was at 76.4% and growing ~0.22 GiB/day with no retention: noetl/ai-meta#491. That is a true positive, not a threshold to tune away.\n\nRUNBOOK: find the volume in the labels, check growth with kubernetes.io/pod/volume/used_bytes over 14 days, then see noetl/ai-meta#491 for the writer volumes (online PVC expansion on premium-rwo; retention is the real fix).\n\n\u26a0 Metric: the GKE system metric kubernetes.io/pod/volume/utilization, queried as kubernetes_io:pod_volume_utilization. NOT kubelet_volume_stats_* (not scraped here) and NOT a GMP Rules object, which is inert on this project (noetl/ai-meta#238)."
     }
   ]
 }
