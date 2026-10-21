@@ -149,6 +149,10 @@ workload:
   # GSM secret holding {"apikey": "...", "secret": "..."}. The value is loaded
   # out-of-band by the operator; this playbook only references the name.
   hotelbeds_secret_name: "hotelbeds-hotels-test"
+  # noetl/travel#166: hotel content from our own copy (cache), not a
+  # per-search Content API call. "live" is an emergency rollback only.
+  hotel_content_source: "cache"
+  firestore_database: "(default)"
   # adiona/frontend#22 — 10 -> 20. The provider ceiling stays 25.
   max_hotels: 20
 
@@ -174,6 +178,8 @@ workflow:
         hotelbeds_api_base: "{{ workload.hotelbeds_api_base | default('https://api.test.hotelbeds.com') }}"
         google_project: "{{ workload.google_project | default('shastaratech-noetl-prod') }}"
         hotelbeds_secret_name: "{{ workload.hotelbeds_secret_name | default('hotelbeds-api-test') }}"
+        hotel_content_source: "{{ workload.hotel_content_source | default('cache') }}"
+        firestore_database: "{{ workload.firestore_database | default('(default)') }}"
         max_hotels: "{{ workload.max_hotels | default(20) }}"
         # book_hotel tolerance (%). HotelBeds default is 2.0; in TEST/SANDBOX the
         # price drifts between checkRate and bookings, so a generous default lets
@@ -696,7 +702,90 @@ workflow:
             except (TypeError, ValueError):
                 return 9999
 
-        def _hotel_images(base, apikey, secret, codes, max_per=MAX_IMAGES_PER_HOTEL):
+        # ── HotelBeds hotel content, from our own copy (noetl/travel#166) ────────
+        # HotelBeds' guide says the Content API must not be used for real-time
+        # lookups (the account's credentials may be blocked):
+        # https://developer.hotelbeds.com/documentation/hotels/content-api/how-use-content-api/
+        # muno/playbooks/hotelbeds-content-sync keeps one Firestore document per
+        # hotel in `hotelbeds_content` (refreshed daily); search reads them here by
+        # hotel code, in one batchGet. A hotel not in the copy yet has no content
+        # (no photos), exactly as when the old live call failed; it never falls
+        # back to a live Content API call. hotel_content_source: "cache" (default),
+        # "live" (the old per-search call: emergency rollback only) or "off".
+        CONTENT_CACHE_COLLECTION = "hotelbeds_content"
+        CONTENT_CACHE_MAX_CODES = 100
+
+
+        def _content_source():
+            source = _text(globals().get("hotel_content_source")).lower() or "cache"
+            return source if source in ("cache", "live", "off") else "cache"
+
+
+        def _cached_content(google_project, firestore_database, codes):
+            """({code: content}, stats) for the codes found in our copy. Never raises."""
+            code_list = []
+            for c in codes:
+                c = _text(c)
+                if c and c not in code_list:
+                    code_list.append(c)
+            code_list = code_list[:CONTENT_CACHE_MAX_CODES]
+            stats = {"source": "cache", "requested": len(code_list), "hits": 0, "misses": len(code_list), "error": None}
+            if not code_list:
+                return {}, stats
+            root = "projects/%s/databases/%s/documents" % (_text(google_project), _text(firestore_database) or "(default)")
+            body = json.dumps({"documents": ["%s/%s/%s" % (root, CONTENT_CACHE_COLLECTION, c) for c in code_list],
+                               "mask": {"fieldPaths": ["json"]}}).encode("utf-8")
+            try:
+                req = urllib.request.Request(
+                    "https://firestore.googleapis.com/v1/%s:batchGet" % root, data=body, method="POST",
+                    headers={"Authorization": "Bearer " + _metadata_token(), "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    rows = json.loads(resp.read().decode("utf-8") or "[]")
+            except Exception as exc:  # noqa: BLE001 — content never breaks search
+                stats["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+                return {}, stats
+            out = {}
+            for row in rows if isinstance(rows, list) else []:
+                found = _as_dict(_as_dict(row).get("found"))
+                name = _text(found.get("name"))
+                raw = _as_dict(_as_dict(found.get("fields")).get("json")).get("stringValue")
+                if not name or not raw:
+                    continue
+                try:
+                    doc = json.loads(raw)
+                except ValueError:
+                    continue
+                code = name.rsplit("/", 1)[-1]
+                if isinstance(doc, dict) and code in code_list:
+                    out[code] = doc
+            stats["hits"], stats["misses"] = len(out), len(code_list) - len(out)
+            return out, stats
+
+
+        def _content_images(doc, max_per=0):
+            """(hotel photo URLs in HotelBeds' order, {roomCode: [url]}) from a cached hotel."""
+            urls, by_room = [], {}
+            for img in sorted(_as_list(_as_dict(doc).get("images")), key=_image_order):
+                img = _as_dict(img)
+                url = _image_url(img.get("path"))
+                if not url:
+                    continue
+                if url not in urls:
+                    if max_per and len(urls) >= max_per:
+                        break
+                    urls.append(url)
+                room_code = _text(img.get("roomCode"))
+                if room_code:
+                    bucket = by_room.setdefault(room_code, [])
+                    if url not in bucket:
+                        bucket.append(url)
+            return urls, by_room
+
+        CONTENT_STATS = None
+        CONTENT_DOCS = {}
+
+
+        def _hotel_images_live(base, apikey, secret, codes, max_per=MAX_IMAGES_PER_HOTEL):
             # Fetch images for ALL availability hotel codes in ONE Content API
             # call and map code -> [CDN url]. Fully graceful: any failure (no
             # content entitlement on the test key, network, parse) returns {} so
@@ -776,6 +865,33 @@ workflow:
                 if by_room:
                     rooms_out[code] = by_room
             return out, rooms_out, reviews_out, None
+
+
+        def _hotel_images(base, apikey, secret, codes, max_per=MAX_IMAGES_PER_HOTEL):
+            # noetl/travel#166: photos, room photos and reviews come from our own
+            # copy of HotelBeds content, not a per-search Content API call.
+            global CONTENT_STATS, CONTENT_DOCS
+            CONTENT_DOCS = {}
+            source = _content_source()
+            if source == "live":
+                CONTENT_STATS = {"source": "live"}
+                return _hotel_images_live(base, apikey, secret, codes, max_per=max_per)
+            if source == "off":
+                CONTENT_STATS = {"source": "off"}
+                return {}, {}, {}, None
+            CONTENT_DOCS, CONTENT_STATS = _cached_content(
+                globals().get("google_project"), globals().get("firestore_database"), codes)
+            out, rooms_out, reviews_out = {}, {}, {}
+            for code, doc in CONTENT_DOCS.items():
+                urls, by_room = _content_images(doc, max_per)
+                if urls:
+                    out[code] = urls
+                if by_room:
+                    rooms_out[code] = by_room
+                if _as_list(doc.get("reviews")):
+                    reviews_out[code] = _as_list(doc.get("reviews"))
+            return out, rooms_out, reviews_out, CONTENT_STATS.get("error")
+
 
         def _tools_list():
             tools = [
@@ -920,6 +1036,14 @@ workflow:
                 # Keep whatever availability gave (always empty in practice)
                 # rather than blanking it when content returns nothing.
                 h["reviews"] = reviews_map.get(_code) or _as_list(h.get("reviews"))
+            # noetl/travel#166: the hotel's address as our copy of HotelBeds content
+            # has it (adiona/frontend#62 item 3 and #95); absent when not cached.
+            for h in summarised:
+                _doc = CONTENT_DOCS.get(str(h.get("code") or "")) or {}
+                if _doc:
+                    h["address"] = _doc.get("address") or h.get("address")
+                    h["city"] = _doc.get("city") or None
+                    h["postalCode"] = _doc.get("postalCode")
             images_with_photos = sum(1 for h in summarised if h.get("images"))
             currency = None
             for hotel in summarised:
@@ -941,6 +1065,7 @@ workflow:
                     "meta": {"count": len(summarised), "source": "hotelbeds", "currency": currency,
                              "images_source": "hotelbeds-content" if images_with_photos else None,
                              "images_with_photos": images_with_photos, "images_error": images_error,
+                             "content_cache": CONTENT_STATS,
                              # adiona/frontend#22 diagnostics: prove the additive
                              # detail actually arrived rather than inferring it
                              # from an empty list downstream.
