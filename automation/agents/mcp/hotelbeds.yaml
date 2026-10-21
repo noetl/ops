@@ -339,6 +339,73 @@ workflow:
                 return [], f"child ages must be between 0 and 17, got {ages}"
             return ages, ""
 
+        def _room_occupancies(rooms, adults, child_ages):
+            """The party as HotelBeds occupancies, or a reason it cannot be split.
+
+            HotelBeds counts guests PER ROOM: an occupancy's `adults` and
+            `children` are each room's, and its `paxes` list one room's guests,
+            so `{"rooms": 2, "adults": 2}` means four adults. Sending the whole
+            party's numbers with `rooms: N` over-counted every multi-room search
+            and failed those with children (adiona/frontend#63). So: deal the
+            adults across the rooms (every room needs one), give each child to
+            the room with the fewest guests so far, and merge rooms that end up
+            with the same guests into one occupancy with `rooms: N`.
+            """
+            if adults < rooms:
+                return [], (f"{rooms} rooms need at least {rooms} adults (one per room), "
+                            f"got {adults}")
+            per_room = [{"adults": 0, "ages": []} for _ in range(rooms)]
+            for i in range(adults):
+                per_room[i % rooms]["adults"] += 1
+            for age in child_ages:
+                emptiest = min(range(rooms), key=lambda r: (per_room[r]["adults"] + len(per_room[r]["ages"]), r))
+                per_room[emptiest]["ages"].append(age)
+            occupancies, index = [], {}
+            for room in per_room:
+                key = (room["adults"], tuple(sorted(room["ages"])))
+                if key in index:
+                    occupancies[index[key]]["rooms"] += 1
+                    continue
+                index[key] = len(occupancies)
+                occupancy = {"rooms": 1, "adults": room["adults"], "children": len(room["ages"])}
+                if room["ages"]:
+                    # One paxes entry per occupant of ONE room. Adults carry no age
+                    # (HotelBeds does not price them by it); each child carries its
+                    # own, which is what the API asks for (noetl/ai-meta#341).
+                    occupancy["paxes"] = ([{"type": "AD"} for _ in range(room["adults"])]
+                                          + [{"type": "CH", "age": age} for age in sorted(room["ages"])])
+                occupancies.append(occupancy)
+            return occupancies, ""
+
+
+        def _party_price(hotel, occupancies):
+            """The cheapest price for the whole party when its rooms differ.
+
+            With several occupancies a hotel's rates are each for ONE of them
+            (the rate says its rooms/adults/children), and HotelBeds' minRate is
+            the cheapest single one, not the party's. The party's price is the
+            sum of the cheapest rate for each occupancy; None when the hotel
+            priced none for one of them.
+            """
+            total = 0.0
+            for occupancy in occupancies:
+                best = None
+                for room in _as_list(_as_dict(hotel).get("rooms")):
+                    for rate in _as_list(_as_dict(room).get("rates")):
+                        rate = _as_dict(rate)
+                        try:
+                            fits = (int(rate.get("rooms")), int(rate.get("adults")), int(rate.get("children") or 0)) == \
+                                (occupancy["rooms"], occupancy["adults"], occupancy["children"])
+                            net = float(rate.get("net"))
+                        except (TypeError, ValueError):
+                            continue
+                        if fits and (best is None or net < best):
+                            best = net
+                if best is None:
+                    return None
+                total += best
+            return round(total, 2)
+
         def _stay_error(check_in, check_out):
             # HotelBeds rejects a check-in before today with
             # `INVALID_DATA: The check-in must be in the future.`  Catching that
@@ -874,16 +941,14 @@ workflow:
             if age_problem:
                 return _error("search_hotels", age_problem, code="validation_error",
                               user_message=f"Those guests cannot be searched: {age_problem}.")
-            occupancy = {"rooms": rooms, "adults": adults, "children": children}
-            if children:
-                # One paxes entry per occupant. Adults carry no age (HotelBeds
-                # does not price them by it); each child carries its own, which
-                # is what the API is asking for — noetl/ai-meta#341.
-                occupancy["paxes"] = ([{"type": "AD"} for _ in range(adults)]
-                                      + [{"type": "CH", "age": age} for age in child_ages])
+            # adiona/frontend#63: HotelBeds counts guests per room (_room_occupancies).
+            occupancies, party_problem = _room_occupancies(rooms, adults, child_ages)
+            if party_problem:
+                return _error("search_hotels", party_problem, code="validation_error",
+                              user_message=f"Those guests cannot be searched: {party_problem}.")
             payload = {
                 "stay": {"checkIn": check_in, "checkOut": check_out},
-                "occupancies": [occupancy],
+                "occupancies": occupancies,
                 "geolocation": {"latitude": lat, "longitude": lng, "radius": radius, "unit": "km"},
             }
             ok, status_code, body = _request("POST", base + AVAILABILITY_PATH, apikey, secret, payload=payload)
@@ -909,6 +974,15 @@ workflow:
             container = _as_dict(body.get("hotels") if isinstance(body, dict) else {})
             hotels = _as_list(container.get("hotels"))
             summarised = [_hotel_summary(hotel) for hotel in hotels[:limit] if isinstance(hotel, dict)]
+            if len(occupancies) > 1:
+                # adiona/frontend#63: rooms with different guests are separate
+                # occupancies, each priced on its own; the party's price is their sum.
+                for h, raw in zip(summarised, [x for x in hotels[:limit] if isinstance(x, dict)]):
+                    party = _party_price(raw, occupancies)
+                    h["party_rooms"] = [{k: o[k] for k in ("rooms", "adults", "children")} for o in occupancies]
+                    h["party_priced"] = party is not None
+                    if party is not None:
+                        h["minRate"] = "%.2f" % party
             # Enrich each hotel with photo URLs from the Content API (one call
             # for all codes). Graceful: on any failure hotels keep empty photos.
             images_map, room_images_map, reviews_map, images_error = _hotel_images(
