@@ -169,6 +169,8 @@ spec:
           value: server
         - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
           value: server
+        - name: NOETL_EHDB_CATALOG_MIRROR_SOURCE
+          value: server
         # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
         # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
         # digest back here, so every pin in this directory was BEHIND live: a
@@ -302,6 +304,8 @@ spec:
         - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
           value: server
         - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_CATALOG_MIRROR_SOURCE
           value: server
         image: curlimages/curl:8.7.1
         imagePullPolicy: IfNotPresent
