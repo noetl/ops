@@ -31,10 +31,13 @@ spec:
     matchLabels:
       app: noetl-worker-system-pool-shard1
       worker-pool: worker-system-pool
+  # Live, and deliberate-looking: never two pods of one shard pool at once
+  # (maxSurge 0). Was the 25%/25% default here, so an apply changed it
+  # (found by `kubectl diff`, 2026-10-21).
   strategy:
     rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 25%
+      maxSurge: 0
+      maxUnavailable: 1
     type: RollingUpdate
   template:
     metadata:
