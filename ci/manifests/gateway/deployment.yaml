@@ -134,11 +134,14 @@ spec:
         # guest (20/h), per client IP (60/h; 20 mints/h) and in total (600/h).
         # shastaranch/chats/inbox (staff replies) is limited on its own below:
         # read-only, returns only the team's reply text for a thread id.
+        # shastaranch/contact/submit (the chat's message form) emails the team
+        # through Resend: allow it only once the resend_api credential exists,
+        # or every submission fails at the email step.
         # The client IP is Cloudflare's header; the LB still accepts direct
         # traffic, so per-IP limits are best effort until it is restricted to
         # Cloudflare ranges (the per-guest and total caps hold regardless).
         - name: GATEWAY_GUEST_PLAYBOOKS
-          value: shastaranch/concierge/turn,shastaranch/chats/inbox
+          value: shastaranch/concierge/turn,shastaranch/chats/inbox,shastaranch/contact/submit
         # Polling for staff replies must not use up a guest's 20 chat
         # messages: chats/inbox has its own hourly budget, per guest / per IP /
         # total. The page asks at most every 2 min (refocus at most once a
