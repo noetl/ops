@@ -4,9 +4,8 @@
 # shastaranch/mountshastaranch): guests may also run shastaranch/chats/inbox,
 # which the concierge page polls for the team's replies, in its own budget
 # (GATEWAY_GUEST_PLAYBOOK_LIMITS, noetl/gateway feat/guest-playbook-limits).
-# Needs a gateway release with that feature: the image line below is a
-# placeholder that refuses to apply until the release digest is filled in.
-# The jump from v3.16.0 also brings v3.17.0 (auth providers, inert while
+# Image: v3.18.0, rolled alone first (2026-10-26) so travel could be checked
+# before the env change; it also brings v3.17.0 (auth providers, inert while
 # GATEWAY_AUTH_PROVIDERS is unset).  Diff the whole object first
 # (agents/rules/apply-safety.md).
 #
@@ -152,9 +151,10 @@ spec:
           value: /var/secrets/guest/key
         - name: GATEWAY_CLIENT_IP_HEADER
           value: cf-connecting-ip
-        # Placeholder: the digest of the gateway release with GATEWAY_GUEST_PLAYBOOK_LIMITS
-        # (was sha256:8e111f6a…, v3.16.0). Invalid on purpose until filled in.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:REPLACE_WITH_RELEASE_DIGEST
+        # v3.18.0 (noetl/gateway#62: GATEWAY_GUEST_PLAYBOOK_LIMITS), crane-copied from
+        # ghcr.io/noetl/gateway:v3.18.0. Rolled 2026-10-26; rollback target v3.16.0 =
+        # sha256:8e111f6aa9761146ffdcfe44c9b500b850323517ccd5a51463ae557531d4b02f.
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:ddf2315ae71cb56b3043e59b3f781c1aa0c0cc7ffe9649fa5e1032d69aec74a6
         imagePullPolicy: Always
         livenessProbe:
           failureThreshold: 3
