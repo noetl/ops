@@ -9,6 +9,12 @@
 # past the auth enforcement and the parity fix.  Re-verify with the diff below
 # before trusting that sentence — it is true only until prod next changes.
 #
+# 2026-10-21: it stopped being true within five days. Prod moved to v3.144.3
+# (sha256:ace47056…) and this pin stayed on v3.144.2, which
+# `ci/manifests/image-drift-check.sh noetl-prod` reported as the one DIFFERS in
+# the tree (noetl/ai-meta#323). Image pin moved to v3.144.3; image was the
+# only changed field.
+#
 # ════════════════════════════════════════════════════════════════════════════
 #  ⚠⚠⚠ APPLYING THIS FILE IS OWNER-GATED.  DO NOT `kubectl apply` IT.
 #
@@ -339,7 +345,7 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_TAIL_REPLICATION_TICK_SECS
           value: '60'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:911f8b300869fa22f9f6ac7a71db8219849c60f9f681ac554ee30662cd69b4fe
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:ace470565072e3955e93f2a30d8c96791e7bc20d16aed4db7d7b58ed79070c8c
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
