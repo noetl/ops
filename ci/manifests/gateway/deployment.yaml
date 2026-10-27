@@ -1,5 +1,14 @@
 # NoETL gateway — PROD.  Captured from the live cluster (noetl/ai-meta#267).
 #
+# STAGED, NOT APPLIED (mountshastaranch staff replies, docs/staff-replies.md in
+# shastaranch/mountshastaranch): guests may also run shastaranch/chats/inbox,
+# which the concierge page polls for the team's replies, in its own budget
+# (GATEWAY_GUEST_PLAYBOOK_LIMITS, noetl/gateway feat/guest-playbook-limits).
+# Image: v3.18.0, rolled alone first (2026-10-26) so travel could be checked
+# before the env change; it also brings v3.17.0 (auth providers, inert while
+# GATEWAY_AUTH_PROVIDERS is unset).  Diff the whole object first
+# (agents/rules/apply-safety.md).
+#
 # RECONCILED AGAINST LIVE 2026-10-20 (noetl/ai-meta#484): v3.16.0
 # (sha256:8e111f6a…) with guest sessions on for shastaranch/concierge/turn —
 # GATEWAY_GUEST_* env, the guest-token-key CSI volume
@@ -122,16 +131,27 @@ spec:
         # Guest sessions (noetl/ai-meta#484, gateway docs/guest-sessions.md):
         # signed-out visitors may run only these playbooks, rate-limited per
         # guest (20/h), per client IP (60/h; 20 mints/h) and in total (600/h).
+        # shastaranch/chats/inbox (staff replies) is limited on its own below:
+        # read-only, returns only the team's reply text for a thread id.
         # The client IP is Cloudflare's header; the LB still accepts direct
         # traffic, so per-IP limits are best effort until it is restricted to
         # Cloudflare ranges (the per-guest and total caps hold regardless).
         - name: GATEWAY_GUEST_PLAYBOOKS
-          value: shastaranch/concierge/turn
+          value: shastaranch/concierge/turn,shastaranch/chats/inbox
+        # Polling for staff replies must not use up a guest's 20 chat
+        # messages: chats/inbox has its own hourly budget, per guest / per IP /
+        # total. The page asks at most every 2 min (refocus at most once a
+        # minute), so 40/guest leaves headroom; a refusal just waits a turn.
+        - name: GATEWAY_GUEST_PLAYBOOK_LIMITS
+          value: shastaranch/chats/inbox=40/120/1200
         - name: GATEWAY_GUEST_TOKEN_KEY_FILE
           value: /var/secrets/guest/key
         - name: GATEWAY_CLIENT_IP_HEADER
           value: cf-connecting-ip
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:8e111f6aa9761146ffdcfe44c9b500b850323517ccd5a51463ae557531d4b02f
+        # v3.18.0 (noetl/gateway#62: GATEWAY_GUEST_PLAYBOOK_LIMITS), crane-copied from
+        # ghcr.io/noetl/gateway:v3.18.0. Rolled 2026-10-26; rollback target v3.16.0 =
+        # sha256:8e111f6aa9761146ffdcfe44c9b500b850323517ccd5a51463ae557531d4b02f.
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:ddf2315ae71cb56b3043e59b3f781c1aa0c0cc7ffe9649fa5e1032d69aec74a6
         imagePullPolicy: Always
         livenessProbe:
           failureThreshold: 3
