@@ -127,7 +127,7 @@ spec:
         # compiled-in default plus muno/playbooks/trip-intake (noetl/travel#154,
         # adiona/frontend#55). Applied live with `kubectl set env` 2026-10-16.
         - name: GATEWAY_USER_PLAYBOOKS
-          value: muno/playbooks/itinerary-planner,muno/playbooks/hotel-cards,muno/playbooks/flights-details,muno/playbooks/profile,travel/playbooks/catalog/calendar/list,muno/playbooks/threads,muno/playbooks/trip-intake,shastaranch/concierge/turn
+          value: muno/playbooks/itinerary-planner,muno/playbooks/hotel-cards,muno/playbooks/flights-details,muno/playbooks/profile,travel/playbooks/catalog/calendar/list,muno/playbooks/threads,muno/playbooks/trip-intake,shastaranch/concierge/turn,shastaranch/chats/inbox,shastaranch/chats/mine,shastaranch/contact/submit
         # Guest sessions (noetl/ai-meta#484, gateway docs/guest-sessions.md):
         # signed-out visitors may run only these playbooks, rate-limited per
         # guest (20/h), per client IP (60/h; 20 mints/h) and in total (600/h).
@@ -147,14 +147,20 @@ spec:
         # minute), so 40/guest leaves headroom; a refusal just waits a turn.
         - name: GATEWAY_GUEST_PLAYBOOK_LIMITS
           value: shastaranch/chats/inbox=40/120/1200
+        # Signed-in users (mountshastaranch.com guests who signed in) get their
+        # own hourly budgets per playbook: per user / all users together
+        # (noetl/gateway user_limits, docs/user-playbook-limits.md). Admins are
+        # exempt; travel's playbooks are not listed, so nothing changes for it.
+        - name: GATEWAY_USER_PLAYBOOK_LIMITS
+          value: shastaranch/chats/inbox=40/1200,shastaranch/chats/mine=20/400,shastaranch/contact/submit=10/200
         - name: GATEWAY_GUEST_TOKEN_KEY_FILE
           value: /var/secrets/guest/key
         - name: GATEWAY_CLIENT_IP_HEADER
           value: cf-connecting-ip
-        # v3.18.0 (noetl/gateway#62: GATEWAY_GUEST_PLAYBOOK_LIMITS), crane-copied from
-        # ghcr.io/noetl/gateway:v3.18.0. Rolled 2026-10-26; rollback target v3.16.0 =
-        # sha256:8e111f6aa9761146ffdcfe44c9b500b850323517ccd5a51463ae557531d4b02f.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:ddf2315ae71cb56b3043e59b3f781c1aa0c0cc7ffe9649fa5e1032d69aec74a6
+        # v3.19.0 (noetl/gateway#63: GATEWAY_USER_PLAYBOOK_LIMITS), crane-copied from
+        # ghcr.io/noetl/gateway:v3.19.0. Rolled 2026-10-27; rollback target v3.18.0 =
+        # sha256:ddf2315ae71cb56b3043e59b3f781c1aa0c0cc7ffe9649fa5e1032d69aec74a6.
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:1aab590022574a853d8fd60f8587776cf24c04efb2ef275a192d884ce3606b4c
         imagePullPolicy: Always
         livenessProbe:
           failureThreshold: 3
