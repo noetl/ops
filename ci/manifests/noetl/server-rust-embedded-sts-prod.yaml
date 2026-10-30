@@ -178,10 +178,14 @@ spec:
           value: 'true'
         - name: NOETL_AUTH_VERIFY_SIGNATURE
           value: enforce
+        # Trusted Auth0 tenants, comma separated (noetl/server
+        # feat/auth0-multi-tenant; older images compare the whole string and
+        # would refuse every login). The first is the default for a login
+        # request that names none: keep travel's tenant first.
         - name: NOETL_AUTH0_DOMAIN
-          value: mestumre-development.us.auth0.com
+          value: mestumre-development.us.auth0.com,shastara.us.auth0.com
         - name: NOETL_AUTH0_AUDIENCE
-          value: Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN,4rgeOzCXS0FLwCPIkfS9wcUdoSVr8XNK
+          value: Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN,4rgeOzCXS0FLwCPIkfS9wcUdoSVr8XNK,ECUiHFlhT9gAR1htdSdROWn59WA0lOCH
         - name: NOETL_SHARD_SUBJECT_ROUTE
           value: 'true'
         - name: NOETL_COMMAND_BUS
@@ -339,7 +343,8 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_TAIL_REPLICATION_TICK_SECS
           value: '60'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:c6532df57e2a9cfcf812afe640a22459254aae7457122b8e9d816228e24c8b88
+        # v3.146.0: trusts a list of Auth0 tenants (NOETL_AUTH0_DOMAIN above).
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:7c0b999dd0631078e8a11a1fd82436bded89a908ff57f219989f63e480087273
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
