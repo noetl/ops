@@ -339,7 +339,7 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_TAIL_REPLICATION_TICK_SECS
           value: '60'
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:911f8b300869fa22f9f6ac7a71db8219849c60f9f681ac554ee30662cd69b4fe
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:c6532df57e2a9cfcf812afe640a22459254aae7457122b8e9d816228e24c8b88
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
