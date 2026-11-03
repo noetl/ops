@@ -171,7 +171,9 @@ spec:
           type: RuntimeDefault
       serviceAccount: noetl-worker
       serviceAccountName: noetl-worker
-      terminationGracePeriodSeconds: 30
+      # noetl/ai-meta#511: a SIGTERM'd worker drains its in-flight commands
+      # (NOETL_WORKER_DRAIN_TIMEOUT_SECS, default 150 s) before exiting.
+      terminationGracePeriodSeconds: 180
       tolerations:
       - effect: NoSchedule
         key: kubernetes.io/arch

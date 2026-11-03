@@ -45,6 +45,9 @@ spec:
         prometheus.io/port: "9090"
     spec:
       serviceAccountName: noetl-worker
+      # noetl/ai-meta#511: room for a SIGTERM'd worker to drain its in-flight
+      # commands (NOETL_WORKER_DRAIN_TIMEOUT_SECS, default 150 s).
+      terminationGracePeriodSeconds: 180
       initContainers:
         - name: wait-for-api
           image: curlimages/curl:8.7.1
