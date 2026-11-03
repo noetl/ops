@@ -1,0 +1,29 @@
+# noetl/ai-meta#497: keep the cluster autoscaler from voluntarily draining the
+# node that holds the writer's / server's RWO disks (the 2026-10-21 outage was
+# those disks stuck on a draining node). A PDB needs no new node and restarts
+# nothing; StatefulSet rolls delete pods directly and are not blocked by it.
+# Pod-template safe-to-evict=false is NOT usable here: on Autopilot it adds a
+# required extended-duration-pods node affinity (stranded the writer 2026-10-22).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: noetl-cmdbus-writer
+  namespace: noetl
+  labels: {app: noetl-cmdbus-writer, managed-by: noetl}
+  annotations: {noetl.io/issue: "noetl/ai-meta#497"}
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels: {app: noetl-cmdbus-writer}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: noetl-server-rust-embedded
+  namespace: noetl
+  labels: {app: noetl-server-rust-embedded, managed-by: noetl}
+  annotations: {noetl.io/issue: "noetl/ai-meta#497"}
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels: {app: noetl-server-rust-embedded}
