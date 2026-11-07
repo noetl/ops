@@ -51,7 +51,7 @@ automation/
 │   └── pagination-server.yaml # Pagination test server automation
 ├── iap/                       # Infrastructure as Playbook (NoETL instead of Terraform/Crossplane)
 │   ├── kind/                  # local kind stacks
-│   │   └── log_analytics.yaml # ClickHouse + Vector + ClickHouse MCP: plan/apply/verify/drift/destroy
+│   │   └── log_analytics.yaml # business-data stack (ClickHouse + Vector + MCP): plan/apply/verify/drift/state/destroy
 │   └── gcp/                   # GCP provider playbooks
 │       ├── gke_autopilot.yaml # GKE Autopilot cluster management
 │       ├── state_sync.yaml    # State synchronization

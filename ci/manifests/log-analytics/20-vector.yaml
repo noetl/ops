@@ -1,6 +1,10 @@
-# Vector (timberio/vector, MPL-2.0) as the in-cluster log shipper: one pod per node
-# tails /var/log/pods (files the kubelet rotates at containerLogMaxSize, see
-# ci/kind/config.yaml) and writes rows into ClickHouse logs.events as the `ingest` user.
+# Vector (timberio/vector, MPL-2.0) as the in-cluster shipper for BUSINESS workload logs:
+# one pod per node tails /var/log/pods (files the kubelet rotates at containerLogMaxSize,
+# see ci/kind/config.yaml) and writes rows into ClickHouse logs.events as `ingest`.
+#
+# Opt-in by namespace: only namespaces labelled noetl.io/log-analytics=capture are
+# shipped. NoETL core namespaces (noetl, postgres, kube-system, ...) are never labelled:
+# core operational events and state stay in EHDB (docs/decisions/ADR-0005).
 # Vector tracks file checkpoints in /var/lib/vector on the node, so a restart resumes
 # where it stopped and rotated files are followed by inode, not by name.
 apiVersion: v1
@@ -66,6 +70,7 @@ data:
       pods:
         type: kubernetes_logs
         self_node_name: "${VECTOR_SELF_NODE_NAME}"
+        extra_namespace_label_selector: "noetl.io/log-analytics=capture"
         # Never ship Vector's own output (a shipping error would feed itself).
         exclude_paths_glob_patterns:
           - "/var/log/pods/log-analytics_vector-*/**"

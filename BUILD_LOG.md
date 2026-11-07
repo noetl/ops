@@ -75,3 +75,61 @@ $N run automation/iap/kind/log_analytics.yaml -r local --set action=verify --set
 $N run automation/iap/kind/log_analytics.yaml -r local --set action=drift  --set noetl_bin=$N --json | jq -r .final_result
 $N run automation/iap/kind/log_analytics.yaml -r local --set action=destroy --set confirm=log-analytics --set noetl_bin=$N --json | jq -r .final_result
 ```
+
+## 2026-11-07 (round 2): two-phase IaC state, business-data boundary, decision record
+
+**User direction.** IaC must keep state on NoETL's own substrate, found in the code rather than
+invented:
+- Phase 0 (bootstrap): the CLI writes events and state to Feather files, backed up to object
+  storage.
+- Phase 1: the control loop holds state in the EHDB log, KV, projections and ehgraph.
+
+ClickHouse is a business-data store only. Record every decision as an ADR.
+
+**Found in the code.**
+- **Shipped:**
+  - `provider_fact`: noetl-tools `provider.rs` `pub mod state`, `ProviderFact`, `fold_facts`,
+    orphans, conflicts.
+  - Its event-log read-back: `/api/ehdb/tiers/eventlog`.
+  - `noetl provider --facts-out/--facts-file`: the "EHDB-less git-backed state sink", JSONL.
+  - The older `noetl iap` DuckDB `.noetl/state.duckdb`, with `gsutil` sync to GCS.
+  - EHDB KV engine (`ehdb-reference` `kv.rs`): platform state, LWW, CAS, tombstones.
+  - Projection refold and recovery routes.
+  - ehgraph tool API.
+  - Catalog register/resource, and catalog-log.
+- **Designed, not shipped:** the CLI Feather local buffer (blueprint § H.11:
+  `~/.noetl/local/<eid>/events.feather`, `noetl push`, `POST /api/events/batch`). It is
+  deferred to R-1.4: CLI 5.4.0 has no `push` subcommand, and nothing in cli, server or worker
+  writes or ingests it. Feather elsewhere is EHDB's execution-state and result tiers in
+  object storage, not IaC state.
+
+**Built.**
+- **Playbook state:**
+  - `state_load` folds the Phase 0 log, restoring it from `state_backup` if missing.
+  - `record_state` appends one `ProviderFact` per declared resource (14 URNs: 12 manifest
+    objects, the generated Secret, the ClickHouse schema), `changed` or `noop` by digest. It
+    prunes owned-but-undeclared resources and copies the log to object storage.
+  - `plan` and `drift` work from state, with five drift classes.
+  - `destroy` deletes what the state owns and records `delete` facts.
+  - New `state` action.
+  - `state_phase: control-plane` is refused with the list of missing pieces.
+  - The namespace digest annotation from round 1 is removed: the fact log is the one state.
+- **CI:** `validate.py` `iap-state` extracts the fold from the playbook and checks it against
+  9 `fold_facts` cases. A mutation (counting `planned` as owned) fails the check. `iap-shell`
+  now reports YAML errors instead of crashing; it caught unquoted `desc:` values containing `: `.
+- **Verified offline:**
+  - The lib functions (`fact`, `kref`, fold, URN) were run. Facts match `ProviderFact` field
+    for field.
+  - `declared()` ran via a client-side dry-run (read-only discovery against kind). It lists
+    14 resources.
+- **Boundary:**
+  - Vector captures only namespaces labelled `noetl.io/log-analytics=capture`.
+  - The core bootstrap's ClickHouse deploy is now opt-in (`deploy_clickhouse: false`).
+- **Decisions:** `docs/decisions/` ADR-0001 … ADR-0006, linked from the spec, the READMEs and
+  the ops wiki.
+
+**Still pending:**
+- the Feather encoding of Phase 0 (CLI R-1.4)
+- the Phase 1 handoff (event-log import path, `provider: kubernetes`, KV HTTP surface,
+  ehgraph writer)
+- kind validation: the cluster is still busy

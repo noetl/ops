@@ -2,7 +2,9 @@
 # For the NoETL-provisioned log-analytics stack (ClickHouse community + Vector + MCP, with
 # real readiness gates, drift detection and teardown) use
 # automation/iap/kind/log_analytics.yaml; spec docs/specs/noetl-iac-log-analytics.md.
-# The two share NodePort 30123 and are mutually exclusive.
+# The two share NodePort 30123 and are mutually exclusive. ClickHouse is a business-data
+# store, not a NoETL core component (docs/decisions/ADR-0004); bootstrap deploys this only
+# with deploy_clickhouse=true.
 apiVersion: noetl.io/v2
 kind: Playbook
 metadata:

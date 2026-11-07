@@ -41,7 +41,7 @@ executor:
   version: noetl-runtime/1
 
 workload:
-  action: help              # plan | apply | verify | drift | status | destroy | help
+  action: help              # plan | apply | verify | drift | state | status | destroy | help
   context: kind-noetl       # kube context; must start with kind- (local only, enforced)
   namespace: log-analytics
   manifests: ci/manifests/log-analytics
@@ -58,6 +58,15 @@ workload:
   clickhouse_url: "http://127.0.0.1:30123"    # kind hostPort -> NodePort 30123
   mcp_url: "http://127.0.0.1:30124"           # kind hostPort -> NodePort 30124
   run_dir: .noetl/log-analytics
+  # IaC state (docs/decisions/ADR-0002, ADR-0003). Phase 0 "bootstrap": an append-only log of
+  # provider_fact records (the noetl-tools ProviderFact schema, the same fold as `noetl provider`),
+  # on the local filesystem, copied to object storage after every write. Phase 1 "control-plane":
+  # the same facts on the EHDB event log (+ KV/projection/ehgraph); not wired for this stack yet.
+  stack: log-analytics
+  state_phase: bootstrap
+  state_file: .noetl/iac/log-analytics/facts.jsonl
+  state_backup: ""          # gs://bucket/path/facts.jsonl or s3://...; empty = local only
+  prune: "true"             # apply deletes resources the state owns that are no longer declared
 
 workflow:
   - step: start
@@ -72,9 +81,10 @@ workflow:
           printf '# kind log-analytics: action=%s context=%s at %s\n' \
             '{{ workload.action }}' '{{ workload.context }}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$LOG"
           ln -sf "$(basename "$LOG")" "$D/latest.log"
-          printf '{"run_log":"%s"}' "$LOG"
+          printf '{"run_log":"%s","run_id":%s%03d}' "$LOG" "$(date +%s)" $(( $$ % 1000 ))
     vars:
       run_log: "{{ result.run_log }}"
+      run_id: "{{ result.run_id }}"
     next:
       spec: { mode: exclusive }
       arcs:
@@ -100,8 +110,8 @@ workflow:
             *) say "REFUSED: context '$CTX' is not a kind cluster; this stack is local-kind only"; exit 2 ;;
           esac
           case "$ACTION" in
-            plan|apply|verify|drift|status|destroy) ;;
-            *) say "REFUSED: unknown action '$ACTION' (plan|apply|verify|drift|status|destroy|help)"; exit 2 ;;
+            plan|apply|verify|drift|state|status|destroy) ;;
+            *) say "REFUSED: unknown action '$ACTION' (plan|apply|verify|drift|state|status|destroy|help)"; exit 2 ;;
           esac
           K="kubectl --context $CTX"
           if ! $K get --raw /readyz >/dev/null; then
@@ -131,6 +141,95 @@ workflow:
           say "preflight ok: context=$CTX namespace=$NS action=$ACTION"
     next:
       spec: { mode: exclusive }
+      arcs: [ { step: state_load } ]
+
+  - step: state_load
+    desc: Load IaC state (Phase 0 provider_fact log, restore from object store if missing) and fold it
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
+          # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
+          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
+          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
+          # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
+          FOLD=$(cat <<'JQ'
+          reduce .[] as $f ({owned: {}, tombstoned: {}};
+            if (($f.verb == "ensure" and ($f.outcome == "changed" or $f.outcome == "noop"))
+                or ($f.verb == "adopt" and $f.outcome == "adopted")) then
+              .tombstoned |= del(.[$f.urn])
+              | .owned[$f.urn] = {urn: $f.urn, stack: $f.stack, provider: $f.provider, service: $f.service,
+                                  resource_type: $f.resource_type, last_desired: $f.desired,
+                                  last_execution_id: $f.execution_id}
+            elif ($f.verb == "delete" and ($f.outcome == "deleted" or $f.outcome == "absent")) then
+              .tombstoned[$f.urn] = (.owned[$f.urn] // {urn: $f.urn, stack: $f.stack, resource_type: $f.resource_type,
+                                                       last_desired: null, last_execution_id: $f.execution_id})
+              | .owned |= del(.[$f.urn])
+            else . end)
+          | .owned |= with_entries(select(.value.stack == $stack))
+          JQ
+          )
+          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # urn of a live/declared k8s object (JSON on stdin)
+          URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
+            | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
+          # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
+          declared() {
+            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+              d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
+              printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
+                | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
+                   resource_type: .kind, desired: {apiVersion, kind, namespace: (.metadata.namespace // \"\"), name: .metadata.name, digest: \$d}}"
+            done
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" '{urn: "k8s://\($ctx)/\($ns)/core/Secret/log-analytics-credentials",
+              provider: "kubernetes", service: "core", resource_type: "Secret",
+              desired: {apiVersion: "v1", kind: "Secret", namespace: $ns, name: "log-analytics-credentials", digest: "generated"}}'
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" --arg d "$(shasum -a 256 < "$M/schema/logs.sql" | cut -c1-16)" \
+              '{urn: "clickhouse://\($ctx)/\($ns)/clickhouse-0/schema/logs", provider: "clickhouse", service: "schema",
+                resource_type: "ClickHouseSchema", desired: {file: "schema/logs.sql", digest: $d}}'
+          }
+          # One provider_fact (the noetl-tools ProviderFact schema) from a declared/owned record.
+          fact() {  # <json> <verb> <outcome>
+            printf '%s' "$1" | jq -c --arg v "$2" --arg o "$3" --arg s "$STACK" --argjson e "$RUN" \
+              '{urn, provider, service, resource_type, verb: $v, stack: $s,
+                desired: (if $v == "delete" then {} else (.desired // .last_desired) end), execution_id: $e, outcome: $o}'
+          }
+          kref() {  # kubectl ref for an owned/declared k8s record: "<kind>.<group>/<name> -n <ns>"
+            printf '%s' "$1" | jq -r '(.desired // .last_desired) as $d | ($d.kind | ascii_downcase) as $k
+              | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
+                + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
+          }
+          backup() {  # object-store copy of the state log after every write
+            [ -n "$BK" ] || return 0
+            case "$BK" in
+              gs://*) gsutil -q cp "$SF" "$BK" ;;
+              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              *) false ;;
+            esac || say "WARN: state backup to $BK failed (local state is intact)"
+          }
+          case '{{ workload.state_phase }}' in
+            bootstrap) ;;
+            control-plane)
+              say "REFUSED: state_phase=control-plane (Phase 1: EHDB event log + KV + projections + ehgraph) is not wired for this"
+              say "        stack yet. It needs the playbook to run on the distributed runtime, where provider facts ride step"
+              say "        results onto the EHDB event log (read back via /api/ehdb/tiers/eventlog). See docs/decisions/ADR-0002."
+              exit 13 ;;
+            *) say "REFUSED: unknown state_phase '{{ workload.state_phase }}' (bootstrap | control-plane)"; exit 13 ;;
+          esac
+          if [ ! -s "$SF" ] && [ -n "$BK" ]; then
+            case "$BK" in gs://*) gsutil -q cp "$BK" "$SF" ;; s3://*) aws s3 cp --only-show-errors "$BK" "$SF" ;; esac \
+              && say "state restored from backup $BK" || say "no backup at $BK yet (fresh state)"
+          fi
+          m=$(fold)
+          say "state: phase=bootstrap log=$SF facts=$(wc -l < "$SF" | tr -d ' ') owned=$(printf '%s' "$m" | jq '.owned | length') tombstoned=$(printf '%s' "$m" | jq '.tombstoned | length')${BK:+ backup=$BK}"
+    next:
+      spec: { mode: exclusive }
       arcs:
         - step: plan
           when: "{{ workload.action == 'plan' }}"
@@ -142,12 +241,14 @@ workflow:
           when: "{{ workload.action == 'drift' }}"
         - step: status
           when: "{{ workload.action == 'status' }}"
+        - step: show_state
+          when: "{{ workload.action == 'state' }}"
         - step: destroy_gate
           when: "{{ workload.action == 'destroy' }}"
 
   # --------------------------------------------------------------------- plan
   - step: plan
-    desc: Server-side dry-run diff of desired vs live (terraform plan)
+    desc: "Plan from state: declared vs owned (provider_fact fold) plus the live server-side diff (terraform plan)"
     tool:
       kind: shell
       cmds:
@@ -155,23 +256,87 @@ workflow:
           set -eu
           LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
           say() { printf '%s\n' "$*" | tee -a "$LOG"; }
-          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
-          if ! $K get ns "$NS" >/dev/null 2>&1; then
-            say "plan: namespace $NS does not exist; apply will CREATE:"
-            $K apply --dry-run=client -o name -f "$M" | sed 's/^/  + /' | tee -a "$LOG"
-            say "  + secret/log-analytics-credentials (generated, never committed)"
-            say "  + schema: database logs, tables logs.events, logs.events_per_minute (+ MV)"
-            exit 0
+          CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
+          # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
+          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
+          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
+          # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
+          FOLD=$(cat <<'JQ'
+          reduce .[] as $f ({owned: {}, tombstoned: {}};
+            if (($f.verb == "ensure" and ($f.outcome == "changed" or $f.outcome == "noop"))
+                or ($f.verb == "adopt" and $f.outcome == "adopted")) then
+              .tombstoned |= del(.[$f.urn])
+              | .owned[$f.urn] = {urn: $f.urn, stack: $f.stack, provider: $f.provider, service: $f.service,
+                                  resource_type: $f.resource_type, last_desired: $f.desired,
+                                  last_execution_id: $f.execution_id}
+            elif ($f.verb == "delete" and ($f.outcome == "deleted" or $f.outcome == "absent")) then
+              .tombstoned[$f.urn] = (.owned[$f.urn] // {urn: $f.urn, stack: $f.stack, resource_type: $f.resource_type,
+                                                       last_desired: null, last_execution_id: $f.execution_id})
+              | .owned |= del(.[$f.urn])
+            else . end)
+          | .owned |= with_entries(select(.value.stack == $stack))
+          JQ
+          )
+          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # urn of a live/declared k8s object (JSON on stdin)
+          URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
+            | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
+          # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
+          declared() {
+            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+              d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
+              printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
+                | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
+                   resource_type: .kind, desired: {apiVersion, kind, namespace: (.metadata.namespace // \"\"), name: .metadata.name, digest: \$d}}"
+            done
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" '{urn: "k8s://\($ctx)/\($ns)/core/Secret/log-analytics-credentials",
+              provider: "kubernetes", service: "core", resource_type: "Secret",
+              desired: {apiVersion: "v1", kind: "Secret", namespace: $ns, name: "log-analytics-credentials", digest: "generated"}}'
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" --arg d "$(shasum -a 256 < "$M/schema/logs.sql" | cut -c1-16)" \
+              '{urn: "clickhouse://\($ctx)/\($ns)/clickhouse-0/schema/logs", provider: "clickhouse", service: "schema",
+                resource_type: "ClickHouseSchema", desired: {file: "schema/logs.sql", digest: $d}}'
+          }
+          # One provider_fact (the noetl-tools ProviderFact schema) from a declared/owned record.
+          fact() {  # <json> <verb> <outcome>
+            printf '%s' "$1" | jq -c --arg v "$2" --arg o "$3" --arg s "$STACK" --argjson e "$RUN" \
+              '{urn, provider, service, resource_type, verb: $v, stack: $s,
+                desired: (if $v == "delete" then {} else (.desired // .last_desired) end), execution_id: $e, outcome: $o}'
+          }
+          kref() {  # kubectl ref for an owned/declared k8s record: "<kind>.<group>/<name> -n <ns>"
+            printf '%s' "$1" | jq -r '(.desired // .last_desired) as $d | ($d.kind | ascii_downcase) as $k
+              | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
+                + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
+          }
+          backup() {  # object-store copy of the state log after every write
+            [ -n "$BK" ] || return 0
+            case "$BK" in
+              gs://*) gsutil -q cp "$SF" "$BK" ;;
+              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              *) false ;;
+            esac || say "WARN: state backup to $BK failed (local state is intact)"
+          }
+          m=$(fold); decl=$(declared)
+          say "plan (state: $(printf '%s' "$m" | jq '.owned | length') owned resources)"
+          printf '%s\n' "$decl" | while IFS= read -r o; do
+            u=$(printf '%s' "$o" | jq -r .urn); d=$(printf '%s' "$o" | jq -r .desired.digest)
+            last=$(printf '%s' "$m" | jq -r --arg u "$u" '.owned[$u].last_desired.digest // ""')
+            if [ -z "$last" ]; then say "  + $u"; elif [ "$last" != "$d" ]; then say "  ~ $u"; fi
+          done
+          printf '%s' "$m" | jq -r '.owned | keys[]' | while IFS= read -r u; do
+            printf '%s\n' "$decl" | jq -e --arg u "$u" 'select(.urn == $u)' >/dev/null \
+              || say "  - $u (no longer declared; apply prunes it when prune=true)"
+          done
+          if $K get ns "$NS" >/dev/null 2>&1; then
+            rc=0; out=$($K diff --server-side --field-manager='{{ workload.field_manager }}' -f "$M") || rc=$?
+            case $rc in
+              0) say "live: objects match the manifests" ;;
+              1) say "live: kubectl diff shows field changes (details in the run log)"; printf '%s\n' "$out" >>"$LOG" ;;
+              *) say "FAILED: kubectl diff exited $rc"; exit $rc ;;
+            esac
           fi
-          rc=0; out=$($K diff --server-side --field-manager='{{ workload.field_manager }}' -f "$M") || rc=$?
-          case $rc in
-            0) say "plan: no changes. Live state matches ci/manifests/log-analytics." ;;
-            1) say "plan: apply would CHANGE:"; printf '%s\n' "$out" | tee -a "$LOG" >/dev/null
-               printf '%s\n' "$out" | grep -E '^(\+\+\+|---) ' | sed 's/^/  /' ;;
-            *) say "FAILED: kubectl diff exited $rc"; exit $rc ;;
-          esac
-          $K -n "$NS" get secret log-analytics-credentials >/dev/null 2>&1 \
-            || say "  + secret/log-analytics-credentials (generated)"
+          say "(+ create  ~ update  - prune; unlisted = no change)"
     next:
       spec: { mode: exclusive }
       arcs: [ { step: report } ]
@@ -297,7 +462,7 @@ workflow:
       arcs: [ { step: record_state } ]
 
   - step: record_state
-    desc: Record what was applied on the namespace (the state lives in the cluster, not in a state file)
+    desc: "Write state: one provider_fact per declared resource (changed/noop), prune owned-but-undeclared"
     tool:
       kind: shell
       cmds:
@@ -305,22 +470,92 @@ workflow:
           set -eu
           LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
           say() { printf '%s\n' "$*" | tee -a "$LOG"; }
-          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
-          digest=$(cat "$M"/*.yaml "$M"/schema/*.sql | shasum -a 256 | cut -c1-16)
-          rev=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
-          $K annotate ns "$NS" --overwrite --field-manager='{{ workload.field_manager }}-state' \
-            noetl.io/applied-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            noetl.io/applied-by="automation/iap/kind/log_analytics.yaml" \
-            noetl.io/desired-digest="$digest" \
-            noetl.io/git-rev="$rev" >/dev/null
-          say "state recorded on namespace/$NS: desired-digest=$digest git-rev=$rev"
+          CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
+          # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
+          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
+          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
+          # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
+          FOLD=$(cat <<'JQ'
+          reduce .[] as $f ({owned: {}, tombstoned: {}};
+            if (($f.verb == "ensure" and ($f.outcome == "changed" or $f.outcome == "noop"))
+                or ($f.verb == "adopt" and $f.outcome == "adopted")) then
+              .tombstoned |= del(.[$f.urn])
+              | .owned[$f.urn] = {urn: $f.urn, stack: $f.stack, provider: $f.provider, service: $f.service,
+                                  resource_type: $f.resource_type, last_desired: $f.desired,
+                                  last_execution_id: $f.execution_id}
+            elif ($f.verb == "delete" and ($f.outcome == "deleted" or $f.outcome == "absent")) then
+              .tombstoned[$f.urn] = (.owned[$f.urn] // {urn: $f.urn, stack: $f.stack, resource_type: $f.resource_type,
+                                                       last_desired: null, last_execution_id: $f.execution_id})
+              | .owned |= del(.[$f.urn])
+            else . end)
+          | .owned |= with_entries(select(.value.stack == $stack))
+          JQ
+          )
+          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # urn of a live/declared k8s object (JSON on stdin)
+          URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
+            | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
+          # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
+          declared() {
+            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+              d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
+              printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
+                | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
+                   resource_type: .kind, desired: {apiVersion, kind, namespace: (.metadata.namespace // \"\"), name: .metadata.name, digest: \$d}}"
+            done
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" '{urn: "k8s://\($ctx)/\($ns)/core/Secret/log-analytics-credentials",
+              provider: "kubernetes", service: "core", resource_type: "Secret",
+              desired: {apiVersion: "v1", kind: "Secret", namespace: $ns, name: "log-analytics-credentials", digest: "generated"}}'
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" --arg d "$(shasum -a 256 < "$M/schema/logs.sql" | cut -c1-16)" \
+              '{urn: "clickhouse://\($ctx)/\($ns)/clickhouse-0/schema/logs", provider: "clickhouse", service: "schema",
+                resource_type: "ClickHouseSchema", desired: {file: "schema/logs.sql", digest: $d}}'
+          }
+          # One provider_fact (the noetl-tools ProviderFact schema) from a declared/owned record.
+          fact() {  # <json> <verb> <outcome>
+            printf '%s' "$1" | jq -c --arg v "$2" --arg o "$3" --arg s "$STACK" --argjson e "$RUN" \
+              '{urn, provider, service, resource_type, verb: $v, stack: $s,
+                desired: (if $v == "delete" then {} else (.desired // .last_desired) end), execution_id: $e, outcome: $o}'
+          }
+          kref() {  # kubectl ref for an owned/declared k8s record: "<kind>.<group>/<name> -n <ns>"
+            printf '%s' "$1" | jq -r '(.desired // .last_desired) as $d | ($d.kind | ascii_downcase) as $k
+              | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
+                + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
+          }
+          backup() {  # object-store copy of the state log after every write
+            [ -n "$BK" ] || return 0
+            case "$BK" in
+              gs://*) gsutil -q cp "$SF" "$BK" ;;
+              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              *) false ;;
+            esac || say "WARN: state backup to $BK failed (local state is intact)"
+          }
+          m=$(fold); decl=$(declared); new=$(mktemp); ch=0; no=0
+          printf '%s\n' "$decl" > "$new.decl"
+          while IFS= read -r o; do
+            u=$(printf '%s' "$o" | jq -r .urn); d=$(printf '%s' "$o" | jq -r .desired.digest)
+            last=$(printf '%s' "$m" | jq -r --arg u "$u" '.owned[$u].last_desired.digest // ""')
+            if [ "$last" = "$d" ]; then fact "$o" ensure noop >> "$new"; no=$((no+1))
+            else fact "$o" ensure changed >> "$new"; ch=$((ch+1)); fi
+          done < "$new.decl"
+          pruned=0
+          for u in $(printf '%s' "$m" | jq -r '.owned | keys[]'); do
+            jq -e --arg u "$u" 'select(.urn == $u)' "$new.decl" >/dev/null && continue
+            r=$(printf '%s' "$m" | jq -c --arg u "$u" '.owned[$u]')
+            if [ '{{ workload.prune }}' != "true" ]; then say "orphan kept (prune=false): $u"; continue; fi
+            case "$u" in
+              k8s://*) $K delete $(kref "$r") --ignore-not-found --wait=true --timeout='{{ workload.timeout }}' | tee -a "$LOG"
+                       fact "$r" delete deleted >> "$new"; pruned=$((pruned+1)); say "pruned $u" ;;
+              *) say "orphan kept (data-plane resources are never auto-dropped): $u" ;;
+            esac
+          done
+          cat "$new" >> "$SF"; rm -f "$new" "$new.decl"; backup
+          say "state written: $ch changed, $no unchanged, $pruned pruned -> $SF (execution_id $RUN)"
     next:
       spec: { mode: exclusive }
       arcs: [ { step: publish_credentials } ]
 
-  # Outputs (terraform output / Crossplane connection secret): hand the ingest
-  # password and the MCP token to the local noetl credential store, so playbooks
-  # reference them by alias (`credential: clickhouse_logs_ingest`) and never see values.
   - step: publish_credentials
     desc: Store the ingest password and MCP token as noetl credentials (stdin, never printed)
     tool:
@@ -500,7 +735,7 @@ workflow:
 
   # -------------------------------------------------------------------- drift
   - step: drift
-    desc: Detect unapplied config, live drift, ownership conflicts and orphans (Crossplane reconcile, report mode)
+    desc: "Drift from state: declared vs state, state vs live (missing, fields, conflicts), untracked, orphans"
     tool:
       kind: shell
       cmds:
@@ -508,29 +743,100 @@ workflow:
           set -eu
           LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
           say() { printf '%s\n' "$*" | tee -a "$LOG"; }
-          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
-          SEL="noetl.io/stack=log-analytics"; drift=0
-          if ! $K get ns "$NS" >/dev/null 2>&1; then say "DRIFT: namespace $NS is missing (stack not applied or deleted out of band)"; drift=1
-          else
-            want=$(cat "$M"/*.yaml "$M"/schema/*.sql | shasum -a 256 | cut -c1-16)
-            have=$($K get ns "$NS" -o json | jq -r '.metadata.annotations["noetl.io/desired-digest"] // "none"')
-            if [ "$want" != "$have" ]; then say "DRIFT: repo desired-digest $want != last applied $have (unapplied changes in git)"; drift=1
-            else say "ok  repo matches last apply (desired-digest $have)"; fi
+          CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
+          # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
+          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
+          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
+          # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
+          FOLD=$(cat <<'JQ'
+          reduce .[] as $f ({owned: {}, tombstoned: {}};
+            if (($f.verb == "ensure" and ($f.outcome == "changed" or $f.outcome == "noop"))
+                or ($f.verb == "adopt" and $f.outcome == "adopted")) then
+              .tombstoned |= del(.[$f.urn])
+              | .owned[$f.urn] = {urn: $f.urn, stack: $f.stack, provider: $f.provider, service: $f.service,
+                                  resource_type: $f.resource_type, last_desired: $f.desired,
+                                  last_execution_id: $f.execution_id}
+            elif ($f.verb == "delete" and ($f.outcome == "deleted" or $f.outcome == "absent")) then
+              .tombstoned[$f.urn] = (.owned[$f.urn] // {urn: $f.urn, stack: $f.stack, resource_type: $f.resource_type,
+                                                       last_desired: null, last_execution_id: $f.execution_id})
+              | .owned |= del(.[$f.urn])
+            else . end)
+          | .owned |= with_entries(select(.value.stack == $stack))
+          JQ
+          )
+          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # urn of a live/declared k8s object (JSON on stdin)
+          URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
+            | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
+          # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
+          declared() {
+            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+              d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
+              printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
+                | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
+                   resource_type: .kind, desired: {apiVersion, kind, namespace: (.metadata.namespace // \"\"), name: .metadata.name, digest: \$d}}"
+            done
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" '{urn: "k8s://\($ctx)/\($ns)/core/Secret/log-analytics-credentials",
+              provider: "kubernetes", service: "core", resource_type: "Secret",
+              desired: {apiVersion: "v1", kind: "Secret", namespace: $ns, name: "log-analytics-credentials", digest: "generated"}}'
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" --arg d "$(shasum -a 256 < "$M/schema/logs.sql" | cut -c1-16)" \
+              '{urn: "clickhouse://\($ctx)/\($ns)/clickhouse-0/schema/logs", provider: "clickhouse", service: "schema",
+                resource_type: "ClickHouseSchema", desired: {file: "schema/logs.sql", digest: $d}}'
+          }
+          # One provider_fact (the noetl-tools ProviderFact schema) from a declared/owned record.
+          fact() {  # <json> <verb> <outcome>
+            printf '%s' "$1" | jq -c --arg v "$2" --arg o "$3" --arg s "$STACK" --argjson e "$RUN" \
+              '{urn, provider, service, resource_type, verb: $v, stack: $s,
+                desired: (if $v == "delete" then {} else (.desired // .last_desired) end), execution_id: $e, outcome: $o}'
+          }
+          kref() {  # kubectl ref for an owned/declared k8s record: "<kind>.<group>/<name> -n <ns>"
+            printf '%s' "$1" | jq -r '(.desired // .last_desired) as $d | ($d.kind | ascii_downcase) as $k
+              | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
+                + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
+          }
+          backup() {  # object-store copy of the state log after every write
+            [ -n "$BK" ] || return 0
+            case "$BK" in
+              gs://*) gsutil -q cp "$SF" "$BK" ;;
+              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              *) false ;;
+            esac || say "WARN: state backup to $BK failed (local state is intact)"
+          }
+          m=$(fold); decl=$(declared); drift=0
+          # 1. desired (git) vs state: unapplied changes
+          printf '%s\n' "$decl" | while IFS= read -r o; do
+            u=$(printf '%s' "$o" | jq -r .urn); d=$(printf '%s' "$o" | jq -r .desired.digest)
+            last=$(printf '%s' "$m" | jq -r --arg u "$u" '.owned[$u].last_desired.digest // ""')
+            [ "$last" = "$d" ] || say "DRIFT unapplied: $u (declared ${d}, state ${last:-absent})"
+          done | tee "$LOG.d1" >/dev/null
+          [ -s "$LOG.d1" ] && { cat "$LOG.d1"; drift=1; } || say "ok  declared = state (no unapplied changes)"
+          # 2. state vs live: owned resources deleted out of band
+          for u in $(printf '%s' "$m" | jq -r '.owned | keys[] | select(startswith("k8s://"))'); do
+            r=$(printf '%s' "$m" | jq -c --arg u "$u" '.owned[$u]')
+            $K get $(kref "$r") >/dev/null 2>&1 || { say "DRIFT missing: $u is in state but not in the cluster"; drift=1; }
+          done
+          # 3. live field drift on owned objects (server-side diff as field manager)
+          if $K get ns "$NS" >/dev/null 2>&1; then
             rc=0; out=$($K diff --server-side --field-manager='{{ workload.field_manager }}' -f "$M") || rc=$?
             case $rc in
-              0) say "ok  live objects match desired state" ;;
-              1) say "DRIFT: live objects differ from desired state:"; printf '%s\n' "$out" >>"$LOG"
-                 printf '%s\n' "$out" | grep -E '^\+\+\+ ' | sed 's/^+++ [^ ]*\/\([^/ ]*\).*/  ~ \1/' | sort -u | tee -a "$LOG"; drift=1 ;;
-              *) say "DRIFT: diff failed (exit $rc); often an ownership conflict: a field we own was changed by another manager. apply with --set reconcile=enforce takes it back."; drift=1 ;;
+              0) say "ok  live fields match desired" ;;
+              1) say "DRIFT fields: live objects differ from desired (diff in the run log)"; printf '%s\n' "$out" >>"$LOG"; drift=1 ;;
+              *) say "DRIFT conflict: diff failed (exit $rc); a field we own was changed by another manager. apply --set reconcile=enforce takes it back."; drift=1 ;;
             esac
-            desired=$($K apply --server-side --dry-run=server --field-manager='{{ workload.field_manager }}' -f "$M" -o name 2>/dev/null | sort -u)
-            live=$( { $K get -n "$NS" configmap,service,serviceaccount,statefulset,daemonset,deployment -l "$SEL" -o name;
-                      $K get namespace,clusterrole,clusterrolebinding -l "$SEL" -o name; } | sort -u)
-            orphans=$(comm -13 <(printf '%s\n' "$desired") <(printf '%s\n' "$live") || true)
-            if [ -n "$orphans" ]; then say "DRIFT: labelled objects not in the desired state (orphans; destroy or delete them):"; printf '%s\n' "$orphans" | sed 's/^/  - /' | tee -a "$LOG"; drift=1
-            else say "ok  no orphaned stack objects"; fi
-            $K -n "$NS" get secret log-analytics-credentials >/dev/null 2>&1 || { say "DRIFT: credentials secret missing"; drift=1; }
           fi
+          # 4. untracked: objects carrying our labels that the state does not own
+          live=$( { $K get -n "$NS" configmap,service,serviceaccount,statefulset,daemonset,deployment,secret -l "$SEL" -o json 2>/dev/null || echo '{"items":[]}';
+                    $K get namespace,clusterrole,clusterrolebinding -l "$SEL" -o json; } | jq -r --arg ctx "$CTX" ".items[] | $URNJQ")
+          for u in $live; do
+            printf '%s' "$m" | jq -e --arg u "$u" '.owned | has($u)' >/dev/null || { say "DRIFT untracked: $u is labelled but not in state (import or delete it)"; drift=1; }
+          done
+          # 5. orphans in state: owned but no longer declared
+          for u in $(printf '%s' "$m" | jq -r '.owned | keys[]'); do
+            printf '%s\n' "$decl" | jq -e --arg u "$u" 'select(.urn == $u)' >/dev/null || { say "DRIFT orphan: $u is owned but no longer declared (apply prunes it)"; drift=1; }
+          done
+          rm -f "$LOG.d1"
           if [ $drift -eq 0 ]; then say "NO DRIFT"; else say "DRIFT DETECTED (fix: action=apply)"; fi
           [ $drift -eq 0 ] || [ '{{ workload.fail_on_drift }}' != "true" ] || exit 10
     next:
@@ -564,9 +870,90 @@ workflow:
             WHERE ts > now() - INTERVAL 1 DAY GROUP BY source ORDER BY source FORMAT PrettyCompactMonoBlock" | tee -a "$LOG" || true
           $K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q "
             SELECT 'on disk: ' || formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE database = 'logs' AND active" | tee -a "$LOG" || true
+          say "== IaC state (Phase 0 provider_fact log)"
+          SF='{{ workload.state_file }}'
+          if [ -s "$SF" ]; then say "  log $SF: $(wc -l < "$SF" | tr -d ' ') facts; action=state lists what it owns"; else say "  no state yet ($SF)"; fi
           say "== endpoints"
           say "  ClickHouse HTTP  {{ workload.clickhouse_url }}  (users: ingest via credential {{ workload.ingest_credential }}, admin in secret)"
           say "  ClickHouse MCP   {{ workload.mcp_url }}/mcp  (bearer: credential {{ workload.mcp_credential }})"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: report } ]
+
+  - step: show_state
+    desc: List what the state owns (terraform state list)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
+          # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
+          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
+          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
+          # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
+          FOLD=$(cat <<'JQ'
+          reduce .[] as $f ({owned: {}, tombstoned: {}};
+            if (($f.verb == "ensure" and ($f.outcome == "changed" or $f.outcome == "noop"))
+                or ($f.verb == "adopt" and $f.outcome == "adopted")) then
+              .tombstoned |= del(.[$f.urn])
+              | .owned[$f.urn] = {urn: $f.urn, stack: $f.stack, provider: $f.provider, service: $f.service,
+                                  resource_type: $f.resource_type, last_desired: $f.desired,
+                                  last_execution_id: $f.execution_id}
+            elif ($f.verb == "delete" and ($f.outcome == "deleted" or $f.outcome == "absent")) then
+              .tombstoned[$f.urn] = (.owned[$f.urn] // {urn: $f.urn, stack: $f.stack, resource_type: $f.resource_type,
+                                                       last_desired: null, last_execution_id: $f.execution_id})
+              | .owned |= del(.[$f.urn])
+            else . end)
+          | .owned |= with_entries(select(.value.stack == $stack))
+          JQ
+          )
+          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # urn of a live/declared k8s object (JSON on stdin)
+          URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
+            | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
+          # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
+          declared() {
+            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+              d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
+              printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
+                | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
+                   resource_type: .kind, desired: {apiVersion, kind, namespace: (.metadata.namespace // \"\"), name: .metadata.name, digest: \$d}}"
+            done
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" '{urn: "k8s://\($ctx)/\($ns)/core/Secret/log-analytics-credentials",
+              provider: "kubernetes", service: "core", resource_type: "Secret",
+              desired: {apiVersion: "v1", kind: "Secret", namespace: $ns, name: "log-analytics-credentials", digest: "generated"}}'
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" --arg d "$(shasum -a 256 < "$M/schema/logs.sql" | cut -c1-16)" \
+              '{urn: "clickhouse://\($ctx)/\($ns)/clickhouse-0/schema/logs", provider: "clickhouse", service: "schema",
+                resource_type: "ClickHouseSchema", desired: {file: "schema/logs.sql", digest: $d}}'
+          }
+          # One provider_fact (the noetl-tools ProviderFact schema) from a declared/owned record.
+          fact() {  # <json> <verb> <outcome>
+            printf '%s' "$1" | jq -c --arg v "$2" --arg o "$3" --arg s "$STACK" --argjson e "$RUN" \
+              '{urn, provider, service, resource_type, verb: $v, stack: $s,
+                desired: (if $v == "delete" then {} else (.desired // .last_desired) end), execution_id: $e, outcome: $o}'
+          }
+          kref() {  # kubectl ref for an owned/declared k8s record: "<kind>.<group>/<name> -n <ns>"
+            printf '%s' "$1" | jq -r '(.desired // .last_desired) as $d | ($d.kind | ascii_downcase) as $k
+              | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
+                + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
+          }
+          backup() {  # object-store copy of the state log after every write
+            [ -n "$BK" ] || return 0
+            case "$BK" in
+              gs://*) gsutil -q cp "$SF" "$BK" ;;
+              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              *) false ;;
+            esac || say "WARN: state backup to $BK failed (local state is intact)"
+          }
+          m=$(fold)
+          say "IaC state for stack $STACK (Phase 0 bootstrap log $SF, $(wc -l < "$SF" | tr -d ' ') facts)"
+          printf '%s' "$m" | jq -r '.owned[] | "  \(.resource_type)\t\(.urn)\tdigest=\(.last_desired.digest)\texec=\(.last_execution_id)"' | tee -a "$LOG"
+          n=$(printf '%s' "$m" | jq '.tombstoned | length'); [ "$n" = "0" ] || say "  ($n tombstoned)"
     next:
       spec: { mode: exclusive }
       arcs: [ { step: report } ]
@@ -590,7 +977,7 @@ workflow:
       arcs: [ { step: destroy } ]
 
   - step: destroy
-    desc: Delete in reverse dependency order and wait until every labelled object, PVC and PV is gone
+    desc: Delete what the state owns, in reverse dependency order; record a delete fact per resource; wait until no PV remains
     tool:
       kind: shell
       cmds:
@@ -598,23 +985,94 @@ workflow:
           set -eu
           LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
           say() { printf '%s\n' "$*" | tee -a "$LOG"; }
-          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; SEL="noetl.io/stack=log-analytics"
-          if $K get ns "$NS" >/dev/null 2>&1; then
-            $K -n "$NS" delete deploy,ds -l "$SEL" --wait=true --timeout='{{ workload.timeout }}' | tee -a "$LOG"
-            $K -n "$NS" delete sts -l "$SEL" --wait=true --timeout='{{ workload.timeout }}' | tee -a "$LOG"
-            $K delete ns "$NS" --wait=true --timeout='{{ workload.timeout }}' | tee -a "$LOG"
-          else
-            say "namespace $NS already absent"
-          fi
-          $K delete clusterrolebinding,clusterrole -l "$SEL" --ignore-not-found | tee -a "$LOG"
+          CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
+          # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
+          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
+          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
+          # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
+          FOLD=$(cat <<'JQ'
+          reduce .[] as $f ({owned: {}, tombstoned: {}};
+            if (($f.verb == "ensure" and ($f.outcome == "changed" or $f.outcome == "noop"))
+                or ($f.verb == "adopt" and $f.outcome == "adopted")) then
+              .tombstoned |= del(.[$f.urn])
+              | .owned[$f.urn] = {urn: $f.urn, stack: $f.stack, provider: $f.provider, service: $f.service,
+                                  resource_type: $f.resource_type, last_desired: $f.desired,
+                                  last_execution_id: $f.execution_id}
+            elif ($f.verb == "delete" and ($f.outcome == "deleted" or $f.outcome == "absent")) then
+              .tombstoned[$f.urn] = (.owned[$f.urn] // {urn: $f.urn, stack: $f.stack, resource_type: $f.resource_type,
+                                                       last_desired: null, last_execution_id: $f.execution_id})
+              | .owned |= del(.[$f.urn])
+            else . end)
+          | .owned |= with_entries(select(.value.stack == $stack))
+          JQ
+          )
+          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # urn of a live/declared k8s object (JSON on stdin)
+          URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
+            | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
+          # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
+          declared() {
+            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+              d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
+              printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
+                | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
+                   resource_type: .kind, desired: {apiVersion, kind, namespace: (.metadata.namespace // \"\"), name: .metadata.name, digest: \$d}}"
+            done
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" '{urn: "k8s://\($ctx)/\($ns)/core/Secret/log-analytics-credentials",
+              provider: "kubernetes", service: "core", resource_type: "Secret",
+              desired: {apiVersion: "v1", kind: "Secret", namespace: $ns, name: "log-analytics-credentials", digest: "generated"}}'
+            jq -nc --arg ctx "$CTX" --arg ns "$NS" --arg d "$(shasum -a 256 < "$M/schema/logs.sql" | cut -c1-16)" \
+              '{urn: "clickhouse://\($ctx)/\($ns)/clickhouse-0/schema/logs", provider: "clickhouse", service: "schema",
+                resource_type: "ClickHouseSchema", desired: {file: "schema/logs.sql", digest: $d}}'
+          }
+          # One provider_fact (the noetl-tools ProviderFact schema) from a declared/owned record.
+          fact() {  # <json> <verb> <outcome>
+            printf '%s' "$1" | jq -c --arg v "$2" --arg o "$3" --arg s "$STACK" --argjson e "$RUN" \
+              '{urn, provider, service, resource_type, verb: $v, stack: $s,
+                desired: (if $v == "delete" then {} else (.desired // .last_desired) end), execution_id: $e, outcome: $o}'
+          }
+          kref() {  # kubectl ref for an owned/declared k8s record: "<kind>.<group>/<name> -n <ns>"
+            printf '%s' "$1" | jq -r '(.desired // .last_desired) as $d | ($d.kind | ascii_downcase) as $k
+              | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
+                + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
+          }
+          backup() {  # object-store copy of the state log after every write
+            [ -n "$BK" ] || return 0
+            case "$BK" in
+              gs://*) gsutil -q cp "$SF" "$BK" ;;
+              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              *) false ;;
+            esac || say "WARN: state backup to $BK failed (local state is intact)"
+          }
+          m=$(fold)
+          # Reverse dependency order, driven by what the state owns (not by a label sweep).
+          order='{"Deployment":1,"DaemonSet":2,"StatefulSet":3,"Service":4,"ConfigMap":5,"ServiceAccount":6,"ClusterRoleBinding":7,"ClusterRole":8,"Secret":9,"ClickHouseSchema":10,"Namespace":11}'
+          new=$(mktemp)
+          printf '%s' "$m" | jq -c --argjson o "$order" '.owned | to_entries | map(.value) | sort_by($o[.resource_type] // 0)[]' > "$new.own"
+          [ -s "$new.own" ] || say "state owns nothing for stack $STACK"
+          while IFS= read -r r; do
+            u=$(printf '%s' "$r" | jq -r .urn)
+            case "$u" in
+              clickhouse://*) fact "$r" delete deleted >> "$new"; say "deleted $u (dropped with its PVC and namespace)"; continue ;;
+            esac
+            if $K get $(kref "$r") >/dev/null 2>&1; then
+              $K delete $(kref "$r") --wait=true --timeout='{{ workload.timeout }}' | tee -a "$LOG"
+              fact "$r" delete deleted >> "$new"; say "deleted $u"
+            else
+              fact "$r" delete absent >> "$new"; say "absent  $u (already gone)"
+            fi
+          done < "$new.own"
+          cat "$new" >> "$SF"; rm -f "$new" "$new.own"; backup
           i=0
           while [ "$($K get pv -o json | jq --arg ns "$NS" '[.items[] | select(.spec.claimRef.namespace == $ns)] | length')" != "0" ]; do
             i=$((i+1)); [ $i -lt 30 ] || { say "FAILED: PersistentVolumes for $NS still present after 60s"; exit 12; }; sleep 2
           done
           left=$( { $K get namespace,clusterrole,clusterrolebinding -l "$SEL" -o name; } | wc -l | tr -d ' ')
-          [ "$left" = "0" ] || { say "FAILED: $left labelled objects remain"; exit 12; }
-          say "DESTROYED: namespace, workloads, PVC/PV and cluster RBAC removed; nothing labelled $SEL remains."
-          say "(noetl credentials {{ workload.ingest_credential }} / {{ workload.mcp_credential }} are left in the local store; the next apply overwrites them.)"
+          [ "$left" = "0" ] || { say "FAILED: $left labelled objects remain that the state did not own (untracked); see drift"; exit 12; }
+          say "DESTROYED: state now owns $(fold | jq '.owned | length') resources; no labelled object or PV remains."
+          say "(noetl credentials {{ workload.ingest_credential }} / {{ workload.mcp_credential }} stay in the local store; the next apply overwrites them.)"
     next:
       spec: { mode: exclusive }
       arcs: [ { step: report } ]
@@ -637,9 +1095,11 @@ workflow:
             --set action=plan      what apply would change (server-side dry-run diff)
             --set action=apply     converge: namespace, credentials, ClickHouse, schema, Vector, MCP; wait Ready
             --set action=verify    e2e: insert a row via noetl http, read it back, query it through MCP
-            --set action=drift     report unapplied config, live drift, conflicts, orphans (exit 10 on drift)
+            --set action=drift     from state: unapplied changes, missing, field drift/conflicts, untracked, orphans (exit 10)
+            --set action=state     list what the IaC state owns (terraform state list)
             --set action=status    objects, applied state, kubelet log rotation, rows per source
-            --set action=destroy --set confirm=log-analytics   delete everything, wait until gone
+            --set action=destroy --set confirm=log-analytics   delete what the state owns, wait until gone
           Options: context=kind-noetl reconcile=report|enforce max_load=6 noetl_bin=noetl
+                   state_file=.noetl/iac/log-analytics/facts.jsonl state_backup=gs://... prune=true
           Spec: docs/specs/noetl-iac-log-analytics.md
           EOF

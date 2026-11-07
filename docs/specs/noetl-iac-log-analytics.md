@@ -1,22 +1,34 @@
 # Spec: NoETL as the infrastructure provisioner — kind log-analytics stack
 
-**Status:** implemented (round 1). Offline checks pass. Kind validation: see `BUILD_LOG.md`.
+**Status:** implemented: round 1, plus round 2 (two-phase state, business-data boundary). Offline checks pass. Kind validation: see `BUILD_LOG.md`.
 **Date:** 2026-11-07
 **Code:** `automation/iap/kind/log_analytics.yaml` (provisioner), `ci/manifests/log-analytics/`
 (desired state), `ci/kind/config.yaml` (cluster: kubelet log rotation, port maps).
 **Consumers:** shastaranch/qnetmon `playbooks/housekeeping/logs.yaml` (edge log shipping, #13).
+**Decisions:** [docs/decisions/](../decisions/README.md), ADR-0001 … ADR-0006.
 
 ## 1. Goal
 
-There are two goals.
+There are two goals, with one boundary.
 
-1. **Show that NoETL can replace Terraform and Crossplane** for provisioning infrastructure.
-   One NoETL playbook stands up, verifies, drift-checks and tears down a real multi-component
-   stack on the local kind cluster. No Terraform state, no Crossplane controller, no
-   hand-run helm. Every component in §3 is created by the playbook and deleted by it.
-2. **Give the platform an analytical log workspace.** Logs are rotated at every layer and
-   captured into ClickHouse (community edition). They can be queried by SQL and by AI
-   agents through the ClickHouse MCP server.
+1. **Show that NoETL can replace Terraform and Crossplane** for provisioning infrastructure
+   (ADR-0001). One NoETL playbook plans, applies, verifies, drift-checks and tears down a real
+   multi-component stack on the local kind cluster. It **tracks what it provisioned in
+   NoETL's own state model** (ADR-0002, ADR-0003), not in a Terraform state file or a
+   Crossplane CR.
+2. **Stand up a business-data analytical store and feed it.** ClickHouse community edition,
+   with Vector and the ClickHouse MCP server, holds **business and network logs**. The first
+   dataset is qnetmon's network edge logs. They can be queried by SQL and by AI agents over
+   MCP.
+
+**The boundary (ADR-0004, ADR-0005).** ClickHouse is an example business workload that NoETL
+provisions. It is **not** a NoETL core component:
+- Core never depends on it.
+- Core never writes its operational events or state there.
+- It is optional and removable with `action=destroy`.
+
+NoETL core state lives in EHDB. IaC state lives in the two-phase fact log (§4.4). Neither is
+in ClickHouse.
 
 Scope is the local kind cluster only. The playbook refuses any kube context that doesn't
 start with `kind-`.
@@ -26,17 +38,20 @@ start with `kind-`.
 ```
  macOS host                                   kind cluster "noetl" (context kind-noetl)
 ┌────────────────────────────────────────┐   ┌──────────────────────────────────────────────────────┐
-│ noetl run automation/iap/kind/         │   │ namespace log-analytics (labels: noetl.io/stack=…)    │
-│   log_analytics.yaml  ── kubectl ──────┼──▶│                                                      │
-│   (plan/apply/verify/drift/destroy)    │SSA│  Vector DaemonSet ── tails /var/log/pods/* ──┐       │
-│                                        │   │   (kubelet rotates: 10Mi × 5 per container)  │       │
-│ qnetmon edge (launchd, every 5 min)    │   │                                              ▼       │
-│   housekeeping/logs.yaml               │   │  ClickHouse StatefulSet (26.8 LTS, PVC 2Gi)          │
-│   rotate var/runs/* ─▶ ship ── http ───┼──▶│   :8123 ◀─ NodePort 30123 ◀─ hostPort 30123          │
-│                         (ingest user)  │   │   logs.events (TTL 7d), logs.events_per_minute (MV)  │
-│                                        │   │      ▲ mcp_reader (readonly=2)                       │
-│ MCP clients (Claude Code, agents) ─────┼──▶│  ClickHouse MCP Deployment (mcp-clickhouse 0.7.0)    │
-│   bearer token (credential)            │   │   streamable HTTP :8000/mcp ◀─ NodePort 30124        │
+│ noetl run automation/iap/kind/         │   │ NoETL CORE (namespace noetl …) — not touched, never   │
+│   log_analytics.yaml  ── kubectl ──────┼─┐ │ log-captured; its events/state stay in EHDB           │
+│   (plan/apply/verify/drift/state/      │ │ ├──────────────────────────────────────────────────────┤
+│    destroy)                            │ └▶│ BUSINESS: namespace log-analytics                     │
+│      │ IaC state (ADR-0002)            │SSA│  (noetl.io/stack=log-analytics, …/log-analytics=capture)│
+│      ▼ Phase 0: provider_fact log      │   │  Vector DaemonSet ── tails opted-in pods' logs ──┐   │
+│ .noetl/iac/log-analytics/facts.jsonl   │   │   (kubelet rotates: 10Mi × 5 per container)      │   │
+│      └─▶ object store (state_backup)   │   │                                                  ▼   │
+│      (Phase 1 → EHDB log/KV/proj/graph)│   │  ClickHouse StatefulSet (26.8 LTS, PVC 2Gi)          │
+│                                        │   │   :8123 ◀─ NodePort 30123 ◀─ hostPort 30123          │
+│ qnetmon edge (launchd, every 5 min)    │   │   logs.events (TTL 7d), logs.events_per_minute (MV)  │
+│   housekeeping/logs.yaml: rotate ──────┼──▶│      ▲ mcp_reader (readonly=2)                       │
+│   var/runs/* then ship network logs    │   │  ClickHouse MCP Deployment (mcp-clickhouse 0.7.0)    │
+│ MCP clients (agents), bearer token ────┼──▶│   streamable HTTP :8000/mcp ◀─ NodePort 30124        │
 └────────────────────────────────────────┘   └──────────────────────────────────────────────────────┘
 ```
 
@@ -44,13 +59,14 @@ start with `kind-`.
 
 | # | Object(s) | File | Notes |
 |---|---|---|---|
-| 1 | Namespace `log-analytics` | `00-namespace.yaml` | holds the applied-state annotations (§4.4) |
+| 1 | Namespace `log-analytics` | `00-namespace.yaml` | labelled `noetl.io/log-analytics=capture` (business-log opt-in) |
 | 2 | Secret `log-analytics-credentials` | generated by `ensure_credentials` | 4 random values (admin, ingest, reader, MCP token). Created once, never committed, never printed |
 | 3 | ConfigMap `clickhouse-config`, Services `clickhouse` (headless) and `clickhouse-external` (NodePort 30123), StatefulSet `clickhouse` + PVC `data-clickhouse-0` | `10-clickhouse.yaml` | `clickhouse/clickhouse-server:26.8.36.3`, the official community image (Apache-2.0), no operator. Users declared in `users.d` with `from_env` passwords |
 | 4 | Schema: `logs.events`, `logs.events_per_minute`, MV | `schema/logs.sql` | idempotent DDL converged with `clickhouse-client` (§4.3) |
 | 5 | ServiceAccount, ClusterRole/Binding `log-analytics-vector`, ConfigMap `vector-config`, DaemonSet `vector` | `20-vector.yaml` | `timberio/vector:0.60.0-debian`. Disk buffer 256 MiB |
 | 6 | Deployment + Service `clickhouse-mcp` (NodePort 30124) | `30-mcp.yaml` | `ghcr.io/clickhouse/mcp-clickhouse:0.7.0`, streamable HTTP, bearer auth |
 | 7 | NoETL credentials `clickhouse_logs_ingest`, `clickhouse_logs_mcp` | `publish_credentials` | the stack's *outputs*, in the local NoETL credential store |
+| 8 | IaC state: 14 resource URNs in the `provider_fact` log | `state_load`, `record_state` | Phase 0 log `.noetl/iac/log-analytics/facts.jsonl` (+ `state_backup`), §4.4 |
 
 All images are pinned to exact versions.
 
@@ -79,9 +95,10 @@ for plan/apply/verify), and refuses when another namespace already holds NodePor
 `apply` is an ordered chain of steps. Each step is a resource group plus its readiness gate:
 
 ```
-preflight → apply_namespace → ensure_credentials → apply_clickhouse ──(rollout status sts,
-  wait pod Ready, wait PVC Bound)──▶ converge_schema → apply_shippers ──(rollout status ds/vector,
-  deploy/clickhouse-mcp)──▶ record_state → publish_credentials → status → report
+preflight → state_load (fold the fact log) → apply_namespace → ensure_credentials → apply_clickhouse
+  ──(rollout status sts, wait pod Ready, wait PVC Bound)──▶ converge_schema → apply_shippers
+  ──(rollout status ds/vector, deploy/clickhouse-mcp)──▶ record_state (facts + prune)
+  → publish_credentials → status → report
 ```
 
 Each readiness wait is a hard gate with `timeout` (default 300s). There is no `|| true`, so
@@ -97,17 +114,81 @@ no password is needed inside the pod. Every statement is idempotent: `IF NOT EXI
 `ALTER … MODIFY TTL` so that retention converges. Users and grants are not SQL. They live in
 `users.d/users.xml`, so `plan` and `drift` see them as ordinary ConfigMap state.
 
-### 4.4 State without a state file
+### 4.4 State: two-phase, on NoETL's own substrate (ADR-0002, ADR-0003)
 
-| Terraform keeps… | NoETL keeps it in… |
+**What NoETL already uses for state.** The record below was found in the code on 2026-11-07
+and is reused here rather than replaced:
+
+- **`provider_fact`**: `noetl-tools` `src/tools/provider.rs`, `pub mod state`.
+  `ProviderFact {urn, provider, service, resource_type, verb, stack, desired, execution_id, outcome}`
+  is emitted in step results, so it lands on the **EHDB event log**. It is read back from the
+  raw tier `/api/ehdb/tiers/eventlog` and folded by `fold_facts` into
+  `OwnershipModel {owned, tombstoned}`, with `detect_orphans_scoped` and
+  `detect_stack_conflicts`.
+- **`noetl provider`** (`cli/src/provider_cli.rs`) runs the same fold over `--server` (EHDB)
+  or `--facts-file`. `--facts-out` is the "EHDB-less git-backed state sink", an append-only
+  file of facts.
+- **Designed, not shipped:** CLI local-mode **Arrow Feather** buffering (blueprint § H.11:
+  `~/.noetl/local/<execution_id>/events.feather`, `noetl push`,
+  `POST /api/events/batch`), deferred to CLI phase R-1.4. Also older: `noetl iap`'s DuckDB
+  `.noetl/state.duckdb` with `gsutil` sync to GCS.
+
+**Phase 0: bootstrap** (implemented; `state_phase: bootstrap`). This is used before EHDB and
+noetl-server exist, which includes while they are being provisioned.
+- The log lives on the local filesystem at `state_file`
+  (`.noetl/iac/log-analytics/facts.jsonl`, the `--facts-out` format).
+- After every write it is copied to object storage at `state_backup`: `gs://` via `gsutil`
+  (the `noetl iap sync` pattern) or `s3://` via `aws`. `state_load` restores from there if
+  the local log is missing.
+- Each apply appends one fact per declared resource:
+  - Kubernetes objects: `k8s://<ctx>/<ns|_cluster>/<group>/<Kind>/<name>`
+  - the generated Secret
+  - the ClickHouse schema, as a data-plane resource:
+    `clickhouse://<ctx>/<ns>/clickhouse-0/schema/logs`
+  - `desired` = the object's identity plus a digest of the declared object; values are never
+    stored
+  - `outcome` = `changed`, or `noop` when the digest equals the state's
+- Prunes and destroys append `delete` facts (`deleted` / `absent`).
+- The encoding moves to **Feather V2** when R-1.4 ships. The schema and fold don't change;
+  the fact goes in the `result` column of `events.feather`.
+
+**Phase 1: steady state** (designed; `state_phase: control-plane` is refused today). Once
+the core is up, the NoETL control loop owns state:
+- Provisioning runs on the distributed runtime, so facts land on the **EHDB event log** in
+  step results.
+- **Current state** = the fold of `/api/ehdb/tiers/eventlog` (the `noetl provider --server`
+  path). Its projections can be refolded and checked for determinism
+  (`/api/ehdb/projection-refold`, `projection-fold/determinism`).
+- An **EHDB KV** bucket `iac.<stack>` (key = URN) gives a fast current-state view with CAS.
+  That makes it a fenced single writer per stack (`ehdb-reference` `kv.rs`).
+- **ehgraph** holds the topology: resource nodes, DAG-dependency edges and stack-ownership
+  edges.
+- The Phase 0 log is imported once as the genesis segment and stays archived in object
+  storage.
+- What is missing is listed in ADR-0002 "Pending": an event-log import path (R-1.4 batch
+  ingest or a distributed import playbook), worker-side provisioning (`provider: kubernetes`),
+  a KV HTTP surface, and the ehgraph writer.
+
+**Desired, observed, drift (ADR-0003).**
+- *Desired* = the versioned playbook plus its manifests: git today, the NoETL catalog in
+  Phase 1.
+- *Observed* = the fact log plus its fold. The fold has the same rules as `fold_facts`, and
+  CI pins them (`validate.py` `iap-state`).
+- *Drift* (`action=drift`) is computed from the state:
+
+| class | meaning |
 |---|---|
-| resource inventory (`terraform.tfstate` resources) | the ownership labels `noetl.io/stack=log-analytics` + `app.kubernetes.io/managed-by=noetl` on every object. CI enforces them (`ci/checks/validate.py` `iap-labels`) |
-| per-attribute ownership | SSA `managedFields` (manager `noetl-iac`) |
-| "what was last applied" | namespace annotations `noetl.io/desired-digest` (sha256 of manifests + schema), `applied-at`, `applied-by`, `git-rev` |
-| outputs | NoETL credential store aliases (`clickhouse_logs_ingest`, `clickhouse_logs_mcp`) |
+| unapplied | declared ≠ state |
+| missing | in state, gone from the cluster |
+| fields / conflict | live SSA diff |
+| untracked | labelled but not in state |
+| orphan | in state, no longer declared |
 
-The live cluster is the source of truth. There is no state that can disagree with it, and
-nothing to lock, back up or migrate.
+- `apply` prunes orphans (`prune=true`). `destroy` deletes exactly what the state owns.
+
+The Kubernetes side still carries ownership labels and SSA managedFields (`noetl-iac`). They
+are a cross-check (the *untracked* class) and the field-ownership mechanism. They are not
+the state.
 
 ## 5. Terraform / Crossplane mapping
 
@@ -120,14 +201,18 @@ nothing to lock, back up or migrate.
 | Dependency ordering | implicit graph from references + `depends_on` | composition ordering, readiness checks of composed resources | explicit DAG arcs (§4.2). The order is readable in the playbook |
 | Wait for ready | provider-specific `wait_for` / `wait_for_rollout` | `Ready` condition, `readinessChecks` | `rollout status`, `wait --for=condition=Ready`, `wait --for=jsonpath` PVC Bound. Hard timeouts |
 | Data-plane setup (DB schema, users) | a second provider (e.g. ClickHouse provider) or `local-exec` | a separate provider or a Job | `converge_schema` step (idempotent DDL) + users in config |
-| State | `tfstate` (remote backend, locking) | the API server (MRs are the state) | the API server: labels, managedFields and annotations (§4.4) |
-| Drift detection | `plan -detailed-exitcode` / `-refresh-only` | continuous reconcile, `Synced` condition | `action=drift`: (1) repo digest vs last applied, (2) live SSA diff, (3) labelled orphans, (4) missing credentials. Exits 10 on drift |
+| State | one mutable `tfstate` file, overwritten each apply, in a remote backend with a lock | `status` of managed resources in etcd, overwritten each reconcile | an **append-only `provider_fact` log** + a rebuildable fold. Phase 0: local files + object-store copy, written by the CLI. Phase 1: EHDB event log + KV + projections + ehgraph (§4.4) |
+| State backend & locking | S3/GCS + DynamoDB/TFC lock; stale locks need `force-unlock` | the cluster's etcd; the controller is the single writer | no external backend, no lock file. Appends never overwrite each other. Phase 1 has a fenced single writer per stack (EHDB affinity single-writer, KV CAS) |
+| History / audit | none in state (backend versioning at best) | short-lived Events | every apply/create/delete is a kept fact; replayable |
+| Drift detection | `plan -detailed-exitcode` / `-refresh-only` | continuous reconcile, `Synced` condition | `action=drift` from state: unapplied, missing, fields/conflict, untracked, orphan. Exits 10 on drift |
+| Removed-from-config | `apply` destroys it | composition no longer renders it; it is garbage-collected | `apply` prunes owned-but-undeclared resources (`prune=true`) and records `delete` facts |
 | Drift correction | `apply` | automatic, continuous | `apply`. With `reconcile=enforce`, fields another manager took over are taken back (`--force-conflicts`), which is Crossplane-style |
 | Ownership conflicts | none (last write wins on refresh) | managementPolicies | SSA conflicts. Default `reconcile=report` stops and reports them, the same report/enforce split as `kind: provider` |
 | Continuous reconcile | none (run in CI or cron) | the controller loop | run `action=drift` on a schedule (`kind: Subscription` timer, or the NoETL server scheduler). Same playbook, no resident controller |
 | Outputs / connection details | `output` + remote state | connection secret (`writeConnectionSecretToRef`) | `publish_credentials` → credential aliases. Consumers reference the alias and never see the value |
 | Secrets generation | `random_password` (ends up in state in plaintext) | provider-generated or ESO | `openssl rand` piped into a Secret. The value never appears in state, logs or step results |
-| Destroy | `terraform destroy` + "yes" | delete the claim (`deletionPolicy: Delete`) | `action=destroy --set confirm=log-analytics`: reverse order, wait for delete, then wait until no PV and no labelled object remain |
+| Destroy | `terraform destroy` + "yes" | delete the claim (`deletionPolicy: Delete`) | `action=destroy --set confirm=log-analytics`: deletes **what the state owns** in reverse order, appends `delete` facts, waits until no PV remains, and fails if any untracked labelled object is left |
+| State inspection | `terraform state list/show` | `kubectl get managed` | `action=state` (the folded inventory) |
 | Import / adopt | `terraform import` | `managementPolicies: [Observe]` | not in round 1 for k8s. `kind: provider` (GCP) already has confirm-gated `adopt`, and the k8s family is a follow-up (§9) |
 | Verification | none (`terraform test` is plan-level) | none built in | `action=verify`: end-to-end data path (§7) |
 | Guard rails | Sentinel/OPA (paid or extra) | admission policies | `preflight`: context allowlist, load limit, port ownership. CI: shell syntax + ownership labels |
@@ -140,22 +225,27 @@ nothing to lock, back up or migrate.
   `provider_fact` state, confirm-gated delete and adopt) is the follow-up that makes these
   steps declarative and kubectl-free (§9). The step boundaries were chosen so each one
   maps to one provider action.
-- No locking: concurrent `apply` runs by two operators race. SSA keeps them field-safe, but
-  not order-safe. Local kind has one operator.
+- Phase 0 has no fencing. Two operators running `apply` at once on the same stack both
+  append. The log stays consistent (last fact wins per URN) and SSA keeps the fields safe,
+  but the operations interleave. Phase 1's per-stack single writer closes this. Local kind
+  has one operator.
 
-**What NoETL adds that neither has:** the same DAG continues past infrastructure into
+**What NoETL adds that neither has:** the state is the event log: append-only, audited,
+replayable and rebuildable, rather than an opaque mutable file or overwritten status. It is
+self-hosted: Phase 0 is portable files with an object-store copy, and Phase 1 is NoETL's
+own log, KV, projections and graph. There is no external backend. Beyond that, the same DAG continues past infrastructure into
 data-plane convergence (schema), verification (a real row through the real path, then
 queried through MCP), publishing outputs to the credential store, and the workloads that
 use the stack. The edge shipper is another NoETL playbook. Provisioning, data and
 operations share one runtime, one credential model and one event log.
 
-## 6. Log pipeline
+## 6. Business-log pipeline (ClickHouse, ADR-0004/0005)
 
 ### 6.1 Rotation at every layer
 
 | Log | Bounded by |
 |---|---|
-| container stdout/stderr (`/var/log/pods`) | kubelet `containerLogMaxSize: 10Mi`, `containerLogMaxFiles: 5`, declared in `ci/kind/config.yaml` and reported live from `/configz` by `status`. Takes effect when the cluster is (re)created; until then the same values are the kubelet defaults |
+| container stdout/stderr (`/var/log/pods`), business namespaces only | kubelet `containerLogMaxSize: 10Mi`, `containerLogMaxFiles: 5`, declared in `ci/kind/config.yaml` and reported live from `/configz` by `status`. Takes effect when the cluster is (re)created; until then the same values are the kubelet defaults |
 | ClickHouse server log | `logger.console=1`, file logs removed, so it is just container stdout (above). Level `warning` |
 | ClickHouse system tables | `query_log` and `part_log` TTL 3 days. `metric_log`, `trace_log`, `text_log`, `asynchronous_metric_log`, `processors_profile_log` and similar are removed |
 | captured logs | `logs.events` TTL 7 days (`ttl_only_drop_parts`); `logs.events_per_minute` TTL 30 days |
@@ -164,8 +254,11 @@ operations share one runtime, one credential model and one event log.
 
 ### 6.2 Schema (`logs.events`)
 
-One table for every source. `source` is `k8s` (Vector), `qnetmon` (edge shipper) or
-`noetl` (playbooks, e.g. verify). The columns are `ts`, `received_at`, `source`, `host`,
+One table for every business source. `source` is one of:
+- `k8s`: Vector, only from namespaces labelled `noetl.io/log-analytics=capture`. NoETL core
+  namespaces are never labelled (ADR-0005).
+- `qnetmon`: the edge shipper.
+- `noetl`: rows a playbook writes, for example verify's marker. The columns are `ts`, `received_at`, `source`, `host`,
 `namespace`, `pod`, `container`, `stream`, `level`, `event_type`, `execution_id`, `message`
 and `attrs` (JSON text).
 
@@ -221,7 +314,8 @@ WHERE namespace = 'noetl' AND level = 'error' ORDER BY ts DESC LIMIT 50;
 3. MCP: an unauthenticated call returns 401. `initialize` then `tools/list` lists the three
    tools. `run_query` returns the marker row.
 4. MCP refuses a write: the row must not exist afterwards.
-5. Vector: `source='k8s'` rows arrived in the last 15 minutes, broken down by namespace.
+5. Vector: `source='k8s'` rows arrived in the last 15 minutes from opted-in namespaces, broken
+   down by namespace. Only `log-analytics` is opted in, so no core namespace appears.
 
 The local runtime has no `kind: mcp`, and `kind: mcp` has no auth header support yet (§9).
 So step 3 speaks MCP's streamable HTTP JSON-RPC from a shell step with `curl`, including the
@@ -235,6 +329,9 @@ $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=plan --j
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=apply --json | jq -r .final_result
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=verify --json | jq -r .final_result
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=drift --json | jq -r .final_result
+$NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=state --json | jq -r .final_result
+# keep a copy of the state log in object storage (restored automatically if the local log is lost):
+#   --set state_backup=gs://<bucket>/iac/log-analytics/facts.jsonl
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=destroy --set confirm=log-analytics --json | jq -r .final_result
 ```
 
@@ -257,15 +354,20 @@ operator manifests) also uses NodePort 30123. The two are mutually exclusive, an
 
 ## 9. Follow-ups
 
-These are drafted but not yet filed:
+These are drafted but not yet filed: `gh issue create` was refused by the session's
+permission policy.
 
-1. **noetl/cli:** a failing shell step's stdout/stderr is never shown with `--runtime local`
+1. **noetl/cli R-1.4: the local Feather buffer.** Blueprint § H.11: `LocalEventBuffer`
+   (Feather V2 on `arrow_codec`), `noetl push`, plus server `POST /api/events/batch`. This
+   gives Phase 0 its Feather encoding and the event-log import path for the Phase 1 handoff.
+2. **noetl/tools: `provider: kubernetes`** for `kind: provider` (`objects.ensure | wait | drift | delete`,
+   SSA over REST, `provider_fact`, confirm-gated delete and adopt). It replaces the kubectl
+   shell steps one to one and lets provisioning run on workers (Phase 1).
+3. **noetl/server: an EHDB KV HTTP surface** for the `iac.<stack>` current-state bucket, with CAS.
+4. **ehgraph topology writer** for IaC resources and dependencies.
+5. **noetl/cli:** a failing shell step's stdout/stderr is never shown with `--runtime local`
    (5.4.0).
-2. **noetl/cli:** `noetl subscribe --events` opens the sink with truncate. History is lost on
+6. **noetl/cli:** `noetl subscribe --events` opens the sink with truncate. History is lost on
    restart and copy-truncate is unsafe. Proposal: open with append.
-3. **noetl/tools:** `kind: mcp` should accept `auth:` (bearer via credential) and `headers:`,
-   so the distributed runtime can call authenticated MCP servers. Then add a
-   distributed-runtime verify step that uses `kind: mcp` directly.
-4. **noetl/tools:** a `provider: kubernetes` family for `kind: provider`
-   (`objects.ensure | wait | drift | delete`, SSA over REST, `provider_fact`, confirm-gated
-   delete and adopt), replacing the `kubectl` shell steps one to one.
+7. **noetl/tools:** `kind: mcp` should accept `auth:` and `headers:`, so the distributed
+   runtime can call authenticated MCP servers.

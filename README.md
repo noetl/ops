@@ -77,10 +77,13 @@ noetl run automation/development/noetl.yaml --runtime local --set action=redeplo
 noetl run automation/infrastructure/gateway.yaml --runtime local --set action=deploy-all --set gateway_repo_dir=../gateway
 ```
 
-5. Log analytics, provisioned by NoETL as infrastructure-as-code (optional): ClickHouse community
-   edition, Vector (pod logs → ClickHouse) and the ClickHouse MCP server. The plan/apply/verify/
-   drift/destroy steps replace Terraform or Crossplane. See
-   [docs/specs/noetl-iac-log-analytics.md](docs/specs/noetl-iac-log-analytics.md).
+5. Business-data log analytics, provisioned by NoETL as infrastructure-as-code (optional; not a
+   core component): ClickHouse community edition, Vector (opted-in business namespaces →
+   ClickHouse) and the ClickHouse MCP server.
+   - The plan/apply/verify/drift/state/destroy steps replace Terraform or Crossplane.
+   - State is NoETL's two-phase `provider_fact` log.
+   - Spec: [docs/specs/noetl-iac-log-analytics.md](docs/specs/noetl-iac-log-analytics.md).
+     Decisions: [docs/decisions/](docs/decisions/README.md).
 
 ```bash
 noetl run automation/iap/kind/log_analytics.yaml --runtime local --set action=apply  --json | jq -r .final_result

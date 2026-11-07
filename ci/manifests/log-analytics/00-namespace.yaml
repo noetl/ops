@@ -14,3 +14,5 @@ metadata:
     app.kubernetes.io/managed-by: noetl
     app.kubernetes.io/part-of: log-analytics
     noetl.io/stack: log-analytics
+    # Business-log capture is opt-in per namespace (see 20-vector.yaml).
+    noetl.io/log-analytics: capture
