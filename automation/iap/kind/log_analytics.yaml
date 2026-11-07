@@ -846,6 +846,7 @@ workflow:
               hv=$($K -n "$NS" exec ds/vector -- sh -c 'printf %s "$CH_INGEST_PASSWORD" | sha256sum' 2>/dev/null | cut -c1-12)
               hc=$($K -n "$NS" exec clickhouse-0 -c clickhouse -- sh -c 'printf %s "$CH_INGEST_PASSWORD" | sha256sum' 2>/dev/null | cut -c1-12)
               say "ingest password sha256 prefix: vector=$hv clickhouse=$hc"
+              say "vector pod HTTP basic auth as ingest (curl): $($K -n "$NS" exec ds/vector -- sh -c 'command -v curl >/dev/null || { echo no-curl; exit 0; }; curl -s -o /dev/null -w %{http_code} -u "ingest:$(cat /etc/vector-secrets/ingest_password)" "http://clickhouse.log-analytics.svc.cluster.local:8123/?query=SELECT%201"' 2>&1 | tail -1)"
               say "ingest login inside the cluster: $($K -n "$NS" exec clickhouse-0 -c clickhouse -- sh -c 'clickhouse-client --host clickhouse.log-analytics.svc.cluster.local --user ingest --password "$CH_INGEST_PASSWORD" -q "SELECT currentUser()"' 2>&1 | tail -1 | cut -c1-200)"
               $K -n "$NS" logs clickhouse-0 -c clickhouse --tail=400 2>&1 | grep -iE 'ingest|denied|authenticat|privilege|Code: (497|516|164)' | tail -6 | cut -c1-400 | tee -a "$LOG"
               q "SELECT exception_code, substring(exception, 1, 300) FROM system.query_log WHERE user = 'ingest' AND exception_code != 0 AND event_time > now() - INTERVAL 15 MINUTE ORDER BY event_time DESC LIMIT 3 FORMAT TSV" 2>&1 | tee -a "$LOG" || true
