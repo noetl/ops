@@ -133,3 +133,42 @@ ClickHouse is a business-data store only. Record every decision as an ADR.
 - the Phase 1 handoff (event-log import path, `provider: kubernetes`, KV HTTP surface,
   ehgraph writer)
 - kind validation: the cluster is still busy
+
+## 2026-11-07 (round 3): Phase 0 on the real Feather buffer (R-1.4), push and ingest
+
+**User direction.** Build the Feather path for real, rewire Phase 0 onto it (the encoding
+changes; the facts and the fold do not), cut the releases, then validate on kind and merge.
+
+**Built.**
+- **noetl/cli#102** (merged), branch `feat/r1-4-feather-local-buffer`:
+  - `src/local_buffer.rs`: § H.11.3 `events.feather` (Feather V2) + `metadata.json` under
+    `$NOETL_LOCAL_DIR` or `~/.noetl/local`. Flushes are rewrite-and-rename chunks, guarded by
+    a directory lock; a closed execution is immutable.
+  - `noetl buffer init|append|close|list|cat`, `noetl push`, `noetl run --event-buffer`.
+  - `--facts-file` accepts Feather.
+  - 14 new tests: wiremock checks push headers, ordering, exactly-once and stop-on-failure;
+    the JSONL and Feather encodings fold identically. pyarrow reads the files.
+- **noetl/server#559**, branch `feat/events-batch-arrow-ingest`, rebased on v3.151.4:
+  - `/api/events/batch` dispatches on Content-Type. JSON → the unchanged handler. Arrow →
+    `handlers::events_arrow`, which answers 501 unless `NOETL_EVENTS_ARROW_INGEST=enabled`.
+  - It appends to the EHDB event-log tier only, via the mirror's worker hop, tagged
+    `mirror_source=local_push`. No `noetl.event`, no orchestrator; a source guard enforces
+    this.
+  - 11 tests, including a CLI-written fixture and HTTP tests against a stand-in worker.
+- **ops** (`log_analytics.yaml`):
+  - `state_file` → `state_dir`. Each `record_state`/`destroy` is one buffer execution
+    (`state_begin` → `provider.fact` events → `state_commit`: close + backup).
+  - The fold reads the closed executions of the stack. A read failure exits 15 rather than
+    folding as empty. An uncommitted (RUNNING) write is ignored and reported.
+  - Backup and restore are per execution (`<state_backup>/<eid>/`).
+  - Preflight refuses a CLI without `buffer` (exit 14).
+  - ADR-0007 is added; the ADR-0002 status, the spec §2/§3/§4.4/§5/§8/§9 and the READMEs
+    are updated.
+
+**Verified offline (CLI dev build, fake `gsutil`).**
+- Commit → fold → prune → tombstone.
+- A RUNNING write is ignored, and `last_execution_id` names the buffer execution.
+- Backup holds one directory per execution. After the local state is deleted, a restore
+  gives the same owned set.
+- A corrupt `events.feather` stops the fold (exit 15).
+- `validate.py`: all checks pass.

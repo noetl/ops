@@ -43,10 +43,10 @@ start with `kind-`.
 │   (plan/apply/verify/drift/state/      │ │ ├──────────────────────────────────────────────────────┤
 │    destroy)                            │ └▶│ BUSINESS: namespace log-analytics                     │
 │      │ IaC state (ADR-0002)            │SSA│  (noetl.io/stack=log-analytics, …/log-analytics=capture)│
-│      ▼ Phase 0: provider_fact log      │   │  Vector DaemonSet ── tails opted-in pods' logs ──┐   │
-│ .noetl/iac/log-analytics/facts.jsonl   │   │   (kubelet rotates: 10Mi × 5 per container)      │   │
+│      ▼ Phase 0: Feather buffer (0007)  │   │  Vector DaemonSet ── tails opted-in pods' logs ──┐   │
+│ ~/.noetl/local/<eid>/events.feather    │   │   (kubelet rotates: 10Mi × 5 per container)      │   │
 │      └─▶ object store (state_backup)   │   │                                                  ▼   │
-│      (Phase 1 → EHDB log/KV/proj/graph)│   │  ClickHouse StatefulSet (26.8 LTS, PVC 2Gi)          │
+│      noetl push → EHDB event log (P1)  │   │  ClickHouse StatefulSet (26.8 LTS, PVC 2Gi)          │
 │                                        │   │   :8123 ◀─ NodePort 30123 ◀─ hostPort 30123          │
 │ qnetmon edge (launchd, every 5 min)    │   │   logs.events (TTL 7d), logs.events_per_minute (MV)  │
 │   housekeeping/logs.yaml: rotate ──────┼──▶│      ▲ mcp_reader (readonly=2)                       │
@@ -66,7 +66,7 @@ start with `kind-`.
 | 5 | ServiceAccount, ClusterRole/Binding `log-analytics-vector`, ConfigMap `vector-config`, DaemonSet `vector` | `20-vector.yaml` | `timberio/vector:0.60.0-debian`. Disk buffer 256 MiB |
 | 6 | Deployment + Service `clickhouse-mcp` (NodePort 30124) | `30-mcp.yaml` | `ghcr.io/clickhouse/mcp-clickhouse:0.7.0`, streamable HTTP, bearer auth |
 | 7 | NoETL credentials `clickhouse_logs_ingest`, `clickhouse_logs_mcp` | `publish_credentials` | the stack's *outputs*, in the local NoETL credential store |
-| 8 | IaC state: 14 resource URNs in the `provider_fact` log | `state_load`, `record_state` | Phase 0 log `.noetl/iac/log-analytics/facts.jsonl` (+ `state_backup`), §4.4 |
+| 8 | IaC state: 14 resource URNs as `provider.fact` events | `state_load`, `record_state` | Phase 0 Feather buffer `<state_dir>/<execution_id>/events.feather`, one closed execution per write (+ `state_backup`), §4.4, ADR-0007 |
 
 All images are pinned to exact versions.
 
@@ -128,18 +128,29 @@ and is reused here rather than replaced:
 - **`noetl provider`** (`cli/src/provider_cli.rs`) runs the same fold over `--server` (EHDB)
   or `--facts-file`. `--facts-out` is the "EHDB-less git-backed state sink", an append-only
   file of facts.
-- **Designed, not shipped:** CLI local-mode **Arrow Feather** buffering (blueprint § H.11:
-  `~/.noetl/local/<execution_id>/events.feather`, `noetl push`,
-  `POST /api/events/batch`), deferred to CLI phase R-1.4. Also older: `noetl iap`'s DuckDB
-  `.noetl/state.duckdb` with `gsutil` sync to GCS.
+- **CLI local-mode Arrow Feather buffering** (blueprint § H.11 / R-1.4:
+  `~/.noetl/local/<execution_id>/events.feather`, `noetl push`, and `POST /api/events/batch`
+  for `application/vnd.apache.arrow.file`). On 2026-11-07 this was designed but not shipped.
+  It was built for this stack (noetl/cli#102, noetl/server#559; ADR-0007). Also older:
+  `noetl iap`'s DuckDB `.noetl/state.duckdb` with `gsutil` sync to GCS.
 
 **Phase 0: bootstrap** (implemented; `state_phase: bootstrap`). This is used before EHDB and
 noetl-server exist, which includes while they are being provisioned.
-- The log lives on the local filesystem at `state_file`
-  (`.noetl/iac/log-analytics/facts.jsonl`, the `--facts-out` format).
-- After every write it is copied to object storage at `state_backup`: `gs://` via `gsutil`
-  (the `noetl iap sync` pattern) or `s3://` via `aws`. `state_load` restores from there if
-  the local log is missing.
+- The store is the CLI's **Arrow Feather event buffer** (ADR-0007), under `state_dir`
+  (default `$NOETL_LOCAL_DIR` or `~/.noetl/local`).
+  - Each state write (apply's `record_state`, `destroy`) is **one execution**:
+    `noetl buffer init` → facts appended as `provider.fact` events → `close`.
+  - The result is `<execution_id>/events.feather` (Feather V2, § H.11.3 schema; the fact
+    sits at `result.data.provider_fact`) plus `metadata.json`.
+  - State = the facts of every *closed* execution of the stack, oldest first
+    (`noetl buffer cat --stack … --event-type provider.fact`). A write that never closed is
+    ignored and reported.
+- After every commit the execution is copied to object storage at
+  `<state_backup>/<execution_id>/`: `gs://` via `gsutil` (the `noetl iap sync` pattern) or
+  `s3://` via `aws`. `state_load` restores every execution from there if the stack has none
+  locally.
+- Inspect it with `noetl buffer list --stack log-analytics`, or `pyarrow.feather.read_table`.
+  `noetl provider drift --facts-file <events.feather>` folds it with noetl-tools directly.
 - Each apply appends one fact per declared resource:
   - Kubernetes objects: `k8s://<ctx>/<ns|_cluster>/<group>/<Kind>/<name>`
   - the generated Secret
@@ -149,8 +160,9 @@ noetl-server exist, which includes while they are being provisioned.
     stored
   - `outcome` = `changed`, or `noop` when the digest equals the state's
 - Prunes and destroys append `delete` facts (`deleted` / `absent`).
-- The encoding moves to **Feather V2** when R-1.4 ships. The schema and fold don't change;
-  the fact goes in the `result` column of `events.feather`.
+- Moving from the interim JSONL log to Feather changed only the encoding. The schema and
+  the fold are the same, and CI still pins the fold. A CLI test shows JSONL and Feather fold
+  to the same model.
 
 **Phase 1: steady state** (designed; `state_phase: control-plane` is refused today). Once
 the core is up, the NoETL control loop owns state:
@@ -163,11 +175,15 @@ the core is up, the NoETL control loop owns state:
   That makes it a fenced single writer per stack (`ehdb-reference` `kv.rs`).
 - **ehgraph** holds the topology: resource nodes, DAG-dependency edges and stack-ownership
   edges.
-- The Phase 0 log is imported once as the genesis segment and stays archived in object
-  storage.
-- What is missing is listed in ADR-0002 "Pending": an event-log import path (R-1.4 batch
-  ingest or a distributed import playbook), worker-side provisioning (`provider: kubernetes`),
-  a KV HTTP surface, and the ehgraph writer.
+- The Phase 0 executions are imported once as the genesis segment with
+  **`noetl push --all --stack log-analytics`**. The server's Arrow branch of
+  `/api/events/batch` appends them to the EHDB event-log tier, tagged
+  `mirror_source=local_push`, with no orchestration. They stay archived in object storage.
+  Using it needs the server `NOETL_EVENTS_ARROW_INGEST=enabled` and the worker
+  `NOETL_EHDB_EVENTLOG_MIRROR_SOURCE=server`.
+- Still missing (ADR-0002 "Pending", ADR-0007): worker-side provisioning
+  (`provider: kubernetes`), a KV HTTP surface, and the ehgraph writer. The import path is
+  done.
 
 **Desired, observed, drift (ADR-0003).**
 - *Desired* = the versioned playbook plus its manifests: git today, the NoETL catalog in
@@ -201,9 +217,9 @@ the state.
 | Dependency ordering | implicit graph from references + `depends_on` | composition ordering, readiness checks of composed resources | explicit DAG arcs (§4.2). The order is readable in the playbook |
 | Wait for ready | provider-specific `wait_for` / `wait_for_rollout` | `Ready` condition, `readinessChecks` | `rollout status`, `wait --for=condition=Ready`, `wait --for=jsonpath` PVC Bound. Hard timeouts |
 | Data-plane setup (DB schema, users) | a second provider (e.g. ClickHouse provider) or `local-exec` | a separate provider or a Job | `converge_schema` step (idempotent DDL) + users in config |
-| State | one mutable `tfstate` file, overwritten each apply, in a remote backend with a lock | `status` of managed resources in etcd, overwritten each reconcile | an **append-only `provider_fact` log** + a rebuildable fold. Phase 0: local files + object-store copy, written by the CLI. Phase 1: EHDB event log + KV + projections + ehgraph (§4.4) |
+| State | one mutable `tfstate` file, overwritten each apply, in a remote backend with a lock | `status` of managed resources in etcd, overwritten each reconcile | an **append-only `provider_fact` event log** + a rebuildable fold. Phase 0: the CLI's Arrow Feather buffer, one immutable execution per write, each copied to object storage. Phase 1: EHDB event log + KV + projections + ehgraph, fed by `noetl push` (§4.4) |
 | State backend & locking | S3/GCS + DynamoDB/TFC lock; stale locks need `force-unlock` | the cluster's etcd; the controller is the single writer | no external backend, no lock file. Appends never overwrite each other. Phase 1 has a fenced single writer per stack (EHDB affinity single-writer, KV CAS) |
-| History / audit | none in state (backend versioning at best) | short-lived Events | every apply/create/delete is a kept fact; replayable |
+| History / audit | none in state (backend versioning at best; "serials" overwrite) | short-lived Events | every apply/destroy is its own closed Feather execution (action, run id, timestamps) of kept facts; replayable |
 | Drift detection | `plan -detailed-exitcode` / `-refresh-only` | continuous reconcile, `Synced` condition | `action=drift` from state: unapplied, missing, fields/conflict, untracked, orphan. Exits 10 on drift |
 | Removed-from-config | `apply` destroys it | composition no longer renders it; it is garbage-collected | `apply` prunes owned-but-undeclared resources (`prune=true`) and records `delete` facts |
 | Drift correction | `apply` | automatic, continuous | `apply`. With `reconcile=enforce`, fields another manager took over are taken back (`--force-conflicts`), which is Crossplane-style |
@@ -212,7 +228,7 @@ the state.
 | Outputs / connection details | `output` + remote state | connection secret (`writeConnectionSecretToRef`) | `publish_credentials` → credential aliases. Consumers reference the alias and never see the value |
 | Secrets generation | `random_password` (ends up in state in plaintext) | provider-generated or ESO | `openssl rand` piped into a Secret. The value never appears in state, logs or step results |
 | Destroy | `terraform destroy` + "yes" | delete the claim (`deletionPolicy: Delete`) | `action=destroy --set confirm=log-analytics`: deletes **what the state owns** in reverse order, appends `delete` facts, waits until no PV remains, and fails if any untracked labelled object is left |
-| State inspection | `terraform state list/show` | `kubectl get managed` | `action=state` (the folded inventory) |
+| State inspection | `terraform state list/show` | `kubectl get managed` | `action=state` (the folded inventory); `noetl buffer list/cat` for the raw executions |
 | Import / adopt | `terraform import` | `managementPolicies: [Observe]` | not in round 1 for k8s. `kind: provider` (GCP) already has confirm-gated `adopt`, and the k8s family is a follow-up (§9) |
 | Verification | none (`terraform test` is plan-level) | none built in | `action=verify`: end-to-end data path (§7) |
 | Guard rails | Sentinel/OPA (paid or extra) | admission policies | `preflight`: context allowlist, load limit, port ownership. CI: shell syntax + ownership labels |
@@ -324,14 +340,18 @@ So step 3 speaks MCP's streamable HTTP JSON-RPC from a shell step with `curl`, i
 ## 8. Operating
 
 ```bash
-NOETL=noetl   # CLI >= 5.4.0 (needs `noetl credential`); run from the ops repo root
+NOETL=noetl   # CLI >= 5.5.0 (`noetl credential` + `noetl buffer`); run from the ops repo root; add --set noetl_bin=$NOETL if it is not on PATH
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=plan --json | jq -r .final_result
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=apply --json | jq -r .final_result
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=verify --json | jq -r .final_result
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=drift --json | jq -r .final_result
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=state --json | jq -r .final_result
-# keep a copy of the state log in object storage (restored automatically if the local log is lost):
-#   --set state_backup=gs://<bucket>/iac/log-analytics/facts.jsonl
+# keep a copy of each state write in object storage (restored automatically if local state is lost):
+#   --set state_backup=gs://<bucket>/iac/log-analytics
+# where the state lives: --set state_dir=<dir> (default ~/.noetl/local); inspect with
+#   $NOETL buffer list --stack log-analytics ; $NOETL buffer cat --stack log-analytics --event-type provider.fact
+# once a NoETL server + EHDB exist, import the bootstrap state onto the event log (Phase 1 genesis):
+#   $NOETL push --all --stack log-analytics --server http://localhost:8082
 $NOETL run automation/iap/kind/log_analytics.yaml -r local --set action=destroy --set confirm=log-analytics --json | jq -r .final_result
 ```
 
@@ -357,9 +377,11 @@ operator manifests) also uses NodePort 30123. The two are mutually exclusive, an
 These are drafted but not yet filed: `gh issue create` was refused by the session's
 permission policy.
 
-1. **noetl/cli R-1.4: the local Feather buffer.** Blueprint § H.11: `LocalEventBuffer`
-   (Feather V2 on `arrow_codec`), `noetl push`, plus server `POST /api/events/batch`. This
-   gives Phase 0 its Feather encoding and the event-log import path for the Phase 1 handoff.
+1. ~~noetl/cli R-1.4: the local Feather buffer~~. **Done:** noetl/cli#102 (buffer +
+   `noetl push`) and noetl/server#559 (Arrow ingest); see ADR-0007. Remaining from § H.11:
+   `commands.feather`, the `payloads/` offload, and the R-1.1 runner emitting through an
+   `EventSink`, which would give per-step events while the run is in progress.
+   `--event-buffer` records them from the run outcome today.
 2. **noetl/tools: `provider: kubernetes`** for `kind: provider` (`objects.ensure | wait | drift | delete`,
    SSA over REST, `provider_fact`, confirm-gated delete and adopt). It replaces the kubectl
    shell steps one to one and lets provisioning run on workers (Phase 1).

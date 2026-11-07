@@ -2,8 +2,11 @@
 
 - **Date:** 2026-11-07
 - **Status:** Accepted.
-  - Phase 0 is implemented for the kind stack, using the shipped fact format (JSONL).
-  - The Arrow Feather encoding of Phase 0 waits on CLI phase R-1.4.
+  - Phase 0 is implemented for the kind stack.
+  - **Its interim JSONL encoding (below) is superseded by [ADR-0007](ADR-0007-phase0-feather-state.md)**
+    (2026-11-07): Phase 0 state is now the CLI's Arrow Feather event buffer (R-1.4), and
+    `noetl push` is the event-log import path (pending item 2(a)). This record is kept
+    as written; ADR-0007 has the current implementation.
   - The Phase 1 handoff is designed but not wired (see "Implementation status").
 
 ## Context: how NoETL stores state today (from the code, 2026-11-07)

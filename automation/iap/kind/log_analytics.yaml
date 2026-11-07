@@ -52,20 +52,21 @@ workload:
   max_load: "6"             # refuse plan/apply/verify when the host 1-min load is above this ("0" = off)
   confirm: ""               # destroy only runs when confirm == namespace
   fail_on_drift: "true"     # drift exits non-zero when anything drifted (for schedules/alerts)
-  noetl_bin: noetl          # CLI used to store credentials (needs `noetl credential`, >= 5.4.0)
+  noetl_bin: noetl          # CLI for credentials and IaC state (`noetl credential` + `noetl buffer`, >= 5.5.0)
   ingest_credential: clickhouse_logs_ingest   # noetl credential alias: ClickHouse `ingest` password
   mcp_credential: clickhouse_logs_mcp         # noetl credential alias: MCP bearer token
   clickhouse_url: "http://127.0.0.1:30123"    # kind hostPort -> NodePort 30123
   mcp_url: "http://127.0.0.1:30124"           # kind hostPort -> NodePort 30124
   run_dir: .noetl/log-analytics
-  # IaC state (docs/decisions/ADR-0002, ADR-0003). Phase 0 "bootstrap": an append-only log of
-  # provider_fact records (the noetl-tools ProviderFact schema, the same fold as `noetl provider`),
-  # on the local filesystem, copied to object storage after every write. Phase 1 "control-plane":
-  # the same facts on the EHDB event log (+ KV/projection/ehgraph); not wired for this stack yet.
+  # IaC state (docs/decisions/ADR-0002, ADR-0003, ADR-0007). Phase 0 "bootstrap": provider_fact
+  # events (the noetl-tools ProviderFact schema, the same fold as `noetl provider`) in the CLI's
+  # Arrow Feather event buffer (blueprint § H.11): one closed execution per state write at
+  # <state_dir>/<execution_id>/events.feather, each copied to object storage. `noetl push`
+  # imports them onto the EHDB event log (Phase 1 "control-plane", not wired for this stack yet).
   stack: log-analytics
   state_phase: bootstrap
-  state_file: .noetl/iac/log-analytics/facts.jsonl
-  state_backup: ""          # gs://bucket/path/facts.jsonl or s3://...; empty = local only
+  state_dir: ""             # buffer root; "" = $NOETL_LOCAL_DIR or ~/.noetl/local (§ H.11.3)
+  state_backup: ""          # gs://bucket/prefix or s3://bucket/prefix (one <execution_id>/ per write); "" = local only
   prune: "true"             # apply deletes resources the state owns that are no longer declared
 
 workflow:
@@ -155,8 +156,10 @@ workflow:
           CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
           SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
           # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
-          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
-          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Phase 0 store: the R-1.4 Feather event buffer (ADR-0007); one closed execution per state write.
+          SD='{{ workload.state_dir }}'; BK='{{ workload.state_backup }}'; NB='{{ workload.noetl_bin }}'
+          LB="$NB buffer"; [ -z "$SD" ] || LB="$LB --dir $SD"
+          ROOT="${SD:-${NOETL_LOCAL_DIR:-$HOME/.noetl/local}}"; case "$ROOT" in "~"*) ROOT="$HOME${ROOT#\~}" ;; esac
           # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
           # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
           FOLD=$(cat <<'JQ'
@@ -175,7 +178,16 @@ workflow:
           | .owned |= with_entries(select(.value.stack == $stack))
           JQ
           )
-          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # Facts = the provider.fact events of every CLOSED execution of this stack, oldest first. A
+          # RUNNING execution is a write that never committed; `buffer cat` leaves it out.
+          # A read failure must stop the run: an unreadable state folded as "owns nothing" would make
+          # apply re-create and destroy skip. (No pipefail under set -e, hence the explicit checks.)
+          facts() {
+            c=$($LB cat --stack "$STACK" --event-type provider.fact) \
+              || { printf 'FAILED: cannot read IaC state from %s\n' "$ROOT" | tee -a "$LOG" >&2; return 15; }
+            [ -z "$c" ] || printf '%s\n' "$c" | jq -c '.result.data.provider_fact'
+          }
+          fold() { f=$(facts) || exit 15; printf '%s' "$f" | jq -s -c --arg stack "$STACK" "$FOLD"; }
           # urn of a live/declared k8s object (JSON on stdin)
           URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
@@ -205,13 +217,25 @@ workflow:
               | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
                 + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
           }
-          backup() {  # object-store copy of the state log after every write
+          backup() {  # <execution_id>: object-store copy of one closed execution (events.feather + metadata.json)
             [ -n "$BK" ] || return 0
+            d="$ROOT/$1"; b="${BK%/}/$1"
             case "$BK" in
-              gs://*) gsutil -q cp "$SF" "$BK" ;;
-              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              gs://*) gsutil -q cp "$d/events.feather" "$d/metadata.json" "$b/" ;;
+              s3://*) aws s3 cp --only-show-errors "$d/events.feather" "$b/events.feather" \
+                        && aws s3 cp --only-show-errors "$d/metadata.json" "$b/metadata.json" ;;
               *) false ;;
-            esac || say "WARN: state backup to $BK failed (local state is intact)"
+            esac || say "WARN: state backup of execution $1 to $BK failed (local state is intact)"
+          }
+          state_begin() {  # open this write's buffer execution; facts carry its id
+            $LB init --stack "$STACK" --playbook automation/iap/kind/log_analytics.yaml \
+              --label action='{{ workload.action }}' --label run_id='{{ vars.run_id }}'
+          }
+          state_commit() {  # <execution_id> <facts.jsonl> <step>: append as provider.fact events, close, back up
+            jq -c --arg s "$3" '{event_type: "provider.fact", step: $s, status: "COMPLETED", result: {data: {provider_fact: .}}}' "$2" \
+              | $LB append "$1" --jsonl - 2>>"$LOG"
+            $LB close "$1" --status COMPLETED >/dev/null
+            backup "$1"
           }
           case '{{ workload.state_phase }}' in
             bootstrap) ;;
@@ -222,12 +246,24 @@ workflow:
               exit 13 ;;
             *) say "REFUSED: unknown state_phase '{{ workload.state_phase }}' (bootstrap | control-plane)"; exit 13 ;;
           esac
-          if [ ! -s "$SF" ] && [ -n "$BK" ]; then
-            case "$BK" in gs://*) gsutil -q cp "$BK" "$SF" ;; s3://*) aws s3 cp --only-show-errors "$BK" "$SF" ;; esac \
-              && say "state restored from backup $BK" || say "no backup at $BK yet (fresh state)"
+          if ! $LB list --json >/dev/null 2>>"$LOG"; then
+            say "REFUSED: '$NB' has no 'buffer' command; IaC state needs noetl >= 5.5.0 (R-1.4 Feather buffer). Use --set noetl_bin=<path>"
+            exit 14
+          fi
+          ex=$($LB list --stack "$STACK" --json)
+          if [ "$(printf '%s' "$ex" | jq length)" = "0" ] && [ -n "$BK" ]; then
+            mkdir -p "$ROOT"
+            case "$BK" in
+              gs://*) gsutil -q -m cp -r "${BK%/}/*" "$ROOT/" ;;
+              s3://*) aws s3 cp --recursive --only-show-errors "${BK%/}/" "$ROOT/" ;;
+              *) false ;;
+            esac 2>>"$LOG" && say "state restored from backup $BK" || say "no backup at $BK yet (fresh state)"
+            ex=$($LB list --stack "$STACK" --json)
           fi
           m=$(fold)
-          say "state: phase=bootstrap log=$SF facts=$(wc -l < "$SF" | tr -d ' ') owned=$(printf '%s' "$m" | jq '.owned | length') tombstoned=$(printf '%s' "$m" | jq '.tombstoned | length')${BK:+ backup=$BK}"
+          say "state: phase=bootstrap store=feather root=$ROOT executions=$(printf '%s' "$ex" | jq '[.[] | select(.status != "RUNNING")] | length') facts=$(facts | wc -l | tr -d ' ') owned=$(printf '%s' "$m" | jq '.owned | length') tombstoned=$(printf '%s' "$m" | jq '.tombstoned | length')${BK:+ backup=$BK}"
+          u=$(printf '%s' "$ex" | jq '[.[] | select(.status == "RUNNING")] | length')
+          [ "$u" = "0" ] || say "state: $u uncommitted write(s) (RUNNING, from an interrupted run) are ignored by the fold"
     next:
       spec: { mode: exclusive }
       arcs:
@@ -259,8 +295,10 @@ workflow:
           CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
           SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
           # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
-          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
-          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Phase 0 store: the R-1.4 Feather event buffer (ADR-0007); one closed execution per state write.
+          SD='{{ workload.state_dir }}'; BK='{{ workload.state_backup }}'; NB='{{ workload.noetl_bin }}'
+          LB="$NB buffer"; [ -z "$SD" ] || LB="$LB --dir $SD"
+          ROOT="${SD:-${NOETL_LOCAL_DIR:-$HOME/.noetl/local}}"; case "$ROOT" in "~"*) ROOT="$HOME${ROOT#\~}" ;; esac
           # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
           # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
           FOLD=$(cat <<'JQ'
@@ -279,7 +317,16 @@ workflow:
           | .owned |= with_entries(select(.value.stack == $stack))
           JQ
           )
-          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # Facts = the provider.fact events of every CLOSED execution of this stack, oldest first. A
+          # RUNNING execution is a write that never committed; `buffer cat` leaves it out.
+          # A read failure must stop the run: an unreadable state folded as "owns nothing" would make
+          # apply re-create and destroy skip. (No pipefail under set -e, hence the explicit checks.)
+          facts() {
+            c=$($LB cat --stack "$STACK" --event-type provider.fact) \
+              || { printf 'FAILED: cannot read IaC state from %s\n' "$ROOT" | tee -a "$LOG" >&2; return 15; }
+            [ -z "$c" ] || printf '%s\n' "$c" | jq -c '.result.data.provider_fact'
+          }
+          fold() { f=$(facts) || exit 15; printf '%s' "$f" | jq -s -c --arg stack "$STACK" "$FOLD"; }
           # urn of a live/declared k8s object (JSON on stdin)
           URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
@@ -309,13 +356,25 @@ workflow:
               | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
                 + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
           }
-          backup() {  # object-store copy of the state log after every write
+          backup() {  # <execution_id>: object-store copy of one closed execution (events.feather + metadata.json)
             [ -n "$BK" ] || return 0
+            d="$ROOT/$1"; b="${BK%/}/$1"
             case "$BK" in
-              gs://*) gsutil -q cp "$SF" "$BK" ;;
-              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              gs://*) gsutil -q cp "$d/events.feather" "$d/metadata.json" "$b/" ;;
+              s3://*) aws s3 cp --only-show-errors "$d/events.feather" "$b/events.feather" \
+                        && aws s3 cp --only-show-errors "$d/metadata.json" "$b/metadata.json" ;;
               *) false ;;
-            esac || say "WARN: state backup to $BK failed (local state is intact)"
+            esac || say "WARN: state backup of execution $1 to $BK failed (local state is intact)"
+          }
+          state_begin() {  # open this write's buffer execution; facts carry its id
+            $LB init --stack "$STACK" --playbook automation/iap/kind/log_analytics.yaml \
+              --label action='{{ workload.action }}' --label run_id='{{ vars.run_id }}'
+          }
+          state_commit() {  # <execution_id> <facts.jsonl> <step>: append as provider.fact events, close, back up
+            jq -c --arg s "$3" '{event_type: "provider.fact", step: $s, status: "COMPLETED", result: {data: {provider_fact: .}}}' "$2" \
+              | $LB append "$1" --jsonl - 2>>"$LOG"
+            $LB close "$1" --status COMPLETED >/dev/null
+            backup "$1"
           }
           m=$(fold); decl=$(declared)
           say "plan (state: $(printf '%s' "$m" | jq '.owned | length') owned resources)"
@@ -473,8 +532,10 @@ workflow:
           CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
           SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
           # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
-          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
-          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Phase 0 store: the R-1.4 Feather event buffer (ADR-0007); one closed execution per state write.
+          SD='{{ workload.state_dir }}'; BK='{{ workload.state_backup }}'; NB='{{ workload.noetl_bin }}'
+          LB="$NB buffer"; [ -z "$SD" ] || LB="$LB --dir $SD"
+          ROOT="${SD:-${NOETL_LOCAL_DIR:-$HOME/.noetl/local}}"; case "$ROOT" in "~"*) ROOT="$HOME${ROOT#\~}" ;; esac
           # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
           # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
           FOLD=$(cat <<'JQ'
@@ -493,7 +554,16 @@ workflow:
           | .owned |= with_entries(select(.value.stack == $stack))
           JQ
           )
-          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # Facts = the provider.fact events of every CLOSED execution of this stack, oldest first. A
+          # RUNNING execution is a write that never committed; `buffer cat` leaves it out.
+          # A read failure must stop the run: an unreadable state folded as "owns nothing" would make
+          # apply re-create and destroy skip. (No pipefail under set -e, hence the explicit checks.)
+          facts() {
+            c=$($LB cat --stack "$STACK" --event-type provider.fact) \
+              || { printf 'FAILED: cannot read IaC state from %s\n' "$ROOT" | tee -a "$LOG" >&2; return 15; }
+            [ -z "$c" ] || printf '%s\n' "$c" | jq -c '.result.data.provider_fact'
+          }
+          fold() { f=$(facts) || exit 15; printf '%s' "$f" | jq -s -c --arg stack "$STACK" "$FOLD"; }
           # urn of a live/declared k8s object (JSON on stdin)
           URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
@@ -523,14 +593,27 @@ workflow:
               | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
                 + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
           }
-          backup() {  # object-store copy of the state log after every write
+          backup() {  # <execution_id>: object-store copy of one closed execution (events.feather + metadata.json)
             [ -n "$BK" ] || return 0
+            d="$ROOT/$1"; b="${BK%/}/$1"
             case "$BK" in
-              gs://*) gsutil -q cp "$SF" "$BK" ;;
-              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              gs://*) gsutil -q cp "$d/events.feather" "$d/metadata.json" "$b/" ;;
+              s3://*) aws s3 cp --only-show-errors "$d/events.feather" "$b/events.feather" \
+                        && aws s3 cp --only-show-errors "$d/metadata.json" "$b/metadata.json" ;;
               *) false ;;
-            esac || say "WARN: state backup to $BK failed (local state is intact)"
+            esac || say "WARN: state backup of execution $1 to $BK failed (local state is intact)"
           }
+          state_begin() {  # open this write's buffer execution; facts carry its id
+            $LB init --stack "$STACK" --playbook automation/iap/kind/log_analytics.yaml \
+              --label action='{{ workload.action }}' --label run_id='{{ vars.run_id }}'
+          }
+          state_commit() {  # <execution_id> <facts.jsonl> <step>: append as provider.fact events, close, back up
+            jq -c --arg s "$3" '{event_type: "provider.fact", step: $s, status: "COMPLETED", result: {data: {provider_fact: .}}}' "$2" \
+              | $LB append "$1" --jsonl - 2>>"$LOG"
+            $LB close "$1" --status COMPLETED >/dev/null
+            backup "$1"
+          }
+          EID=$(state_begin); RUN=$EID
           m=$(fold); decl=$(declared); new=$(mktemp); ch=0; no=0
           printf '%s\n' "$decl" > "$new.decl"
           while IFS= read -r o; do
@@ -550,8 +633,8 @@ workflow:
               *) say "orphan kept (data-plane resources are never auto-dropped): $u" ;;
             esac
           done
-          cat "$new" >> "$SF"; rm -f "$new" "$new.decl"; backup
-          say "state written: $ch changed, $no unchanged, $pruned pruned -> $SF (execution_id $RUN)"
+          state_commit "$EID" "$new" record_state; rm -f "$new" "$new.decl"
+          say "state written: $ch changed, $no unchanged, $pruned pruned -> $ROOT/$EID/events.feather${BK:+ (+ $BK/$EID/)}"
     next:
       spec: { mode: exclusive }
       arcs: [ { step: publish_credentials } ]
@@ -746,8 +829,10 @@ workflow:
           CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
           SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
           # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
-          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
-          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Phase 0 store: the R-1.4 Feather event buffer (ADR-0007); one closed execution per state write.
+          SD='{{ workload.state_dir }}'; BK='{{ workload.state_backup }}'; NB='{{ workload.noetl_bin }}'
+          LB="$NB buffer"; [ -z "$SD" ] || LB="$LB --dir $SD"
+          ROOT="${SD:-${NOETL_LOCAL_DIR:-$HOME/.noetl/local}}"; case "$ROOT" in "~"*) ROOT="$HOME${ROOT#\~}" ;; esac
           # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
           # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
           FOLD=$(cat <<'JQ'
@@ -766,7 +851,16 @@ workflow:
           | .owned |= with_entries(select(.value.stack == $stack))
           JQ
           )
-          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # Facts = the provider.fact events of every CLOSED execution of this stack, oldest first. A
+          # RUNNING execution is a write that never committed; `buffer cat` leaves it out.
+          # A read failure must stop the run: an unreadable state folded as "owns nothing" would make
+          # apply re-create and destroy skip. (No pipefail under set -e, hence the explicit checks.)
+          facts() {
+            c=$($LB cat --stack "$STACK" --event-type provider.fact) \
+              || { printf 'FAILED: cannot read IaC state from %s\n' "$ROOT" | tee -a "$LOG" >&2; return 15; }
+            [ -z "$c" ] || printf '%s\n' "$c" | jq -c '.result.data.provider_fact'
+          }
+          fold() { f=$(facts) || exit 15; printf '%s' "$f" | jq -s -c --arg stack "$STACK" "$FOLD"; }
           # urn of a live/declared k8s object (JSON on stdin)
           URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
@@ -796,13 +890,25 @@ workflow:
               | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
                 + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
           }
-          backup() {  # object-store copy of the state log after every write
+          backup() {  # <execution_id>: object-store copy of one closed execution (events.feather + metadata.json)
             [ -n "$BK" ] || return 0
+            d="$ROOT/$1"; b="${BK%/}/$1"
             case "$BK" in
-              gs://*) gsutil -q cp "$SF" "$BK" ;;
-              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              gs://*) gsutil -q cp "$d/events.feather" "$d/metadata.json" "$b/" ;;
+              s3://*) aws s3 cp --only-show-errors "$d/events.feather" "$b/events.feather" \
+                        && aws s3 cp --only-show-errors "$d/metadata.json" "$b/metadata.json" ;;
               *) false ;;
-            esac || say "WARN: state backup to $BK failed (local state is intact)"
+            esac || say "WARN: state backup of execution $1 to $BK failed (local state is intact)"
+          }
+          state_begin() {  # open this write's buffer execution; facts carry its id
+            $LB init --stack "$STACK" --playbook automation/iap/kind/log_analytics.yaml \
+              --label action='{{ workload.action }}' --label run_id='{{ vars.run_id }}'
+          }
+          state_commit() {  # <execution_id> <facts.jsonl> <step>: append as provider.fact events, close, back up
+            jq -c --arg s "$3" '{event_type: "provider.fact", step: $s, status: "COMPLETED", result: {data: {provider_fact: .}}}' "$2" \
+              | $LB append "$1" --jsonl - 2>>"$LOG"
+            $LB close "$1" --status COMPLETED >/dev/null
+            backup "$1"
           }
           m=$(fold); decl=$(declared); drift=0
           # 1. desired (git) vs state: unapplied changes
@@ -857,8 +963,6 @@ workflow:
           if ! $K get ns "$NS" >/dev/null 2>&1; then say "status: stack not applied (namespace $NS absent)"; exit 0; fi
           say "== objects (label noetl.io/stack=log-analytics)"
           $K -n "$NS" get sts,ds,deploy,svc,pvc -l noetl.io/stack=log-analytics -o wide | tee -a "$LOG"
-          say "== applied state (namespace annotations)"
-          $K get ns "$NS" -o json | jq -r '.metadata.annotations | to_entries[] | select(.key|startswith("noetl.io/")) | "  \(.key)=\(.value)"' | tee -a "$LOG"
           say "== container log rotation (kubelet, live)"
           for node in $($K get nodes -o jsonpath='{.items[*].metadata.name}'); do
             $K get --raw "/api/v1/nodes/$node/proxy/configz" \
@@ -870,9 +974,12 @@ workflow:
             WHERE ts > now() - INTERVAL 1 DAY GROUP BY source ORDER BY source FORMAT PrettyCompactMonoBlock" | tee -a "$LOG" || true
           $K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q "
             SELECT 'on disk: ' || formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE database = 'logs' AND active" | tee -a "$LOG" || true
-          say "== IaC state (Phase 0 provider_fact log)"
-          SF='{{ workload.state_file }}'
-          if [ -s "$SF" ]; then say "  log $SF: $(wc -l < "$SF" | tr -d ' ') facts; action=state lists what it owns"; else say "  no state yet ($SF)"; fi
+          say "== IaC state (Phase 0 Feather buffer)"
+          SD='{{ workload.state_dir }}'; LB="{{ workload.noetl_bin }} buffer"; [ -z "$SD" ] || LB="$LB --dir $SD"
+          ex=$($LB list --stack '{{ workload.stack }}' --json 2>>"$LOG" || echo '[]')
+          if [ "$(printf '%s' "$ex" | jq length)" != "0" ]; then
+            say "  $(printf '%s' "$ex" | jq -r '"\(length) execution(s), \(map(.event_count) | add) event(s); newest \(.[-1].execution_id) \(.[-1].status)"'); action=state lists what it owns"
+          else say "  no state yet"; fi
           say "== endpoints"
           say "  ClickHouse HTTP  {{ workload.clickhouse_url }}  (users: ingest via credential {{ workload.ingest_credential }}, admin in secret)"
           say "  ClickHouse MCP   {{ workload.mcp_url }}/mcp  (bearer: credential {{ workload.mcp_credential }})"
@@ -892,8 +999,10 @@ workflow:
           CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
           SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
           # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
-          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
-          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Phase 0 store: the R-1.4 Feather event buffer (ADR-0007); one closed execution per state write.
+          SD='{{ workload.state_dir }}'; BK='{{ workload.state_backup }}'; NB='{{ workload.noetl_bin }}'
+          LB="$NB buffer"; [ -z "$SD" ] || LB="$LB --dir $SD"
+          ROOT="${SD:-${NOETL_LOCAL_DIR:-$HOME/.noetl/local}}"; case "$ROOT" in "~"*) ROOT="$HOME${ROOT#\~}" ;; esac
           # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
           # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
           FOLD=$(cat <<'JQ'
@@ -912,7 +1021,16 @@ workflow:
           | .owned |= with_entries(select(.value.stack == $stack))
           JQ
           )
-          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # Facts = the provider.fact events of every CLOSED execution of this stack, oldest first. A
+          # RUNNING execution is a write that never committed; `buffer cat` leaves it out.
+          # A read failure must stop the run: an unreadable state folded as "owns nothing" would make
+          # apply re-create and destroy skip. (No pipefail under set -e, hence the explicit checks.)
+          facts() {
+            c=$($LB cat --stack "$STACK" --event-type provider.fact) \
+              || { printf 'FAILED: cannot read IaC state from %s\n' "$ROOT" | tee -a "$LOG" >&2; return 15; }
+            [ -z "$c" ] || printf '%s\n' "$c" | jq -c '.result.data.provider_fact'
+          }
+          fold() { f=$(facts) || exit 15; printf '%s' "$f" | jq -s -c --arg stack "$STACK" "$FOLD"; }
           # urn of a live/declared k8s object (JSON on stdin)
           URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
@@ -942,16 +1060,28 @@ workflow:
               | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
                 + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
           }
-          backup() {  # object-store copy of the state log after every write
+          backup() {  # <execution_id>: object-store copy of one closed execution (events.feather + metadata.json)
             [ -n "$BK" ] || return 0
+            d="$ROOT/$1"; b="${BK%/}/$1"
             case "$BK" in
-              gs://*) gsutil -q cp "$SF" "$BK" ;;
-              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              gs://*) gsutil -q cp "$d/events.feather" "$d/metadata.json" "$b/" ;;
+              s3://*) aws s3 cp --only-show-errors "$d/events.feather" "$b/events.feather" \
+                        && aws s3 cp --only-show-errors "$d/metadata.json" "$b/metadata.json" ;;
               *) false ;;
-            esac || say "WARN: state backup to $BK failed (local state is intact)"
+            esac || say "WARN: state backup of execution $1 to $BK failed (local state is intact)"
+          }
+          state_begin() {  # open this write's buffer execution; facts carry its id
+            $LB init --stack "$STACK" --playbook automation/iap/kind/log_analytics.yaml \
+              --label action='{{ workload.action }}' --label run_id='{{ vars.run_id }}'
+          }
+          state_commit() {  # <execution_id> <facts.jsonl> <step>: append as provider.fact events, close, back up
+            jq -c --arg s "$3" '{event_type: "provider.fact", step: $s, status: "COMPLETED", result: {data: {provider_fact: .}}}' "$2" \
+              | $LB append "$1" --jsonl - 2>>"$LOG"
+            $LB close "$1" --status COMPLETED >/dev/null
+            backup "$1"
           }
           m=$(fold)
-          say "IaC state for stack $STACK (Phase 0 bootstrap log $SF, $(wc -l < "$SF" | tr -d ' ') facts)"
+          say "IaC state for stack $STACK (Phase 0 Feather buffer $ROOT: $($LB list --stack "$STACK" --json | jq '[.[] | select(.status != "RUNNING")] | length') executions, $(facts | wc -l | tr -d ' ') facts)"
           printf '%s' "$m" | jq -r '.owned[] | "  \(.resource_type)\t\(.urn)\tdigest=\(.last_desired.digest)\texec=\(.last_execution_id)"' | tee -a "$LOG"
           n=$(printf '%s' "$m" | jq '.tombstoned | length'); [ "$n" = "0" ] || say "  ($n tombstoned)"
     next:
@@ -988,8 +1118,10 @@ workflow:
           CTX='{{ workload.context }}'; K="kubectl --context $CTX"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
           SEL="noetl.io/stack=log-analytics"; STACK='{{ workload.stack }}'; RUN='{{ vars.run_id }}'
           # IaC state, Phase 0 (bootstrap): append-only provider_fact log (docs/decisions/ADR-0002).
-          SF='{{ workload.state_file }}'; BK='{{ workload.state_backup }}'
-          mkdir -p "$(dirname "$SF")"; touch "$SF"
+          # Phase 0 store: the R-1.4 Feather event buffer (ADR-0007); one closed execution per state write.
+          SD='{{ workload.state_dir }}'; BK='{{ workload.state_backup }}'; NB='{{ workload.noetl_bin }}'
+          LB="$NB buffer"; [ -z "$SD" ] || LB="$LB --dir $SD"
+          ROOT="${SD:-${NOETL_LOCAL_DIR:-$HOME/.noetl/local}}"; case "$ROOT" in "~"*) ROOT="$HOME${ROOT#\~}" ;; esac
           # Fold = noetl-tools provider_state::fold_facts, same rules: an applied ensure (changed|noop)
           # or adopt (adopted) owns the URN, delete (deleted|absent) tombstones it, planned is ignored.
           FOLD=$(cat <<'JQ'
@@ -1008,7 +1140,16 @@ workflow:
           | .owned |= with_entries(select(.value.stack == $stack))
           JQ
           )
-          fold() { jq -s -c --arg stack "$STACK" "$FOLD" "$SF"; }
+          # Facts = the provider.fact events of every CLOSED execution of this stack, oldest first. A
+          # RUNNING execution is a write that never committed; `buffer cat` leaves it out.
+          # A read failure must stop the run: an unreadable state folded as "owns nothing" would make
+          # apply re-create and destroy skip. (No pipefail under set -e, hence the explicit checks.)
+          facts() {
+            c=$($LB cat --stack "$STACK" --event-type provider.fact) \
+              || { printf 'FAILED: cannot read IaC state from %s\n' "$ROOT" | tee -a "$LOG" >&2; return 15; }
+            [ -z "$c" ] || printf '%s\n' "$c" | jq -c '.result.data.provider_fact'
+          }
+          fold() { f=$(facts) || exit 15; printf '%s' "$f" | jq -s -c --arg stack "$STACK" "$FOLD"; }
           # urn of a live/declared k8s object (JSON on stdin)
           URNJQ='(.apiVersion | split("/")) as $av | (if ($av | length) == 2 then $av[0] else "core" end) as $g
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
@@ -1038,14 +1179,27 @@ workflow:
               | (if .service == "core" then $k else "\($k).\(.service)" end) + "/" + $d.name
                 + (if ($d.namespace // "") != "" then " -n " + $d.namespace else "" end)'
           }
-          backup() {  # object-store copy of the state log after every write
+          backup() {  # <execution_id>: object-store copy of one closed execution (events.feather + metadata.json)
             [ -n "$BK" ] || return 0
+            d="$ROOT/$1"; b="${BK%/}/$1"
             case "$BK" in
-              gs://*) gsutil -q cp "$SF" "$BK" ;;
-              s3://*) aws s3 cp --only-show-errors "$SF" "$BK" ;;
+              gs://*) gsutil -q cp "$d/events.feather" "$d/metadata.json" "$b/" ;;
+              s3://*) aws s3 cp --only-show-errors "$d/events.feather" "$b/events.feather" \
+                        && aws s3 cp --only-show-errors "$d/metadata.json" "$b/metadata.json" ;;
               *) false ;;
-            esac || say "WARN: state backup to $BK failed (local state is intact)"
+            esac || say "WARN: state backup of execution $1 to $BK failed (local state is intact)"
           }
+          state_begin() {  # open this write's buffer execution; facts carry its id
+            $LB init --stack "$STACK" --playbook automation/iap/kind/log_analytics.yaml \
+              --label action='{{ workload.action }}' --label run_id='{{ vars.run_id }}'
+          }
+          state_commit() {  # <execution_id> <facts.jsonl> <step>: append as provider.fact events, close, back up
+            jq -c --arg s "$3" '{event_type: "provider.fact", step: $s, status: "COMPLETED", result: {data: {provider_fact: .}}}' "$2" \
+              | $LB append "$1" --jsonl - 2>>"$LOG"
+            $LB close "$1" --status COMPLETED >/dev/null
+            backup "$1"
+          }
+          EID=$(state_begin); RUN=$EID
           m=$(fold)
           # Reverse dependency order, driven by what the state owns (not by a label sweep).
           order='{"Deployment":1,"DaemonSet":2,"StatefulSet":3,"Service":4,"ConfigMap":5,"ServiceAccount":6,"ClusterRoleBinding":7,"ClusterRole":8,"Secret":9,"ClickHouseSchema":10,"Namespace":11}'
@@ -1064,7 +1218,7 @@ workflow:
               fact "$r" delete absent >> "$new"; say "absent  $u (already gone)"
             fi
           done < "$new.own"
-          cat "$new" >> "$SF"; rm -f "$new" "$new.own"; backup
+          state_commit "$EID" "$new" destroy; rm -f "$new" "$new.own"
           i=0
           while [ "$($K get pv -o json | jq --arg ns "$NS" '[.items[] | select(.spec.claimRef.namespace == $ns)] | length')" != "0" ]; do
             i=$((i+1)); [ $i -lt 30 ] || { say "FAILED: PersistentVolumes for $NS still present after 60s"; exit 12; }; sleep 2
@@ -1100,6 +1254,6 @@ workflow:
             --set action=status    objects, applied state, kubelet log rotation, rows per source
             --set action=destroy --set confirm=log-analytics   delete what the state owns, wait until gone
           Options: context=kind-noetl reconcile=report|enforce max_load=6 noetl_bin=noetl
-                   state_file=.noetl/iac/log-analytics/facts.jsonl state_backup=gs://... prune=true
+                   state_dir=~/.noetl/local state_backup=gs://bucket/prefix prune=true
           Spec: docs/specs/noetl-iac-log-analytics.md
           EOF
