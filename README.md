@@ -77,6 +77,16 @@ noetl run automation/development/noetl.yaml --runtime local --set action=redeplo
 noetl run automation/infrastructure/gateway.yaml --runtime local --set action=deploy-all --set gateway_repo_dir=../gateway
 ```
 
+5. Log analytics, provisioned by NoETL as infrastructure-as-code (optional): ClickHouse community
+   edition, Vector (pod logs → ClickHouse) and the ClickHouse MCP server. The plan/apply/verify/
+   drift/destroy steps replace Terraform or Crossplane. See
+   [docs/specs/noetl-iac-log-analytics.md](docs/specs/noetl-iac-log-analytics.md).
+
+```bash
+noetl run automation/iap/kind/log_analytics.yaml --runtime local --set action=apply  --json | jq -r .final_result
+noetl run automation/iap/kind/log_analytics.yaml --runtime local --set action=verify --json | jq -r .final_result
+```
+
 ## GKE workflow
 
 Use `automation/gcp_gke/noetl_gke_fresh_stack.yaml` from this repo.

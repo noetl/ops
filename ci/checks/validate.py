@@ -29,7 +29,7 @@ import os
 import subprocess
 import sys
 
-MIN = {"yaml": 200, "shell": 15, "python": 15, "charts": 1}
+MIN = {"yaml": 200, "shell": 15, "python": 15, "charts": 1, "iap-shell": 10, "iap-labels": 10}
 
 
 def tracked(*globs: str) -> list[str]:
@@ -122,6 +122,62 @@ def check_python() -> bool:
     return ok
 
 
+def _iap_playbooks() -> list[str]:
+    """Infrastructure-as-Playbook playbooks that drive kubectl: every *.yaml
+    under automation/iap/kind/ (discovered)."""
+    return [p for p in tracked("automation/iap/kind/*.yaml", "automation/iap/kind/**/*.yaml")]
+
+
+def check_iap_shell() -> bool:
+    """Every `kind: shell` block in an IaP playbook parses as bash once its
+    `{{ ... }}` templates are rendered to a placeholder, and every arc points at
+    a step that exists.  A shell syntax error in a provisioning playbook is
+    otherwise found mid-apply, with half the stack converged."""
+    import re
+    import yaml
+    blocks, failures = 0, []
+    for f in _iap_playbooks():
+        doc = yaml.safe_load(open(f))
+        steps = doc.get("workflow") or []
+        names = {s["step"] for s in steps}
+        for s in steps:
+            for arc in ((s.get("next") or {}).get("arcs") or []):
+                if arc["step"] not in names:
+                    failures.append(f"{f}: step {s['step']} -> unknown step {arc['step']}")
+            tool = s.get("tool") or {}
+            if tool.get("kind") != "shell":
+                continue
+            cmds = tool.get("cmds") or []
+            for i, cmd in enumerate(cmds if isinstance(cmds, list) else [cmds]):
+                blocks += 1
+                rendered = re.sub(r"\{\{.*?\}\}", "X", cmd, flags=re.S)
+                r = subprocess.run(["bash", "-n"], input=rendered, capture_output=True, text=True)
+                if r.returncode != 0:
+                    failures.append(f"{f}: step {s['step']} cmd {i}: {r.stderr.strip().splitlines()[0]}")
+    return report("iap-shell", blocks, failures)
+
+
+def check_iap_labels() -> bool:
+    """Every object in a NoETL-provisioned stack carries the ownership labels:
+    they are the inventory that drift (orphans) and destroy select on, so an
+    unlabelled object is one destroy would silently leave behind."""
+    import yaml
+    objs, failures = 0, []
+    for f in tracked("ci/manifests/log-analytics/*.yaml"):
+        for d in yaml.safe_load_all(open(f)):
+            if not d:
+                continue
+            objs += 1
+            labels = (d.get("metadata") or {}).get("labels") or {}
+            name = f"{f}: {d.get('kind')}/{(d.get('metadata') or {}).get('name')}"
+            if labels.get("noetl.io/stack") != "log-analytics" or labels.get("app.kubernetes.io/managed-by") != "noetl":
+                failures.append(f"{name}: missing noetl.io/stack / managed-by labels")
+            tmpl = ((d.get("spec") or {}).get("template") or {}).get("metadata")
+            if tmpl is not None and (tmpl.get("labels") or {}).get("noetl.io/stack") != "log-analytics":
+                failures.append(f"{name}: pod template not labelled noetl.io/stack")
+    return report("iap-labels", objs, failures)
+
+
 def main() -> int:
     print("noetl/ops pre-merge validation (noetl/ai-meta#375)")
     results = {
@@ -129,6 +185,8 @@ def main() -> int:
         "charts": check_charts(),
         "shell": check_shell(),
         "python": check_python(),
+        "iap-shell": check_iap_shell(),
+        "iap-labels": check_iap_labels(),
     }
     print("\n" + "─" * 60)
     for name, ok in results.items():

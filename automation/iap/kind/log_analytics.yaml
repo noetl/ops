@@ -1,0 +1,645 @@
+# NoETL as the infrastructure provisioner (Infrastructure as Playbook) for the local
+# kind log-analytics stack: ClickHouse community edition + Vector + ClickHouse MCP.
+#
+# This playbook is the provisioner. There is no Terraform state, no Crossplane
+# controller and no helm release: the desired state is the manifests in
+# ci/manifests/log-analytics/, and this DAG converges the cluster to it.
+#
+#   noetl run automation/iap/kind/log_analytics.yaml -r local --set action=plan    --json
+#   noetl run automation/iap/kind/log_analytics.yaml -r local --set action=apply   --json
+#   noetl run automation/iap/kind/log_analytics.yaml -r local --set action=verify  --json
+#   noetl run automation/iap/kind/log_analytics.yaml -r local --set action=drift   --json
+#   noetl run automation/iap/kind/log_analytics.yaml -r local --set action=status  --json
+#   noetl run automation/iap/kind/log_analytics.yaml -r local --set action=destroy --set confirm=log-analytics --json
+#
+# Run from the ops repo root with noetl CLI >= 5.4.0 (it needs `noetl credential`).
+# The human-readable report is `final_result` in the --json output; every step also
+# appends to .noetl/log-analytics/latest.log, which is the place to look when a step
+# fails (CLI 5.4.0 does not print a failing shell step's stderr).
+#
+# | action  | Terraform analogue   | Crossplane analogue                         |
+# |---------|----------------------|---------------------------------------------|
+# | plan    | terraform plan       | (none; composition is applied, not planned) |
+# | apply   | terraform apply      | claim created -> managed resources Ready    |
+# | drift   | plan -detailed-exitcode / refresh | reconcile loop detecting drift |
+# | status  | terraform show       | kubectl get managed / claim conditions      |
+# | destroy | terraform destroy    | claim deleted, deletionPolicy: Delete       |
+# Full mapping: docs/specs/noetl-iac-log-analytics.md
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kind_log_analytics
+  path: iap/kind/log-analytics
+  description: Provision, verify, drift-check and destroy the kind log-analytics stack (ClickHouse + Vector + MCP)
+  labels:
+    iap.noetl.io/provider: kubernetes
+    iap.noetl.io/target: kind
+    iap.noetl.io/stack: log-analytics
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help              # plan | apply | verify | drift | status | destroy | help
+  context: kind-noetl       # kube context; must start with kind- (local only, enforced)
+  namespace: log-analytics
+  manifests: ci/manifests/log-analytics
+  field_manager: noetl-iac  # server-side-apply owner of every field we declare
+  reconcile: report         # report: a field another manager changed is a conflict and apply stops
+                            # enforce: take the field back (--force-conflicts), Crossplane-style
+  timeout: 300s             # readiness wait per component
+  max_load: "6"             # refuse plan/apply/verify when the host 1-min load is above this ("0" = off)
+  confirm: ""               # destroy only runs when confirm == namespace
+  fail_on_drift: "true"     # drift exits non-zero when anything drifted (for schedules/alerts)
+  noetl_bin: noetl          # CLI used to store credentials (needs `noetl credential`, >= 5.4.0)
+  ingest_credential: clickhouse_logs_ingest   # noetl credential alias: ClickHouse `ingest` password
+  mcp_credential: clickhouse_logs_mcp         # noetl credential alias: MCP bearer token
+  clickhouse_url: "http://127.0.0.1:30123"    # kind hostPort -> NodePort 30123
+  mcp_url: "http://127.0.0.1:30124"           # kind hostPort -> NodePort 30124
+  run_dir: .noetl/log-analytics
+
+workflow:
+  - step: start
+    desc: Open the run log; every later step appends to it
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          D='{{ workload.run_dir }}'; mkdir -p "$D"
+          LOG="$D/{{ workload.action }}-$(date -u +%Y%m%dT%H%M%SZ).log"
+          printf '# kind log-analytics: action=%s context=%s at %s\n' \
+            '{{ workload.action }}' '{{ workload.context }}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$LOG"
+          ln -sf "$(basename "$LOG")" "$D/latest.log"
+          printf '{"run_log":"%s"}' "$LOG"
+    vars:
+      run_log: "{{ result.run_log }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: show_help
+          when: "{{ workload.action == 'help' }}"
+        - step: preflight
+
+  # ---------------------------------------------------------------- preflight
+  # Provider configuration + guard rails: which cluster, is it reachable, is the
+  # host calm enough, and is anything else holding the ports we declare.
+  - step: preflight
+    desc: Guard the target (kind only), check reachability, host load and NodePort ownership
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          CTX='{{ workload.context }}'; NS='{{ workload.namespace }}'; ACTION='{{ workload.action }}'
+          case "$CTX" in
+            kind-*) ;;
+            *) say "REFUSED: context '$CTX' is not a kind cluster; this stack is local-kind only"; exit 2 ;;
+          esac
+          case "$ACTION" in
+            plan|apply|verify|drift|status|destroy) ;;
+            *) say "REFUSED: unknown action '$ACTION' (plan|apply|verify|drift|status|destroy|help)"; exit 2 ;;
+          esac
+          K="kubectl --context $CTX"
+          if ! $K get --raw /readyz >/dev/null; then
+            say "FAILED: kube API for '$CTX' is not reachable"; exit 3
+          fi
+          MAX='{{ workload.max_load }}'
+          case "$ACTION" in plan|apply|verify)
+            if [ "$MAX" != "0" ]; then
+              L=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || true)
+              [ -n "$L" ] || L=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)
+              if awk -v l="$L" -v m="$MAX" 'BEGIN{exit !(l>m)}'; then
+                say "REFUSED: host 1-min load $L is above max_load=$MAX; retry later or --set max_load=0"; exit 4
+              fi
+              say "host load $L (max $MAX)"
+            fi ;;
+          esac
+          if [ "$ACTION" = "apply" ] || [ "$ACTION" = "plan" ]; then
+            for p in 30123 30124; do
+              owner=$($K get svc -A -o json | jq -r --arg p "$p" --arg ns "$NS" \
+                '.items[] | select(.metadata.namespace != $ns) | select(any(.spec.ports[]?; (.nodePort|tostring) == $p)) | "\(.metadata.namespace)/\(.metadata.name)"' | head -1)
+              if [ -n "$owner" ]; then
+                say "REFUSED: NodePort $p is held by $owner (outside $NS). The legacy ci/manifests/clickhouse stack uses 30123: undeploy it first (automation/infrastructure/clickhouse.yaml action=undeploy)."
+                exit 5
+              fi
+            done
+          fi
+          say "preflight ok: context=$CTX namespace=$NS action=$ACTION"
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: plan
+          when: "{{ workload.action == 'plan' }}"
+        - step: apply_namespace
+          when: "{{ workload.action == 'apply' }}"
+        - step: verify_marker
+          when: "{{ workload.action == 'verify' }}"
+        - step: drift
+          when: "{{ workload.action == 'drift' }}"
+        - step: status
+          when: "{{ workload.action == 'status' }}"
+        - step: destroy_gate
+          when: "{{ workload.action == 'destroy' }}"
+
+  # --------------------------------------------------------------------- plan
+  - step: plan
+    desc: Server-side dry-run diff of desired vs live (terraform plan)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          if ! $K get ns "$NS" >/dev/null 2>&1; then
+            say "plan: namespace $NS does not exist; apply will CREATE:"
+            $K apply --dry-run=client -o name -f "$M" | sed 's/^/  + /' | tee -a "$LOG"
+            say "  + secret/log-analytics-credentials (generated, never committed)"
+            say "  + schema: database logs, tables logs.events, logs.events_per_minute (+ MV)"
+            exit 0
+          fi
+          rc=0; out=$($K diff --server-side --field-manager='{{ workload.field_manager }}' -f "$M") || rc=$?
+          case $rc in
+            0) say "plan: no changes. Live state matches ci/manifests/log-analytics." ;;
+            1) say "plan: apply would CHANGE:"; printf '%s\n' "$out" | tee -a "$LOG" >/dev/null
+               printf '%s\n' "$out" | grep -E '^(\+\+\+|---) ' | sed 's/^/  /' ;;
+            *) say "FAILED: kubectl diff exited $rc"; exit $rc ;;
+          esac
+          $K -n "$NS" get secret log-analytics-credentials >/dev/null 2>&1 \
+            || say "  + secret/log-analytics-credentials (generated)"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: report } ]
+
+  # -------------------------------------------------------------------- apply
+  # The dependency graph is the DAG: namespace -> credentials -> ClickHouse ->
+  # ready -> schema -> (Vector, MCP) -> ready -> record state -> outputs.
+  - step: apply_namespace
+    desc: Server-side apply the namespace
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; M='{{ workload.manifests }}'
+          FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
+          $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/00-namespace.yaml" | tee -a "$LOG"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: ensure_credentials } ]
+
+  - step: ensure_credentials
+    desc: Generate the credentials Secret once (random, in-cluster only; values are never printed)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'
+          if $K -n "$NS" get secret log-analytics-credentials >/dev/null 2>&1; then
+            say "secret/log-analytics-credentials exists (kept; credentials are stable across applies)"
+            exit 0
+          fi
+          $K -n "$NS" create secret generic log-analytics-credentials \
+              --from-literal=admin-password="$(openssl rand -hex 24)" \
+              --from-literal=ingest-password="$(openssl rand -hex 24)" \
+              --from-literal=reader-password="$(openssl rand -hex 24)" \
+              --from-literal=mcp-token="$(openssl rand -hex 32)" \
+              --dry-run=client -o json \
+            | jq '.metadata.labels = {"app.kubernetes.io/managed-by":"noetl","app.kubernetes.io/part-of":"log-analytics","noetl.io/stack":"log-analytics"}' \
+            | $K apply --server-side --field-manager='{{ workload.field_manager }}' -f - >/dev/null
+          say "secret/log-analytics-credentials created (4 generated values)"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: apply_clickhouse } ]
+
+  - step: apply_clickhouse
+    desc: Server-side apply ClickHouse (ConfigMap, Services, StatefulSet + PVC) and wait for Ready
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
+          rv() { $K -n "$NS" get cm "$1" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true; }
+          before=$(rv clickhouse-config)
+          $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/10-clickhouse.yaml" | tee -a "$LOG"
+          # A ConfigMap change does not roll the pod by itself. Restart only when an
+          # existing config actually changed (a fresh create needs no restart).
+          if [ -n "$before" ] && [ "$before" != "$(rv clickhouse-config)" ]; then
+            say "clickhouse-config changed: rolling statefulset/clickhouse"
+            $K -n "$NS" rollout restart sts/clickhouse | tee -a "$LOG"
+          fi
+          say "waiting for statefulset/clickhouse (timeout {{ workload.timeout }})"
+          $K -n "$NS" rollout status sts/clickhouse --timeout='{{ workload.timeout }}' | tee -a "$LOG"
+          $K -n "$NS" wait pod/clickhouse-0 --for=condition=Ready --timeout='{{ workload.timeout }}' | tee -a "$LOG"
+          $K -n "$NS" wait pvc/data-clickhouse-0 --for=jsonpath='{.status.phase}'=Bound --timeout=60s | tee -a "$LOG"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: converge_schema } ]
+
+  - step: converge_schema
+    desc: Converge the ClickHouse schema (idempotent DDL) as the localhost-only default user
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          $K -n "$NS" exec -i clickhouse-0 -c clickhouse -- clickhouse-client --multiquery < "$M/schema/logs.sql"
+          tables=$($K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q \
+            "SELECT arrayStringConcat(groupArray(name), ', ') FROM system.tables WHERE database = 'logs'")
+          say "schema converged: logs.{ $tables }"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: apply_shippers } ]
+
+  - step: apply_shippers
+    desc: Server-side apply Vector (DaemonSet + RBAC) and the ClickHouse MCP server, wait for Ready
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
+          rv() { $K -n "$NS" get cm "$1" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true; }
+          before=$(rv vector-config)
+          for f in 20-vector.yaml 30-mcp.yaml; do
+            $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/$f" | tee -a "$LOG"
+          done
+          if [ -n "$before" ] && [ "$before" != "$(rv vector-config)" ]; then
+            say "vector-config changed: rolling daemonset/vector"
+            $K -n "$NS" rollout restart ds/vector | tee -a "$LOG"
+          fi
+          for obj in ds/vector deploy/clickhouse-mcp; do
+            say "waiting for $obj (timeout {{ workload.timeout }})"
+            $K -n "$NS" rollout status "$obj" --timeout='{{ workload.timeout }}' | tee -a "$LOG"
+          done
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: record_state } ]
+
+  - step: record_state
+    desc: Record what was applied on the namespace (the state lives in the cluster, not in a state file)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          digest=$(cat "$M"/*.yaml "$M"/schema/*.sql | shasum -a 256 | cut -c1-16)
+          rev=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+          $K annotate ns "$NS" --overwrite --field-manager='{{ workload.field_manager }}-state' \
+            noetl.io/applied-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            noetl.io/applied-by="automation/iap/kind/log_analytics.yaml" \
+            noetl.io/desired-digest="$digest" \
+            noetl.io/git-rev="$rev" >/dev/null
+          say "state recorded on namespace/$NS: desired-digest=$digest git-rev=$rev"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: publish_credentials } ]
+
+  # Outputs (terraform output / Crossplane connection secret): hand the ingest
+  # password and the MCP token to the local noetl credential store, so playbooks
+  # reference them by alias (`credential: clickhouse_logs_ingest`) and never see values.
+  - step: publish_credentials
+    desc: Store the ingest password and MCP token as noetl credentials (stdin, never printed)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; N='{{ workload.noetl_bin }}'
+          if ! "$N" credential list >/dev/null 2>&1; then
+            say "WARN: '$N' has no 'credential' command (needs noetl CLI >= 5.4.0); credentials not published."
+            say "      re-run with --set noetl_bin=/path/to/noetl-5.4.0 to publish them."
+            exit 0
+          fi
+          sec=$($K -n "$NS" get secret log-analytics-credentials -o json)
+          printf '%s' "$sec" | jq -r '.data["ingest-password"]' | base64 -d | "$N" credential set '{{ workload.ingest_credential }}' >/dev/null
+          printf '%s' "$sec" | jq -r '.data["mcp-token"]'       | base64 -d | "$N" credential set '{{ workload.mcp_credential }}' >/dev/null
+          say "credentials published: {{ workload.ingest_credential }} (ClickHouse user 'ingest'), {{ workload.mcp_credential }} (MCP bearer token)"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: status } ]
+
+  # ------------------------------------------------------------------- verify
+  # End to end: NoETL writes a marker row over ClickHouse HTTP with its own http
+  # tool (credential by alias), reads it back, then asks the MCP server for it.
+  - step: verify_marker
+    desc: Mint a unique marker and make sure the ingest credential is available
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" >>"$LOG"; }
+          N='{{ workload.noetl_bin }}'
+          if ! "$N" credential list 2>/dev/null | awk '{print $1}' | grep -qx '{{ workload.ingest_credential }}'; then
+            say "FAILED: noetl credential '{{ workload.ingest_credential }}' not found; run action=apply with noetl CLI >= 5.4.0 first"
+            exit 6
+          fi
+          if ! curl -fsS -m 3 '{{ workload.clickhouse_url }}/ping' >/dev/null; then
+            say "FAILED: ClickHouse is not reachable at {{ workload.clickhouse_url }} (kind hostPort 30123 missing? see docs)"
+            exit 6
+          fi
+          m="noetl-verify-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+          say "verify marker: $m"
+          printf '{"marker":"%s","ts":"%s"}' "$m" "$(date -u +%Y-%m-%d\ %H:%M:%S)"
+    vars:
+      marker: "{{ result.marker }}"
+      marker_ts: "{{ result.ts }}"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: verify_insert } ]
+
+  - step: verify_insert
+    desc: INSERT one log row through ClickHouse HTTP with the noetl http tool
+    tool:
+      kind: http
+      method: POST
+      url: "{{ workload.clickhouse_url }}/"
+      params:
+        query: "INSERT INTO logs.events (ts, source, host, stream, level, event_type, message, attrs) FORMAT JSONEachRow"
+      headers: { X-ClickHouse-User: ingest, content-type: application/x-ndjson }
+      auth: { type: api_key, credential: "{{ workload.ingest_credential }}", header: X-ClickHouse-Key }
+      body: '{"ts":"{{ vars.marker_ts }}","source":"noetl","host":"noetl-local","stream":"verify","level":"info","event_type":"iac.verify","message":"{{ vars.marker }}","attrs":"{\"playbook\":\"iap/kind/log-analytics\"}"}'
+    vars:
+      insert_status: "{{ result.status }}"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: verify_select } ]
+
+  - step: verify_select
+    desc: Read the marker back through ClickHouse HTTP
+    tool:
+      kind: http
+      method: POST
+      url: "{{ workload.clickhouse_url }}/"
+      params:
+        query: "SELECT count() FROM logs.events WHERE source = 'noetl' AND message = {m:String}"
+        param_m: "{{ vars.marker }}"
+      headers: { X-ClickHouse-User: ingest }
+      auth: { type: api_key, credential: "{{ workload.ingest_credential }}", header: X-ClickHouse-Key }
+    vars:
+      select_status: "{{ result.status }}"
+      select_body: "{{ result.body }}"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: verify_mcp } ]
+
+  - step: verify_mcp
+    desc: Ask the ClickHouse MCP server for the marker (JSON-RPC over streamable HTTP), check auth and read-only
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'
+          MARK='{{ vars.marker }}'
+          [ '{{ vars.insert_status }}' = "200" ] || { say "FAILED: insert returned HTTP {{ vars.insert_status }} (want 200); the ClickHouse error is in the --json step_results of verify_insert"; exit 7; }
+          n=$(printf '%s' '{{ vars.select_body }}' | tr -d '[:space:]')
+          [ '{{ vars.select_status }}' = "200" ] && [ "$n" = "1" ] || { say "FAILED: select HTTP {{ vars.select_status }} count='$n' (want 1)"; exit 7; }
+          say "ok  noetl http -> ClickHouse: marker row inserted and read back (count=1)"
+
+          MCP='{{ workload.mcp_url }}'; PF=""
+          if ! curl -fsS -m 3 "$MCP/health" >/dev/null 2>&1; then
+            # No kind hostPort for 30124 on this cluster (created before it was added): tunnel.
+            $K -n "$NS" port-forward svc/clickhouse-mcp 38124:8000 >/dev/null 2>&1 &
+            PF=$!; MCP="http://127.0.0.1:38124"
+            i=0; until curl -fsS -m 2 "$MCP/health" >/dev/null 2>&1; do i=$((i+1)); [ $i -lt 20 ] || break; sleep 0.5; done
+          fi
+          trap '[ -n "$PF" ] && kill "$PF" 2>/dev/null || true' EXIT
+          TOKEN=$($K -n "$NS" get secret log-analytics-credentials -o json | jq -r '.data["mcp-token"]' | base64 -d)
+          H=$(mktemp); B=$(mktemp)
+          rpc() {  # rpc <json> [session]; prints the JSON-RPC response (plain JSON or SSE data:)
+            set -- "$1" "${2:-}"
+            if [ -n "$2" ]; then
+              curl -sS -m 30 -o "$B" -D "$H" -H "Authorization: Bearer $TOKEN" -H "mcp-session-id: $2" \
+                -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d "$1" "$MCP/mcp"
+            else
+              curl -sS -m 30 -o "$B" -D "$H" -H "Authorization: Bearer $TOKEN" \
+                -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d "$1" "$MCP/mcp"
+            fi
+            if grep -q '^data: ' "$B"; then sed -n 's/^data: //p' "$B" | tail -1; else cat "$B"; fi
+          }
+          code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":0,"method":"tools/list"}' "$MCP/mcp")
+          [ "$code" = "401" ] || { say "FAILED: unauthenticated MCP call returned HTTP $code (want 401)"; exit 8; }
+          say "ok  MCP rejects unauthenticated calls (401)"
+          rpc '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"noetl-iac-verify","version":"1"}}}' >/dev/null
+          SID=$(awk 'tolower($1)=="mcp-session-id:"{print $2}' "$H" | tr -d '\r')
+          rpc '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$SID" >/dev/null || true
+          tools=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$SID" | jq -r '[.result.tools[].name] | join(",")')
+          say "ok  MCP session ${SID:+established }tools: $tools"
+          q=$(jq -nc --arg m "$MARK" '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"run_query",arguments:{query:"SELECT source, event_type, message FROM logs.events WHERE message = {m:String}",params:{m:$m}}}}')
+          res=$(rpc "$q" "$SID")
+          printf '%s' "$res" | jq -e --arg m "$MARK" '(.result.isError | not) and (.result.content[0].text | contains($m))' >/dev/null \
+            || { say "FAILED: MCP run_query did not return the marker: $(printf '%s' "$res" | head -c 400)"; exit 8; }
+          say "ok  MCP run_query found the marker row in logs.events"
+          w=$(jq -nc '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"run_query",arguments:{query:"INSERT INTO logs.events (source, message) VALUES ('mcp', 'should-not-land')"}}}')
+          res=$(rpc "$w" "$SID")
+          landed=$($K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q \
+            "SELECT count() FROM logs.events WHERE message = 'should-not-land'")
+          if [ "$landed" = "0" ]; then
+            say "ok  MCP refuses writes (read-only): $(printf '%s' "$res" | jq -r '.result.content[0].text // .error.message // "refused"' | head -c 120)"
+          else
+            say "FAILED: a write through MCP landed in ClickHouse ($landed rows)"; exit 8
+          fi
+          rm -f "$H" "$B"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: verify_pipeline } ]
+
+  - step: verify_pipeline
+    desc: Check that Vector is capturing pod logs into ClickHouse
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'
+          q() { $K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q "$1"; }
+          i=0
+          until [ "$(q "SELECT count() FROM logs.events WHERE source = 'k8s' AND received_at > now() - INTERVAL 15 MINUTE")" -gt 0 ]; do
+            i=$((i+1)); [ $i -lt 12 ] || { say "FAILED: no k8s rows from Vector in the last 15 minutes"; exit 9; }; sleep 5
+          done
+          say "ok  Vector -> ClickHouse: pod logs arriving"
+          q "SELECT namespace, count() AS rows FROM logs.events WHERE source = 'k8s' AND received_at > now() - INTERVAL 15 MINUTE GROUP BY namespace ORDER BY rows DESC LIMIT 8 FORMAT PrettyCompactMonoBlock" | tee -a "$LOG"
+          say "VERIFY PASSED"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: report } ]
+
+  # -------------------------------------------------------------------- drift
+  - step: drift
+    desc: Detect unapplied config, live drift, ownership conflicts and orphans (Crossplane reconcile, report mode)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
+          SEL="noetl.io/stack=log-analytics"; drift=0
+          if ! $K get ns "$NS" >/dev/null 2>&1; then say "DRIFT: namespace $NS is missing (stack not applied or deleted out of band)"; drift=1
+          else
+            want=$(cat "$M"/*.yaml "$M"/schema/*.sql | shasum -a 256 | cut -c1-16)
+            have=$($K get ns "$NS" -o json | jq -r '.metadata.annotations["noetl.io/desired-digest"] // "none"')
+            if [ "$want" != "$have" ]; then say "DRIFT: repo desired-digest $want != last applied $have (unapplied changes in git)"; drift=1
+            else say "ok  repo matches last apply (desired-digest $have)"; fi
+            rc=0; out=$($K diff --server-side --field-manager='{{ workload.field_manager }}' -f "$M") || rc=$?
+            case $rc in
+              0) say "ok  live objects match desired state" ;;
+              1) say "DRIFT: live objects differ from desired state:"; printf '%s\n' "$out" >>"$LOG"
+                 printf '%s\n' "$out" | grep -E '^\+\+\+ ' | sed 's/^+++ [^ ]*\/\([^/ ]*\).*/  ~ \1/' | sort -u | tee -a "$LOG"; drift=1 ;;
+              *) say "DRIFT: diff failed (exit $rc); often an ownership conflict: a field we own was changed by another manager. apply with --set reconcile=enforce takes it back."; drift=1 ;;
+            esac
+            desired=$($K apply --server-side --dry-run=server --field-manager='{{ workload.field_manager }}' -f "$M" -o name 2>/dev/null | sort -u)
+            live=$( { $K get -n "$NS" configmap,service,serviceaccount,statefulset,daemonset,deployment -l "$SEL" -o name;
+                      $K get namespace,clusterrole,clusterrolebinding -l "$SEL" -o name; } | sort -u)
+            orphans=$(comm -13 <(printf '%s\n' "$desired") <(printf '%s\n' "$live") || true)
+            if [ -n "$orphans" ]; then say "DRIFT: labelled objects not in the desired state (orphans; destroy or delete them):"; printf '%s\n' "$orphans" | sed 's/^/  - /' | tee -a "$LOG"; drift=1
+            else say "ok  no orphaned stack objects"; fi
+            $K -n "$NS" get secret log-analytics-credentials >/dev/null 2>&1 || { say "DRIFT: credentials secret missing"; drift=1; }
+          fi
+          if [ $drift -eq 0 ]; then say "NO DRIFT"; else say "DRIFT DETECTED (fix: action=apply)"; fi
+          [ $drift -eq 0 ] || [ '{{ workload.fail_on_drift }}' != "true" ] || exit 10
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: report } ]
+
+  # ------------------------------------------------------------------- status
+  - step: status
+    desc: Show objects, applied state, kubelet log-rotation settings, and what ClickHouse holds
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'
+          if ! $K get ns "$NS" >/dev/null 2>&1; then say "status: stack not applied (namespace $NS absent)"; exit 0; fi
+          say "== objects (label noetl.io/stack=log-analytics)"
+          $K -n "$NS" get sts,ds,deploy,svc,pvc -l noetl.io/stack=log-analytics -o wide | tee -a "$LOG"
+          say "== applied state (namespace annotations)"
+          $K get ns "$NS" -o json | jq -r '.metadata.annotations | to_entries[] | select(.key|startswith("noetl.io/")) | "  \(.key)=\(.value)"' | tee -a "$LOG"
+          say "== container log rotation (kubelet, live)"
+          for node in $($K get nodes -o jsonpath='{.items[*].metadata.name}'); do
+            $K get --raw "/api/v1/nodes/$node/proxy/configz" \
+              | jq -r --arg n "$node" '.kubeletconfig | "  \($n): containerLogMaxSize=\(.containerLogMaxSize) containerLogMaxFiles=\(.containerLogMaxFiles)"' | tee -a "$LOG"
+          done
+          say "== ClickHouse logs.* (rows by source, last 24h)"
+          $K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q "
+            SELECT source, count() AS rows, max(ts) AS newest FROM logs.events
+            WHERE ts > now() - INTERVAL 1 DAY GROUP BY source ORDER BY source FORMAT PrettyCompactMonoBlock" | tee -a "$LOG" || true
+          $K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q "
+            SELECT 'on disk: ' || formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE database = 'logs' AND active" | tee -a "$LOG" || true
+          say "== endpoints"
+          say "  ClickHouse HTTP  {{ workload.clickhouse_url }}  (users: ingest via credential {{ workload.ingest_credential }}, admin in secret)"
+          say "  ClickHouse MCP   {{ workload.mcp_url }}/mcp  (bearer: credential {{ workload.mcp_credential }})"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: report } ]
+
+  # ------------------------------------------------------------------ destroy
+  - step: destroy_gate
+    desc: Refuse to destroy unless confirm equals the namespace (terraform destroy's "yes")
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'
+          if [ '{{ workload.confirm }}' != '{{ workload.namespace }}' ]; then
+            printf '%s\n' "REFUSED: destroy deletes the namespace, its PVC and all captured logs. Re-run with --set confirm={{ workload.namespace }}" | tee -a "$LOG"
+            exit 11
+          fi
+          printf 'destroy confirmed\n' | tee -a "$LOG"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: destroy } ]
+
+  - step: destroy
+    desc: Delete in reverse dependency order and wait until every labelled object, PVC and PV is gone
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -eu
+          LOG='{{ vars.run_log }}'; exec 2>>"$LOG"
+          say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+          K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; SEL="noetl.io/stack=log-analytics"
+          if $K get ns "$NS" >/dev/null 2>&1; then
+            $K -n "$NS" delete deploy,ds -l "$SEL" --wait=true --timeout='{{ workload.timeout }}' | tee -a "$LOG"
+            $K -n "$NS" delete sts -l "$SEL" --wait=true --timeout='{{ workload.timeout }}' | tee -a "$LOG"
+            $K delete ns "$NS" --wait=true --timeout='{{ workload.timeout }}' | tee -a "$LOG"
+          else
+            say "namespace $NS already absent"
+          fi
+          $K delete clusterrolebinding,clusterrole -l "$SEL" --ignore-not-found | tee -a "$LOG"
+          i=0
+          while [ "$($K get pv -o json | jq --arg ns "$NS" '[.items[] | select(.spec.claimRef.namespace == $ns)] | length')" != "0" ]; do
+            i=$((i+1)); [ $i -lt 30 ] || { say "FAILED: PersistentVolumes for $NS still present after 60s"; exit 12; }; sleep 2
+          done
+          left=$( { $K get namespace,clusterrole,clusterrolebinding -l "$SEL" -o name; } | wc -l | tr -d ' ')
+          [ "$left" = "0" ] || { say "FAILED: $left labelled objects remain"; exit 12; }
+          say "DESTROYED: namespace, workloads, PVC/PV and cluster RBAC removed; nothing labelled $SEL remains."
+          say "(noetl credentials {{ workload.ingest_credential }} / {{ workload.mcp_credential }} are left in the local store; the next apply overwrites them.)"
+    next:
+      spec: { mode: exclusive }
+      arcs: [ { step: report } ]
+
+  # ------------------------------------------------------------------- report
+  - step: report
+    desc: Print this run's log as the playbook result
+    tool:
+      kind: shell
+      cmds:
+        - "cat '{{ vars.run_log }}'"
+
+  - step: show_help
+    tool:
+      kind: shell
+      cmds:
+        - |
+          cat <<'EOF'
+          kind log-analytics stack, provisioned by NoETL (Infrastructure as Playbook)
+            --set action=plan      what apply would change (server-side dry-run diff)
+            --set action=apply     converge: namespace, credentials, ClickHouse, schema, Vector, MCP; wait Ready
+            --set action=verify    e2e: insert a row via noetl http, read it back, query it through MCP
+            --set action=drift     report unapplied config, live drift, conflicts, orphans (exit 10 on drift)
+            --set action=status    objects, applied state, kubelet log rotation, rows per source
+            --set action=destroy --set confirm=log-analytics   delete everything, wait until gone
+          Options: context=kind-noetl reconcile=report|enforce max_load=6 noetl_bin=noetl
+          Spec: docs/specs/noetl-iac-log-analytics.md
+          EOF
