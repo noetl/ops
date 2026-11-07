@@ -63,6 +63,14 @@ metadata:
 data:
   vector.yaml: |
     data_dir: /var/lib/vector
+    # The ClickHouse password comes from the mounted Secret file, not "${ENV}" interpolation:
+    # on kind with Vector 0.60 the interpolated value never matched (ClickHouse code 516) even
+    # though the pod env did. The directory backend reads the Secret's bytes verbatim.
+    secret:
+      ch:
+        type: directory
+        path: /etc/vector-secrets
+        remove_trailing_whitespace: true
     api:
       enabled: true
       address: 0.0.0.0:8686
@@ -118,7 +126,7 @@ data:
         auth:
           strategy: basic
           user: ingest
-          password: "${CH_INGEST_PASSWORD}"
+          password: "SECRET[ch.ingest_password]"
         batch:
           max_events: 5000
           timeout_secs: 5
@@ -183,6 +191,9 @@ spec:
             - name: config
               mountPath: /etc/vector
               readOnly: true
+            - name: ch-secret
+              mountPath: /etc/vector-secrets
+              readOnly: true
             - name: var-log
               mountPath: /var/log
               readOnly: true
@@ -192,6 +203,11 @@ spec:
         - name: config
           configMap:
             name: vector-config
+        - name: ch-secret
+          secret:
+            secretName: log-analytics-credentials
+            items:
+              - { key: ingest-password, path: ingest_password }
         - name: var-log
           hostPath:
             path: /var/log

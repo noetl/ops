@@ -193,7 +193,9 @@ workflow:
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
           # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
           declared() {
-            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+            # Rendered from the manifests alone (no live merge, no API call), so the digest is a pure
+            # function of the declared YAML: a field another manager changes cannot move it.
+            $K create --dry-run=client --validate=false -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
               d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
               printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
                 | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
@@ -332,7 +334,9 @@ workflow:
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
           # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
           declared() {
-            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+            # Rendered from the manifests alone (no live merge, no API call), so the digest is a pure
+            # function of the declared YAML: a field another manager changes cannot move it.
+            $K create --dry-run=client --validate=false -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
               d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
               printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
                 | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
@@ -414,7 +418,14 @@ workflow:
           say() { printf '%s\n' "$*" | tee -a "$LOG"; }
           K="kubectl --context {{ workload.context }}"; M='{{ workload.manifests }}'
           FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
-          $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/00-namespace.yaml" | tee -a "$LOG"
+          # Server-side apply whose failure STOPS the step. (`kubectl … | tee` alone reports tee's
+          # status: a conflict under reconcile=report would be logged and then recorded as applied.)
+          ssa() {
+            rc=0; out=$($K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE "$@" 2>&1) || rc=$?
+            printf '%s\n' "$out" | tee -a "$LOG"
+            [ $rc -eq 0 ] || { say "FAILED: apply $* (exit $rc). Under reconcile=report a field owned by another manager stops the apply; --set reconcile=enforce takes it back."; exit 6; }
+          }
+          ssa -f "$M/00-namespace.yaml"
     next:
       spec: { mode: exclusive }
       arcs: [ { step: ensure_credentials } ]
@@ -459,7 +470,14 @@ workflow:
           FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
           rv() { $K -n "$NS" get cm "$1" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true; }
           before=$(rv clickhouse-config)
-          $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/10-clickhouse.yaml" | tee -a "$LOG"
+          # Server-side apply whose failure STOPS the step. (`kubectl … | tee` alone reports tee's
+          # status: a conflict under reconcile=report would be logged and then recorded as applied.)
+          ssa() {
+            rc=0; out=$($K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE "$@" 2>&1) || rc=$?
+            printf '%s\n' "$out" | tee -a "$LOG"
+            [ $rc -eq 0 ] || { say "FAILED: apply $* (exit $rc). Under reconcile=report a field owned by another manager stops the apply; --set reconcile=enforce takes it back."; exit 6; }
+          }
+          ssa -f "$M/10-clickhouse.yaml"
           # A ConfigMap change does not roll the pod by itself. Restart only when an
           # existing config actually changed (a fresh create needs no restart).
           if [ -n "$before" ] && [ "$before" != "$(rv clickhouse-config)" ]; then
@@ -503,10 +521,17 @@ workflow:
           say() { printf '%s\n' "$*" | tee -a "$LOG"; }
           K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
           FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
+          # Server-side apply whose failure STOPS the step. (`kubectl … | tee` alone reports tee's
+          # status: a conflict under reconcile=report would be logged and then recorded as applied.)
+          ssa() {
+            rc=0; out=$($K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE "$@" 2>&1) || rc=$?
+            printf '%s\n' "$out" | tee -a "$LOG"
+            [ $rc -eq 0 ] || { say "FAILED: apply $* (exit $rc). Under reconcile=report a field owned by another manager stops the apply; --set reconcile=enforce takes it back."; exit 6; }
+          }
           rv() { $K -n "$NS" get cm "$1" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true; }
           before=$(rv vector-config)
           for f in 20-vector.yaml 30-mcp.yaml; do
-            $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/$f" | tee -a "$LOG"
+            ssa -f "$M/$f"
           done
           if [ -n "$before" ] && [ "$before" != "$(rv vector-config)" ]; then
             say "vector-config changed: rolling daemonset/vector"
@@ -569,7 +594,9 @@ workflow:
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
           # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
           declared() {
-            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+            # Rendered from the manifests alone (no live merge, no API call), so the digest is a pure
+            # function of the declared YAML: a field another manager changes cannot move it.
+            $K create --dry-run=client --validate=false -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
               d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
               printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
                 | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
@@ -714,7 +741,9 @@ workflow:
     desc: Read the marker back through ClickHouse HTTP
     tool:
       kind: http
-      method: POST
+      # GET: a body-less POST is refused by ClickHouse (HTTP 411, no Content-Length), and a GET
+      # query is read-only by construction.
+      method: GET
       url: "{{ workload.clickhouse_url }}/"
       params:
         query: "SELECT count() FROM logs.events WHERE source = 'noetl' AND message = {m:String}"
@@ -807,7 +836,23 @@ workflow:
           q() { $K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q "$1"; }
           i=0
           until [ "$(q "SELECT count() FROM logs.events WHERE source = 'k8s' AND received_at > now() - INTERVAL 15 MINUTE")" -gt 0 ]; do
-            i=$((i+1)); [ $i -lt 12 ] || { say "FAILED: no k8s rows from Vector in the last 15 minutes"; exit 9; }; sleep 5
+            i=$((i+1))
+            if [ $i -ge 24 ]; then
+              say "FAILED: no k8s rows from Vector in the last 15 minutes (waited 2 min). Diagnostics:"
+              $K -n "$NS" get pods -l app.kubernetes.io/name=vector -o wide 2>&1 | tee -a "$LOG"
+              $K -n "$NS" logs ds/vector --tail=40 2>&1 | grep -iv 'password' | tee -a "$LOG"
+              say "namespaces opted in: $($K get ns -l noetl.io/log-analytics=capture -o name | tr '\n' ' ')"
+              # Secret-free comparisons: hashes of the password each side sees, never the value.
+              hv=$($K -n "$NS" exec ds/vector -- sh -c 'printf %s "$CH_INGEST_PASSWORD" | sha256sum' 2>/dev/null | cut -c1-12)
+              hc=$($K -n "$NS" exec clickhouse-0 -c clickhouse -- sh -c 'printf %s "$CH_INGEST_PASSWORD" | sha256sum' 2>/dev/null | cut -c1-12)
+              say "ingest password sha256 prefix: vector=$hv clickhouse=$hc"
+              say "vector pod HTTP basic auth as ingest (curl): $($K -n "$NS" exec ds/vector -- sh -c 'command -v curl >/dev/null || { echo no-curl; exit 0; }; curl -s -o /dev/null -w %{http_code} -u "ingest:$(cat /etc/vector-secrets/ingest_password)" "http://clickhouse.log-analytics.svc.cluster.local:8123/?query=SELECT%201"' 2>&1 | tail -1)"
+              say "ingest login inside the cluster: $($K -n "$NS" exec clickhouse-0 -c clickhouse -- sh -c 'clickhouse-client --host clickhouse.log-analytics.svc.cluster.local --user ingest --password "$CH_INGEST_PASSWORD" -q "SELECT currentUser()"' 2>&1 | tail -1 | cut -c1-200)"
+              $K -n "$NS" logs clickhouse-0 -c clickhouse --tail=400 2>&1 | grep -iE 'ingest|denied|authenticat|privilege|Code: (497|516|164)' | tail -6 | cut -c1-400 | tee -a "$LOG"
+              q "SELECT exception_code, substring(exception, 1, 300) FROM system.query_log WHERE user = 'ingest' AND exception_code != 0 AND event_time > now() - INTERVAL 15 MINUTE ORDER BY event_time DESC LIMIT 3 FORMAT TSV" 2>&1 | tee -a "$LOG" || true
+              exit 9
+            fi
+            sleep 5
           done
           say "ok  Vector -> ClickHouse: pod logs arriving"
           q "SELECT namespace, count() AS rows FROM logs.events WHERE source = 'k8s' AND received_at > now() - INTERVAL 15 MINUTE GROUP BY namespace ORDER BY rows DESC LIMIT 8 FORMAT PrettyCompactMonoBlock" | tee -a "$LOG"
@@ -866,7 +911,9 @@ workflow:
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
           # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
           declared() {
-            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+            # Rendered from the manifests alone (no live merge, no API call), so the digest is a pure
+            # function of the declared YAML: a field another manager changes cannot move it.
+            $K create --dry-run=client --validate=false -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
               d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
               printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
                 | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
@@ -1036,7 +1083,9 @@ workflow:
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
           # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
           declared() {
-            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+            # Rendered from the manifests alone (no live merge, no API call), so the digest is a pure
+            # function of the declared YAML: a field another manager changes cannot move it.
+            $K create --dry-run=client --validate=false -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
               d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
               printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
                 | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),
@@ -1155,7 +1204,9 @@ workflow:
             | "k8s://\($ctx)/\(.metadata.namespace // "_cluster")/\($g)/\(.kind)/\(.metadata.name)"'
           # Declared resources, one JSON line each: {urn, provider, service, resource_type, desired{..., digest}}
           declared() {
-            $K apply --dry-run=client -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
+            # Rendered from the manifests alone (no live merge, no API call), so the digest is a pure
+            # function of the declared YAML: a field another manager changes cannot move it.
+            $K create --dry-run=client --validate=false -o json -f "$M" | jq -c '(.items // [.])[]' | while IFS= read -r o; do
               d=$(printf '%s' "$o" | jq -S -c 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' | shasum -a 256 | cut -c1-16)
               printf '%s' "$o" | jq -c --arg ctx "$CTX" --arg d "$d" "($URNJQ) as \$u | (.apiVersion | split(\"/\")) as \$av
                 | {urn: \$u, provider: \"kubernetes\", service: (if (\$av | length) == 2 then \$av[0] else \"core\" end),

@@ -172,3 +172,68 @@ changes; the facts and the fold do not), cut the releases, then validate on kind
   gives the same owned set.
 - A corrupt `events.feather` stops the fold (exit 15).
 - `validate.py`: all checks pass.
+
+## 2026-11-07 (round 3, continued): releases, merges, pins; kind validation staged
+
+**Merged and released.**
+- noetl/cli#102 → **v5.5.0**.
+- noetl/server#559 → **v3.152.0**. The release builds images only; nothing is deployed, and
+  the Arrow ingest is off unless `NOETL_EVENTS_ARROW_INGEST=enabled`.
+- noetl/ops#361 → `c49803e`.
+- shastaranch/qnetmon#14 → `8b010a9`.
+- ops wiki → `0c0bfb5`.
+- noetl/ai-meta#535 pins cli v5.5.0, server v3.152.0, ops `c49803e` and the ops wiki. It was
+  made from a separate clone; the shared ai-meta tree was not touched.
+
+**Kind end-to-end: staged, not run.** At 10:00–10:10 PST the host 1-min load was 10–15,
+from Adobe Creative Cloud processes, not kind. The kind VM (`podman machine noetl-dev`) was
+stopped by the scheme-2 session, which has since gone idle.
+`ci/kind/e2e_log_analytics.sh` is the one-shot run:
+- plan, apply, verify;
+- qnetmon `logs.yaml` shipping a copy of the live edge logs, then SQL and MCP counts;
+- Phase 0 Feather state: second apply is a no-op, backup, loss, restore;
+- drift: clean, then a foreign field manager (exit 10), then `reconcile=enforce`, clean;
+- destroy and teardown checks.
+
+The script uses a private credential store, state dir and a local object-store stand-in.
+It refuses unless load < 5, and it stops the VM again if it started it. A dry check
+refused at load 10.1 and touched nothing.
+
+```bash
+NOETL_BIN=<noetl >= 5.5.0> QNETMON=<qnetmon checkout> LIVE_RUNS=<qnetmon>/var/runs ci/kind/e2e_log_analytics.sh
+```
+
+## 2026-11-07 (round 3, validated): kind end-to-end PASSED, 27/27
+
+Ran `ci/kind/e2e_log_analytics.sh` at 11:52 PST (host load 3.5, kind free). The script:
+- started the stopped `noetl-dev` podman machine and the `noetl-control-plane` node;
+- ran the cycle with noetl 5.5.0 (built from the merged source), a private credential store,
+  a private state dir and a local object-store stand-in;
+- tore everything down and stopped the node and the machine again.
+
+| Stage | Result |
+|---|---|
+| plan → apply | ClickHouse 26.8, Vector 0.60 and MCP 0.7 provisioned by the playbook; 14 resources recorded as `changed` |
+| verify | noetl `http` insert + read-back; MCP 401 without auth, session, `run_query` finds the marker, writes refused (code 497); Vector pod logs arriving |
+| qnetmon | `logs.yaml` shipped a copy of the live edge logs: **2548 rows** (1271 events, 1277 stderr). The SQL count equals the MCP `run_query` count |
+| Phase 0 Feather state | `events.feather` is Arrow IPC (pyarrow: 14 rows). Second apply: 0 changed, 14 unchanged. The object store holds every execution. After local state was deleted, restore gave the same 14 owned. `noetl push --dry-run` built both executions |
+| drift | Clean after apply. Another manager changing a declared field (replicas) is classed `conflict`. `reconcile=report` stops; `reconcile=enforce` takes the field back, then drift is clean |
+| destroy | State owns 0. Namespace, PV and cluster-scoped objects are gone |
+
+**Bugs found by the earlier runs, all fixed on ops#362 before the passing run.**
+1. `declared()` digested `kubectl apply --dry-run=client` output, which merges the live
+   object. The digest drifted whenever another manager touched an object (false `unapplied`;
+   enforce could never clear it). Now `kubectl create --dry-run=client --validate=false`:
+   rendered from the manifests only, deterministic and offline.
+2. `verify_select` POSTed with no body; ClickHouse answered 411. It is now a GET.
+3. `kubectl apply … | tee` reported tee's status, so a `reconcile=report` conflict was logged
+   and then **recorded in state as applied**. `ssa()` now fails the step (exit 6).
+4. Vector's `${CH_INGEST_PASSWORD}` interpolation never matched: ClickHouse code 516,
+   although the env hash equalled ClickHouse's. Vector now reads the Secret file through its
+   `directory` secret backend (`SECRET[ch.ingest_password]`).
+5. e2e harness:
+   - a stopped kind node container is started and re-stopped;
+   - a settle wait is added under the playbook's `max_load` guard. The guard is kept; it
+     refused mid-run while the NoETL core pods booted;
+   - drift is injected on a declared field and its class is read from the output, because
+     `noetl run` maps every failure to exit 1.
