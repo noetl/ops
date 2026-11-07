@@ -1,0 +1,18 @@
+# Log-analytics stack: desired state, applied by NoETL (not Terraform, not Crossplane).
+#
+#   noetl run automation/iap/kind/log_analytics.yaml --set action=apply
+#
+# Every object carries the stack's ownership labels. The labels are the inventory:
+# `drift` finds orphans and `destroy` finds what to delete by selecting on
+# noetl.io/stack=log-analytics, so there is no separate state file.
+# Spec: docs/specs/noetl-iac-log-analytics.md
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: log-analytics
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    noetl.io/stack: log-analytics
+    # Business-log capture is opt-in per namespace (see 20-vector.yaml).
+    noetl.io/log-analytics: capture

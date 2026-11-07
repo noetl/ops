@@ -1,0 +1,201 @@
+# Vector (timberio/vector, MPL-2.0) as the in-cluster shipper for BUSINESS workload logs:
+# one pod per node tails /var/log/pods (files the kubelet rotates at containerLogMaxSize,
+# see ci/kind/config.yaml) and writes rows into ClickHouse logs.events as `ingest`.
+#
+# Opt-in by namespace: only namespaces labelled noetl.io/log-analytics=capture are
+# shipped. NoETL core namespaces (noetl, postgres, kube-system, ...) are never labelled:
+# core operational events and state stay in EHDB (docs/decisions/ADR-0005).
+# Vector tracks file checkpoints in /var/lib/vector on the node, so a restart resumes
+# where it stopped and rotated files are followed by inode, not by name.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vector
+  namespace: log-analytics
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: vector
+    noetl.io/stack: log-analytics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: log-analytics-vector
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: vector
+    noetl.io/stack: log-analytics
+rules:
+  - apiGroups: [""]
+    resources: [pods, namespaces, nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: log-analytics-vector
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: vector
+    noetl.io/stack: log-analytics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: log-analytics-vector
+subjects:
+  - kind: ServiceAccount
+    name: vector
+    namespace: log-analytics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-config
+  namespace: log-analytics
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: vector
+    noetl.io/stack: log-analytics
+data:
+  vector.yaml: |
+    data_dir: /var/lib/vector
+    api:
+      enabled: true
+      address: 0.0.0.0:8686
+    sources:
+      pods:
+        type: kubernetes_logs
+        self_node_name: "${VECTOR_SELF_NODE_NAME}"
+        extra_namespace_label_selector: "noetl.io/log-analytics=capture"
+        # Never ship Vector's own output (a shipping error would feed itself).
+        exclude_paths_glob_patterns:
+          - "/var/log/pods/log-analytics_vector-*/**"
+        glob_minimum_cooldown_ms: 5000
+        max_line_bytes: 65536
+    transforms:
+      shape:
+        type: remap
+        inputs: [pods]
+        source: |
+          msg = string(.message) ?? ""
+          lvl = ""
+          parsed, perr = parse_json(msg)
+          if perr == null && is_object(parsed) {
+            o = object!(parsed)
+            lvl = string(o.level) ?? string(o.severity) ?? string(o.lvl) ?? ""
+          }
+          if lvl == "" {
+            m, rerr = parse_regex(msg, r'(?i)\b(?P<l>trace|debug|info|warn|warning|error|fatal|panic)\b')
+            if rerr == null { lvl = string(m.l) ?? "" }
+          }
+          lvl = downcase(lvl)
+          if lvl == "warning" { lvl = "warn" }
+          . = {
+            "ts": .timestamp,
+            "source": "k8s",
+            "host": string(.kubernetes.pod_node_name) ?? "",
+            "namespace": string(.kubernetes.pod_namespace) ?? "",
+            "pod": string(.kubernetes.pod_name) ?? "",
+            "container": string(.kubernetes.container_name) ?? "",
+            "stream": string(.stream) ?? "",
+            "level": lvl,
+            "message": msg,
+            "attrs": encode_json(.kubernetes.pod_labels)
+          }
+    sinks:
+      clickhouse:
+        type: clickhouse
+        inputs: [shape]
+        endpoint: http://clickhouse.log-analytics.svc.cluster.local:8123
+        database: logs
+        table: events
+        skip_unknown_fields: true
+        date_time_best_effort: true
+        auth:
+          strategy: basic
+          user: ingest
+          password: "${CH_INGEST_PASSWORD}"
+        batch:
+          max_events: 5000
+          timeout_secs: 5
+        # Survives a ClickHouse restart; drops the newest events rather than
+        # blocking the node if ClickHouse stays down long enough to fill 256 MiB.
+        buffer:
+          type: disk
+          max_size: 268435488
+          when_full: drop_newest
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vector
+  namespace: log-analytics
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: vector
+    noetl.io/stack: log-analytics
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vector
+      noetl.io/stack: log-analytics
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: noetl
+        app.kubernetes.io/part-of: log-analytics
+        app.kubernetes.io/name: vector
+        noetl.io/stack: log-analytics
+    spec:
+      serviceAccountName: vector
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: vector
+          image: timberio/vector:0.60.0-debian
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/vector/vector.yaml"]
+          env:
+            - name: VECTOR_SELF_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: VECTOR_SELF_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: VECTOR_SELF_POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: CH_INGEST_PASSWORD
+              valueFrom: { secretKeyRef: { name: log-analytics-credentials, key: ingest-password } }
+          ports:
+            - name: api
+              containerPort: 8686
+          readinessProbe:
+            httpGet: { path: /health, port: api }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 300m, memory: 256Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+              readOnly: true
+            - name: var-log
+              mountPath: /var/log
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/vector
+      volumes:
+        - name: config
+          configMap:
+            name: vector-config
+        - name: var-log
+          hostPath:
+            path: /var/log
+        - name: data
+          hostPath:
+            path: /var/lib/vector
+            type: DirectoryOrCreate

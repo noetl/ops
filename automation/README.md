@@ -33,7 +33,7 @@ automation/
 │   ├── postgres.yaml          # PostgreSQL deployment and management
 │   ├── qdrant.yaml            # Qdrant vector database management
 │   ├── nats.yaml              # NATS JetStream messaging
-│   ├── clickhouse.yaml        # ClickHouse analytics database
+│   ├── clickhouse.yaml        # ClickHouse analytics database (legacy; see iap/kind/log_analytics.yaml)
 │   ├── monitoring.yaml        # VictoriaMetrics monitoring stack
 │   ├── observability.yaml     # Aggregate observability operations
 │   └── kind.yaml              # Kind Kubernetes cluster management
@@ -49,7 +49,9 @@ automation/
 │   └── publish_distribution_repos.yaml # Publish Homebrew tap + APT repo updates
 ├── test/                      # Testing workflows
 │   └── pagination-server.yaml # Pagination test server automation
-├── iap/                       # Infrastructure as Playbook
+├── iap/                       # Infrastructure as Playbook (NoETL instead of Terraform/Crossplane)
+│   ├── kind/                  # local kind stacks
+│   │   └── log_analytics.yaml # business-data stack (ClickHouse + Vector + MCP): plan/apply/verify/drift/state/destroy
 │   └── gcp/                   # GCP provider playbooks
 │       ├── gke_autopilot.yaml # GKE Autopilot cluster management
 │       ├── state_sync.yaml    # State synchronization
