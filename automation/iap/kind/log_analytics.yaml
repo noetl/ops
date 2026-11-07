@@ -418,7 +418,14 @@ workflow:
           say() { printf '%s\n' "$*" | tee -a "$LOG"; }
           K="kubectl --context {{ workload.context }}"; M='{{ workload.manifests }}'
           FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
-          $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/00-namespace.yaml" | tee -a "$LOG"
+          # Server-side apply whose failure STOPS the step. (`kubectl … | tee` alone reports tee's
+          # status: a conflict under reconcile=report would be logged and then recorded as applied.)
+          ssa() {
+            rc=0; out=$($K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE "$@" 2>&1) || rc=$?
+            printf '%s\n' "$out" | tee -a "$LOG"
+            [ $rc -eq 0 ] || { say "FAILED: apply $* (exit $rc). Under reconcile=report a field owned by another manager stops the apply; --set reconcile=enforce takes it back."; exit 6; }
+          }
+          ssa -f "$M/00-namespace.yaml"
     next:
       spec: { mode: exclusive }
       arcs: [ { step: ensure_credentials } ]
@@ -463,7 +470,14 @@ workflow:
           FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
           rv() { $K -n "$NS" get cm "$1" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true; }
           before=$(rv clickhouse-config)
-          $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/10-clickhouse.yaml" | tee -a "$LOG"
+          # Server-side apply whose failure STOPS the step. (`kubectl … | tee` alone reports tee's
+          # status: a conflict under reconcile=report would be logged and then recorded as applied.)
+          ssa() {
+            rc=0; out=$($K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE "$@" 2>&1) || rc=$?
+            printf '%s\n' "$out" | tee -a "$LOG"
+            [ $rc -eq 0 ] || { say "FAILED: apply $* (exit $rc). Under reconcile=report a field owned by another manager stops the apply; --set reconcile=enforce takes it back."; exit 6; }
+          }
+          ssa -f "$M/10-clickhouse.yaml"
           # A ConfigMap change does not roll the pod by itself. Restart only when an
           # existing config actually changed (a fresh create needs no restart).
           if [ -n "$before" ] && [ "$before" != "$(rv clickhouse-config)" ]; then
@@ -507,10 +521,17 @@ workflow:
           say() { printf '%s\n' "$*" | tee -a "$LOG"; }
           K="kubectl --context {{ workload.context }}"; NS='{{ workload.namespace }}'; M='{{ workload.manifests }}'
           FORCE=""; [ '{{ workload.reconcile }}' = "enforce" ] && FORCE="--force-conflicts"
+          # Server-side apply whose failure STOPS the step. (`kubectl … | tee` alone reports tee's
+          # status: a conflict under reconcile=report would be logged and then recorded as applied.)
+          ssa() {
+            rc=0; out=$($K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE "$@" 2>&1) || rc=$?
+            printf '%s\n' "$out" | tee -a "$LOG"
+            [ $rc -eq 0 ] || { say "FAILED: apply $* (exit $rc). Under reconcile=report a field owned by another manager stops the apply; --set reconcile=enforce takes it back."; exit 6; }
+          }
           rv() { $K -n "$NS" get cm "$1" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true; }
           before=$(rv vector-config)
           for f in 20-vector.yaml 30-mcp.yaml; do
-            $K apply --server-side --field-manager='{{ workload.field_manager }}' $FORCE -f "$M/$f" | tee -a "$LOG"
+            ssa -f "$M/$f"
           done
           if [ -n "$before" ] && [ "$before" != "$(rv vector-config)" ]; then
             say "vector-config changed: rolling daemonset/vector"
@@ -815,7 +836,15 @@ workflow:
           q() { $K -n "$NS" exec clickhouse-0 -c clickhouse -- clickhouse-client -q "$1"; }
           i=0
           until [ "$(q "SELECT count() FROM logs.events WHERE source = 'k8s' AND received_at > now() - INTERVAL 15 MINUTE")" -gt 0 ]; do
-            i=$((i+1)); [ $i -lt 12 ] || { say "FAILED: no k8s rows from Vector in the last 15 minutes"; exit 9; }; sleep 5
+            i=$((i+1))
+            if [ $i -ge 24 ]; then
+              say "FAILED: no k8s rows from Vector in the last 15 minutes (waited 2 min). Diagnostics:"
+              $K -n "$NS" get pods -l app.kubernetes.io/name=vector -o wide 2>&1 | tee -a "$LOG"
+              $K -n "$NS" logs ds/vector --tail=40 2>&1 | grep -iv 'password' | tee -a "$LOG"
+              say "namespaces opted in: $($K get ns -l noetl.io/log-analytics=capture -o name | tr '\n' ' ')"
+              exit 9
+            fi
+            sleep 5
           done
           say "ok  Vector -> ClickHouse: pod logs arriving"
           q "SELECT namespace, count() AS rows FROM logs.events WHERE source = 'k8s' AND received_at > now() - INTERVAL 15 MINUTE GROUP BY namespace ORDER BY rows DESC LIMIT 8 FORMAT PrettyCompactMonoBlock" | tee -a "$LOG"

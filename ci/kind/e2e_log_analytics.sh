@@ -56,8 +56,18 @@ EOF
 chmod +x "$W/bin/gsutil"; export PATH="$W/bin:$PATH" FAKE_BUCKET="$W/bucket"
 BK=gs://fake/iac/log-analytics
 
+PB_MAX_LOAD=${PB_MAX_LOAD:-6}   # the playbook's own max_load guard (workload default)
+settle() {  # wait (≤ 5 min) until the 1-min load is under the playbook's guard; the kind node's own
+            # pods (NoETL core) spike the host right after boot, and the guard is kept, not disabled.
+  local i=0 l
+  while l=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}'); awk -v l="$l" -v m="$PB_MAX_LOAD" 'BEGIN{exit !(l>=m-0.5)}'; do
+    i=$((i+1)); [ $i -le 30 ] || { echo "  (load still $l after 5 min; the playbook guard will decide)"; return 0; }
+    [ $i = 1 ] && echo "  waiting for load $l to settle under $PB_MAX_LOAD"; sleep 10
+  done
+}
 pb() {  # pb <action> [--set k=v ...]  → prints the run log; returns the playbook's exit code
   local a=$1; shift
+  case "$a" in plan|apply|verify) settle >&2 ;; esac
   (cd "$OPS" && "$N" run automation/iap/kind/log_analytics.yaml -r local --set action="$a" --set noetl_bin="$N" \
      --set state_dir="$W/state" --set state_backup="$BK" "$@" --json > "$W/out.json" 2>"$W/err.log")
   local rc=$?
@@ -99,7 +109,7 @@ for o in statefulset/clickhouse daemonset/vector deployment/clickhouse-mcp; do
   $K -n "$NS" get "$o" >/dev/null && ok "$o exists" || bad "$o missing"; done
 
 step "2. verify (noetl http insert/select + MCP)"
-pb verify > "$W/verify.txt" && ok "verify passed" || bad "verify failed"
+pb verify > "$W/verify.txt" && ok "verify passed" || { bad "verify failed"; grep -E 'FAILED|^  |vector|namespaces opted' "$W/verify.txt" | tail -30 | sed 's/^/       /'; }
 grep '^ok ' "$W/verify.txt" | sed 's/^/       /' || true
 
 step "3. qnetmon log rows → ClickHouse → MCP"
