@@ -172,3 +172,33 @@ changes; the facts and the fold do not), cut the releases, then validate on kind
   gives the same owned set.
 - A corrupt `events.feather` stops the fold (exit 15).
 - `validate.py`: all checks pass.
+
+## 2026-11-07 (round 3, continued): releases, merges, pins; kind validation staged
+
+**Merged and released.**
+- noetl/cli#102 → **v5.5.0**.
+- noetl/server#559 → **v3.152.0**. The release builds images only; nothing is deployed, and
+  the Arrow ingest is off unless `NOETL_EVENTS_ARROW_INGEST=enabled`.
+- noetl/ops#361 → `c49803e`.
+- shastaranch/qnetmon#14 → `8b010a9`.
+- ops wiki → `0c0bfb5`.
+- noetl/ai-meta#535 pins cli v5.5.0, server v3.152.0, ops `c49803e` and the ops wiki. It was
+  made from a separate clone; the shared ai-meta tree was not touched.
+
+**Kind end-to-end: staged, not run.** At 10:00–10:10 PST the host 1-min load was 10–15,
+from Adobe Creative Cloud processes, not kind. The kind VM (`podman machine noetl-dev`) was
+stopped by the scheme-2 session, which has since gone idle.
+`ci/kind/e2e_log_analytics.sh` is the one-shot run:
+- plan, apply, verify;
+- qnetmon `logs.yaml` shipping a copy of the live edge logs, then SQL and MCP counts;
+- Phase 0 Feather state: second apply is a no-op, backup, loss, restore;
+- drift: clean, then a foreign field manager (exit 10), then `reconcile=enforce`, clean;
+- destroy and teardown checks.
+
+The script uses a private credential store, state dir and a local object-store stand-in.
+It refuses unless load < 5, and it stops the VM again if it started it. A dry check
+refused at load 10.1 and touched nothing.
+
+```bash
+NOETL_BIN=<noetl >= 5.5.0> QNETMON=<qnetmon checkout> LIVE_RUNS=<qnetmon>/var/runs ci/kind/e2e_log_analytics.sh
+```
