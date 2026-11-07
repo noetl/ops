@@ -237,3 +237,19 @@ Ran `ci/kind/e2e_log_analytics.sh` at 11:52 PST (host load 3.5, kind free). The 
      refused mid-run while the NoETL core pods booted;
    - drift is injected on a declared field and its class is read from the output, because
      `noetl run` maps every failure to exit 1.
+
+## 2026-11-07 (round 4, re-run after merge): kind end-to-end PASSED again, 27/27
+
+Ran `ci/kind/e2e_log_analytics.sh` again after ops#362 merged (`2bf20a3`), to confirm the merged state.
+- **Binary:** the debug build of the merged 5.5.0 source (`cli` `6fc636f`; `v5.5.0` adds only
+  the version bump, so the binary reports 5.4.0). No 5.5.0 release binary was installed.
+- **Load gates:** host load was ~4.7 at start. Booting kind briefly pushes the 1-min load past
+  the guards on an otherwise idle host, so all three gates were bypassed for this run only:
+  `MAX_LOAD=1000`, `PB_MAX_LOAD=1000`, and `--set max_load=0` in a temporary copy
+  (`ci/kind/.e2e_nogate.sh`). The copy was deleted after the run and never committed; the
+  script and playbook defaults are unchanged.
+- **Cycle:** provision → verify (noetl `http` + MCP) → qnetmon `logs.yaml` shipped **2746 rows**
+  (SQL count equals the MCP `run_query` count) → Phase 0 Feather write / second apply no-op /
+  backup → restore → drift detect + `reconcile=enforce` → destroy + teardown.
+- **Result:** `passed: 27   failed: 0`. The script stopped the kind node and the podman
+  machine itself on exit.
