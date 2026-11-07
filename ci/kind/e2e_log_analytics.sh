@@ -109,7 +109,7 @@ for o in statefulset/clickhouse daemonset/vector deployment/clickhouse-mcp; do
   $K -n "$NS" get "$o" >/dev/null && ok "$o exists" || bad "$o missing"; done
 
 step "2. verify (noetl http insert/select + MCP)"
-pb verify > "$W/verify.txt" && ok "verify passed" || { bad "verify failed"; grep -E 'FAILED|^  |vector|namespaces opted' "$W/verify.txt" | tail -30 | sed 's/^/       /'; }
+pb verify > "$W/verify.txt" && ok "verify passed" || { bad "verify failed"; grep -vE 'ERROR sink|^ok |^#|^state:|^preflight|^host load|^verify marker' "$W/verify.txt" | tail -25 | sed 's/^/       /'; }
 grep '^ok ' "$W/verify.txt" | sed 's/^/       /' || true
 
 step "3. qnetmon log rows → ClickHouse → MCP"
