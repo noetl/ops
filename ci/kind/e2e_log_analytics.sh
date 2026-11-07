@@ -153,11 +153,20 @@ pb state > "$W/state.txt" && grep -q "state restored from backup" "$W/state.txt"
 
 step "5. drift"
 pb drift > "$W/drift0.txt" && ok "drift clean after apply" || bad "drift not clean: $(tail -5 "$W/drift0.txt")"
-$K -n "$NS" patch deployment clickhouse-mcp --field-manager=e2e-intruder --type=merge \
-  -p '{"spec":{"template":{"spec":{"terminationGracePeriodSeconds":7}}}}' >/dev/null
+# Another field manager takes a field the stack DECLARES (replicas). An undeclared field is not
+# drift under SSA, by design. `noetl run` maps any failing exit to 1, so the class is read from
+# the output rather than from the playbook's exit 10.
+$K -n "$NS" patch deployment clickhouse-mcp --field-manager=e2e-intruder --type=merge -p '{"spec":{"replicas":2}}' >/dev/null
 set +e; pb drift > "$W/drift1.txt"; rc=$?; set -e
-[ $rc = 10 ] && ok "drift detects the foreign change (exit 10)" || bad "drift exit $rc after a foreign change, want 10"
-pb apply --set reconcile=enforce > "$W/apply3.txt" && pb drift > "$W/drift2.txt" && ok "apply reconcile=enforce restores; drift clean" || bad "enforce/redrift failed"
+if [ $rc != 0 ] && grep -q "DRIFT DETECTED" "$W/drift1.txt" && ! grep -q "DRIFT unapplied" "$W/drift1.txt" \
+   && grep -qiE "DRIFT (fields|conflict)" "$W/drift1.txt"; then
+  ok "drift classifies the foreign change as fields/conflict: $(grep -iE 'DRIFT (fields|conflict)' "$W/drift1.txt" | head -1 | cut -c1-110)"
+else bad "drift after a foreign change (rc=$rc): $(grep DRIFT "$W/drift1.txt" | head -3 | tr '\n' ' ')"; fi
+set +e; pb apply > "$W/apply3r.txt"; rc=$?; set -e
+[ $rc != 0 ] && ok "apply reconcile=report stops on the conflict" || bad "apply reconcile=report did not stop on a conflict"
+pb apply --set reconcile=enforce > "$W/apply3.txt" && pb drift > "$W/drift2.txt" \
+  && [ "$($K -n "$NS" get deployment clickhouse-mcp -o jsonpath='{.spec.replicas}')" = 1 ] \
+  && ok "apply reconcile=enforce takes the field back (replicas=1); drift clean" || bad "enforce/redrift failed: $(grep DRIFT "$W/drift2.txt" | head -2 | tr '\n' ' ')"
 
 step "6. destroy + teardown"
 pb destroy --set confirm=log-analytics > "$W/destroy.txt" && ok "destroy" || bad "destroy failed"
