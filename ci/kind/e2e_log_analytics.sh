@@ -17,7 +17,8 @@
 # Isolation: a private credential store, a private state dir and a local stand-in for the
 # object store (a gsutil shim over a directory: no cloud is touched). The live qnetmon
 # var/runs is only READ (copied). Gates: 1-min load below MAX_LOAD (default 5); the kind
-# API must answer. If the podman machine was stopped, it is started and stopped again at the end.
+# API must answer. A podman machine or kind node container that was stopped is started, and
+# stopped again at the end, so the cluster is left as it was found.
 #
 #   ci/kind/e2e_log_analytics.sh            # from the ops repo root
 #   NOETL_BIN=/path/to/noetl (>= 5.5.0)  QNETMON=/path/to/qnetmon  LIVE_RUNS=/path/to/var/runs
@@ -32,12 +33,14 @@ CTX=kind-noetl; NS=log-analytics; K="kubectl --context $CTX"
 W=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/la-e2e.XXXXXX")}
 mkdir -p "$W/bin" "$W/bucket" "$W/creds" "$W/state" "$W/qn"
 export NOETL_CREDENTIALS_DIR="$W/creds"
-STARTED=0
+STARTED=0; NODE_STARTED=0
+NODE=${KIND_NODE:-noetl-control-plane}
 pass=0; fails=()
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$*"; }
 bad()  { fails+=("$*"); printf '  FAIL %s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
 cleanup() {
+  if [ "$NODE_STARTED" = 1 ]; then echo; echo "stopping kind node $NODE (it was stopped before this run)"; podman stop "$NODE" >/dev/null || true; fi
   if [ "$STARTED" = 1 ]; then echo; echo "stopping podman machine $MACHINE (it was stopped before this run)"; podman machine stop "$MACHINE" >/dev/null || true; fi
 }
 trap cleanup EXIT
@@ -77,7 +80,13 @@ if ! $K get --raw /readyz >/dev/null 2>&1; then
   if podman machine inspect "$MACHINE" --format '{{.State}}' 2>/dev/null | grep -qv running; then
     echo "  starting podman machine $MACHINE"; podman machine start "$MACHINE" >/dev/null; STARTED=1
   fi
-  i=0; until $K get --raw /readyz >/dev/null 2>&1; do i=$((i+1)); [ $i -lt 90 ] || { echo "FAILED: kind API not ready"; exit 4; }; sleep 2; done
+  # A machine restart does not restart the kind node container (no restart policy).
+  if [ "$(podman inspect "$NODE" --format '{{.State.Running}}' 2>/dev/null)" = false ]; then
+    echo "  starting kind node $NODE"; podman start "$NODE" >/dev/null; NODE_STARTED=1
+  fi
+  i=0; until $K get --raw /readyz >/dev/null 2>&1; do i=$((i+1)); [ $i -lt 150 ] || { echo "FAILED: kind API not ready"; exit 4; }; sleep 2; done
+  # Let the node's own workloads settle before adding ours (and re-check load).
+  $K wait --for=condition=Ready node --all --timeout=300s >/dev/null
 fi
 ok "kind API ready ($CTX)"
 $K get ns "$NS" >/dev/null 2>&1 && { echo "REFUSED: namespace $NS already exists; destroy it first"; exit 5; }
