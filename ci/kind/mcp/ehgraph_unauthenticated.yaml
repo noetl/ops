@@ -1,0 +1,26 @@
+# The negative half of the e2e: the same catalog server, no credential. ehgraph answers
+# the tools/call with `isError: true` (HTTP 200). With `on_provider_error: fail` the step
+# must FAIL the run, not complete it.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: mcp_ehgraph_unauthenticated
+  path: tests/mcp/ehgraph_unauthenticated
+workflow:
+  - step: start
+    tool:
+      kind: noop
+    next:
+      - step: read
+  - step: read
+    tool:
+      kind: mcp
+      server: mcp/noetl-cluster
+      on_provider_error: fail
+      tool: graph.instance.info
+      arguments: {}
+    next:
+      - step: end
+  - step: end
+    tool:
+      kind: noop
