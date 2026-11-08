@@ -253,3 +253,35 @@ Ran `ci/kind/e2e_log_analytics.sh` again after ops#362 merged (`2bf20a3`), to co
   backup → restore → drift detect + `reconcile=enforce` → destroy + teardown.
 - **Result:** `passed: 27   failed: 0`. The script stopped the kind node and the podman
   machine itself on exit.
+
+## 2026-11-08: `kind: mcp` end to end in kind (RFC interop/AI-MCP Phase 2)
+
+**Goal.** A playbook's `kind: mcp` step calls the server's embedded ehgraph MCP endpoint and gets a result
+recorded on the event log. The server is found through the catalog (`server: mcp/noetl-cluster`), the call
+authenticates (keychain bearer), and a refused call fails the step (`on_provider_error: fail`). Finding 4 of
+the entry above (`kind: mcp` sends no auth headers) is closed by noetl/worker#397.
+
+**Placement.** ops `ci/kind/e2e_mcp_ehgraph.sh` + `ci/kind/mcp/` (a `kind: Mcp` resource and two playbooks).
+noetl/worker#397 (catalog resolution, auth headers, per-step policy). noetl/server#561 (tool-kind gates open
+inside the off-server wasm drive).
+
+**Isolation.** The server and worker deployments are snapshotted before the run and restored on exit.
+`NOETL_TOOL_KIND_MCP=true` and the embedded graph are armed on the kind server only, for the duration of the
+run. The ehgraph grant lives in a throwaway Secret. Nothing in prod is armed, and no manifest sets either flag.
+
+**Result.** 23/23 (`e2e7`): the authenticated upsert and read both COMPLETED, with `call.done` on the event log
+(`status ok`, `isError false`, the endpoint taken from the catalog, `sent_headers: [authorization]`, and no
+token on the log). The unauthenticated call FAILED with `command.failed` naming the missing credential.
+
+**Findings.**
+1. The off-server orchestrate drive (wasm) has no environment, so the Phase 1 gates read closed there and
+   every `kind: mcp` execution failed at the first drive with `did not match any variant of untagged enum
+   ToolDefinition`. Fixed in noetl/server#561. Admission stays gated at registration and the server's parse.
+2. The embedded ehgraph config needs `backup_prefix`, and must not carry `[embedded]` (the single-writer
+   declaration comes from `NOETL_EHGRAPH_HOST_REPLICAS`). Both are reflected in the script's config.
+3. A templated `{{ execution_id }}` renders as an integer, but ehgraph wants a string. The fixture prefixes it.
+4. `auth_*` result keys are redacted by the worker's event scrubber, so the header-name field is `sent_headers`.
+5. **Open.** In 1 of 6 roundtrip runs, the first execution right after the rollout looped: the drive
+   re-issued the `noop` `start` step about every 80 ms (5k events in 90 s) and never reached the `mcp` step.
+   The other 5 runs, on the same images, completed. Not yet explained. The script now cancels an execution
+   that never reaches a terminal state, and `HOLD_FILE` keeps the cluster armed for inspection.
