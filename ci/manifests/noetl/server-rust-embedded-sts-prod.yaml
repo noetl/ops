@@ -343,8 +343,19 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_TAIL_REPLICATION_TICK_SECS
           value: '60'
-        # v3.146.0: trusts a list of Auth0 tenants (NOETL_AUTH0_DOMAIN above).
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:7c0b999dd0631078e8a11a1fd82436bded89a908ff57f219989f63e480087273
+        # Interop build plan (ai-meta#544), canary-enabled 2026-11-10 after kind (ops#365).
+        # Item 5: /api/mcp serves playbooks that opt in with metadata.expose.mcp.
+        - name: NOETL_MCP_SERVER
+          value: 'true'
+        # Item 7: /api/agents. NOETL_AGENT_CALLBACK_ORIGINS unset = every callback_url refused.
+        - name: NOETL_AGENT_ENDPOINT
+          value: 'true'
+        # Item 9: /api/instances. Trust defaults to an empty allowlist (admits nobody) until
+        # NOETL_INSTANCE_TRUSTED_IDS is set. The topology writer stays off: no embedded ehgraph here.
+        - name: NOETL_INSTANCE_REGISTRY
+          value: 'true'
+        # v3.156.0 (rolled 2026-11-10; previous live pin v3.153.0 sha256:36406e7d…).
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:b00f4f2cd0680aea21562451cf3152a2603c495c362127206faa34b0d17326da
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
