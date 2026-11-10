@@ -1,0 +1,36 @@
+# Opting a playbook in to /api/mcp and /api/agents (build plan items 5 and 7). Add the
+# `expose` block to the playbook's own metadata and register it. Nothing else changes.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: example
+  path: team/tools/example
+  expose:
+    mcp:
+      tool: team_example                # [A-Za-z0-9_.-]{1,64}
+      description: What the tool does, for the model that will call it.
+      input_schema:                     # hand-written; also the allowlist of arguments
+        type: object
+        properties:
+          question: { type: string }
+        required: [question]
+      mode: sync                        # or async (returns an execution id + helpers)
+      timeout: 30                       # sync wait, max 120
+      result_step: answer               # optional
+    agent:                              # optional; reuses expose.mcp.input_schema
+      card:
+        name: team-example
+        description: What the agent does.
+        version: "1"
+      result_step: answer
+workload:
+  question: ""
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: answer } ]
+  - step: answer
+    tool:
+      kind: python
+      input: { question: "{{ workload.question }}" }
+      code: "result = {'answer': 'you asked: ' + str(question)}"
