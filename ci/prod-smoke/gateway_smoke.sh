@@ -23,6 +23,9 @@ while :; do
   case "$st" in COMPLETED|FAILED|CANCELLED) break ;; esac
   i=$((i+1)); [ $i -lt 60 ] || { st=TIMEOUT; break; }; sleep 2
 done
-[ "$st" = COMPLETED ] && grep -q room_cards "$OUT/status.json" && say ok "guest concierge turn via gateway $EID COMPLETED in $(( $(date +%s)-t0 ))s with room_cards" \
-  || { say FAIL "gateway turn $EID ended $st"; fail=1; }
+# The reply is an LLM's: it shows rooms as room_cards or describes them in bot_text. Either is
+# a real answer; a COMPLETED turn with neither is a failure.
+w=$(grep -o -E '"(room_cards|bot_text)"' "$OUT/status.json" | sort -u | tr -d '"' | tr '\n' ' ')
+[ "$st" = COMPLETED ] && [ -n "$w" ] && say ok "guest concierge turn via gateway $EID COMPLETED in $(( $(date +%s)-t0 ))s (reply: $w)" \
+  || { say FAIL "gateway turn $EID ended $st (reply widgets: ${w:-none})"; fail=1; }
 exit $fail

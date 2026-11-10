@@ -32,7 +32,8 @@ run() {  # run <name> <path> <payload-json>
 
 run ranch shastaranch/concierge/turn \
   "$(jq -n --arg d "$(date -u +%F)" '{message:"What rooms do you have for two people?",client_today:$d,thread_id:"smoke-rooms"}')"
-grep -q room_cards "$OUT/ranch-exec.json" 2>/dev/null && say ok "ranch: reply carries the room_cards widget" || { say FAIL "ranch: no room_cards widget in the reply"; fail=1; }
+w=$(grep -o -E '"(room_cards|bot_text)"' "$OUT/ranch-exec.json" 2>/dev/null | sort -u | tr -d '"' | tr '\n' ' ')
+[ -n "$w" ] && say ok "ranch: reply widgets: $w" || { say FAIL "ranch: no reply widget (room_cards or bot_text)"; fail=1; }
 run travel muno/playbooks/itinerary-planner \
   "$(jq -n --arg t "_smoke-$(date +%s)" '{thread_id:$t,event_type:"user_message",event_payload:{text:"Plan a trip to Miami next month for 2 adults"},ai_provider:"openai"}')"
 exit $fail

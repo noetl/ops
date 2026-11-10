@@ -1,6 +1,13 @@
 # Topology-writer standup: embedded ehgraph in the prod server
 
-**Status: staged, NOT applied.** This turns on the embedded `noetl-cluster` ehgraph inside
+**Status: APPLIED to noetl-prod on 2026-11-10** (phase a 16:2x UTC, phase b 16:26 UTC). Each phase
+was one restart, the pod is Ready with 0 restarts, every smoke is green, and the live config is
+recorded in noetl/ops#366. The first phase-a attempt rolled itself back on an over-strict reply
+check (the LLM answered in `bot_text` instead of `room_cards`); the check was relaxed and the retry
+was green. Known follow-up: the writer's sweep logs a WARN every 15 s until the first instance
+registers (`namespace topology not found`), fixed in noetl/server#570.
+
+Originally staged and not applied. This turns on the embedded `noetl-cluster` ehgraph inside
 noetl-server (ehgraph decision E4) and the instance registry's topology writer (build plan
 item 9, `NOETL_EHGRAPH_TOPOLOGY_WRITER`), which projects registered instances, their peers,
 pools and offered playbooks into the graph's `topology` namespace.

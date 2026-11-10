@@ -23,7 +23,8 @@ else
   umask 077; T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
   openssl rand -hex 32 | tr -d '\n' > "$T/token"
   TOPOLOGY_TOKEN=$(cat "$T/token") envsubst '${TOPOLOGY_TOKEN}' < "$HERE/config.template.toml" > "$T/config.toml"
-  grep -q 'TOPOLOGY_TOKEN' "$T/config.toml" && { echo "render failed"; exit 4; }
+  grep -qF '${TOPOLOGY_TOKEN}' "$T/config.toml" && { echo "render failed"; exit 4; }
+  grep -q '^token = "[0-9a-f]\{64\}"$' "$T/config.toml" || { echo "render produced no token line"; exit 4; }
   gcloud secrets create noetl-ehgraph-topology-token --project "$PROJECT" --replication-policy=automatic --data-file="$T/token" >/dev/null
   gcloud secrets create noetl-ehgraph-config --project "$PROJECT" --replication-policy=automatic --data-file="$T/config.toml" >/dev/null
   echo "created noetl-ehgraph-topology-token and noetl-ehgraph-config (token not shown)"
