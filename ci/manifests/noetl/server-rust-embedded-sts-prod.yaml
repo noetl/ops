@@ -370,9 +370,10 @@ spec:
           value: 'true'
         - name: NOETL_EHGRAPH_TOPOLOGY_TOKEN_FILE
           value: /var/secrets/sm/ehgraph-topology-token
-        # v3.156.1 (rolled 2026-11-10 17:0x UTC, server#570 sweep-warning fix); rollback pin
-        # v3.156.0 sha256:b00f4f2cd0680aea21562451cf3152a2603c495c362127206faa34b0d17326da.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:e1a99debb65beffa253b9373b972ca12c9aa9fad90852c6707b8e8822fefdf76
+        # v3.156.2 (rolled 2026-11-10 22:17 UTC, server#571: embedded ehgraph 760f572 -> f200516,
+        # the multi-seed subgraph fix, Cypher and transactions); rollback pin
+        # v3.156.1 sha256:e1a99debb65beffa253b9373b972ca12c9aa9fad90852c6707b8e8822fefdf76.
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:1433c32191277c66eae87ccf88b9e708d6c98cf38420f0f14f2b3b620efcec44
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
