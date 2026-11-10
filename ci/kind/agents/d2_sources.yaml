@@ -1,0 +1,25 @@
+# Direction 2 on the cluster: a model whose tools are a third-party MCP server
+# (keychain credential) and a NoETL agent; the worker's AgentTool answers both.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: agents_d2_sources, path: tests/agents/d2_sources }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: ask } ]
+  - step: ask
+    tool:
+      kind: agent
+      framework: claude
+      model: stub
+      prompt: Look the site up and ask the echo agent.
+      endpoint: http://agents-stubs.noetl.svc.cluster.local:8081
+      max_turns: 3
+      auth: { type: api_key, credential: e2e_agents_model }
+      mcp_servers:
+        - { name: stub, endpoint: "http://agents-stubs.noetl.svc.cluster.local:8083/mcp", auth: { type: bearer, credential: e2e_agents_mcp } }
+      agents:
+        - { name: echo_agent, endpoint: "http://noetl-server-rust.noetl.svc.cluster.local:8082", agent: tests/agents/echo, timeout: 120 }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

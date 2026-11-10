@@ -1,0 +1,18 @@
+# Direction 2 + 4 on the cluster: framework remote calls a NoETL agent (the
+# server's /api/agents, i.e. a playbook-as-agent) and waits for its result.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: agents_d2_remote_noetl, path: tests/agents/d2_remote_noetl }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: ask } ]
+  - step: ask
+    tool:
+      kind: agent
+      framework: remote
+      remote: { endpoint: http://noetl-server-rust.noetl.svc.cluster.local:8082, protocol: noetl, agent: tests/agents/echo, timeout: 120 }
+      input: { who: d2-remote }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }
