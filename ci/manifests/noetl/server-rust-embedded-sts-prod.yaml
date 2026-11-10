@@ -354,6 +354,22 @@ spec:
         # NOETL_INSTANCE_TRUSTED_IDS is set. The topology writer stays off: no embedded ehgraph here.
         - name: NOETL_INSTANCE_REGISTRY
           value: 'true'
+        # Embedded ehgraph `noetl-cluster` + the instance registry's topology writer, applied
+        # 2026-11-10 by ci/manifests/noetl/ehgraph-topology/apply.sh a|b (rollback.sh b|a).
+        # Config and token come from GSM through the noetl-server-secrets SecretProviderClass;
+        # the graph lives at /data/ehgraph on the ehdb-embedded PVC.
+        - name: NOETL_EHGRAPH_EMBEDDED
+          value: 'true'
+        - name: NOETL_EHGRAPH_CONFIG
+          value: /var/secrets/sm/ehgraph-config.toml
+        - name: NOETL_EHGRAPH_HOST_REPLICAS
+          value: '1'
+        - name: NOETL_EHGRAPH_HOST_ORDINAL
+          value: '0'
+        - name: NOETL_EHGRAPH_TOPOLOGY_WRITER
+          value: 'true'
+        - name: NOETL_EHGRAPH_TOPOLOGY_TOKEN_FILE
+          value: /var/secrets/sm/ehgraph-topology-token
         # v3.156.0 (rolled 2026-11-10; previous live pin v3.153.0 sha256:36406e7d…).
         image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:b00f4f2cd0680aea21562451cf3152a2603c495c362127206faa34b0d17326da
         imagePullPolicy: IfNotPresent
