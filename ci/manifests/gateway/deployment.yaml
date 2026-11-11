@@ -157,10 +157,10 @@ spec:
           value: /var/secrets/guest/key
         - name: GATEWAY_CLIENT_IP_HEADER
           value: cf-connecting-ip
-        # v3.19.0 (noetl/gateway#63: GATEWAY_USER_PLAYBOOK_LIMITS), crane-copied from
-        # ghcr.io/noetl/gateway:v3.19.0. Rolled 2026-10-27; rollback target v3.18.0 =
-        # sha256:ddf2315ae71cb56b3043e59b3f781c1aa0c0cc7ffe9649fa5e1032d69aec74a6.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:1aab590022574a853d8fd60f8587776cf24c04efb2ef275a192d884ce3606b4c
+        # v3.21.0 (noetl/gateway#65: /noetl/mcp, off unless GATEWAY_MCP_PROXY=true), crane-copied
+        # from ghcr.io/noetl/gateway:v3.21.0 (index digest identical). Rolled 2026-11-10;
+        # rollback target v3.20.0 = sha256:e5026100af6ae99af431aba2e74c5f0f01a9172fac9c966a6ca6bab01e8c1ad9.
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-gateway@sha256:b646336a5cab65d7d71e3c44b9c8e4d0e6ffcfc04b205bdda55ab0c4ad5cb151
         imagePullPolicy: Always
         livenessProbe:
           failureThreshold: 3
