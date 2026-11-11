@@ -1,0 +1,17 @@
+# Pinning e2e (noetl/ai-meta#548): wait long enough for the test to register a
+# new child version mid-flight, then call the child by path and return what it says.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: catalog_pin_parent, path: tests/catalog_pin/parent }
+workflow:
+  - step: start
+    tool: { kind: shell, command: "sleep 20" }
+    next: [ { step: call_child } ]
+  - step: call_child
+    tool:
+      kind: playbook
+      path: tests/catalog_pin/child
+      return_result: true
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }
