@@ -1,0 +1,19 @@
+# Opts in: the root lists the child in metadata.catalog.hot_reload, and the call
+# says @latest. With NOETL_CATALOG_HOT_RELOAD=true each iteration resolves afresh.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: catalog_hot_root
+  path: tests/catalog_hot/root
+  catalog: { hot_reload: ["tests/catalog_hot/*"] }
+workload: { items: [1, 2, 3, 4, 5, 6] }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: each } ]
+  - step: each
+    loop: { in: "{{ workload.items }}", iterator: item }
+    tool: { kind: playbook, path: "tests/catalog_hot/child@latest", return_result: true }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }
