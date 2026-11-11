@@ -1,0 +1,7 @@
+# Cross-instance e2e (noetl/ai-meta#548 follow-up): B's leaf. VER is substituted.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: xc_leaf, path: xc/leaf }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { leaf: "VER" } }

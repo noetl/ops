@@ -1,0 +1,7 @@
+# Cross-instance e2e: proves B is a full runtime (its own bus and workers).
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: xc_local_b, path: xc/local_b }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { ran_on: "B" } }
