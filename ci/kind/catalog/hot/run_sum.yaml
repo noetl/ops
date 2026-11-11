@@ -1,0 +1,13 @@
+# Runs the compiled playbook (plug-in compiled/sum@1) on the worker's wasmtime host.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: run_sum, path: tests/compiled/run_sum }
+workflow:
+  - step: start
+    tool:
+      kind: wasm
+      plugin: { path: compiled/sum, version: 1, entry: run }
+      args: { workload: { a: 2, b: 3 } }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }
