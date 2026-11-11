@@ -343,6 +343,13 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_TAIL_REPLICATION_TICK_SECS
           value: '60'
+        # Admit kind: mcp / kind: agent at registration and execute (orchestrate-core
+        # ToolKindGates, strict "true", read once per process). Enabled 2026-11-11 on
+        # v3.156.2 with worker 6.12.0 (noetl/ai-meta#330, #539).
+        - name: NOETL_TOOL_KIND_MCP
+          value: 'true'
+        - name: NOETL_TOOL_KIND_AGENT
+          value: 'true'
         # v3.146.0: trusts a list of Auth0 tenants (NOETL_AUTH0_DOMAIN above).
         image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:7c0b999dd0631078e8a11a1fd82436bded89a908ff57f219989f63e480087273
         imagePullPolicy: IfNotPresent

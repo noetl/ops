@@ -70,6 +70,11 @@ spec:
           value: '15'
         - name: WORKER_MAX_CONCURRENT
           value: '4'
+        # kind: agent on the user pool (build plan item 4, noetl/ai-meta#330). Worker
+        # >= 6.12.0. Registers AgentTool::for_shared_pool (claude-code refused).
+        # Enabled 2026-11-11; the server gate NOETL_TOOL_KIND_AGENT is separate.
+        - name: NOETL_WORKER_AGENT_TOOL
+          value: 'true'
         - name: WORKER_METRICS_BIND
           value: 0.0.0.0:9090
         - name: RUST_LOG
