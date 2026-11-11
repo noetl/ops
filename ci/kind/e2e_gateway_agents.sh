@@ -14,7 +14,11 @@
 #                  through /noetl/agents/tasks/{id} with the greeting;
 #                guest B: the same task id → 404 (owner-only)
 #                no token at all → 401
-#   4  restore   server as found; gateway pod, secret, test paths removed
+#   4  mcp       GATEWAY_MCP_PROXY=true, GATEWAY_GUEST_RUNS_PER_HOUR=1 (fresh pod, fresh
+#                limiter): a guest's first MCP tools/call on the echo tool starts it, the
+#                second gets 429 + Retry-After and starts nothing (set MCP_GUEST_LIMIT=0
+#                to skip on a gateway older than the guest-limit fix)
+#   5  restore   server as found; gateway pod, secret, test paths removed
 #
 # Usage:
 #   GATEWAY_IMAGE=localhost/noetl-gateway:<tag> [SERVER_IMAGE=ghcr.io/noetl/server:3.156.2-arm64] \
@@ -72,7 +76,7 @@ $K get deploy noetl-server-rust -o json | jq 'del(.metadata.resourceVersion,.met
 ARMED=1
 jq --arg img "$SERVER_IMAGE" '
   .spec.template.spec.containers[0].image = $img
-  | .spec.template.spec.containers[0].env += [{"name":"NOETL_AGENT_ENDPOINT","value":"true"}]
+  | .spec.template.spec.containers[0].env += [{"name":"NOETL_AGENT_ENDPOINT","value":"true"},{"name":"NOETL_MCP_SERVER","value":"true"}]
 ' "$W/snap/noetl-server-rust.json" | $K replace -f - >/dev/null
 $K rollout status deploy/noetl-server-rust --timeout=600s >/dev/null && ok "server ($SERVER_IMAGE) with NOETL_AGENT_ENDPOINT=true" || { bad "server rollout"; exit 1; }
 $K port-forward svc/noetl-server-rust "$PORT:8082" >/dev/null 2>&1 & PF=$!
@@ -88,10 +92,12 @@ n=$(api "$S/api/agents" | jq '[.agents[]?.agent] | map(select(.=="tests/agents/e
 [ "$n" = 2 ] && ok "server /api/agents lists both test agents (the unfiltered view)" || bad "server agents: $n"
 
 $K create secret generic e2e-gateway-guest --from-literal=key="$(openssl rand -hex 32)" --dry-run=client -o yaml | $K apply -f - >/dev/null
-gateway() { # gateway <agents-proxy: true|unset>
+gateway() { # gateway <agents-proxy: true|unset|mcp>
   $K delete pod,svc e2e-gateway --ignore-not-found --wait=true >/dev/null 2>&1 || true
   local extra=""
   [ "$1" = true ] && extra='        - { name: GATEWAY_AGENTS_PROXY, value: "true" }'
+  [ "$1" = mcp ] && extra='        - { name: GATEWAY_MCP_PROXY, value: "true" }
+        - { name: GATEWAY_GUEST_RUNS_PER_HOUR, value: "1" }'
   $K apply -f - >/dev/null <<YAML
 apiVersion: v1
 kind: Pod
@@ -154,5 +160,22 @@ c=$(gw "$B" "$G/noetl/agents/tasks/$T"); [ "$c" = 404 ] && ok "guest B reading g
 c=$(gw "$A" "$G/noetl/agents/tasks/1%20OR%201"); [ "$c" = 400 ] && ok "malformed task id → 400" || bad "bad id: $c"
 $K logs e2e-gateway > "$W/gw.log" 2>&1 || true
 grep -q "agent send refused" "$W/gw.log" && ok "gateway logged the refused send" || bad "no refusal log line"
+
+if [ "${MCP_GUEST_LIMIT:-1}" = 1 ]; then
+  step "4. mcp: a guest tools/call counts against the guest run limits"
+  gateway mcp && ok "gateway pod restarted with GATEWAY_MCP_PROXY=true, GATEWAY_GUEST_RUNS_PER_HOUR=1" || { bad "gateway pod: $($K logs e2e-gateway --tail=3 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-220)"; exit 1; }
+  C=$(guest)
+  call() { gw "$C" -X POST "$G/noetl/mcp" -D "$W/hdr.txt" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agents_echo","arguments":{"who":"guest-c"}}}'; }
+  c=$(call); cp "$W/gw.json" "$W/mcp-1.json"
+  [ "$c" = 200 ] && jq -e '.result' "$W/mcp-1.json" >/dev/null && ok "guest C tools/call #1 → 200 (execution $(jq -r '.result._meta["noetl/execution_id"] // "?"' "$W/mcp-1.json"))" || bad "mcp call 1: $c $(head -c 300 "$W/mcp-1.json")"
+  c=$(call)
+  if [ "$c" = 429 ] && grep -qi '^retry-after:' "$W/hdr.txt" && [ "$(jq -r '.error.code' "$W/gw.json")" = -32000 ]; then
+    ok "guest C tools/call #2 → 429, Retry-After $(grep -i '^retry-after:' "$W/hdr.txt" | tr -d '\r' | cut -d' ' -f2)s, JSON-RPC -32000 (no execution started)"
+  else
+    bad "mcp call 2: $c $(head -c 300 "$W/gw.json")"
+  fi
+  c=$(gw "$C" -X POST "$G/noetl/mcp" -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+  [ "$c" = 200 ] && ok "tools/list is not counted (200 after the limit)" || bad "tools/list after limit: $c"
+fi
 
 [ ${#fails[@]} -eq 0 ]
