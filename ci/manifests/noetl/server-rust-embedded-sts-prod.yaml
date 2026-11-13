@@ -343,8 +343,9 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_TAIL_REPLICATION_TICK_SECS
           value: '60'
-        # v3.146.0: trusts a list of Auth0 tenants (NOETL_AUTH0_DOMAIN above).
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:7c0b999dd0631078e8a11a1fd82436bded89a908ff57f219989f63e480087273
+        # v3.161.2 (rolled 2026-11-13T02:50Z): cancel-spelling fixes noetl/server#581 + #583.
+        # Rollback: v3.156.2 sha256:1433c32191277c66eae87ccf88b9e708d6c98cf38420f0f14f2b3b620efcec44.
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:e4e49e787baf3927cd7ff7cfa17721f135bd7efef2e985c4838c648faea39cfd
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
