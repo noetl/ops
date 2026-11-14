@@ -7,6 +7,7 @@
 #   load      bench/seq10_noop   n=$N_LOAD C=$C_LOAD   contention: C runs at once
 #   auth      check_playbook_access n=$N_AUTH        must stay < 15 s
 #   toollist  bench/toollist     n=$N_HOP  C=1   one step, 4-tool list → one command
+#   slots     bench/await_slots  n=6 C=6         6 awaiting parents on a 4-slot pool (opt-in: ARMS=slots)
 #
 #   suite.sh OUT_DIR            → OUT_DIR/{noop,py,await,load,auth}/
 #   report.py OUT_DIR/noop OTHER/noop      (before/after per arm)
@@ -14,7 +15,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 if [ "${1:-}" = "--compare" ]; then
-  for a in noop py await load auth toollist; do
+  for a in noop py await load auth toollist slots; do
     [ -d "$2/$a" ] && [ -d "$3/$a" ] || continue
     echo; echo "################ $a"; python3 "$HERE/report.py" "$2/$a" "$3/$a" | sed -n '/== delta/,$p'
   done
@@ -34,6 +35,7 @@ for a in $ARMS; do
     load)  "$HERE/bench.sh" run bench/seq10_noop "$N_LOAD" "$C_LOAD" "$OUT/load" > "$OUT/load.log" 2>&1;;
     auth)  "$HERE/auth.sh" "$N_AUTH" "$OUT/auth" > "$OUT/auth.log" 2>&1;;
     toollist) "$HERE/bench.sh" run bench/toollist "$N_HOP" 1 "$OUT/toollist" > "$OUT/toollist.log" 2>&1;;
+    slots) "$HERE/bench.sh" run bench/await_slots "${N_SLOTS:-6}" "${C_SLOTS:-6}" "$OUT/slots" > "$OUT/slots.log" 2>&1;;
   esac
-  grep -E "exec.wall|overhead|drive |pickup|hop\.|auth arm|PASS|FAIL" "$OUT/$a.log" | sed 's/^/   /' || true
+  grep -E "runs:|exec.wall|overhead|drive |pickup|hop\.|auth arm|PASS|FAIL" "$OUT/$a.log" | sed 's/^/   /' || true
 done

@@ -20,7 +20,7 @@
 #
 # Usage
 #   SERVER_IMAGE=... WORKER_IMAGE=... ci/kind/latency/stack.sh up
-#   ci/kind/latency/stack.sh set  [--server-image I] [--worker-image I] \
+#   ci/kind/latency/stack.sh set  [--prod-resources] [--server-image I] [--worker-image I] \
 #                                 [--server-env K=V ...] [--worker-env K=V ...]
 #   ci/kind/latency/stack.sh status
 #   ci/kind/latency/stack.sh down        # deletes every *-lat object + noetl_lat
@@ -140,6 +140,7 @@ YAML
   if grep -qE 'noetl-cmdbus-writer-0\.noetl|noetl-server-rust\.noetl|http://noetl\.noetl\.svc' "$W"/*-lat.json "$W"/writer-lat.json; then
     die "an A address survived in the lat specs: $(grep -lE 'noetl-cmdbus-writer-0\.noetl|noetl-server-rust\.noetl|http://noetl\.noetl\.svc' "$W"/*lat*.json | xargs -n1 basename | tr '\n' ' ')"
   fi
+  [ "${LAT_PROD_RESOURCES:-1}" = 1 ] && prod_resources
   wait_ready
 }
 
@@ -156,10 +157,22 @@ status_line() {
   echo "server=$s worker=$w"
 }
 
+# Prod's pool CPU shape (resource model 2026-11-11; worker-rust-deployment-prod.yaml,
+# worker-system-pool-deployment-prod.yaml): user pool 250m request / 2 CPU limit,
+# system pool 750m. Kind A's manifests cap the user pool at 500m, and a stage that
+# moves work between pools (#558 moves the drive onto the user pool) is then
+# measured against a CFS throttle prod does not have (2026-11-14: 250 of 446
+# periods throttled in a minute at 500m).
+prod_resources() {
+  $K get deploy noetl-worker-lat -o json | jq "$clean | .spec.template.spec.containers[0].resources.requests.cpu = \"250m\" | .spec.template.spec.containers[0].resources.limits.cpu = \"2\"" | $K replace -f - >/dev/null
+  $K get deploy noetl-worker-system-lat -o json | jq "$clean | .spec.template.spec.containers[0].resources.requests.cpu = \"750m\" | .spec.template.spec.containers[0].resources.limits.cpu = \"750m\"" | $K replace -f - >/dev/null
+}
+
 set_cmd() {
   local sp=() wp=() si="" wi=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --prod-resources) prod_resources; shift;;
       --server-image) si=$2; shift 2;;
       --worker-image) wi=$2; shift 2;;
       --server-env) sp+=("$2"); shift 2;;
