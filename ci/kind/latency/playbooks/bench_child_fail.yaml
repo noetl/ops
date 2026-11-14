@@ -1,0 +1,8 @@
+# Latency bench (ai-meta#559): an awaited child whose execution FAILS (a tool
+# error, not a python raise, which today completes with status error).
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_child_fail, path: bench/child_fail }
+workflow:
+  - step: start
+    tool: { kind: http, method: GET, url: "http://bench-child-fail.invalid/", timeout: 3 }
