@@ -140,13 +140,24 @@ rename() {  # rename <name>: a Deployment/StatefulSet as a new app, no inherited
   | .spec.template.spec.volumes = [ (.spec.template.spec.volumes // [])[] | select(.persistentVolumeClaim == null) ]"
 }
 
+# Optional extra env for every server / worker of both runtimes (space-separated
+# K=V), e.g. E2E_SERVER_ENV="NOETL_CATALOG_REMOTE_PUSH=true NOETL_EXECUTION_WAIT=true"
+# E2E_WORKER_ENV="NOETL_EXECUTION_WAIT=true" for the ai-meta#559 push arm.
+kv_json() { local out="[]" kv; for kv in $1; do out=$(jq -c --arg n "${kv%%=*}" --arg v "${kv#*=}" '. + [{name:$n,value:$v}]' <<<"$out"); done; echo "$out"; }
+SERVER_EXTRA=$(kv_json "${E2E_SERVER_ENV:-}"); WORKER_EXTRA=$(kv_json "${E2E_WORKER_ENV:-}")
+worker_env=".spec.template.spec.containers[0].env += $WORKER_EXTRA"
+# Optional memory limit for every worker of both runtimes (e.g. E2E_WORKER_MEM=2Gi):
+# kind A's manifests cap workers at 768Mi, and a long-lived A database OOM-kills
+# them mid-test (2026-11-14: 11 OOM kills in one run, flags on and off alike).
+[ -n "${E2E_WORKER_MEM:-}" ] && worker_env="$worker_env | .spec.template.spec.containers[0].resources.limits.memory = \"$E2E_WORKER_MEM\""
+
 # --- A: the new server image + REMOTE_CALLS; the new worker image on both pools.
 peer_env a.json "$SVC_A" cluster-a "$ID_B" "$SVC_B#cluster-b" \
-  | jq '. + [{name:"NOETL_CATALOG_REMOTE_CALLS",value:"true"}]' > "$W/env-a.json"
+  | jq --argjson x "$SERVER_EXTRA" '. + [{name:"NOETL_CATALOG_REMOTE_CALLS",value:"true"}] + $x' > "$W/env-a.json"
 jq --arg img "$SERVER_IMAGE" --slurpfile e "$W/env-a.json" ".spec.template.spec.containers[0].image = \$img
   | .spec.template.spec.containers[0].env += \$e[0] | $mount_keys" "$W/snap/noetl-server-rust.json" | $K replace -f - >/dev/null
 for d in noetl-worker-rust noetl-worker-system-pool; do
-  jq --arg img "$WORKER_IMAGE" '.spec.template.spec.containers[0].image = $img' "$W/snap/$d.json" | $K replace -f - >/dev/null
+  jq --arg img "$WORKER_IMAGE" ".spec.template.spec.containers[0].image = \$img | $worker_env" "$W/snap/$d.json" | $K replace -f - >/dev/null
 done
 
 # --- B: writer, server, shared worker, system-pool worker.
@@ -155,7 +166,7 @@ jq "$(rename noetl-cmdbus-writer-b) | .spec.serviceName = \"noetl-cmdbus-writer-
 jq '.metadata.name = "noetl-cmdbus-writer-b-0" | del(.metadata.labels,.metadata.annotations) | .spec.selector = {app:"noetl-cmdbus-writer-b"}' "$W/snap/svc-noetl-cmdbus-writer-0.json" > "$W/svc-writer-b.json"
 jq '.metadata.name = "noetl-cmdbus-writer-b-headless" | del(.metadata.labels,.metadata.annotations) | .spec.selector = {app:"noetl-cmdbus-writer-b"} | .spec.clusterIP = "None"' "$W/snap/svc-noetl-cmdbus-writer-headless.json" > "$W/svc-writer-b-headless.json"
 peer_env b.json "$SVC_B" cluster-b "$ID_A" "$SVC_A#cluster-a" \
-  | jq '. + [{name:"NOETL_CATALOG_REMOTE_SERVE",value:"true"},{name:"NOETL_CATALOG_REMOTE_SERVE_ALLOW",value:"xc/*"}]' > "$W/env-b.json"
+  | jq --argjson x "$SERVER_EXTRA" '. + [{name:"NOETL_CATALOG_REMOTE_SERVE",value:"true"},{name:"NOETL_CATALOG_REMOTE_SERVE_ALLOW",value:"xc/*"}] + $x' > "$W/env-b.json"
 jq --arg img "$SERVER_IMAGE" --slurpfile e "$W/env-b.json" "$(rename noetl-server-b) | $to_b
   | .spec.template.spec.containers[0].volumeMounts = [ (.spec.template.spec.containers[0].volumeMounts // [])[] | select(.mountPath | startswith(\"/data\") | not) ]
   | .spec.template.spec.containers[0].image = \$img
@@ -166,7 +177,7 @@ jq --arg img "$SERVER_IMAGE" --slurpfile e "$W/env-b.json" "$(rename noetl-serve
           elif .name == \"NOETL_PUBLIC_SERVER_URL\" then .value = \"$SVC_B\" else . end ] + \$e[0])
   | $mount_keys" "$W/snap/noetl-server-rust.json" > "$W/server-b.json"
 for pair in noetl-worker-rust:noetl-worker-b noetl-worker-system-pool:noetl-worker-system-b; do
-  jq --arg img "$WORKER_IMAGE" "$(rename "${pair#*:}") | .spec.template.spec.containers[0].image = \$img | $to_b" "$W/snap/${pair%%:*}.json" > "$W/${pair#*:}.json"
+  jq --arg img "$WORKER_IMAGE" "$(rename "${pair#*:}") | .spec.template.spec.containers[0].image = \$img | $to_b | $worker_env" "$W/snap/${pair%%:*}.json" > "$W/${pair#*:}.json"
 done
 for f in svc-writer-b svc-writer-b-headless writer-b server-b noetl-worker-b noetl-worker-system-b; do $K apply -f "$W/$f.json" >/dev/null; done
 $K apply -f - >/dev/null <<YAML
