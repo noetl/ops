@@ -1,0 +1,22 @@
+{
+ "displayName": "NoETL EHDB: tier diverged from the authoritative event log",
+ "combiner": "OR",
+ "conditions": [
+  {
+   "displayName": "NoETL EHDB: tier diverged from the authoritative event log",
+   "conditionPrometheusQueryLanguage": {
+    "query": "sum(increase(noetl_ehdb_crossstore_divergence_total[10m])) > 0",
+    "duration": "300s",
+    "evaluationInterval": "60s"
+   }
+  }
+ ],
+ "documentation": {
+  "content": "The cross-store comparator found the EHDB event-log tier disagreeing with the authoritative `noetl.event` log. While the tier is `primary` this is a correctness signal about a store that is actively being served. KNOWN OPEN AT CREATION (2026-08-13): every hourly `system/scheduled_cleanup` execution mirrors 11 of 13 events \u2014 the two missing are both `command.claimed`. User-pool executions are clean (29/29). So this alert is EXPECTED to be firing until that is fixed; do not treat an initial firing as a false positive. Ref noetl/ai-meta#257, noetl/ai-meta#258.",
+  "mimeType": "text/markdown"
+ },
+ "notificationChannels": [
+  "projects/shastaratech-noetl-prod/notificationChannels/8780236184765331124"
+ ],
+ "enabled": true
+}
