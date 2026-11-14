@@ -1,0 +1,29 @@
+# Embedded ehgraph for the `noetl-cluster` domain inside noetl-server (ehgraph decision E4).
+# Rendered by stage-secrets.sh with a fresh token and stored WHOLE in GSM as
+# `noetl-ehgraph-config`; the rendered file is never committed and never printed.
+# The CSI driver mounts it at /var/secrets/sm/ehgraph-config.toml (SecretProviderClass
+# noetl-server-secrets), next to the server's other GSM secrets.
+instance_id = "ehgraph-noetl-cluster"
+domain = "noetl-cluster"
+# On the server's existing 10Gi PVC (ehdb-embedded, mounted at /data; 8% used 2026-11-10).
+data_dir = "/data/ehgraph/data"
+# Same volume for now: protects against process crashes, not volume loss. A gs:// prefix
+# (auth = "metadata", Workload Identity) is the follow-up once a bucket is chosen.
+backup_prefix = "/data/ehgraph/backup"
+backup_interval_s = 30
+
+[store]
+# Format-1 manifests only, so a server rollback can always reopen the graph (E9).
+compaction = false
+
+[auth]
+mode = "bearer"
+
+# The instance registry's topology writer (NOETL_EHGRAPH_TOPOLOGY_WRITER). The same token is
+# stored alone in GSM as `noetl-ehgraph-topology-token` for NOETL_EHGRAPH_TOPOLOGY_TOKEN_FILE.
+[[auth.grants]]
+token = "${TOPOLOGY_TOKEN}"
+principal = "noetl-instance-registry"
+namespace = "topology"
+read = true
+write = true
