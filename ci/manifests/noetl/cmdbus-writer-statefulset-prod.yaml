@@ -297,7 +297,33 @@ spec:
             # check of the probe fields would have reported clean.
             memory: 12Gi
           requests:
-            cpu: 250m
+            # ⚠⚠ 1 core, up from 250m — NOT a tuning guess (noetl/ai-meta#481).
+            #
+            # Measured on prod 2026-10-18: this container sustains 0.18-0.92
+            # cores (mean ~0.55), i.e. cpu/request_utilization min 0.430, MAX
+            # 3.546, mean 2.027 — it runs at 2-3.5x its request continuously.
+            # Meanwhile cpu/limit_utilization peaks at only 0.443, so it is NOT
+            # limit-throttled; it simply lives on burstable capacity above its
+            # guarantee.
+            #
+            # Everything above a request is reclaimable: present when the node
+            # is idle, withdrawn when it is contended, at which point CFS
+            # allocates proportionally to requests and this pod is entitled to
+            # 250m.  At 250m it cannot both run the boot Cranelift compile and
+            # answer an HTTP probe within 2 s — which is why the #470 readiness
+            # swap evicted a HEALTHY, SERVING writer from its Service for
+            # 4 m 17 s on 2026-10-18 (noetl_worker_serving_ready read 1
+            # throughout).
+            #
+            # 1 core covers the observed peak of 0.886 (3.546 x 250m) with ~13%
+            # headroom and still leaves half the 2-core limit for bursts.
+            #
+            # ⚠ Scope: ONLY this workload.  noetl-worker-system-pool and
+            # -shard1 already request 750m while hosting neither bus; this pod
+            # hosts BOTH and requested the least of the four.
+            # noetl-worker-rust stays at 250m — it is KEDA-scaled, so a bump
+            # multiplies across every replica, and it hosts no bus.
+            cpu: '1'
             ephemeral-storage: 1Gi
             memory: 512Mi
         securityContext:
