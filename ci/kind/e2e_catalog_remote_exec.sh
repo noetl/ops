@@ -146,6 +146,10 @@ rename() {  # rename <name>: a Deployment/StatefulSet as a new app, no inherited
 kv_json() { local out="[]" kv; for kv in $1; do out=$(jq -c --arg n "${kv%%=*}" --arg v "${kv#*=}" '. + [{name:$n,value:$v}]' <<<"$out"); done; echo "$out"; }
 SERVER_EXTRA=$(kv_json "${E2E_SERVER_ENV:-}"); WORKER_EXTRA=$(kv_json "${E2E_WORKER_ENV:-}")
 worker_env=".spec.template.spec.containers[0].env += $WORKER_EXTRA"
+# Optional memory limit for every worker of both runtimes (e.g. E2E_WORKER_MEM=2Gi):
+# kind A's manifests cap workers at 768Mi, and a long-lived A database OOM-kills
+# them mid-test (2026-11-14: 11 OOM kills in one run, flags on and off alike).
+[ -n "${E2E_WORKER_MEM:-}" ] && worker_env="$worker_env | .spec.template.spec.containers[0].resources.limits.memory = \"$E2E_WORKER_MEM\""
 
 # --- A: the new server image + REMOTE_CALLS; the new worker image on both pools.
 peer_env a.json "$SVC_A" cluster-a "$ID_B" "$SVC_B#cluster-b" \
