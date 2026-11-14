@@ -26,7 +26,7 @@ for i in $(seq 1 "$REPS"); do
   done
 done
 for side in A B; do
-  for a in noop py await load auth toollist; do
+  for a in noop py await load auth toollist slots; do
     for i in $(seq 1 "$REPS"); do
       d="$OUT/$side-$i/$a"; [ -d "$d" ] || continue
       mkdir -p "$OUT/$side/$a/children"

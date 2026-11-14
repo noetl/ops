@@ -1,0 +1,12 @@
+# Latency bench (ai-meta#559): an awaited child that holds a user-pool slot
+# for ~2 s (a shell sleep), so concurrent parents compete with their children
+# for the same 4 slots.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_child_slow, path: bench/child_slow }
+workflow:
+  - step: start
+    tool: { kind: shell, command: "sleep 2" }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop, result: { answer: 42 } }
