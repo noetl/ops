@@ -1,0 +1,43 @@
+# Build plan items 5 + 7 (ai-meta docs/rfc/interop-missing-tools-build-plan.md): one playbook
+# exposed both as an MCP tool (/api/mcp) and as an agent (/api/agents), run for real by the
+# kind workers. The input schema is authored once, under expose.mcp, and reused by the agent.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: interop_echo
+  path: tests/interop/echo
+  expose:
+    mcp:
+      tool: interop_echo
+      description: Greets whoever is named. kind e2e fixture.
+      input_schema:
+        type: object
+        properties: { who: { type: string } }
+        required: [who]
+      timeout: 90
+      result_step: greet
+    agent:
+      card:
+        name: interop-echo
+        description: Greets whoever is named. kind e2e fixture.
+        version: "1"
+      result_step: greet
+workload:
+  who: nobody
+workflow:
+  - step: start
+    tool:
+      kind: noop
+    next:
+      - step: greet
+  - step: greet
+    tool:
+      kind: python
+      input:
+        who: "{{ workload.who }}"
+      code: "result = {'greeting': 'hello ' + str(who)}"
+    next:
+      - step: end
+  - step: end
+    tool:
+      kind: noop
