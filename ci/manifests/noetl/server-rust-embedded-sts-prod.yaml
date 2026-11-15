@@ -319,6 +319,14 @@ spec:
         # `kubectl exec ... -- env | grep "^NOETL_CHAIN_"`.
         - name: NOETL_CHAIN_ADVANCE
           value: 'true'
+        # noetl/ai-meta#558/#559 — enabled in prod 2026-11-15 (ci/manifests/noetl/latency-prod/README.md).
+        # #559 flags REQUIRE NOETL_STATE_BUILDER=offserver (noetl/ai-meta#570).
+        - name: NOETL_SERVER_ADVANCE_API
+          value: 'true'
+        - name: NOETL_EXECUTION_WAIT
+          value: 'true'
+        - name: NOETL_PLAYBOOK_AWAIT_PARK
+          value: 'true'
         - name: NOETL_CHAIN_POPULATE
           value: 'true'
         - name: NOETL_CHAIN_SOURCE
@@ -345,7 +353,7 @@ spec:
           value: '60'
         # v3.161.2 (rolled 2026-11-13T02:50Z): cancel-spelling fixes noetl/server#581 + #583.
         # Rollback: v3.156.2 sha256:1433c32191277c66eae87ccf88b9e708d6c98cf38420f0f14f2b3b620efcec44.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:e4e49e787baf3927cd7ff7cfa17721f135bd7efef2e985c4838c648faea39cfd
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:f850267dc3aaea63f179f186f5e4cf1425f5aadfffbac860fb2fb42f7d024e28
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
