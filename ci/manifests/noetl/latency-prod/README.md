@@ -90,3 +90,27 @@ Notes:
   max 4.41 s, 5 turns, 0 stalls.
 
 Rollback of the warm-up: `kubectl -n noetl set env deploy/noetl-worker-rust NOETL_WARM_ORCHESTRATE_PLUGIN-`.
+
+## #561 slice 1 (2026-11-15 12:05–13:00Z): server v3.163.1, worker 6.18.0, resolve TTL
+
+- server v3.163.1 `c280c2c5…` (noetl/server#587, abandoned-claim sweeper) — rollback v3.163.0 `f850267d…`.
+- worker 6.18.0 `e5b1d72c…` (noetl/worker#405: warm on local-drive pools, resolve TTL, unlocked flush, stop
+  local drive on drain) — rollback 6.17.0 `70c2b675…`.
+- `NOETL_WASM_RESOLVE_TTL_MS=30000` on the user pool. Each drive had re-fetched the whole module to learn its
+  digest (`plugin_load_seconds{phase="fetch"}` 22.4 s / 367 = 61 ms); after, 7–8 fetches per pod.
+
+| prod p50 / p95 | TTL off | TTL 30 s |
+|---|---|---|
+| drive segment, serial noop | 65.7 / 225 ms | 34.3 / 227 ms |
+| drive segment, load C=4 | 91.9 / 536 ms | 46.5 / 290 ms |
+| overhead per step, serial | 216 ms | 182 ms |
+| seq10 noop wall | 3.65 s | 3.45 s |
+| load wall | 5.63 / 8.05 s | 5.19 / 6.70 s |
+| auth fallback max | 4.84 s | 4.64 s |
+
+- `NOETL_WASM_FLUSH_UNLOCKED` left OFF: local drives return their result through `apply`, not plug-in
+  intents, so it does not touch the prod path (only `kind: wasm` tool steps).
+- Kind churn (3 lat workers, a pod deleted every 15 s, 400 × seq10 noop): stalls >2 s 11/400 → 0/400 with the fix.
+- Note: one auth fallback run read 15.0 s at 11:45Z during a KEDA scale-out while `GET /api/executions` (a
+  ~5 s list query, polled every ~5 s by an unidentified client) loaded the DB; 20 reruns max 4.55 s. Tracked
+  separately.

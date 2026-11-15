@@ -353,7 +353,7 @@ spec:
           value: '60'
         # v3.161.2 (rolled 2026-11-13T02:50Z): cancel-spelling fixes noetl/server#581 + #583.
         # Rollback: v3.156.2 sha256:1433c32191277c66eae87ccf88b9e708d6c98cf38420f0f14f2b3b620efcec44.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:f850267dc3aaea63f179f186f5e4cf1425f5aadfffbac860fb2fb42f7d024e28
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:c280c2c583bcd87d1f3368fbb5762cdc8fafc6d4aab42fdada7777fa8bba0446
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6

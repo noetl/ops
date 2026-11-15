@@ -71,6 +71,11 @@ spec:
         # scale-out stall). Default-on for local-drive workers from noetl/worker#405.
         - name: NOETL_WARM_ORCHESTRATE_PLUGIN
           value: 'true'
+        # noetl/ai-meta#561 (worker 6.18.0): reuse the system/orchestrate digest
+        # resolution for 30 s instead of re-fetching the module on every drive
+        # (prod: 61 ms per drive; drive p50 65.7 -> 34.3 ms).
+        - name: NOETL_WASM_RESOLVE_TTL_MS
+          value: '30000'
         - name: WORKER_ID
           valueFrom:
             fieldRef:
