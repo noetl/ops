@@ -65,3 +65,28 @@ Notes:
   This change adds only this rollout's lines; reconciling the rest is separate.
 - `harness/`: the prod variants of the kind harness used here (bench playbooks are
   registered in prod under `bench/`).
+
+## Follow-up 2026-11-15 (08:57–10:05Z): #559 rolled back, root-caused, re-enabled
+
+- 08:57Z #559 rolled back after ~4 s next-step stalls (2 of the first 5 turns, then 1/30
+  noop, 1/10 turns). Controls: flags-off steady had them too (3/30 turns); every stall sat
+  near a pod restart or KEDA scale event.
+- Cause 1: a fresh local-drive user-pool pod compiled `system/orchestrate` on its FIRST drive
+  (`plugin_load_seconds{phase="compile"}` 4.75 s). Fix: `NOETL_WARM_ORCHESTRATE_PLUGIN=true`
+  on `deploy/noetl-worker-rust` (10:05Z; default-on in noetl/worker#405). Verified: both new
+  pods `plugin_warm_total{outcome="warmed"} 1`; 0 stalls after the restart.
+- Cause 2: a completion claimed for local drive by a pod that then exits waits for the
+  claim TTL + an 8 s reconcile tick (kind churn: 11/400 stalled with local drive on, 0/400
+  off). Fix in review: server claim sweeper + worker stops local drive on drain.
+- Interleaved prod A/B, 2 reps/side, A = #558 only, B = #558 + #559 (p50 / p95):
+
+| | A | B |
+|---|---|---|
+| await3 wall (n=20) | 11.9 / 33.4 s | 6.2 / 8.4 s |
+| awaited hop (n=60) | 2.71 / 9.66 s | 0.96 / 2.08 s |
+| real travel turn (n=30) | 13.5 / 32.3 s | 11.1 / 21.6 s |
+
+- 10:05Z #559 re-enabled (server + worker) with the warm-up. Smoke: noop 12/12, auth fallback
+  max 4.41 s, 5 turns, 0 stalls.
+
+Rollback of the warm-up: `kubectl -n noetl set env deploy/noetl-worker-rust NOETL_WARM_ORCHESTRATE_PLUGIN-`.
