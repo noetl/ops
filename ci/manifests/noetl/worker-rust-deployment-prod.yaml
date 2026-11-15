@@ -59,6 +59,13 @@ spec:
       - env:
         - name: WORKER_POOL_NAME
           value: worker-rust-pool
+        # noetl/ai-meta#558/#559 — enabled in prod 2026-11-15 on worker 6.17.0 (latency-prod/README.md).
+        - name: NOETL_WORKER_LOCAL_DRIVE
+          value: 'true'
+        - name: NOETL_EXECUTION_WAIT
+          value: 'true'
+        - name: NOETL_PLAYBOOK_AWAIT_PARK
+          value: 'true'
         - name: WORKER_ID
           valueFrom:
             fieldRef:
