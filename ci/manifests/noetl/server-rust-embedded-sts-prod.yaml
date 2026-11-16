@@ -332,6 +332,8 @@ spec:
           value: 'true'
         - name: NOETL_PLAYBOOK_PARSE_CACHE
           value: 'true'
+        - name: NOETL_POOL_ROUTES
+          value: api_integration/auth0/=auth
         - name: NOETL_CHAIN_POPULATE
           value: 'true'
         - name: NOETL_CHAIN_SOURCE
@@ -358,7 +360,7 @@ spec:
           value: '60'
         # v3.161.2 (rolled 2026-11-13T02:50Z): cancel-spelling fixes noetl/server#581 + #583.
         # Rollback: v3.156.2 sha256:1433c32191277c66eae87ccf88b9e708d6c98cf38420f0f14f2b3b620efcec44.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:ee4186201bc5922e027a75a64f39921927ad4e5458952ea45aacf04c03ee27ab
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:898313da50280db618b1afa4ea8d063d01ab7c65f5542344403120b5d06ec710
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6

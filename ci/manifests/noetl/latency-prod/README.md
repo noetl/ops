@@ -147,3 +147,52 @@ Rollback of the warm-up: `kubectl -n noetl set env deploy/noetl-worker-rust NOET
   per segment and wall times were host-noise dominated. Judged on the prod per-event metrics above.
 - #562: nothing applied. Autopilot's own balloon pods already absorb a 16-pod burst (scheduled ≤9 s).
   See ai-meta#562.
+
+## 2026-11-16 (21:28–23:05Z): server v3.164.0, dedicated auth pool, fused step events (flag left off), and an incident
+
+Release: noetl/server#591, released as **v3.164.0** `898313da` (rollback v3.163.3 `ee418620`). Both new flags are off by default.
+
+### Auth pool (ai-meta#562): LIVE
+- `deploy/noetl-worker-auth-pool` (`worker-auth-pool-deployment-prod.yaml`):
+  - 2 fixed replicas, same image and env as the user pool;
+  - `NOETL_FEED_FILTER_SUBJECT=noetl.commands.auth.>`;
+  - applied 21:38Z.
+- The server sets `NOETL_POOL_ROUTES=api_integration/auth0/=auth`, on since 21:57:36Z. Every `api_integration/auth0/*` execution is routed to `noetl.commands.auth.<eid>` for its whole life.
+- Verified: the auth pods' pickup counters equal the auth runs, and later steps drive locally on those pods.
+- Auth fallback under a concurrent shared-pool load (`seq10_noop` ×32 at concurrency 8, `harness authload.sh`):
+
+| | Load wall, p50 | Auth p50 | Auth max |
+|---|---|---|---|
+| Off (v3.164.0) | 6.6 s | 2.38 s | 8.13 s |
+| On, run 1 (fresh auth pods) | 9.5 s | 3.81 s | 9.45 s |
+| On, run 2 (pool saturated, KEDA 2→3 waiting on a node) | **14.5 s** | 3.44 s | **7.62 s** |
+| On, standalone | — | 2.21 s | 3.39 s |
+| On, after recovery | — | 2.31 s | 4.41 s |
+
+- The isolation shows in on-run 2: the shared pool's load wall doubled while auth stayed under 8 s.
+- In kind (6 vCPU, one server), routing removed the claim queue (issued→claimed 4.3 s → 0.8 s mean), but end-to-end auth was capped by server CPU there.
+- Rollback: unset `NOETL_POOL_ROUTES` first (`set env NOETL_POOL_ROUTES-`), let in-flight auth runs drain, then delete the deployment.
+- Cost: 2 × (250m CPU / 256Mi) requests. The pool takes a little of Autopilot's burst headroom (a later user-pool scale-up hit `Insufficient memory` and waited for a node).
+
+### Fused step events (ai-meta#561): built, measured, LEFT OFF
+- Finding: every `emit_events` call carried one row, in kind (6,656 / 6,656) and in prod (4,545 / 4,534). So a per-call burst alone never engages.
+- The fix fuses `step.enter` / `step.skipped` with the `command.issued` rows into one `emit_events` call, sent as one pipelined burst. The writer already group-commits, so **no ehdb or cmdbus-writer change** was needed and the writer was not rolled.
+- Prod phase metrics, flag on: 419 fused bursts at **6.59 ms** each vs 12.53 ms per single row. That is about 18 ms saved per fused pair, roughly one per step.
+- Wall time was inconclusive against prod noise:
+
+| | noop | py | await |
+|---|---|---|---|
+| Off | 2.32 s | 3.56 s | 5.26 s |
+| On, run 1 | 2.26 s | 4.63 s | 5.11 s |
+| On, run 2 | 3.05 s | 3.54 s | — |
+
+- Left OFF pending a clean interleaved A/B.
+- Under the load runs, the per-row publish rose to 35 ms. The writer is the contended resource, and that is where fusion helps most.
+
+### INCIDENT 22:12–22:57Z: server down ~45 min (self-inflicted)
+- **Cause:** the A/B script turned the flag "off" with `kubectl set env … NOETL_EVENT_PUBLISH_BATCH=` (an empty value). envy rejected `''` for a bool, the server logged `Failed to load app config, using defaults`, `NOETL_COMMAND_BUS` was then unset, and the server refused to start (CrashLoopBackOff).
+- **Why it stayed down:** the StatefulSet (OrderedReady) does not replace a pod that never becomes Ready, so the following "on" flips never applied.
+- **Recovered** 22:57:48Z: removed the var (`set env NOETL_EVENT_PUBLISH_BATCH-`) and deleted the stuck pod.
+- **Impact:** server API unavailable for ~45 min. The `hotelbeds-content-sync` run at 22:17 failed (hourly, next run 23:17). No stranded executions found afterwards.
+- **Post-recovery smoke:** noop 12/12 p50 2.19 s, auth max 4.41 s, 5/5 real travel turns (p50 8.1 s).
+- **Rule:** turn a bool flag off by REMOVING the variable (`NAME-`), never `NAME=`. Watch every prod flip to Ready, and never script flips unattended.
