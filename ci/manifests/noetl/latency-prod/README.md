@@ -114,3 +114,36 @@ Rollback of the warm-up: `kubectl -n noetl set env deploy/noetl-worker-rust NOET
 - Note: one auth fallback run read 15.0 s at 11:45Z during a KEDA scale-out while `GET /api/executions` (a
   ~5 s list query, polled every ~5 s by an unidentified client) loaded the DB; 20 reruns max 4.55 s. Tracked
   separately.
+
+## 2026-11-16: archive keyset fix (server v3.163.2) and #561 slice 2 (server v3.163.3)
+
+- **v3.163.2 `a6cb6408…`** (noetl/server#589), rolled 05:32:02Z; rollback v3.163.1 `c280c2c5…`.
+  - Root cause of the slow `GET /api/executions`-shaped query: the server's own archive pass paged its
+    candidate listing by `offset`. That was quadratic: 137 pages climbing to ~4 s each, back to back, for
+    4–5 min of every 300 s interval.
+  - Listing query active: 120/120 one-second samples → 0/120.
+  - Pass time: 4–5 min → 7 s, examining all 13,616 executions.
+  - Slow list statements: 376/h (1,133 s of DB time per hour) → 0.
+- **v3.163.3 `ee418620…`** (noetl/server#590), rolled 05:58:02Z with flags off; rollback v3.163.2 `a6cb6408…`,
+  or unset the env vars.
+  - `NOETL_INGEST_CATALOG_FROM_DESCRIPTOR=true`, on 06:08:46Z: `catalog_id` ingest phase 14.56 → 0.04 ms per event.
+  - `NOETL_PLAYBOOK_PARSE_CACHE=true`, on 06:21:45Z: worker local-drive `apply` 171.5 → 109.0 ms.
+
+| prod p50 (p95) | v3.163.3 flags off | + descriptor | + parse cache (final) |
+|---|---|---|---|
+| seq10 noop wall | 3.46 s | 2.73 / 2.50 s | 2.39 / 2.22 s |
+| overhead per step, noop | 181 ms | 155 / 152 ms | 145 / 143 ms |
+| seq10 py wall | 4.95 s | 4.51 s | 3.47 s |
+| await3 wall | 6.87 s | 5.65 / 7.68 s | 4.94 / 4.46 s |
+| awaited hop | 1.21 s | 1.10 / 1.16 s | 0.83 / 0.89 s |
+| load C=4 wall | 4.15 (4.91) s | 2.62 / 3.92 s (a first run read 6.03 s during KEDA churn) | 3.20 (4.95) s |
+| auth fallback max | 22.4 s (in the suite, queued behind load) / 4.42 s (standalone, n=20) | 6.35 s | 2.89 s |
+| travel turn | — | — | 7.6 s p50, 10/10 COMPLETED |
+
+- Auth: the sync path stayed ~211–219 ms throughout. The fallback playbook exceeds 15 s only when it queues
+  behind a saturated user pool (the auth arm starts right after the load arm, and KEDA was scaling 2→3).
+  Standalone it is ≤4.4 s.
+- Kind could not show slice 2: kind's catalog lookup is sub-millisecond on a local DB. The A/B was flat
+  per segment and wall times were host-noise dominated. Judged on the prod per-event metrics above.
+- #562: nothing applied. Autopilot's own balloon pods already absorb a 16-pod burst (scheduled ≤9 s).
+  See ai-meta#562.
