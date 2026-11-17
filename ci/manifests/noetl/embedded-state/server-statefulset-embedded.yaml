@@ -1,0 +1,261 @@
+# INERT -- NOT APPLIED TO PROD. See README.md (#419, ai-meta#332).
+# Target shape for the serve-from-embedded flip: StatefulSet + volumeClaimTemplate.
+#
+# ⚠ DISTINCT LABELS ON PURPOSE (app=noetl-server-rust-embedded). The running
+# server Deployment's pods carry app=noetl-server-rust; selecting that here would
+# give two controllers an overlapping selector, which Kubernetes leaves undefined.
+# Side-by-side identity also makes the cutover one Service-selector edit, and the
+# rollback the same edit reversed.
+#
+# ⚠ The image IS pinned here, unlike the shape-only manifests (ops#301). Shape-only
+# works when PATCHING a live object -- server-side apply merges with what is already
+# there. A brand-new object has nothing to merge with, and the API rejects it:
+#   The StatefulSet is invalid: spec.template.spec.containers[0].image: Required value
+# Update this digest from RELEASE-LEDGER.md at flip time.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-server-rust-embedded-headless
+  namespace: noetl
+  labels:
+    app: noetl-server-rust-embedded
+    component: server
+    runtime: rust
+    variant: embedded
+spec:
+  clusterIP: None
+  selector:
+    app: noetl-server-rust-embedded
+  ports:
+  - port: 8082
+    name: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: noetl-server-rust-embedded
+  namespace: noetl
+  labels: &id001
+    app: noetl-server-rust-embedded
+    component: server
+    runtime: rust
+    variant: embedded
+spec:
+  serviceName: noetl-server-rust-embedded-headless
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: noetl-server-rust-embedded
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - env:
+        - name: NOETL_ENCRYPTION_KEY_FILE
+          value: /var/secrets/sm/encryption-key
+        - name: POSTGRES_PASSWORD_FILE
+          value: /var/secrets/sm/postgres-password
+        - name: NOETL_INTERNAL_API_TOKEN_FILE
+          value: /var/secrets/sm/token
+        - name: NOETL_OBJECT_STORE_BACKEND
+          value: gcs
+        - name: NOETL_OBJECT_STORE_GCS_BUCKET
+          value: shastaratech-noetl-prod-results
+        - name: NOETL_OBJECT_STORE_GCS_ENDPOINT
+          value: https://storage.googleapis.com
+        - name: NOETL_OBJECT_STORE_GCS_AUTH
+          value: auto
+        - name: NOETL_RESULT_CELL_ENV
+          value: prod
+        - name: NOETL_RESULT_CELL_REGION
+          value: usc1
+        - name: NOETL_RESULT_CELL
+          value: usc1-a
+        - name: NOETL_RESULT_SHARD_COUNT
+          value: '256'
+        - name: NOETL_HOST
+          value: 0.0.0.0
+        - name: NOETL_PORT
+          value: '8082'
+        - name: RUST_LOG
+          value: info,noetl_server=info,sqlx=warn
+        - name: POSTGRES_HOST
+          value: pgbouncer.postgres.svc.cluster.local
+        - name: POSTGRES_PORT
+          value: '5432'
+        - name: POSTGRES_USER
+          value: noetl
+        - name: POSTGRES_DATABASE
+          value: noetl
+        - name: NOETL_SCHEMA
+          value: noetl
+        - name: NOETL_PG_STATEMENT_CACHE_CAPACITY
+          value: '0'
+        - name: NOETL_PUBLIC_SERVER_URL
+          value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+        - name: NOETL_SERVER_MACHINE_ID
+          value: '2'
+        - name: NOETL_EVENT_READ_PATH
+          value: event_scan
+        - name: NOETL_RESULT_MINT_AUTHORITATIVE
+          value: 'true'
+        - name: NOETL_RESULT_STORE_DUAL_WRITE
+          value: 'false'
+        - name: NOETL_OFFSERVER_ATTACH_TAIL
+          value: 'false'
+        - name: NOETL_OFFSERVER_TAIL_PLAYBOOK_PREFIXES
+          value: muno/playbooks/itinerary-planner,automation/agents/mcp/
+        - name: NOETL_ORPHAN_SWEEP_ENABLED
+          value: 'true'
+        - name: NOETL_AUTH_VERIFY_SIGNATURE
+          value: shadow
+        - name: NOETL_AUTH0_DOMAIN
+          value: mestumre-development.us.auth0.com
+        - name: NOETL_AUTH0_AUDIENCE
+          value: Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN
+        - name: NOETL_SHARD_SUBJECT_ROUTE
+          value: 'true'
+        - name: NOETL_COMMAND_BUS
+          value: ehdb
+        - name: NOETL_EVENT_BUS
+          value: ehdb
+        - name: NOETL_COMMAND_SHARD_COUNT
+          value: '1'
+        - name: NOETL_COMMAND_BUS_WRITER_ADDRS
+          value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9100
+        - name: NOETL_EVENT_BUS_WRITER_ADDRS
+          value: 0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9103
+        - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
+          value: 'true'
+        - name: NOETL_STATE_BUILDER
+          value: offserver
+        - name: NOETL_EVENT_SHARD_COUNT
+          value: '1'
+        - name: NOETL_PERMANENT_LOG_LEAN
+          value: 'true'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_WORKER_QUERY_URL
+          value: http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_ENABLED
+          value: 'true'
+        - name: NOETL_ORCH_RETRIGGER_ON_CLEAR
+          value: 'true'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_ASYNC
+          value: 'true'
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS
+          value: '30'
+        - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_PROJECTION_PARITY_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_PROJECTION_READ_SOURCE
+          value: wal
+        - name: NOETL_CATALOG_SNAPSHOT
+          value: digest
+        - name: NOETL_CATALOG_LOG
+          value: shadow
+        - name: NOETL_DATABASE_ROUTES_AUTH
+          value: disable_execute
+        - name: NOETL_CATALOG_READ_SOURCE
+          value: verify
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_DRAIN_CONCURRENCY
+          value: '1'
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_CONTENT
+          value: 'true'
+        - name: NOETL_NONCONVERGENCE_SWEEP_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_MAX_RETRIES
+          value: '7'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_RETRY_BACKOFF_MS
+          value: '500'
+        - name: NOETL_EHDB_RECOVERY_SOURCE
+          value: verify
+        - name: NOETL_EHDB_EMBEDDED
+          value: 'true'
+        - name: NOETL_EHDB_EMBEDDED_DIR
+          value: /data/ehdb-embedded
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:f2ab83c0fdf7fdbf9eccb89b8d03607df0e3117bd1c3319514c10ca87896d31d
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /api/health
+            port: 8082
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: noetl-server
+        ports:
+        - containerPort: 8082
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 12
+          httpGet:
+            path: /api/health
+            port: 8082
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: '2'
+            ephemeral-storage: 1Gi
+            memory: 1Gi
+          requests:
+            cpu: 250m
+            ephemeral-storage: 1Gi
+            memory: 256Mi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/secrets/sm
+          name: sm-secrets
+          readOnly: true
+        - name: ehdb-embedded
+          mountPath: /data
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: noetl-server-rust
+      serviceAccountName: noetl-server-rust
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: kubernetes.io/arch
+        operator: Equal
+        value: amd64
+      volumes:
+      - csi:
+          driver: secrets-store-gke.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: noetl-server-secrets
+        name: sm-secrets
+  volumeClaimTemplates:
+  - metadata:
+      name: ehdb-embedded
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: standard-rwo
+      resources:
+        requests:
+          storage: 10Gi
