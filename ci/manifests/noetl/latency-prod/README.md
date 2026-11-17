@@ -196,3 +196,41 @@ Release: noetl/server#591, released as **v3.164.0** `898313da` (rollback v3.163.
 - **Impact:** server API unavailable for ~45 min. The `hotelbeds-content-sync` run at 22:17 failed (hourly, next run 23:17). No stranded executions found afterwards.
 - **Post-recovery smoke:** noop 12/12 p50 2.19 s, auth max 4.41 s, 5/5 real travel turns (p50 8.1 s).
 - **Rule:** turn a bool flag off by REMOVING the variable (`NAME-`), never `NAME=`. Watch every prod flip to Ready, and never script flips unattended.
+
+## 2026-11-17 (03:16–07:00Z): batch flag decided ON, worker lifecycle fusion ON, await-park fix
+
+All flag changes went through a guarded setter (`harness/prodchg.sh`, `harness/ab_batch.sh` in the session scratch, logic recorded here): **off = remove the variable**; after every change the spec must match, the rollout finish, every pod be Ready with 0 restarts, the server log carry no `Failed to load app config`, `/api/health` answer and a smoke execution COMPLETE — else remove the flag / restore the pinned image and stop. No restarts were made in :14–:21 (hourly `hotelbeds-content-sync` at :17). 14 guarded changes, 0 aborts, 0 restarts.
+
+### 1. `NOETL_EVENT_PUBLISH_BATCH` (server, step.enter fused with command.issued) — ON
+
+Interleaved A/B on v3.164.0, 3 blocks per side (on/off/on/off/on/off), each block noop×12, py×12, await3×10 (102 executions per side, all COMPLETED):
+
+| p50 / p95 | off | on |
+|---|---|---|
+| seq10_noop | 2.34 / 5.27 s | 2.25 / 3.34 s |
+| seq10_py | 3.09 / 10.87 s | 3.16 / 4.48 s |
+| await3 | 4.95 / 9.21 s | 5.15 / 8.70 s |
+
+Server publish time 69.0 s → 54.2 s for the same work (−21%; ~1,000 per-row publishes became bursts, 7.2 ms/burst vs 8.5–8.9 ms/row). p50 deltas within block-to-block spread, p95 better on every arm → **ON since 2026-11-17T04:08Z**.
+
+### 2. Worker lifecycle fusion (`NOETL_WORKER_FUSE_LIFECYCLE`, worker 6.19.0 + server ≥ 3.165.0) — ON
+
+A command's `call.done` is held and sent with its `command.completed` in one `POST /api/events/seq`, **only** for exactly one in-process tool (noop/python/http/postgres/duckdb/rhai/shell/script/wasm), no `cases`, no sink, no task_sequence `do:` verb, a completing success, never the orchestrate drive. A step with an ordered tool list of several tools (any runtimes), conditional jumps, failures and parked/callback steps keep per-event writes. `command.started` is never fused.
+
+**Correctness (kind, byte-compare of `noetl.event` rows, ids/timestamps normalized):** `bench/fuse_multitool` (single python → [python, rhai, noop] list → a `do: jump` loop list → single rhai), `bench/fuse_goto` (guarded back-edge loop ×3 with arc `set:`, exclusive branch with one arm never taken, a skipped step) and `seq10_py`: 5 on/off pairs each, then 20 pairs each of goto + seq10_py — every pair identical except (a) the `__context_bytes__` of a command whose rendered context embeds a prior step's `duration_ms` (off-vs-off differs identically) and (b) 5/40 runs where the `step.enter` parent link points at an orchestrate drive instead of the completion — a pre-existing local-drive/reconcile race (2/40 flag off vs 3/40 on), identical once that link is ignored. Fused writes 115, per-event fallback exactly 10 (the two multi-tool steps × 5).
+
+**Prod A/B #1** (v3.165.0): p50 better on all arms but await p95 +1.75 s. Root cause: `await-park` `try_resolve` saw the child terminal, then the child detail read answered NotFound and the error fell to the 5 s sweep — pre-existing (4× flag off) but hit 9× once children got faster. Fixed in **v3.165.1** (noetl/server#593: settle like the missing-call.done wait). **A/B #2** (v3.165.1, noisier hour): resolve failures 0 vs 0.
+
+Pooled, both A/Bs (6 blocks per side; ~70 runs/arm/side, all COMPLETED):
+
+| p50 / p95 | off | on |
+|---|---|---|
+| seq10_noop | 2.36 / 4.38 s | 2.23 / 5.19 s |
+| seq10_py | 3.70 / 5.85 s | 3.26 / 4.89 s |
+| await3 | 5.84 / 17.7 s | 5.47 / 8.33 s |
+
+Per step one critical-path write fewer (fused 11.6–13.9 ms vs `call.done` 7–30 ms + `command.completed` 9–15 ms). The noop p95 rise comes from one environmentally slow on-block (whole-block p50 3.86 s) whose gaps are queue pickup / pre-dispatch / drive, not the fused write; no emit failures or refusals were logged. **ON since 2026-11-17T06:53:37Z.** After enabling: auth fallback 10/10, max 4.69 s (budget 15 s); 5/5 real travel turns (overhead/step p50 351 ms vs 359 ms before); real traffic fused 22, per-event 2 (multi-tool fallback live).
+
+Rollback: `kubectl -n noetl set env deploy/noetl-worker-rust NOETL_WORKER_FUSE_LIFECYCLE-` (then image 6.18.0 `e5b1d72c` if needed); server `NOETL_EVENT_PUBLISH_BATCH-`; server image v3.165.0 `0709d7c2` / v3.164.0 `898313da`.
+
+Known, not fixed here: the shadow chain populator logs `dangling_prev` a few times an hour (await3 resume links, and one read-race on a fused pair) — it refuses and falls back to Postgres by design; on/off counts 6 vs 11 (A/B #1), even in A/B #2.

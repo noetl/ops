@@ -71,6 +71,13 @@ spec:
         # scale-out stall). Default-on for local-drive workers from noetl/worker#405.
         - name: NOETL_WARM_ORCHESTRATE_PLUGIN
           value: 'true'
+        # noetl/ai-meta#561 lifecycle fusion (worker 6.19.0 + server >= 3.165.0):
+        # one tool's call.done + command.completed in one POST /api/events/seq;
+        # multi-tool steps, cases, jumps, sinks, failures and parked steps stay
+        # per event. ON in prod 2026-11-17T06:53Z after two interleaved A/Bs.
+        # OFF = REMOVE this entry (never `value: ''`).
+        - name: NOETL_WORKER_FUSE_LIFECYCLE
+          value: 'true'
         # noetl/ai-meta#561 (worker 6.18.0): reuse the system/orchestrate digest
         # resolution for 30 s instead of re-fetching the module on every drive
         # (prod: 61 ms per drive; drive p50 65.7 -> 34.3 ms).
