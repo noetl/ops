@@ -277,3 +277,64 @@ The consuming planner branch (the `shadow_slm_compare` leaf, gated on
 [`noetl/travel`](https://github.com/noetl/travel) under
 `playbooks/itinerary-planner.yaml`; a self-contained orchestrator self-test is
 `playbooks/slm/shadow-selftest.yaml` there.
+
+## Continuous-improvement loop — `improve.yaml` (noetl/ai-meta#150)
+
+The flywheel pieces above each work, but a human still had to run them in order
+and decide whether a new model was worth promoting. `improve.yaml` is the
+orchestration that ties them into ONE gated loop — "keep the domain SLM
+constantly improved" with no human in the inner loop. Generic + config-driven:
+every knob comes from the org `slm.config.yaml` `improvement` block, so any
+domain runs the identical loop.
+
+| Playbook / lib | Role |
+| :-- | :-- |
+| `improve.yaml` | Five NoETL steps sharing one `run_dir`: HARVEST → THRESHOLD GATE → TRAIN → EVAL + PROMOTION GATE → REPORT. |
+| `lib/slm_improve.py` | The loop engine (subcommands `harvest` / `gate` / `train` / `eval-promote` / `report` / `run`). |
+| `lib/slm_improve_smoke.py` | Reproducible assertion harness — proves every loop invariant offline (stub backend, local registry). |
+
+The five stages and two gates:
+
+1. **HARVEST** — ingest NEW shadow records since the last run
+   (`slm_replay --shadow`, read-only) + optional oracle-labeled synthetic
+   top-up → assemble + **register a candidate dataset** in G3 (leak-free split,
+   100% schema validity). `new_real_turns` counts only the real-traffic delta.
+2. **THRESHOLD GATE** — proceed to train only when the candidate carries
+   ≥ `improvement.min_new_real_turns` NEW real turns **or** the cadence elapsed;
+   else no-op + report "insufficient new data". Stops pointless retrains.
+3. **TRAIN** — finetune on the new dataset with the validated recipe
+   (qwen2.5-1.5B single multitask LoRA, balanced extract distribution, **no
+   envelope-first render serialization** — the v4 negative-result learnings) →
+   **register a G3 model** (lineage → dataset). `mode=stub|mlx|container`.
+4. **EVAL + PROMOTION GATE** — eval under constrained decoding vs the oracle
+   floor **and the current champion**. Promote (register a G3 `release`, the
+   champion marker) only if the candidate **regresses no field vs the champion
+   AND meets every configured per-field threshold**; else keep the champion +
+   record the rejection reason. Champion = latest `release`; bootstrapped on the
+   first run from `improvement.champion` (travel: v3).
+5. **REPORT** — `run_summary.json`: dataset delta, candidate-vs-champion
+   per-field table, promote/reject decision + reason, lineage URNs.
+
+### Offline / kind validation
+
+```bash
+# the reproducible assertion harness (asserts every loop invariant):
+NOETL_REGISTRY_BACKEND=local python3 lib/slm_improve_smoke.py --config <slm.config.yaml>
+
+# the loop via the playbook (-r local, file-backed registry, stub backend):
+NOETL_REGISTRY_BACKEND=local NOETL_REGISTRY_LOCAL_DIR=/tmp/slm_reg \
+noetl exec automation/mlops/slm/improve.yaml -r local \
+  --set config=/abs/.../travel/automation/mlops/slm/travel/slm.config.yaml \
+  --set shadow_corpus=<harvested slm_replay --shadow corpus> \
+  --set base_corpus=<seed corpus> \
+  --set champion_eval_ref=registry://muno/travel/eval/travel_slm_multitask/3
+```
+
+### Scheduling (operator-gated — not scheduled on prod)
+
+`improve.yaml` is written to run on a cadence (the config `improvement.schedule`
+cron) or a data-threshold trigger; an operator wires it — see the
+`§ SCHEDULE / TRIGGER HOOK` block at the bottom of `improve.yaml`. The threshold
+gate makes a cadence run cheap when no new traffic arrived: it harvests, sees
+< N new turns, and no-ops before training. Nothing is scheduled on prod by this
+work.
