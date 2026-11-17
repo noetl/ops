@@ -200,6 +200,23 @@ spec:
         - containerPort: 9108
           name: events-wal
           protocol: TCP
+        # ⛔⛔ DO NOT APPLY THIS PROBE BLOCK — blocked on noetl/ai-meta#481.
+        #
+        # Measured on prod 2026-10-18: /readyz also gates on boot warmup, and
+        # warmup on this writer takes 300 s (2026-10-16, v6.6.2) to 435 s
+        # (2026-10-18, v6.7.0).  Switching readiness to /readyz therefore holds
+        # the writer NotReady for 5-7.4 MINUTES on every restart instead of
+        # ~7 s, and a NotReady pod leaves EVERY Service that selects it — this
+        # pod hosts both buses, so that is minutes of stopped dispatch per
+        # restart.  The startupProbe budget below (300 s) is also too small:
+        # today's pod took 435 s, so the probe would have killed it.
+        #
+        # ⚠ Warmup is NOT caused by #470 — v6.6.2 took 300 s.  The coupling is
+        # pre-existing and was invisible while nothing probed /readyz.
+        #
+        # The IMAGE half is live and safe (prod runs v6.7.0, heartbeats
+        # observable, probes unchanged).  Only this block is blocked.
+        #
         # Readiness reads /readyz, not a TCP handshake (noetl/ai-meta#470).
         #
         # A port that accepts a connection and then answers nothing passes a TCP

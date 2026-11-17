@@ -1,3 +1,54 @@
+# ⛔⛔ DO NOT APPLY — blocked on noetl/ai-meta#481
+
+**Applying the probe change in this directory will take prod dispatch down for
+5–7.4 minutes per writer restart, and the `startupProbe` budget here would have
+killed the writer outright.**
+
+Measured on prod 2026-10-18 after rolling the #470 image (`v6.7.0`):
+
+| restart | version | boot warmup (`noetl_worker_ready` 0→1) |
+| :-- | :-- | --: |
+| 2026-10-16 | v6.6.2 | **300 s** |
+| 2026-10-18 | v6.7.0 | **435 s** |
+
+`/readyz` returns 200 only once boot warmup completes. So switching
+`readinessProbe` to `httpGet /readyz` holds the writer **NotReady for 5–7.4
+minutes on every restart** instead of ~7 s on `tcpSocket`. A NotReady pod leaves
+**every** Service that selects it, and this pod hosts **both buses** — so that is
+minutes of stopped dispatch, per restart.
+
+And the `startupProbe: failureThreshold: 60` (300 s) recorded below is **too
+small**: today's pod took 435 s to answer 200, so the probe would have killed it;
+2026-10-16's 300 s sat exactly on the boundary. The quantity is variable, so
+sizing to the last sample is not a fix either.
+
+⚠ Warmup is **not** caused by #470 — v6.6.2 took 300 s. The coupling is
+pre-existing and was invisible while nothing probed `/readyz`.
+
+**The image half IS live and safe**: prod runs `v6.7.0`, the serving heartbeats
+are observable and scraped, and the probes are unchanged, so nothing gates on
+`/readyz`. Only the probe half is blocked.
+
+**UPDATE 2026-10-18 — the warmup half is FIXED; a second blocker remains.**
+
+noetl/ai-meta#480 shipped in worker **v6.8.0** (live on prod): `/readyz` is now
+role-aware, so a bus host reports ready at **~bus-bind time (≤14 s measured)**
+instead of waiting 435 s for warmup. The numbers above describe the OLD build.
+
+The swap was then applied to prod on 2026-10-18 and **rolled back within ~7
+minutes**: the writer flapped out of its Service, 8 of 12 samples NotReady with
+the endpoint empty.
+
+⚠ **The predicate was not at fault.** `noetl_worker_serving_ready` stayed **1
+for the whole flap window** — the bus was serving throughout. The pod was
+**CPU-throttled by boot warmup** (110–257 core-seconds/min against a `cpu: '2'`
+limit) and could not answer the probe inside `timeoutSeconds: 2`. Even
+`/healthz`, which only returns `"ok"`, stalled up to 0.788 s.
+
+Unblock: [noetl/ai-meta#481](https://github.com/noetl/ai-meta/issues/481).
+
+---
+
 # Applying the #470 writer readiness probe — the path, and why it is not `kubectl apply`
 
 Staged, **not applied**. noetl/ai-meta#470 step 6 is gated on the owner.
