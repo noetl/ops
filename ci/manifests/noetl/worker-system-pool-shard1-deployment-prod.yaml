@@ -31,10 +31,13 @@ spec:
     matchLabels:
       app: noetl-worker-system-pool-shard1
       worker-pool: worker-system-pool
+  # Live, and deliberate-looking: never two pods of one shard pool at once
+  # (maxSurge 0). Was the 25%/25% default here, so an apply changed it
+  # (found by `kubectl diff`, 2026-10-21).
   strategy:
     rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 25%
+      maxSurge: 0
+      maxUnavailable: 1
     type: RollingUpdate
   template:
     metadata:
@@ -165,6 +168,8 @@ spec:
         - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
           value: server
         - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_CATALOG_MIRROR_SOURCE
           value: server
         # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
         # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
@@ -299,6 +304,8 @@ spec:
         - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
           value: server
         - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_CATALOG_MIRROR_SOURCE
           value: server
         image: curlimages/curl:8.7.1
         imagePullPolicy: IfNotPresent
