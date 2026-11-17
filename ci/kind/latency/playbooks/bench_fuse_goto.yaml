@@ -1,0 +1,40 @@
+# ai-meta#561 lifecycle-fusion correctness: CONDITIONAL JUMPS. A guarded
+# back-edge loop (inc -> inc while n < 3, carrying a counter through arc `set:`),
+# an exclusive two-way branch where only one arm is taken, and a step that the
+# routing jumps over. The event trace + final state must match flag on vs off.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: fuse_goto, path: bench/fuse_goto }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { n: 0 } }
+    next: [ { step: inc, set: { counter: 0 } } ]
+  - step: inc
+    tool:
+      kind: python
+      input: { c: '{{ counter | default(0) }}' }
+      code: |
+        result = {"n": int(c) + 1}
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - { step: inc, when: '{{ inc.n < 3 }}', set: { counter: '{{ inc.n }}' } }
+        - { step: route, when: '{{ inc.n >= 3 }}' }
+  - step: route
+    tool: { kind: rhai, code: "#{ pick: \"hi\" }" }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - { step: branch_hi, when: '{{ route.pick == "hi" }}' }
+        - { step: branch_lo, when: '{{ route.pick == "lo" }}' }
+  - step: branch_hi
+    tool: { kind: python, code: "result = {'arm': 'hi'}" }
+    next: [ { step: end } ]
+  - step: branch_lo
+    tool: { kind: python, code: "result = {'arm': 'lo'}" }
+    next: [ { step: skipped } ]
+  - step: skipped
+    tool: { kind: noop }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

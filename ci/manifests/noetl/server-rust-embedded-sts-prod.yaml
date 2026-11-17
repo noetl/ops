@@ -334,6 +334,11 @@ spec:
           value: 'true'
         - name: NOETL_POOL_ROUTES
           value: api_integration/auth0/=auth
+        # noetl/ai-meta#561 — interleaved prod A/B 2026-11-17 (3 blocks/side):
+        # publish time -21%, p95 better on every arm, p50 within noise. ON since
+        # 04:08Z. OFF = REMOVE this entry (never `value: ''` — see ledger v3.164.0).
+        - name: NOETL_EVENT_PUBLISH_BATCH
+          value: 'true'
         - name: NOETL_CHAIN_POPULATE
           value: 'true'
         - name: NOETL_CHAIN_SOURCE
@@ -360,7 +365,7 @@ spec:
           value: '60'
         # v3.161.2 (rolled 2026-11-13T02:50Z): cancel-spelling fixes noetl/server#581 + #583.
         # Rollback: v3.156.2 sha256:1433c32191277c66eae87ccf88b9e708d6c98cf38420f0f14f2b3b620efcec44.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:898313da50280db618b1afa4ea8d063d01ab7c65f5542344403120b5d06ec710
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:8778fd8b1987d7c37ebbf4370007175bcfe32d82018edb886e99e5771ad47792
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
