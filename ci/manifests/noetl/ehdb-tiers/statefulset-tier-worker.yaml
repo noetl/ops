@@ -1,0 +1,197 @@
+# DRAFT — NOT APPLIED. Reviewable proposal for noetl/ai-meta#247.
+#
+# A dedicated workload to host the EHDB storage tiers (phases 6-10) in SHADOW.
+#
+# ---------------------------------------------------------------------------
+# Why a new workload rather than reusing something that exists
+# ---------------------------------------------------------------------------
+#
+# The tiers need TWO properties at once, and no existing workload has both:
+#
+#   durable disk           the mirror is the artefact the parity evidence is
+#                          computed from; on ephemeral storage a scale-down
+#                          silently discards it
+#
+#   on the event-emit path the mirror hook lives in `emit_event`
+#                          (worker/src/client/control_plane.rs), so a process
+#                          only mirrors events it EMITS
+#
+#   noetl-worker-rust / system-pool : emit events, NO PVC, KEDA-scaled 2->20
+#   noetl-cmdbus-writer             : has PVCs, but MEASURED zero pulls and
+#                                     zero dispatches — it hosts the buses and
+#                                     emits nothing, so tier flags there would
+#                                     mirror NOTHING while reading as enabled
+#
+# Hence a dispatching worker with its own volume. It claims from the same bus
+# as the user pool, so it genuinely emits events and genuinely mirrors them.
+#
+# ---------------------------------------------------------------------------
+# Why shadow is NOT free, and why this is a StatefulSet
+# ---------------------------------------------------------------------------
+#
+# Shadow is "dual-write + compare, never serve", which sounds costless. It is
+# not: if the mirror is lost, the parity check keeps PASSING. The comparator's
+# primary invariant is the engine's own gapless-from-1 property
+# (`global_sequence == log_record_count`), and a replacement pod starting a
+# fresh mirror at sequence 1 still satisfies it. Sequence parity against the
+# authoritative log is only enforced "when known".
+#
+# So shadow on ephemeral storage would report clean parity while having
+# silently lost history — worse than no evidence, because it manufactures
+# confidence for the primary cutover. The PVC is what makes the evidence mean
+# anything.
+#
+# ---------------------------------------------------------------------------
+# Before applying — decisions this manifest does NOT make
+# ---------------------------------------------------------------------------
+#
+#   * storage size below is a guess (10Gi); size it from the observed mirror
+#     growth rate over a shadow window, not from this file
+#   * `NOETL_FEED_FILTER_SUBJECT` decides which commands this worker claims.
+#     As written it claims the SAME subject as the user pool, so it competes
+#     for work. If the intent is "mirror everything without taking work from
+#     the user pool", that needs a different subject or a dedicated pool — an
+#     open question, not a default
+#   * whether the tiers ultimately live here or move once shadow proves out
+#
+# See docs/runbooks/247-ehdb-tier-shadow-enablement.md for the sequence.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: noetl-worker-tier
+  namespace: noetl
+  labels:
+    app: noetl-worker-tier
+    worker-pool: tier
+    app.kubernetes.io/part-of: noetl
+  annotations:
+    noetl.io/draft: "true"
+    noetl.io/tracks: "https://github.com/noetl/ai-meta/issues/247"
+spec:
+  serviceName: noetl-worker-tier
+  # Deliberately 1. The tiers are being OBSERVED, not scaled; a second replica
+  # doubles the mirror set and complicates parity attribution for no benefit
+  # during shadow.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: noetl-worker-tier
+  template:
+    metadata:
+      labels:
+        app: noetl-worker-tier
+        worker-pool: tier
+    spec:
+      # Same GSA as the other worker pools — the tiers need no new identity.
+      serviceAccountName: noetl-worker
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: noetl-worker
+          # Pin by DIGEST at apply time, as every other prod workload does.
+          image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust:REPLACE_WITH_DIGEST
+          ports:
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: WORKER_POOL_NAME
+              value: worker-tier-pool
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NOETL_SERVER_URL
+              value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+            - name: WORKER_HEARTBEAT_INTERVAL
+              value: "15"
+            - name: WORKER_MAX_CONCURRENT
+              value: "2"
+            - name: WORKER_METRICS_BIND
+              value: 0.0.0.0:9090
+            - name: RUST_LOG
+              value: info,noetl_worker=info,noetl_executor=info
+
+            # ---- bus wiring: identical to the user pool ----
+            - name: NOETL_COMMAND_BUS
+              value: ehdb
+            - name: NOETL_COMMAND_BUS_HOST
+              value: "false"
+            - name: NOETL_COMMAND_SHARD_COUNT
+              value: "1"
+            - name: NOETL_COMMAND_BUS_CLAIM_ADDR
+              value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9101
+            # ⚠ SEE THE HEADER. Same subject as the user pool means this worker
+            # competes for the same commands. Deliberate for shadow (it must
+            # emit real events to mirror them), but revisit before primary.
+            - name: NOETL_FEED_FILTER_SUBJECT
+              value: noetl.commands.shared.>
+
+            # ---- EHDB tiers: SHADOW only ----
+            # Every one of these is `shadow`, never `primary`. Shadow
+            # dual-writes and compares; it never serves a read. Flipping any of
+            # them to `primary` is a separate, gated decision (#247 step d) and
+            # must not ride along with this manifest.
+            - name: NOETL_EHDB_ENABLED
+              value: "true"
+            - name: NOETL_EHDB_CLIENT_ROLE
+              value: worker
+            - name: NOETL_EHDB_MODE
+              value: local_reference
+            - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
+              value: /data/ehdb/reference.jsonl
+            # Enable ONE tier at a time (see the runbook). Start with the
+            # cheapest signal and leave the event log for last.
+            - name: NOETL_EHDB_PROJECTION
+              value: "off"
+            - name: NOETL_EHDB_KV
+              value: "off"
+            - name: NOETL_EHDB_OBJECT
+              value: "off"
+            - name: NOETL_EHDB_VECTOR
+              value: "off"
+            - name: NOETL_EHDB_EVENTLOG
+              value: "off"
+          volumeMounts:
+            - name: tier-data
+              mountPath: /data/ehdb
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: tier-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: premium-rwo
+        resources:
+          requests:
+            # GUESS. Size from observed mirror growth during shadow.
+            storage: 10Gi
+---
+# Scrape it, or the parity evidence is invisible. A PodMonitoring that selects
+# by label rather than an enumerated app list — an enumerated list is itself a
+# representation and drifted before (it omitted a live shard and would have
+# scraped half the pool while looking green).
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: noetl-worker-tier
+  namespace: noetl
+  annotations:
+    noetl.io/draft: "true"
+spec:
+  selector:
+    matchLabels:
+      worker-pool: tier
+  endpoints:
+    - port: metrics
+      interval: 30s
