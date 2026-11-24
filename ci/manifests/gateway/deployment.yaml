@@ -139,14 +139,23 @@ spec:
         # The client IP is Cloudflare's header; the LB still accepts direct
         # traffic, so per-IP limits are best effort until it is restricted to
         # Cloudflare ranges (the per-guest and total caps hold regardless).
+        # shastaranch/concierge/log (applied 2026-11-24; the edge concierge
+        # pilot, docs/decisions/2026-11-23-edge-concierge.md in
+        # shastaranch/mountshastaranch): after an edge turn the page hands its
+        # record id to this playbook, which fetches the record from the edge
+        # with a stored credential (returned once) and logs the turn, the
+        # thread state and the team alert. A caller can't forge or replay a
+        # turn with it; its own budget below keeps it off the chat budget.
         - name: GATEWAY_GUEST_PLAYBOOKS
-          value: shastaranch/concierge/turn,shastaranch/chats/inbox,shastaranch/contact/submit
+          value: shastaranch/concierge/turn,shastaranch/chats/inbox,shastaranch/contact/submit,shastaranch/concierge/log
         # Polling for staff replies must not use up a guest's 20 chat
         # messages: chats/inbox has its own hourly budget, per guest / per IP /
         # total. The page asks at most every 2 min (refocus at most once a
         # minute), so 40/guest leaves headroom; a refusal just waits a turn.
+        # concierge/log: one run per edge turn, so the edge's own turn limits
+        # (20 per conversation, 60 per IP, 600 in total per hour) apply.
         - name: GATEWAY_GUEST_PLAYBOOK_LIMITS
-          value: shastaranch/chats/inbox=40/120/1200
+          value: shastaranch/chats/inbox=40/120/1200,shastaranch/concierge/log=20/60/600
         # Signed-in users (mountshastaranch.com guests who signed in) get their
         # own hourly budgets per playbook: per user / all users together
         # (noetl/gateway user_limits, docs/user-playbook-limits.md). Admins are
