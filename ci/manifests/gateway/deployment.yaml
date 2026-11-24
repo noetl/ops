@@ -139,7 +139,7 @@ spec:
         # The client IP is Cloudflare's header; the LB still accepts direct
         # traffic, so per-IP limits are best effort until it is restricted to
         # Cloudflare ranges (the per-guest and total caps hold regardless).
-        # shastaranch/concierge/log (STAGED, NOT APPLIED; the edge concierge
+        # shastaranch/concierge/log (applied 2026-11-24; the edge concierge
         # pilot, docs/decisions/2026-11-23-edge-concierge.md in
         # shastaranch/mountshastaranch): after an edge turn the page hands its
         # record id to this playbook, which fetches the record from the edge
