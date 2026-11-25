@@ -1,0 +1,12 @@
+# Child tool for d8_playbook_tools: always FAILS, so the agent sees an is_error result.
+# A configuration error (a playbook call with no path) fails the execution on every
+# runtime; a python `raise` does not (its step error is routed, and `end` completes).
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: agents_d8_broken, path: tests/agents/d8_broken }
+workflow:
+  - step: start
+    tool: { kind: playbook }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

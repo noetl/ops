@@ -1,0 +1,15 @@
+# Latency bench (ai-meta#559): awaiting a failing child must FAIL the parent,
+# flag on or off (a parked await resumes with call.error + command.failed, the
+# events the worker emits when the tool errors).
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_await_fail, path: bench/await_fail }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: h1 } ]
+  - step: h1
+    tool: { kind: playbook, path: bench/child_fail, return_result: true, timeout: 60 }
+    next: [ { step: after } ]
+  - step: after
+    tool: { kind: noop, result: { reached: true } }

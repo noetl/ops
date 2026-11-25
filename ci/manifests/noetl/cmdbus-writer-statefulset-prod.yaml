@@ -20,8 +20,8 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   annotations:
-    autopilot.gke.io/resource-adjustment: '{"input":{"containers":[{"limits":{"cpu":"2","memory":"4Gi"},"requests":{"cpu":"250m","memory":"512Mi"},"name":"noetl-worker"}]},"output":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"4Gi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"512Mi"},"name":"noetl-worker"}]},"computeClassAtAdmission":"Default","modified":true}'
-    autopilot.gke.io/warden-version: 35.26.5-gke.2
+    autopilot.gke.io/resource-adjustment: '{"input":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"12Gi"},"requests":{"cpu":"1","ephemeral-storage":"1Gi","memory":"512Mi"},"name":"noetl-worker"}]},"output":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"12Gi"},"requests":{"cpu":"1","ephemeral-storage":"1Gi","memory":"1Gi"},"name":"noetl-worker"}]},"computeClassAtAdmission":"Default","modified":true}'
+    autopilot.gke.io/warden-version: 35.26.6-gke.0
   labels:
     app: noetl-cmdbus-writer
     command-bus: ehdb
@@ -141,6 +141,21 @@ spec:
           value: tail
         - name: NOETL_EHDB_REFERENCE_RUNTIME_CACHE
           value: 'true'
+        # ⚠ The five below were set LIVE and never written back (found
+        # 2026-10-21 by a field-by-field diff of live vs this file). Two of them
+        # are load-bearing safety switches: an apply that dropped them would have
+        # silently turned off writer election and epoch fencing. Values match
+        # live exactly; change them here, not with `kubectl set env`.
+        - name: NOETL_EXECUTION_FAIL_ON_STEP_ERROR
+          value: 'true'
+        - name: NOETL_EHDB_TIER_SEAL_MAX_BYTES
+          value: '268435456'
+        - name: NOETL_EHDB_TIER_MAX_INFLIGHT
+          value: '4'
+        - name: NOETL_EHDB_ELECTION
+          value: 'true'
+        - name: NOETL_EHDB_FENCING
+          value: enforce
         # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
         # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
         # digest back here, so every pin in this directory was BEHIND live: a
@@ -200,85 +215,106 @@ spec:
         - containerPort: 9108
           name: events-wal
           protocol: TCP
-        # Readiness reads /readyz, not a TCP handshake (noetl/ai-meta#470).
+        # ⛔ LIVE readiness is the TCP check below, and there is NO startupProbe.
         #
-        # A port that accepts a connection and then answers nothing passes a TCP
-        # probe forever.  That is noetl/ai-meta#469: this writer accepted TCP and
-        # never sent HTTP headers for over a day, across two pod generations,
-        # while the pod read Ready, restarts=0, every listener logged "up", and
-        # there were zero ERROR lines.  `tcpSocket: cmdbus-claim` cannot see it,
-        # by construction.
-        #
-        # /readyz returns 200 only when boot warmup is done AND every required
-        # serving face is bound AND each ticked inside the freshness threshold;
-        # otherwise 503 with a body naming the failed check and the face.  The
-        # comparison happens in-process because a probe is stateless — it cannot
-        # diff two scrapes, so it cannot notice a number that stopped moving.
-        #
-        # ⚠ On the metrics port deliberately.  :9090 is one of the ports that
-        # wedged in #469, so a probe that cannot get an HTTP response out of
-        # :9090 SHOULD fail — that is the signal, not a flaw in the target.
-        #
-        # Which faces are required is NOETL_SERVING_REQUIRED on the container
-        # (default: command ingest + command claim).  Measured container-relative
-        # bind times on this pod, 2026-10-16 (startedAt 17:05:13Z, restarts=0):
-        # metrics 1.6 s, command ingest/claim 2.6 s, event ingest 56.0 s, tier
-        # 60.5 s, event claim 308.4 s.  A NotReady pod leaves EVERY Service that
-        # selects it, so requiring a later-binding face makes the faces that are
-        # already up unreachable for the difference: +51 s per restart to require
-        # event ingest, +303 s to require event claim.  The default costs
-        # nothing — it is ready before the old probe's 5 s initialDelay elapsed.
-        # Widening it means raising the startupProbe budget below to match.
+        # The commented block after it is the STAGED #470 probe swap (httpGet
+        # /readyz + a 300 s startupProbe). It is NOT LIVE: ops#336 holds it until
+        # boot warmup no longer gates /readyz for minutes (ai-meta#480 shipped
+        # role-aware /readyz; ai-meta#481's CPU request is now live). Enabling it
+        # is its own gated writer roll — uncomment deliberately, never as a side
+        # effect of applying this file. Until 2026-10-21 these lines were live
+        # YAML while prod ran tcpSocket, so applying the file would have stacked
+        # the swap onto any other change (a server-side diff rejected the merge:
+        # "may not specify more than 1 handler type").
         readinessProbe:
           failureThreshold: 3
-          httpGet:
-            path: /readyz
-            port: metrics
+          initialDelaySeconds: 5
           periodSeconds: 5
           successThreshold: 1
-          timeoutSeconds: 2
-        # The bind window, so startup slowness cannot trip liveness.
+          tcpSocket:
+            port: cmdbus-claim
+          timeoutSeconds: 1
         #
-        # While a startupProbe is running, kubelet suppresses BOTH the readiness
-        # and liveness probes — which is the point: /readyz legitimately answers
-        # 503 until the required faces bind, and that must read as "not started
-        # yet" rather than as a failure.
-        #
-        # ⚠⚠ 60 x 5 s = 300 s, NOT the 60 s a bind-window reading suggests.
-        #
-        # Sizing this to the 2.6 s bind window was wrong and kind proved it: at
-        # 12 x 5 s the writer CRASH-LOOPED.  The container was SIGTERMed at
-        # exactly 61 s with exitCode 0 — `Startup probe failed: HTTP probe
-        # failed with statuscode: 503`, for the whole 62 s budget, then
-        # `failed startup probe, will be restarted`.
-        #
-        # The cause is that /readyz gates on boot warmup as well as on the bus
-        # faces, and warmup is a separate, much longer thing than binding.  A
-        # budget derived from bind times measures the wrong quantity.
-        #
-        # ⚠ Not fully isolated: the FIRST container on a new image took > 62 s
-        # to answer 200, while every subsequent fresh container answered within
-        # ~16 s, and nothing was logged in the 61 s gap.  No on-disk warmup
-        # cache was found, so the obvious cold-start explanation is unconfirmed.
-        # The budget is sized to absorb it either way.
-        #
-        # 300 s is ~19x the ~16 s a fresh container actually takes.  Generous on
-        # purpose, because the downside is asymmetric: an over-generous budget
-        # delays nothing, since startup ends on the first success rather than at
-        # the budget, while an under-generous one kills the single-writer host —
-        # which is exactly what 60 s did.
-        #
-        # Raise to >= 70 (350 s) before setting NOETL_SERVING_REQUIRED to a set
-        # that includes event claim, which binds at 308 s.
-        startupProbe:
-          failureThreshold: 60
-          httpGet:
-            path: /readyz
-            port: metrics
-          initialDelaySeconds: 2
-          periodSeconds: 5
-          successThreshold: 1
-          timeoutSeconds: 2
+        # ---- STAGED, NOT LIVE: the #470 probe swap ----
+        # # Readiness reads /readyz, not a TCP handshake (noetl/ai-meta#470).
+        # #
+        # # A port that accepts a connection and then answers nothing passes a TCP
+        # # probe forever.  That is noetl/ai-meta#469: this writer accepted TCP and
+        # # never sent HTTP headers for over a day, across two pod generations,
+        # # while the pod read Ready, restarts=0, every listener logged "up", and
+        # # there were zero ERROR lines.  `tcpSocket: cmdbus-claim` cannot see it,
+        # # by construction.
+        # #
+        # # /readyz returns 200 only when boot warmup is done AND every required
+        # # serving face is bound AND each ticked inside the freshness threshold;
+        # # otherwise 503 with a body naming the failed check and the face.  The
+        # # comparison happens in-process because a probe is stateless — it cannot
+        # # diff two scrapes, so it cannot notice a number that stopped moving.
+        # #
+        # # ⚠ On the metrics port deliberately.  :9090 is one of the ports that
+        # # wedged in #469, so a probe that cannot get an HTTP response out of
+        # # :9090 SHOULD fail — that is the signal, not a flaw in the target.
+        # #
+        # # Which faces are required is NOETL_SERVING_REQUIRED on the container
+        # # (default: command ingest + command claim).  Measured container-relative
+        # # bind times on this pod, 2026-10-16 (startedAt 17:05:13Z, restarts=0):
+        # # metrics 1.6 s, command ingest/claim 2.6 s, event ingest 56.0 s, tier
+        # # 60.5 s, event claim 308.4 s.  A NotReady pod leaves EVERY Service that
+        # # selects it, so requiring a later-binding face makes the faces that are
+        # # already up unreachable for the difference: +51 s per restart to require
+        # # event ingest, +303 s to require event claim.  The default costs
+        # # nothing — it is ready before the old probe's 5 s initialDelay elapsed.
+        # # Widening it means raising the startupProbe budget below to match.
+        # readinessProbe:
+        #   failureThreshold: 3
+        #   httpGet:
+        #     path: /readyz
+        #     port: metrics
+        #   periodSeconds: 5
+        #   successThreshold: 1
+        #   timeoutSeconds: 2
+        # # The bind window, so startup slowness cannot trip liveness.
+        # #
+        # # While a startupProbe is running, kubelet suppresses BOTH the readiness
+        # # and liveness probes — which is the point: /readyz legitimately answers
+        # # 503 until the required faces bind, and that must read as "not started
+        # # yet" rather than as a failure.
+        # #
+        # # ⚠⚠ 60 x 5 s = 300 s, NOT the 60 s a bind-window reading suggests.
+        # #
+        # # Sizing this to the 2.6 s bind window was wrong and kind proved it: at
+        # # 12 x 5 s the writer CRASH-LOOPED.  The container was SIGTERMed at
+        # # exactly 61 s with exitCode 0 — `Startup probe failed: HTTP probe
+        # # failed with statuscode: 503`, for the whole 62 s budget, then
+        # # `failed startup probe, will be restarted`.
+        # #
+        # # The cause is that /readyz gates on boot warmup as well as on the bus
+        # # faces, and warmup is a separate, much longer thing than binding.  A
+        # # budget derived from bind times measures the wrong quantity.
+        # #
+        # # ⚠ Not fully isolated: the FIRST container on a new image took > 62 s
+        # # to answer 200, while every subsequent fresh container answered within
+        # # ~16 s, and nothing was logged in the 61 s gap.  No on-disk warmup
+        # # cache was found, so the obvious cold-start explanation is unconfirmed.
+        # # The budget is sized to absorb it either way.
+        # #
+        # # 300 s is ~19x the ~16 s a fresh container actually takes.  Generous on
+        # # purpose, because the downside is asymmetric: an over-generous budget
+        # # delays nothing, since startup ends on the first success rather than at
+        # # the budget, while an under-generous one kills the single-writer host —
+        # # which is exactly what 60 s did.
+        # #
+        # # Raise to >= 70 (350 s) before setting NOETL_SERVING_REQUIRED to a set
+        # # that includes event claim, which binds at 308 s.
+        # startupProbe:
+        #   failureThreshold: 60
+        #   httpGet:
+        #     path: /readyz
+        #     port: metrics
+        #   initialDelaySeconds: 2
+        #   periodSeconds: 5
+        #   successThreshold: 1
+        #   timeoutSeconds: 2
         resources:
           limits:
             cpu: '2'
@@ -297,9 +333,15 @@ spec:
             # check of the probe fields would have reported clean.
             memory: 12Gi
           requests:
-            cpu: 250m
+            # 1 core since the 2026-10-21 writer roll (ai-meta#481): it ran at
+            # 2-3.5x a 250m request and lost that headroom under contention.
+            cpu: '1'
             ephemeral-storage: 1Gi
-            memory: 512Mi
+            # 1Gi is what Autopilot ADMITS for a 1-core request: its webhook
+            # enforces a minimum memory:CPU ratio, and the resource-adjustment
+            # annotation above records input 512Mi -> output 1Gi. Declared at the
+            # admitted value so applying this file is a no-op.
+            memory: 1Gi
         securityContext:
           capabilities:
             drop:
@@ -333,6 +375,9 @@ spec:
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler
+      # Live since before this file tracked it; omitting it would leave the pod
+      # on the namespace default service account on any recreate-from-file.
+      serviceAccountName: noetl-cmdbus-writer
       securityContext:
         seccompProfile:
           type: RuntimeDefault

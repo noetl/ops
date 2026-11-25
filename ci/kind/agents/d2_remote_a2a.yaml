@@ -1,0 +1,17 @@
+# Direction 2 on the cluster: framework remote calls a third-party A2A agent.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: agents_d2_remote_a2a, path: tests/agents/d2_remote_a2a }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: ask } ]
+  - step: ask
+    tool:
+      kind: agent
+      framework: remote
+      remote: { endpoint: http://agents-stubs.noetl.svc.cluster.local:8082, protocol: a2a }
+      prompt: d2-a2a
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

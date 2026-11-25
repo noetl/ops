@@ -61,3 +61,15 @@ jobs:
 
       - name: validate
         run: python3 ci/checks/validate.py
+
+      # Applying ci/monitoring/alertpolicies.json is a MANUAL step, so the file
+      # is a representation with no forcing function — the shape
+      # agents/rules/representation-drift.md describes. On 2026-10-15 a missing
+      # `duration` key was applied as 0s, and a STABLE divergence count of 35
+      # paged immediately and kept paging (noetl/ai-meta#471).
+      #
+      # ⚠ This checks the FILE, not the cloud: CI has no prod credentials, so it
+      # cannot tell whether a policy is applied. `--live` does that and is for
+      # manual use; it SKIPS LOUDLY without a token rather than reporting clean.
+      - name: alert policies are well-formed
+        run: bash ci/monitoring/check-alertpolicies.sh

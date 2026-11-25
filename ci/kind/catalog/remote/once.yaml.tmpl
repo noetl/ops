@@ -1,0 +1,10 @@
+# Cross-instance e2e: a fresh root after v2 — it must see v2.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: xc_once_MODE, path: xc/once_MODE }
+workflow:
+  - step: start
+    tool: { kind: playbook, path: "noetl://B_ID/xc/target", remote: MODE, return_result: true, result_step: call_leaf, timeout: 240 }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

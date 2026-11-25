@@ -1,0 +1,12 @@
+# Cross-instance e2e: B's target. It calls B's own xc/leaf by bare name, so
+# delegated it runs B's leaf on B; imported it runs peer/<B>/xc/leaf on A
+# (home-instance resolution). VER marks the target's own version.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: xc_target, path: xc/target, labels: { xc_version: "VER" } }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: call_leaf } ]
+  - step: call_leaf
+    tool: { kind: playbook, path: xc/leaf, return_result: true, result_step: start }
