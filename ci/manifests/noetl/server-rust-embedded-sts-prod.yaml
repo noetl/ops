@@ -120,6 +120,24 @@ spec:
     spec:
       containers:
       - env:
+        # Live-only until 2026-11-25 (set directly on prod by earlier rollouts; see
+        # latency-prod/README.md). Declared here at their live positions and values.
+        - name: NOETL_DSL_KB
+          value: 'true'
+        - name: NOETL_CATALOG_PARSE_ON_REGISTER
+          value: shadow
+        - name: EHDB_BLOOM_SCHEME
+          value: '2'
+        - name: NOETL_EHDB_FLOOR_EXACT
+          value: 'true'
+        - name: NOETL_EHDB_RETENTION_HOURS
+          value: '24'
+        - name: NOETL_EHDB_ARCHIVE_KNOWN_PERSIST
+          value: 'on'
+        - name: NOETL_EHDB_ARCHIVE_RETOUCH
+          value: shadow
+        - name: NOETL_CHAIN_RETENTION_HOURS
+          value: '168'
         - name: NOETL_ENCRYPTION_KEY_FILE
           value: /var/secrets/sm/encryption-key
         - name: POSTGRES_PASSWORD_FILE
@@ -319,26 +337,6 @@ spec:
         # `kubectl exec ... -- env | grep "^NOETL_CHAIN_"`.
         - name: NOETL_CHAIN_ADVANCE
           value: 'true'
-        # noetl/ai-meta#558/#559 — enabled in prod 2026-11-15 (ci/manifests/noetl/latency-prod/README.md).
-        # #559 flags REQUIRE NOETL_STATE_BUILDER=offserver (noetl/ai-meta#570).
-        - name: NOETL_SERVER_ADVANCE_API
-          value: 'true'
-        - name: NOETL_EXECUTION_WAIT
-          value: 'true'
-        - name: NOETL_PLAYBOOK_AWAIT_PARK
-          value: 'true'
-        # noetl/ai-meta#561 slice 2 (noetl/server#590) — enabled in prod 2026-11-16.
-        - name: NOETL_INGEST_CATALOG_FROM_DESCRIPTOR
-          value: 'true'
-        - name: NOETL_PLAYBOOK_PARSE_CACHE
-          value: 'true'
-        - name: NOETL_POOL_ROUTES
-          value: api_integration/auth0/=auth
-        # noetl/ai-meta#561 — interleaved prod A/B 2026-11-17 (3 blocks/side):
-        # publish time -21%, p95 better on every arm, p50 within noise. ON since
-        # 04:08Z. OFF = REMOVE this entry (never `value: ''` — see ledger v3.164.0).
-        - name: NOETL_EVENT_PUBLISH_BATCH
-          value: 'true'
         - name: NOETL_CHAIN_POPULATE
           value: 'true'
         - name: NOETL_CHAIN_SOURCE
@@ -363,9 +361,62 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_TAIL_REPLICATION_TICK_SECS
           value: '60'
-        # v3.161.2 (rolled 2026-11-13T02:50Z): cancel-spelling fixes noetl/server#581 + #583.
-        # Rollback: v3.156.2 sha256:1433c32191277c66eae87ccf88b9e708d6c98cf38420f0f14f2b3b620efcec44.
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:8778fd8b1987d7c37ebbf4370007175bcfe32d82018edb886e99e5771ad47792
+        # Interop build plan (ai-meta#544), canary-enabled 2026-11-10 after kind (ops#365).
+        # Item 5: /api/mcp serves playbooks that opt in with metadata.expose.mcp.
+        - name: NOETL_MCP_SERVER
+          value: 'true'
+        # Item 7: /api/agents. NOETL_AGENT_CALLBACK_ORIGINS unset = every callback_url refused.
+        - name: NOETL_AGENT_ENDPOINT
+          value: 'true'
+        # Item 9: /api/instances. Trust defaults to an empty allowlist (admits nobody) until
+        # NOETL_INSTANCE_TRUSTED_IDS is set.
+        - name: NOETL_INSTANCE_REGISTRY
+          value: 'true'
+        # Embedded ehgraph `noetl-cluster` + the instance registry's topology writer, applied
+        # 2026-11-10 by ci/manifests/noetl/ehgraph-topology/apply.sh a|b (rollback.sh b|a).
+        # Config and token come from GSM through the noetl-server-secrets SecretProviderClass
+        # (referenced by path only; values never live in this repo).
+        - name: NOETL_EHGRAPH_EMBEDDED
+          value: 'true'
+        - name: NOETL_EHGRAPH_CONFIG
+          value: /var/secrets/sm/ehgraph-config.toml
+        - name: NOETL_EHGRAPH_HOST_REPLICAS
+          value: '1'
+        - name: NOETL_EHGRAPH_HOST_ORDINAL
+          value: '0'
+        - name: NOETL_EHGRAPH_TOPOLOGY_WRITER
+          value: 'true'
+        - name: NOETL_EHGRAPH_TOPOLOGY_TOKEN_FILE
+          value: /var/secrets/sm/ehgraph-topology-token
+        # Admit kind: mcp / kind: agent at registration and execute. Enabled 2026-11-11
+        # with worker 6.12.0 (noetl/ai-meta#330, #539).
+        - name: NOETL_TOOL_KIND_MCP
+          value: 'true'
+        - name: NOETL_TOOL_KIND_AGENT
+          value: 'true'
+        # noetl/ai-meta#558/#559 — enabled in prod 2026-11-15 (ci/manifests/noetl/latency-prod/README.md).
+        # #559 flags REQUIRE NOETL_STATE_BUILDER=offserver (noetl/ai-meta#570).
+        - name: NOETL_SERVER_ADVANCE_API
+          value: 'true'
+        - name: NOETL_EXECUTION_WAIT
+          value: 'true'
+        - name: NOETL_PLAYBOOK_AWAIT_PARK
+          value: 'true'
+        # noetl/ai-meta#561 slice 2 (noetl/server#590) — enabled in prod 2026-11-16.
+        - name: NOETL_INGEST_CATALOG_FROM_DESCRIPTOR
+          value: 'true'
+        - name: NOETL_PLAYBOOK_PARSE_CACHE
+          value: 'true'
+        - name: NOETL_POOL_ROUTES
+          value: api_integration/auth0/=auth
+        # noetl/ai-meta#561 — interleaved prod A/B 2026-11-17 (3 blocks/side):
+        # publish time -21%, p95 better on every arm, p50 within noise. ON since
+        # 04:08Z. OFF = REMOVE this entry (never `value: ''` — see ledger v3.164.0).
+        - name: NOETL_EVENT_PUBLISH_BATCH
+          value: 'true'
+        # v3.165.2 (live since 2026-11-18, rollout revision 154: adiona/frontend#122 413 body cap).
+        # Rollback: v3.165.1 sha256:8778fd8b1987d7c37ebbf4370007175bcfe32d82018edb886e99e5771ad47792.
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:3d5e6959967453f60f38071630f2c4dc2b8ac6577bb662589cca08f55e89cd58
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6
