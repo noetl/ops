@@ -148,7 +148,7 @@ spec:
         # ⚠ STAGED, NOT LIVE (checked read-only 2026-11-25): the live user pool does not
         # carry this env. Applying this file ADDS it, which changes the pod template and
         # ROLLS the user pool. Step 2 of 3 of the #199 sink-gate enablement
-        # (playbooks/199-sink-gate/PROD-ENABLE-CHECKLIST.md); apply it only as part of that.
+        # (noetl/ai-meta#199 PROD-ENABLE-CHECKLIST); apply it only as part of that.
         #
         # Bearer for /api/internal/* (noetl/ai-meta#199 Slice A). Sink steps
         # (`sink: true`) run on this pool and post /api/internal/sink-state/{mark,confirm};
