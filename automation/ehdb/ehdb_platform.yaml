@@ -1,0 +1,393 @@
+# EHDB-only NoETL platform topology — the entry point.
+# =============================================================================
+# NATS was deleted from the platform on 2026-08-01.  Everything the buses used
+# to do — command dispatch, the events feed, the SSE fan-out, the KV store the
+# gateway's sessions and requests live in — is now served by the EHDB writer.
+# None of that shape existed as IaC: it was applied imperatively during the
+# cutover with `kubectl set env` / `kubectl patch` and never written back.
+#
+# This playbook set is that shape, declared and re-runnable:
+#
+#   ehdb_writer.yaml       the writer StatefulSet + per-shard PVCs + Services,
+#                          hosting all nine bus faces
+#   ehdb_runtime.yaml      server / user pool / system pool / gateway pointed at
+#                          those faces, with the NATS-era env stripped off
+#   ehdb_autoscaler.yaml   the user pool's KEDA ScaledObject on EHDB per-subject
+#                          lag, plus the writer's scrape
+#   ehdb_verify.yaml       the functional proof — paired evidence, not a green
+#                          execution count
+#
+# ── USAGE ────────────────────────────────────────────────────────────────────
+#   noetl run automation/ehdb/ehdb_platform.yaml --runtime local \
+#     --set action=converge --set profile=kind
+#
+#   action=plan      render everything and server-side dry-run it; changes nothing
+#   action=converge  reconcile the topology, then verify it
+#   action=status    report what is deployed and assert the EHDB-only invariants
+#   action=verify    the functional proof on an already-converged cluster
+#   action=teardown  remove the writer + ScaledObject (PVCs are kept)
+#
+# ── PROFILES ─────────────────────────────────────────────────────────────────
+#   kind  local kind cluster.  Default storage class, small PVCs, local images
+#         with imagePullPolicy=Never, and the state-builder WAL drain in shadow
+#         so the :9108 fan-out face has a real client.
+#   prod  GKE.  `premium-rwo` (PD-SSD) — the writer's durability posture is
+#         fsync-per-append, so disk sync latency IS the append-latency budget;
+#         on PD-standard a synced append is tens of ms.  Digest-pinned images,
+#         and `writer_storage_mode=claim` to adopt the existing PVCs.
+#
+# Anything a profile sets can be overridden on the command line; the profile is
+# a set of defaults, not a lock.
+#
+# ── THE DEFAULTS DESCRIBE PROD, NOT KIND ─────────────────────────────────────
+# Read-only discovery against shastaratech-noetl-prod on 2026-08-03 found six
+# defaults in this file that disagreed with the cluster they would be applied
+# to.  Applied as they stood, a `profile=prod` converge would have turned a
+# running subsystem off, mounted PVCs that do not exist, aborted half-way on a
+# container name, and halved the writer's memory limit.  All six now carry
+# prod's measured value, because a default that is wrong on the most dangerous
+# target is the defect this playbook set exists to remove:
+#
+#   state_builder            offserver  (was `server` — would have turned the
+#                                       off-server state builder OFF; prod runs
+#                                       it on the server AND both system pools)
+#   writer_claim_*           shard-INDEXED names (`noetl-cmdbus-writer-0-data`,
+#                                       …) — the un-indexed ones came from the
+#                                       kind soak and match no PVC in prod
+#   user_pool_container      noetl-worker (was `worker`)
+#   gateway_namespace        gateway      (was `noetl`)
+#   gateway_deployment       gateway      (was `noetl-gateway`)
+#   writer_memory_limit      4Gi          (was 2Gi, prod runs 4Gi)
+#
+# Two defaults were checked and are RIGHT for prod, contrary to earlier notes:
+# `state_shard_write=true` and the three-group `verify_groups` — prod runs all
+# three materializer groups (:9106 shows noetl_state_materializer live at lag
+# 0).  Narrowing either would make this playbook's own verify read a live group
+# as absent and fail on it.
+#
+# Full record: noetl/ai-meta `playbooks/223-ehdb-prod-runbook/P0-discovery.md`.
+# Everything marked "measured" above must be RE-CONFIRMED against prod at apply
+# time — it is a reading from one day, not an invariant.
+#
+# ── WHAT THIS DOES NOT DO ────────────────────────────────────────────────────
+# It does not install KEDA, create the namespace, deploy Postgres, or build
+# images.  Those belong to `automation/development/noetl.yaml` (kind) and
+# `automation/gcp_gke/noetl_gke_fresh_stack.yaml` (GKE).  This playbook takes a
+# cluster that already runs NoETL and reconciles the *bus topology* on it.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ehdb_platform
+  path: automation/ehdb/ehdb-platform
+  description: Reconcile and verify the EHDB-only NoETL platform topology
+  labels:
+    noetl.io/command-bus: ehdb
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # help | plan | converge | status | verify | teardown
+  action: help
+  # kind | prod
+  profile: kind
+
+  context: kind-noetl
+  namespace: noetl
+  # The gateway is NOT in the platform namespace on prod — it is Deployment
+  # `gateway` in namespace `gateway` (shastaratech-noetl-prod, 2026-08-03).
+  # With the old `noetl` / `noetl-gateway` defaults, `gateway_reconcile=true`
+  # failed the run outright and `auto` silently skipped the workload carrying
+  # the SPA's only live-update path.  See gateway_deployment below.
+  gateway_namespace: gateway
+
+  writer_name: noetl-cmdbus-writer
+  shard_count: "1"
+
+  # ── writer ────────────────────────────────────────────────────────────────
+  writer_image: "localhost/noetl-worker:h5209b"
+  writer_image_pull_policy: Never
+  # template | claim — `claim` adopts pre-existing named PVCs (the prod
+  # Deployment→StatefulSet conversion path).  See ehdb_writer.yaml.
+  writer_storage_mode: template
+  writer_storage_class: ""
+  writer_cmdbus_storage: 5Gi
+  writer_eventbus_storage: 5Gi
+  writer_kv_storage: 1Gi
+  # Prod's live writer: requests 250m / 512Mi, limits 2 CPU / 4Gi (measured
+  # 2026-08-03).  The old 100m/256Mi/2Gi defaults would have SHRUNK a running
+  # workload on adoption — a converge must not quietly take memory away from the
+  # process holding both buses' L0 index.
+  writer_cpu_request: 250m
+  writer_cpu_limit: "2"
+  writer_memory_request: 512Mi
+  writer_memory_limit: 4Gi
+  # storage_mode=claim only — the names of the PVCs the StatefulSet adopts.
+  # These are shard-indexed because that is what the cluster being adopted
+  # actually names them; read off shastaratech-noetl-prod on 2026-08-03:
+  #   noetl-cmdbus-writer-0-data / noetl-eventbus-writer-0-data /
+  #   noetl-eventbus-kv-0-data   (all premium-rwo, 20Gi/50Gi/20Gi, Bound).
+  # Mounting the wrong claim strands the live command and event logs, so these
+  # are threaded to ehdb_writer.yaml rather than left to the child's defaults —
+  # `--set claim_cmdbus=...` on this entry point silently did nothing before.
+  writer_claim_cmdbus: noetl-cmdbus-writer-0-data
+  writer_claim_eventbus: noetl-eventbus-writer-0-data
+  writer_claim_kv: noetl-eventbus-kv-0-data
+
+  # ── runtime ───────────────────────────────────────────────────────────────
+  server_deployment: noetl-server-rust
+  server_container: noetl-server
+  user_pool_deployment: noetl-worker-rust
+  # Prod names every worker container `noetl-worker`, the user pool's included;
+  # the kind rig names that one `worker`.  A wrong container name does NOT
+  # no-op — a strategic merge appends a second, imageless container and the API
+  # server rejects the patch, aborting the converge half-applied.  So this is
+  # prod's name and ehdb_runtime.yaml resolves it against the live Deployment.
+  user_pool_container: noetl-worker
+  # Whitespace-separated.  Prod runs two system pools on the same
+  # `commands.system.>` subject (`-shard1` is a second replica, not a shard).
+  # Absent names are skipped, so this is safe on a one-pool cluster.
+  system_pool_deployment: "noetl-worker-system-pool noetl-worker-system-pool-shard1"
+  system_pool_container: noetl-worker
+  gateway_reconcile: auto
+  gateway_deployment: gateway
+  gateway_container: gateway
+  # `offserver` is what prod runs — server AND both system pools, with
+  # NOETL_STATE_BUILDER_SOURCE=ehdb and a live :9108 WAL client (measured
+  # 2026-08-03).  The old `server` default would have turned that subsystem OFF
+  # on a converge.  A kind rig that wants the server-side builder passes
+  # `--set state_builder=server`.
+  state_builder: offserver
+  # `offserver` already puts a real client on :9108, and prod carries no
+  # NOETL_STATE_BUILDER_SHADOW at all — the shadow drain is the kind-only
+  # substitute for a real client and must not be paired with the default above.
+  state_builder_shadow: "false"
+  # Enables the third materializer group (noetl_state_materializer) on the
+  # system pool.  Threaded because `--set state_shard_write=...` on this entry
+  # point silently did nothing before — the child defaulted it and the value
+  # never reached ehdb_runtime.yaml, so a converge could only ever apply the
+  # child's default whatever the operator asked for.
+  #
+  # Default `true` matches prod: on shastaratech-noetl-prod (2026-08-03) both
+  # system pools carry NOETL_STATE_SHARD_WRITE=true and the writer's :9106
+  # reports all three groups live at lag 0 — noetl_materializer,
+  # noetl_result_materializer AND noetl_state_materializer.  Earlier notes
+  # claiming prod does not run the third group are wrong; see the P0 discovery
+  # record in noetl/ai-meta playbooks/223-ehdb-prod-runbook/P0-discovery.md.
+  state_shard_write: "true"
+
+  # ── autoscaler ────────────────────────────────────────────────────────────
+  autoscaler_enabled: "true"
+  scaledobject_name: noetl-worker-rust
+  pool_subject: "commands.shared.shard.0"
+  min_replicas: "2"
+  max_replicas: "20"
+  target_value: "2"
+  autoscaler_paused: "false"
+  monitoring: auto
+
+  # ── verify ────────────────────────────────────────────────────────────────
+  verify_executions: "20"
+  verify_concurrency: "10"
+  verify_groups: "noetl_materializer noetl_result_materializer noetl_state_materializer"
+  verify_playbook: "fixtures/playbooks/hello_world"
+
+workflow:
+  - step: start
+    desc: Guard the target cluster, then hand the action to each child in turn
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          ACTION="{{ workload.action }}"
+          echo "EHDB-only platform — action=$ACTION profile={{ workload.profile }} context={{ workload.context }}"
+
+          case "$ACTION" in
+            plan|converge|status|verify|teardown) ;;
+            help)
+              cat <<'TXT'
+
+          EHDB-only NoETL platform topology.
+
+            noetl run automation/ehdb/ehdb_platform.yaml --runtime local \
+              --set action=<plan|converge|status|verify|teardown> \
+              --set profile=<kind|prod> \
+              --set context=<kube-context>
+
+          kind (from repos/ops):
+            noetl run automation/ehdb/ehdb_platform.yaml -r local \
+              --set action=converge --set profile=kind --set context=kind-noetl \
+              --set writer_image=localhost/noetl-worker:<tag>
+
+          prod (after gcloud re-auth; adopts the existing PVCs).  Every setting
+          below is required; `profile=prod` sets no defaults on its own, it is a
+          context guard.  The defaults for state_builder, the claim names, the
+          container name, the gateway location and the writer memory limit now
+          carry prod's measured values, so they do NOT appear here — but they
+          MUST be re-confirmed against the cluster in the plan diff before the
+          converge:
+
+            noetl run automation/ehdb/ehdb_platform.yaml -r local \
+              --set action=plan --set profile=prod \
+              --set context=gke_shastaratech-noetl-prod_us-central1_noetl-prod-autopilot \
+              --set writer_storage_mode=claim \
+              --set writer_storage_class=premium-rwo \
+              --set writer_image=<AR ref>@sha256:<digest> \
+              --set writer_image_pull_policy=IfNotPresent \
+              --set gateway_reconcile=true \
+              --set autoscaler_enabled=false
+
+          Read the plan output before running converge against prod.  Confirm in
+          the diff: the three writer_claim_* names match the live PVCs verbatim;
+          NOETL_STATE_BUILDER renders `offserver` on the server and both system
+          pools; the writer's memory limit is 4Gi; the gateway patch targets
+          namespace `gateway`.
+
+          TXT
+              # Every child no-ops on an action it does not own, so `help`
+              # walks the chain and changes nothing.
+              exit 0 ;;
+            *)
+              echo "ERROR: unknown action '$ACTION' (want plan|converge|status|verify|teardown|help)." >&2
+              exit 1 ;;
+          esac
+
+          if ! kubectl --context "{{ workload.context }}" version --request-timeout=10s >/dev/null 2>&1; then
+            echo "ERROR: cannot reach context '{{ workload.context }}'." >&2
+            exit 1
+          fi
+          # A profile/context mismatch is how a kind-shaped topology reaches a
+          # real cluster.  `kind` refuses anything that is not a kind context;
+          # `prod` refuses a kind one.
+          case "{{ workload.profile }}:{{ workload.context }}" in
+            kind:kind-*) : ;;
+            kind:*) echo "ERROR: profile=kind but context '{{ workload.context }}' is not a kind context." >&2; exit 1 ;;
+            prod:kind-*) echo "ERROR: profile=prod pointed at kind context '{{ workload.context }}'." >&2; exit 1 ;;
+            prod:*) : ;;
+            *) echo "ERROR: unknown profile '{{ workload.profile }}' (want kind|prod)." >&2; exit 1 ;;
+          esac
+          kubectl --context "{{ workload.context }}" -n "{{ workload.namespace }}" get deploy,sts 2>&1 | head -20
+    next:
+      arcs:
+        - step: writer
+
+  # The chain is LINEAR and every child gets the same action.  A child no-ops on
+  # an action it does not own, which is what makes `verify` and `teardown` safe
+  # to run through the same path as `converge`.
+  #
+  # Two reasons there is no conditional branching here.  The local runtime's
+  # templating is plain substitution with no conditionals, so there is nowhere
+  # to translate one action vocabulary into another.  And conditional arc
+  # evaluation in that runtime is non-deterministic: a true condition takes its
+  # arc only about half the time, which for IaC means silently doing nothing.
+  #
+  # Teardown runs the writer delete before the autoscaler delete.  For the few
+  # seconds in between, the ScaledObject points at a writer that is gone; KEDA's
+  # fallback pins the pool at minReplicaCount rather than scaling on a stale
+  # reading, so this is harmless.
+  - step: writer
+    desc: Reconcile the writer StatefulSet, PVCs and per-shard Services
+    tool:
+      kind: playbook
+      path: ehdb_writer.yaml
+      input:
+        action: "{{ workload.action }}"
+        context: "{{ workload.context }}"
+        namespace: "{{ workload.namespace }}"
+        name: "{{ workload.writer_name }}"
+        shard_count: "{{ workload.shard_count }}"
+        image: "{{ workload.writer_image }}"
+        image_pull_policy: "{{ workload.writer_image_pull_policy }}"
+        storage_mode: "{{ workload.writer_storage_mode }}"
+        storage_class: "{{ workload.writer_storage_class }}"
+        cmdbus_storage: "{{ workload.writer_cmdbus_storage }}"
+        eventbus_storage: "{{ workload.writer_eventbus_storage }}"
+        kv_storage: "{{ workload.writer_kv_storage }}"
+        claim_cmdbus: "{{ workload.writer_claim_cmdbus }}"
+        claim_eventbus: "{{ workload.writer_claim_eventbus }}"
+        claim_kv: "{{ workload.writer_claim_kv }}"
+        cpu_request: "{{ workload.writer_cpu_request }}"
+        cpu_limit: "{{ workload.writer_cpu_limit }}"
+        memory_request: "{{ workload.writer_memory_request }}"
+        memory_limit: "{{ workload.writer_memory_limit }}"
+        server_url: "http://{{ workload.server_deployment }}.{{ workload.namespace }}.svc.cluster.local:8082"
+    next:
+      arcs:
+        - step: runtime
+
+  - step: runtime
+    desc: Point the server, worker pools and gateway at the EHDB faces
+    tool:
+      kind: playbook
+      path: ehdb_runtime.yaml
+      input:
+        action: "{{ workload.action }}"
+        context: "{{ workload.context }}"
+        namespace: "{{ workload.namespace }}"
+        gateway_namespace: "{{ workload.gateway_namespace }}"
+        writer_name: "{{ workload.writer_name }}"
+        shard_count: "{{ workload.shard_count }}"
+        server_deployment: "{{ workload.server_deployment }}"
+        server_container: "{{ workload.server_container }}"
+        user_pool_deployment: "{{ workload.user_pool_deployment }}"
+        user_pool_container: "{{ workload.user_pool_container }}"
+        system_pool_deployment: "{{ workload.system_pool_deployment }}"
+        system_pool_container: "{{ workload.system_pool_container }}"
+        gateway_reconcile: "{{ workload.gateway_reconcile }}"
+        gateway_deployment: "{{ workload.gateway_deployment }}"
+        gateway_container: "{{ workload.gateway_container }}"
+        state_builder: "{{ workload.state_builder }}"
+        state_builder_shadow: "{{ workload.state_builder_shadow }}"
+        state_shard_write: "{{ workload.state_shard_write }}"
+    next:
+      arcs:
+        - step: autoscaler
+
+  - step: autoscaler
+    desc: Reconcile the user-pool ScaledObject on EHDB per-subject lag
+    tool:
+      kind: playbook
+      path: ehdb_autoscaler.yaml
+      input:
+        action: "{{ workload.action }}"
+        enabled: "{{ workload.autoscaler_enabled }}"
+        context: "{{ workload.context }}"
+        namespace: "{{ workload.namespace }}"
+        writer_name: "{{ workload.writer_name }}"
+        scaledobject_name: "{{ workload.scaledobject_name }}"
+        target_deployment: "{{ workload.user_pool_deployment }}"
+        pool_subject: "{{ workload.pool_subject }}"
+        min_replicas: "{{ workload.min_replicas }}"
+        max_replicas: "{{ workload.max_replicas }}"
+        target_value: "{{ workload.target_value }}"
+        paused: "{{ workload.autoscaler_paused }}"
+        monitoring: "{{ workload.monitoring }}"
+    next:
+      arcs:
+        - step: verify
+
+  - step: verify
+    desc: Prove the platform works — paired evidence, not an execution count
+    tool:
+      kind: playbook
+      path: ehdb_verify.yaml
+      input:
+        action: "{{ workload.action }}"
+        context: "{{ workload.context }}"
+        namespace: "{{ workload.namespace }}"
+        writer_name: "{{ workload.writer_name }}"
+        server_service: "{{ workload.server_deployment }}"
+        playbook_path: "{{ workload.verify_playbook }}"
+        executions: "{{ workload.verify_executions }}"
+        concurrency: "{{ workload.verify_concurrency }}"
+        groups: "{{ workload.verify_groups }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

@@ -1,0 +1,170 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: chat_completion
+  path: automation/agents/mcp/vllm
+  description: |
+    vLLM MCP backend for self-hosted inference. Implements the same
+    chat_completion contract as automation/agents/mcp/ollama and
+    automation/agents/mcp/vertex-ai, so a call site swaps backends by
+    changing a workload knob (or NOETL_SLM_BACKEND) rather than code.
+
+    vLLM already speaks the OpenAI chat-completions API, so this playbook
+    is a thin pass-through: no request translation, only the MCP envelope.
+
+    ⚠ NOT REACHABLE BY DEFAULT. No vLLM server is deployed in prod at the
+    time of writing (0 GPU nodes). Selecting this backend requires standing
+    one up first; until then it fails loudly with a tool_error envelope
+    rather than silently falling back.
+  agent: true
+  exposes_as_mcp: true
+  exposed_in_ui: false
+  tags: [mcp, vllm, self-hosted, chat-completion]
+
+workload:
+  model: ""
+  messages: []
+  system: ""
+  temperature: 0.1
+  max_tokens: 512
+
+  method: "tools/call"
+  tool: "chat_completion"
+  arguments: {}
+
+  # OpenAI-shaped endpoint of the vLLM server. Matches
+  # model_backend.DEFAULT_VLLM_ENDPOINT.
+  vllm_endpoint: "http://vllm.noetl.svc.cluster.local:8000/v1/chat/completions"
+  vllm_api_key: ""
+
+workflow:
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`
+    tool:
+      kind: noop
+    next:
+      arcs:
+        - step: vllm_chat_completion
+
+  - step: vllm_chat_completion
+    desc: POST an OpenAI chat-completions request to the vLLM server
+    tool:
+      kind: python
+      code: |
+        import json
+        import time
+        import urllib.error
+        import urllib.request
+
+        def _as_dict(value):
+          return value if isinstance(value, dict) else {}
+
+        def _as_list(value):
+          return value if isinstance(value, list) else []
+
+        def _message_text(message):
+          if isinstance(message, str):
+            return message
+          if not isinstance(message, dict):
+            return str(message)
+          content = message.get("content", "")
+          if isinstance(content, str):
+            return content
+          if isinstance(content, list):
+            parts = []
+            for item in content:
+              if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+              elif item is not None:
+                parts.append(str(item))
+            return "\n".join(parts)
+          return str(content)
+
+        def _normalise_messages(value, system_text):
+          out = []
+          if isinstance(system_text, str) and system_text.strip():
+            out.append({"role": "system", "content": system_text.strip()})
+          for message in _as_list(value):
+            if isinstance(message, dict):
+              role = str(message.get("role") or "user")
+              text = _message_text(message).strip()
+            else:
+              role, text = "user", str(message).strip()
+            if text:
+              out.append({"role": role, "content": text})
+          return out or [{"role": "user", "content": "ping"}]
+
+        def _error_envelope(model_name, endpoint, message, detail=None):
+          return {
+            "status": "error",
+            "content": [{"type": "text", "text": message}],
+            "error": {
+              "category": "tool_error",
+              "root_cause": message,
+              "suggested_action": (
+                "Check that a vLLM server is deployed and reachable at the "
+                "configured endpoint. No vLLM server ships by default."
+              ),
+              "detail": detail,
+            },
+            "meta": {"backend": "vllm", "model": model_name, "endpoint": endpoint},
+          }
+
+        args = _as_dict(arguments)
+        model_name = str(args.get("model") or model or "").strip()
+        endpoint = str(vllm_endpoint or "").strip()
+        msgs = _normalise_messages(args.get("messages") or messages, args.get("system") or system)
+
+        if not model_name:
+          result = _error_envelope(model_name, endpoint, "vllm: no model specified")
+        elif not endpoint:
+          result = _error_envelope(model_name, endpoint, "vllm: no endpoint configured")
+        else:
+          body = json.dumps({
+            "model": model_name,
+            "messages": msgs,
+            "temperature": float(temperature or 0),
+            "max_tokens": int(max_tokens or 512),
+          }).encode("utf-8")
+          headers = {"Content-Type": "application/json"}
+          key = str(vllm_api_key or "").strip()
+          if key:
+            headers["Authorization"] = "Bearer " + key
+          req = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+          started = time.time()
+          try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+              payload = json.loads(resp.read().decode("utf-8"))
+            elapsed_ms = int((time.time() - started) * 1000)
+            choice = (_as_list(payload.get("choices")) or [{}])[0]
+            text = _message_text(_as_dict(choice).get("message") or {})
+            usage = _as_dict(payload.get("usage"))
+            result = {
+              "status": "ok",
+              "content": [{"type": "text", "text": text}],
+              "usage": {
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "total_tokens": int(usage.get("total_tokens") or 0),
+              },
+              "meta": {
+                "backend": "vllm",
+                "source_hint": "vllm",
+                "model": model_name,
+                "endpoint": endpoint,
+                "latency_ms": elapsed_ms,
+              },
+            }
+          except urllib.error.HTTPError as exc:
+            result = _error_envelope(model_name, endpoint, f"vllm: HTTP {exc.code}", exc.read().decode("utf-8", "replace")[:500])
+          except Exception as exc:
+            result = _error_envelope(model_name, endpoint, f"vllm: {type(exc).__name__}", str(exc)[:500])
+      args:
+        model: "{{ workload.model }}"
+        messages: "{{ workload.messages }}"
+        system: "{{ workload.system }}"
+        temperature: "{{ workload.temperature }}"
+        max_tokens: "{{ workload.max_tokens }}"
+        arguments: "{{ workload.arguments }}"
+        vllm_endpoint: "{{ workload.vllm_endpoint }}"
+        vllm_api_key: "{{ workload.vllm_api_key }}"

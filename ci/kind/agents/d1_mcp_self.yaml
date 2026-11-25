@@ -1,0 +1,20 @@
+# Direction 1 + 3 on the cluster: a playbook calls the server's own playbook MCP
+# endpoint (/api/mcp), which runs another playbook on the workers.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: agents_d1_self, path: tests/agents/d1_self }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: call } ]
+  - step: call
+    tool:
+      kind: mcp
+      endpoint: http://noetl-server-rust.noetl.svc.cluster.local:8082/api/mcp
+      tool: agents_echo
+      arguments: { who: d1-self }
+      timeout: 100
+      on_provider_error: fail
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

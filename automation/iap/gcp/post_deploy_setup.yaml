@@ -14,9 +14,9 @@ workload:
   e2e_repo_dir: "../e2e"
 
   # PostgreSQL configuration
-  postgres_admin_password: demo
+  postgres_admin_password: REPLACE_ME_LOCAL_DEV_ONLY
   demo_user: demo
-  demo_password: demo
+  demo_password: REPLACE_ME_LOCAL_DEV_ONLY
   demo_database: demo_noetl
 
 workflow:

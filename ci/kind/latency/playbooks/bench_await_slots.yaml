@@ -1,0 +1,18 @@
+# Latency bench (ai-meta#559): one awaited child hop with a 30 s await timeout.
+# Run C=6 at once on the 4-slot lat user pool (the `slots` arm): today each
+# parent HOLDS its slot while its child waits for one, so 6 parents on 4 slots
+# leave children unscheduled until awaits time out (the resource model's
+# same-pool deadlock_note). With NOETL_PLAYBOOK_AWAIT_PARK the parent frees its
+# slot and every run completes.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_await_slots, path: bench/await_slots }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: h1 } ]
+  - step: h1
+    tool: { kind: playbook, path: bench/child_slow, return_result: true, result_step: end, timeout: 30 }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

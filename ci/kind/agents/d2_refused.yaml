@@ -1,0 +1,22 @@
+# The worker refuses what it cannot run: a playbook-bound agent tool (needs the
+# CLI host; cluster = RFC Phase 6 Stage B).
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: agents_d2_refused, path: tests/agents/d2_refused }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: ask } ]
+  - step: ask
+    tool:
+      kind: agent
+      framework: claude
+      model: stub
+      prompt: hi
+      endpoint: http://agents-stubs.noetl.svc.cluster.local:8081
+      auth: { type: api_key, credential: e2e_agents_model }
+      tools:
+        - { name: local_tool, description: x, playbook: tests/agents/echo }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

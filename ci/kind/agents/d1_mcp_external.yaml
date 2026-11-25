@@ -1,0 +1,20 @@
+# Direction 1 on the cluster: a playbook calls a third-party MCP server, with a
+# keychain bearer credential, on the worker (noetl-tools McpTool).
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: agents_d1_external, path: tests/agents/d1_external }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: call } ]
+  - step: call
+    tool:
+      kind: mcp
+      endpoint: http://agents-stubs.noetl.svc.cluster.local:8083/mcp
+      tool: site.lookup
+      arguments: { site: ranch }
+      auth: e2e_agents_mcp
+      on_provider_error: fail
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

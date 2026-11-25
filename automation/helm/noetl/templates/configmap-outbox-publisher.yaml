@@ -11,4 +11,8 @@ data:
 {{- range $key, $value := .Values.config.outboxPublisher }}
   {{ $key }}: {{ $value | quote }}
 {{- end }}
+{{- if and .Values.ehdb .Values.ehdb.enabled }}
+  # EHDB bounded data-plane env (system role, local_reference) — see templates/_ehdb.tpl.
+{{- include "noetl.ehdb.configmapEnv" (dict "clientRole" "system" "roleKey" "outboxPublisher" "root" $) | nindent 2 }}
+{{- end }}
 {{- end }}

@@ -1,0 +1,55 @@
+# NoETL Rust user-pool autoscaler on EHDB command-bus lag — KIND validation twin
+# =============================================================================
+# The kind counterpart of the prod user-pool scaler
+# (`scaledobject-worker-rust-prod.yaml`), and the manifest the scale-on-EHDB-lag
+# proof for noetl/ai-meta#194 was run with.
+#
+# Identical trigger shape to prod — `metrics-api`, `format: prometheus`, same
+# `valueLocation`, same `targetValue` — so what is proven here is the mechanism
+# prod runs.  Three deliberate differences:
+#
+#   1. **Writer service name.** kind runs one un-suffixed writer Deployment
+#      (`noetl-cmdbus-writer`); prod runs one per shard
+#      (`noetl-cmdbus-writer-0`, `-1`).
+#   2. **No NATS trigger.** This file exists to isolate the EHDB signal.  Prod
+#      keeps its NATS trigger until the T5 teardown so nothing regresses while
+#      NATS is still installed.
+#   3. **Not paused.** The whole point here is to watch it scale.  Prod ships
+#      paused; unpausing prod is a deliberate operator step.
+#
+# Prerequisites in kind (the flip is kind-only and reversible with
+# `kubectl set env deploy/<d> NOETL_COMMAND_BUS=nats`):
+#   - `NOETL_COMMAND_BUS=ehdb` on noetl-server-rust, noetl-worker-rust, the
+#     system pools, and noetl-cmdbus-writer.
+#   - KEDA installed (`kubectl apply --server-side -f \
+#     https://github.com/kedacore/keda/releases/download/v2.15.0/keda-2.15.0.yaml`)
+#     — the kind cluster does not carry it by default.
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: noetl-worker-rust-ehdb
+  namespace: noetl
+  labels:
+    app: noetl-worker-rust
+    worker-pool: worker-rust-pool
+    command-bus: ehdb
+    managed-by: noetl
+spec:
+  scaleTargetRef:
+    name: noetl-worker-rust
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  pollingInterval: 10
+  cooldownPeriod: 30
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+    - type: metrics-api
+      metadata:
+        url: "http://noetl-cmdbus-writer.noetl.svc.cluster.local:9102/metrics"
+        format: prometheus
+        valueLocation: "ehdb_feed_total_lag"
+        targetValue: "2"
+        activationTargetValue: "1"

@@ -5,6 +5,29 @@ image:
   tag: "latest"
   pullPolicy: Always
 
+# ---------------------------------------------------------------------------
+# EHDB (Event Horizon Database) integration — DISABLED BY DEFAULT.
+#
+# When `enabled: false` (the default) the gateway deployment renders
+# byte-identical to pre-EHDB: no NOETL_EHDB_* env, no attach, no behavior
+# change.
+#
+# The gateway is a CONTROL-PLANE role.  When enabled it receives
+# control-plane-only EHDB env (NOETL_EHDB_MODE=control_plane,
+# NOETL_EHDB_CAPABILITIES=control_plane) and NEVER a data-plane storage handle
+# (no NOETL_EHDB_LOCAL_REFERENCE_LOG).  The boundary is enforced in
+# `templates/_ehdb.tpl` keyed on the gateway client role — it is not
+# values-configurable.  The noetl worker/system data-plane roles live in the
+# separate `automation/helm/noetl` chart.
+#
+# See https://github.com/noetl/ehdb/wiki/Claude-Handoff-EHDB-NoETL-Integration
+# (Phase A).
+ehdb:
+  enabled: false
+  roles:
+    gateway:
+      enabled: true
+
 service:
   type: LoadBalancer
   port: 8090
@@ -27,8 +50,7 @@ env:
   routerPort: "8090"
   noetlBaseUrl: "http://noetl.noetl.svc.cluster.local:8082"
   rustLog: "info,gateway=debug"
-  corsAllowedOrigins: "http://localhost:8080,http://localhost:8090,http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173,https://mestumre.dev,https://travel.mestumre.dev,https://gateway.mestumre.dev"
-  natsUrl: "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
+  corsAllowedOrigins: "http://localhost:8080,http://localhost:8090,http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173,https://mestumre.dev,https://travel.mestumre.dev,https://gateway.mestumre.dev,https://team4.mestumre.dev,https://console.noetl.ai"
   # NATS subject prefix the gateway's playbook_state listener
   # subscribes to (``{prefix}>``).  Must match the noetl event publisher's
   # ``NOETL_EVENT_NATS_SUBJECT_PREFIX`` (``noetl.events`` by default),

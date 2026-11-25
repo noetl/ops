@@ -262,13 +262,13 @@ noetl run automation/ibkr/test_login.yaml --payload '{"gateway_url":"https://loc
 Or run the helper directly:
 
 ```bash
-python scripts/ibkr/authenticate_gateway.py --gateway-url https://localhost:15000 --manual
+python automation/ibkr/scripts/authenticate_gateway.py --gateway-url https://localhost:15000 --manual
 ```
 
 If you want autofill:
 
 ```bash
-IBKR_USERNAME=... IBKR_PASSWORD=... python scripts/ibkr/authenticate_gateway.py --paper
+IBKR_USERNAME=... IBKR_PASSWORD=... python automation/ibkr/scripts/authenticate_gateway.py --paper
 ```
 
 ### Maintain session (tickle/reauth)

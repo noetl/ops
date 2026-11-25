@@ -1,0 +1,135 @@
+# promtool unit tests for the async-mirror alerts (noetl/ai-meta#155).
+# =============================================================================
+# Run:
+#   cd ci/manifests/noetl/tests
+#   ./extract-rules.sh                     # GMP Rules -> plain prometheus rules
+#   promtool test rules alerts-ehdb-mirror-lag.test.yaml
+#
+# ## Why these exist
+#
+# A rule that has never fired is indistinguishable from a rule that CANNOT
+# fire — the same defect `agents/rules/representation-drift.md` names one level
+# up.  `promtool check rules` proves only that the YAML parses; it says nothing
+# about whether the expression selects anything.
+#
+# So every alert here is tested BOTH ways.  The negative cases are the ones
+# with teeth:
+#
+#   * test 2 — the same high lag with the tolerance gauge at 0 must stay
+#     SILENT.  Without it the rule would page every deployment that never
+#     turned the async mirror on, which is currently all of them.
+#   * test 3 — lag inside a wide window must stay silent, or the alert is
+#     just "the mirror exists".
+#   * test 5 — a queue with a backlog that IS draining must stay silent.  A
+#     burst is not a stall; a rule that cannot tell them apart gets muted by
+#     the first person on call.
+#
+# Test 4 is the subtle one and the reason `EhdbMirrorQueueStalled` watches a
+# gauge rather than the lag histogram: a queue that has stopped entirely emits
+# NO lag observations, so its histogram reads exactly like an idle healthy
+# system.  The fixture supplies a flat `drained` counter and a non-zero pending
+# gauge — no lag series at all — and the alert still fires.
+rule_files:
+  - rules-ehdb-mirror-lag.promql.yaml
+evaluation_interval: 30s
+tests:
+  # 1. Lag past the window, tolerance armed -> MUST fire.
+  - interval: 30s
+    name: lag exceeds the configured window
+    input_series:
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="5"}'
+        values: '0+0x60'
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="10"}'
+        values: '0+10x60'
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="30"}'
+        values: '0+10x60'
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="+Inf"}'
+        values: '0+10x60'
+      - series: 'noetl_ehdb_crossstore_parity_lag_tolerance_seconds'
+        values: '5+0x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EhdbMirrorLagExceedsParityWindow
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: ehdb-eventlog-mirror
+              noetl_io_flip_guardrail: eventlog-mirror-async
+            exp_annotations:
+              summary: "EHDB mirror lag (9.95s p99) exceeds the parity tolerance window"
+              description: "The async event-log mirror's p99 enqueue-to-durable lag has been above NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS for 10m. The comparator only forgives absences younger than that window, so events are aging out of it while still queued — they will be reported as missing_event divergence and the serve policy will demote a tier that is actually healthy. Check noetl_ehdb_eventlog_mirror_pending_events and the tier service; the immediate revert is NOETL_EHDB_EVENTLOG_MIRROR_ASYNC=false, which restores the inline mirror and makes the window unnecessary."
+              runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorlagexceedsparitywindow"
+
+  # 2. SAME high lag, tolerance 0 (async off) -> MUST stay silent.
+  #    Without this the rule would page every deployment that never turned
+  #    the feature on.
+  - interval: 30s
+    name: silent when tolerance is 0 (async off)
+    input_series:
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="5"}'
+        values: '0+0x60'
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="10"}'
+        values: '0+10x60'
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="+Inf"}'
+        values: '0+10x60'
+      - series: 'noetl_ehdb_crossstore_parity_lag_tolerance_seconds'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EhdbMirrorLagExceedsParityWindow
+        exp_alerts: []
+
+  # 3. Lag comfortably inside a wide window -> MUST stay silent.
+  - interval: 30s
+    name: silent when lag is inside the window
+    input_series:
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="0.5"}'
+        values: '0+10x60'
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="1"}'
+        values: '0+10x60'
+      - series: 'noetl_ehdb_eventlog_mirror_lag_seconds_bucket{le="+Inf"}'
+        values: '0+10x60'
+      - series: 'noetl_ehdb_crossstore_parity_lag_tolerance_seconds'
+        values: '30+0x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EhdbMirrorLagExceedsParityWindow
+        exp_alerts: []
+
+  # 4. Queue stalled: events pending, nothing draining -> MUST fire.
+  #    The case whose whole point is that the lag histogram looks HEALTHY
+  #    (no observations at all) while the queue is dead.
+  - interval: 30s
+    name: stalled queue fires on the gauge, not the histogram
+    input_series:
+      - series: 'noetl_ehdb_eventlog_mirror_pending_events'
+        values: '120+0x60'
+      - series: 'noetl_ehdb_eventlog_mirror_queue_total{outcome="drained"}'
+        values: '900+0x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EhdbMirrorQueueStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: ehdb-eventlog-mirror
+              noetl_io_flip_guardrail: eventlog-mirror-async
+            exp_annotations:
+              summary: "EHDB mirror queue STALLED — 120 events pending, nothing draining"
+              description: "Events are queued for the event-log tier and the drain task has delivered nothing for 10m. Every one of those events is absent from a primary-serving tier and will age past the parity window. A stalled queue emits no lag observations, so the lag histogram looks healthy — this gauge is the only signal. Check the tier service relay (NOETL_EHDB_WORKER_QUERY_URL) and the server logs for `event-log tier mirror relay failed`."
+              runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-ehdb-mirror-async.md#ehdbmirrorqueuestalled"
+
+  # 5. Busy but healthy queue: pending > 0 AND draining -> MUST stay silent.
+  #    A backlog under load is not a stall; without this the rule would page
+  #    on every burst.
+  - interval: 30s
+    name: silent when the queue is busy but draining
+    input_series:
+      - series: 'noetl_ehdb_eventlog_mirror_pending_events'
+        values: '120+0x60'
+      - series: 'noetl_ehdb_eventlog_mirror_queue_total{outcome="drained"}'
+        values: '0+50x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EhdbMirrorQueueStalled
+        exp_alerts: []

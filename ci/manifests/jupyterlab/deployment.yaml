@@ -67,7 +67,7 @@ spec:
           
           # Start JupyterLab
           start-notebook.sh \
-            --ServerApp.token='noetl' \
+            --ServerApp.token='REPLACE_ME_LOCAL_DEV_ONLY' \
             --ServerApp.password='' \
             --ServerApp.allow_origin='*' \
             --ServerApp.base_url=/ \

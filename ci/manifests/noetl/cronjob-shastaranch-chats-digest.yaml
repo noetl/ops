@@ -1,0 +1,77 @@
+# Mount Shasta Ranch daily chat digest CronJob — PROD (shastaranch/mountshastaranch,
+# docs/staff-replies.md).
+#
+# Triggers shastaranch/chats/digest with send: true: one email to the team with
+# every conversation waiting for a person, then the last 24 hours' other chats.
+# The playbook reads Firestore through the worker's Workload Identity and sends
+# through Resend (keychain alias resend_api); this job holds no credential.
+# With nothing to report it sends nothing.
+#
+# 14:00 UTC = 07:00 Pacific in summer, 06:00 in winter (no timeZone field: none
+# of the other CronJobs here use one).
+#
+# Not applied by merging. Apply only with an explicit go, after the playbook is
+# registered and the resend_api credential exists, per agents/rules/apply-safety.md:
+#   kubectl --context <prod> -n noetl diff --server-side -f <this file>
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  labels:
+    app: noetl-shastaranch-chats-digest
+    component: system-cron
+  name: noetl-shastaranch-chats-digest
+  namespace: noetl
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 120
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: noetl-shastaranch-chats-digest
+        spec:
+          containers:
+          - command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "Triggering shastaranch/chats/digest (send) ..."
+              curl -fsS -X POST \
+                http://noetl-server-rust.noetl.svc.cluster.local:8082/api/execute \
+                -H 'Content-Type: application/json' \
+                -d '{"path": "shastaranch/chats/digest", "payload": {"hours": 24, "send": true}}'
+              echo
+              echo "Triggered."
+            image: curlimages/curl:8.7.1
+            imagePullPolicy: IfNotPresent
+            name: trigger
+            resources:
+              limits:
+                cpu: 100m
+                ephemeral-storage: 1Gi
+                memory: 64Mi
+              requests:
+                cpu: 50m
+                ephemeral-storage: 1Gi
+                memory: 52Mi
+            securityContext:
+              capabilities:
+                drop:
+                - NET_RAW
+          restartPolicy: Never
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          tolerations:
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Equal
+            value: amd64
+  schedule: 0 14 * * *
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  suspend: false

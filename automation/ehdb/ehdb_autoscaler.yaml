@@ -1,0 +1,371 @@
+# User-pool autoscaling on EHDB per-subject lag, plus the writer scrape.
+# =============================================================================
+# Renders the KEDA ScaledObject that scales the user pool on the command bus's
+# backlog, and the monitoring object that scrapes the writer.
+#
+# ── ONE TRIGGER, metrics-api, NO NATS ────────────────────────────────────────
+# There is no NATS trigger here and there never will be again.  The one this
+# replaces was kept as a "harmless no-op until the teardown"; it was not
+# harmless.  Its JetStream consumer still held the messages undelivered at the
+# cutover, so the backlog was frozen rather than draining, and the moment the
+# object was unpaused KEDA — which takes MAX across triggers — asked for ~15
+# replicas unconditionally and forever (noetl/ai-meta#210).  A stale queue and a
+# busy one are indistinguishable at the scaler interface.
+#
+# `metrics-api` rather than `prometheus` because prod monitoring is Google
+# Managed Prometheus: there is no in-cluster PromQL endpoint, and the two ways
+# to give KEDA one both need a new `monitoring.*` IAM grant.  metrics-api
+# scrapes the writer's `:9102` directly over the same ClusterIP the workers
+# already claim through, so autoscaling does not depend on the monitoring
+# pipeline being healthy.  The scrape below stays as the observability path.
+#
+# ── THE valueLocation IS A BYTE-LEVEL CONTRACT ───────────────────────────────
+# KEDA's metrics-api scaler in `format: prometheus` has no label selector: it
+# prefix-matches `valueLocation` against the whole `name{labels}` token of each
+# exposition line and takes the first match.  The ehdb renderer emits sorted,
+# single-label, space-free lines precisely so this stays stable.  Do not tidy
+# the rendered value, and do not add whitespace inside the braces.
+#
+# ── PER-SUBJECT, NOT WHOLE-SHARD ─────────────────────────────────────────────
+# One command shard carries both `commands.shared.shard.N` (the user pool) and
+# `commands.system.shard.N`, and a consumer group's lag counts every subject
+# past one committed cursor.  Triggering on `ehdb_feed_total_lag` would not just
+# over-report — a stuck system-pool command pins the global committed cursor,
+# which pins whole-shard lag high forever and holds the user pool at
+# maxReplicaCount indefinitely.  `ehdb_feed_subject_lag{subject=...}` is the
+# pool's own backlog (noetl/ehdb#303, noetl/worker#197).
+#
+# ── PAUSING IS NOT A SOFT PAUSE ──────────────────────────────────────────────
+# `autoscaling.keda.sh/paused` makes KEDA 2.15 DELETE the HPA and stop running
+# the scaler loop, so a paused object means *no autoscaling at all* while still
+# looking configured — `.status.externalMetricNames` does not refresh and goes
+# on naming whatever it named before.  The prod user pool spent 2026-07-26 to
+# -07-31 in that state without anyone noticing (noetl/ai-meta#210).  `paused:
+# "true"` is available below for a deliberate rollback; it is not a way to stage
+# a change.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: ehdb_autoscaler
+  path: automation/ehdb/ehdb-autoscaler
+  description: KEDA ScaledObject on EHDB per-subject lag + the writer scrape
+  labels:
+    noetl.io/command-bus: ehdb
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  # converge | plan | status | delete | teardown
+  # Anything else makes every step a no-op.
+  action: status
+
+  # Set false to leave autoscaling alone on a cluster that manages it elsewhere.
+  # `converge` then degrades to `status`, so the object is still reported on.
+  enabled: "true"
+
+  context: kind-noetl
+  namespace: noetl
+
+  writer_name: noetl-cmdbus-writer
+  # The shard whose :9102 the scaler reads.  Single-shard today; a multi-shard
+  # cluster needs one ScaledObject per (pool, shard) pair, which is a shape
+  # change rather than a value change — see README.
+  shard: "0"
+
+  scaledobject_name: noetl-worker-rust
+  target_deployment: noetl-worker-rust
+  pool_subject: "commands.shared.shard.0"
+
+  min_replicas: "2"
+  max_replicas: "20"
+  polling_interval: "10"
+  cooldown_period: "30"
+  # desiredReplicas = ceil(lag / target_value), as an AverageValue.  Each replica
+  # runs WORKER_MAX_CONCURRENT=4, so at min 2 the pool has 8 slots; a target of 2
+  # reaches those 8 slots in replicas at a backlog of 8, with a replica of
+  # headroom already on the way up.  Scaling only once backlog exceeds capacity
+  # is too late — the #205 saturating-burst measurement put p50 dispatch at ~2s
+  # from queueing alone once the slots were full.
+  target_value: "2"
+  activation_target_value: "1"
+  # A writer that is down means the bus is down.  Without a fallback KEDA holds
+  # the last known replica count indefinitely on a scrape error; with it the
+  # pool settles at its idle floor after 3 failures (~30s at pollingInterval 10).
+  fallback_failure_threshold: "3"
+
+  paused: "false"
+
+  # auto | gmp | vm | none  — auto picks by which CRD the cluster actually has.
+  monitoring: auto
+
+workflow:
+  - step: start
+    desc: Dispatch on action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          echo "ehdb_autoscaler: action={{ workload.action }} enabled={{ workload.enabled }} context={{ workload.context }}"
+    next:
+      arcs:
+        - step: reconcile
+
+  - step: reconcile
+    desc: Render and apply the ScaledObject and the writer scrape
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|plan) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          if [ "{{ workload.enabled }}" != "true" ]; then
+            echo "  skip (enabled={{ workload.enabled }})"; exit 0
+          fi
+          CTX="{{ workload.context }}"
+          NS="{{ workload.namespace }}"
+          WRITER="{{ workload.writer_name }}"
+          SHARD="{{ workload.shard }}"
+          OUT="$(mktemp -d)"
+          trap 'rm -rf "$OUT"' EXIT
+
+          if ! kubectl --context "$CTX" get crd scaledobjects.keda.sh >/dev/null 2>&1; then
+            echo "ERROR: KEDA is not installed on this cluster (no scaledobjects.keda.sh CRD)." >&2
+            echo "       kubectl apply --server-side -f \\" >&2
+            echo "         https://github.com/kedacore/keda/releases/download/v2.15.0/keda-2.15.0.yaml" >&2
+            exit 1
+          fi
+
+          PAUSE_ANNOTATION=""
+          if [ "{{ workload.paused }}" = "true" ]; then
+            PAUSE_ANNOTATION='  annotations: { autoscaling.keda.sh/paused: "true" }'
+          fi
+
+          cat > "$OUT/scaledobject.yaml" <<YAML
+          apiVersion: keda.sh/v1alpha1
+          kind: ScaledObject
+          metadata:
+            name: {{ workload.scaledobject_name }}
+            namespace: ${NS}
+            labels:
+              app: {{ workload.target_deployment }}
+              command-bus: ehdb
+              managed-by: noetl
+              # KEDA stamps this itself; carried here so a re-apply does not
+              # prune it out from under the controller.
+              scaledobject.keda.sh/name: {{ workload.scaledobject_name }}
+          ${PAUSE_ANNOTATION}
+          spec:
+            scaleTargetRef:
+              name: {{ workload.target_deployment }}
+            minReplicaCount: {{ workload.min_replicas }}
+            maxReplicaCount: {{ workload.max_replicas }}
+            pollingInterval: {{ workload.polling_interval }}
+            cooldownPeriod: {{ workload.cooldown_period }}
+            fallback:
+              failureThreshold: {{ workload.fallback_failure_threshold }}
+              replicas: {{ workload.min_replicas }}
+            triggers:
+              - type: metrics-api
+                metadata:
+                  url: "http://${WRITER}-${SHARD}.${NS}.svc.cluster.local:9102/metrics"
+                  format: prometheus
+                  valueLocation: 'ehdb_feed_subject_lag{subject="{{ workload.pool_subject }}"}'
+                  targetValue: "{{ workload.target_value }}"
+                  activationTargetValue: "{{ workload.activation_target_value }}"
+          YAML
+
+          # Monitoring flavour: prod is GMP (PodMonitoring), the kind vmstack is
+          # VictoriaMetrics (VMPodScrape).  Neither CRD exists on a bare kind
+          # cluster, so `none` is a legitimate outcome and not a failure.
+          MON="{{ workload.monitoring }}"
+          if [ "$MON" = "auto" ]; then
+            if kubectl --context "$CTX" get crd podmonitorings.monitoring.googleapis.com >/dev/null 2>&1; then
+              MON=gmp
+            elif kubectl --context "$CTX" get crd vmpodscrapes.operator.victoriametrics.com >/dev/null 2>&1; then
+              MON=vm
+            else
+              MON=none
+            fi
+          fi
+          echo "monitoring: $MON"
+
+          if [ "$MON" = "gmp" ]; then
+            cat > "$OUT/scrape.yaml" <<YAML
+          apiVersion: monitoring.googleapis.com/v1
+          kind: PodMonitoring
+          metadata:
+            name: ${WRITER}
+            namespace: ${NS}
+            labels: { app: ${WRITER}, command-bus: ehdb, managed-by: noetl }
+          spec:
+            # Selects the stable \`component\` label, not \`app\`: every shard's pod
+            # carries it, so a new shard is scraped the moment it exists.
+            selector:
+              matchLabels: { component: cmdbus-writer }
+            endpoints:
+              - { port: cmdbus-lag, path: /metrics, interval: 10s }
+              - { port: events-lag, path: /metrics, interval: 10s }
+              - { port: metrics,    path: /metrics, interval: 15s }
+            targetLabels:
+              metadata: [container, pod, top_level_controller_name, top_level_controller_type]
+          YAML
+          elif [ "$MON" = "vm" ]; then
+            cat > "$OUT/scrape.yaml" <<YAML
+          apiVersion: operator.victoriametrics.com/v1beta1
+          kind: VMPodScrape
+          metadata:
+            name: ${WRITER}
+            namespace: ${NS}
+            labels: { app: ${WRITER}, command-bus: ehdb, managed-by: noetl }
+          spec:
+            selector:
+              matchLabels: { component: cmdbus-writer }
+            podMetricsEndpoints:
+              - { port: cmdbus-lag, path: /metrics, interval: 10s }
+              - { port: events-lag, path: /metrics, interval: 10s }
+              - { port: metrics,    path: /metrics, interval: 15s }
+          YAML
+          fi
+
+          if [ "$ACTION" = "plan" ]; then
+            echo "── rendered ────────────────────────────────────────────────"
+            cat "$OUT/scaledobject.yaml"
+            [ -f "$OUT/scrape.yaml" ] && { echo "---"; cat "$OUT/scrape.yaml"; }
+            kubectl --context "$CTX" apply --dry-run=server -f "$OUT/scaledobject.yaml"
+            [ -f "$OUT/scrape.yaml" ] && kubectl --context "$CTX" apply --dry-run=server -f "$OUT/scrape.yaml"
+            exit 0
+          fi
+
+          kubectl --context "$CTX" apply -f "$OUT/scaledobject.yaml"
+          if [ -f "$OUT/scrape.yaml" ]; then
+            kubectl --context "$CTX" apply -f "$OUT/scrape.yaml"
+          else
+            echo "no scrape CRD on this cluster — the metrics-api trigger reads :9102 directly, so autoscaling still works; only the dashboards are missing"
+          fi
+    next:
+      arcs:
+        - step: delete
+
+  - step: delete
+    desc: Remove the ScaledObject (the Deployment keeps its current replica count)
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in delete|teardown) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          kubectl --context {{ workload.context }} -n {{ workload.namespace }} \
+            delete scaledobject {{ workload.scaledobject_name }} --ignore-not-found
+    next:
+      arcs:
+        - step: status
+
+  - step: status
+    desc: Assert the scaler is actually live — an HPA exists and the metric resolves
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          # Action guard in the shell, not in a `when:` arc.  Conditional arc
+          # evaluation is non-deterministic in the noetl local runtime (a true
+          # `when` takes its arc only about half the time), which would make
+          # this playbook silently skip reconciling — the exact silent-no-op
+          # class the EHDB cutover has already been bitten by.  Linear chain,
+          # guarded in shell, is deterministic on every CLI version.
+          ACTION="{{ workload.action }}"
+          case "$ACTION" in converge|status) ;; *) echo "  skip (action=$ACTION)"; exit 0 ;; esac
+          CTX="{{ workload.context }}"
+          NS="{{ workload.namespace }}"
+          K="kubectl --context $CTX -n $NS"
+          SO="{{ workload.scaledobject_name }}"
+          rc=0
+
+          if ! $K get scaledobject "$SO" >/dev/null 2>&1; then
+            echo "  ABSENT ScaledObject/$SO"
+            exit 0
+          fi
+
+          # KEDA fills `.status` asynchronously after the object is created, so a
+          # read taken immediately after `apply` says Unknown regardless.
+          i=0
+          while [ "$i" -lt 15 ]; do
+            ready="$($K get scaledobject "$SO" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"
+            [ -n "$ready" ] && [ "$ready" != "Unknown" ] && break
+            i=$((i + 1)); sleep 2
+          done
+          active="$($K get scaledobject "$SO" -o jsonpath='{.status.conditions[?(@.type=="Active")].status}')"
+          echo "  ScaledObject/$SO: Ready=$ready Active=$active"
+
+          # `.status` on a ScaledObject is NOT proof of anything — it does not
+          # refresh while the object is paused, which is how a pool went five
+          # days with no autoscaling while the object still read as configured
+          # (noetl/ai-meta#210).  The HPA is the thing that actually scales, so
+          # its existence is the gate.
+          hpa="keda-hpa-$SO"
+          if $K get hpa "$hpa" >/dev/null 2>&1; then
+            echo "  OK   HPA/$hpa exists"
+            $K get hpa "$hpa" --no-headers
+          else
+            echo "  FAIL HPA/$hpa missing — KEDA is not scaling this pool."
+            echo "       A 'paused' annotation deletes the HPA and stops the scaler loop."
+            rc=1
+          fi
+
+          # And the trigger's own reading, taken the way KEDA takes it, so a
+          # renamed or relabelled metric fails here rather than as a pool that
+          # quietly never scales.
+          POD="{{ workload.writer_name }}-{{ workload.shard }}"
+          if $K get pod "$POD" >/dev/null 2>&1; then
+            metrics="$($K exec "$POD" -- sh -c "wget -qO- http://127.0.0.1:9102/metrics" 2>/dev/null || true)"
+            line="$(printf '%s\n' "$metrics" | grep -F 'ehdb_feed_subject_lag{subject="{{ workload.pool_subject }}"}' | head -1 || true)"
+            appends="$(printf '%s\n' "$metrics" | awk '$1=="ehdb_l0_appends" {print $2}')"
+            if [ -n "$line" ]; then
+              echo "  OK   trigger metric present: $line"
+            elif ! printf '%s\n' "$metrics" | grep -q '^# TYPE ehdb_feed_subject_lag'; then
+              # The family is not even declared: this writer build predates
+              # noetl/ehdb#303 + noetl/worker#197 and can never serve this
+              # trigger.  KEDA would read nothing, forever, silently.
+              echo "  FAIL ehdb_feed_subject_lag is not exposed at all on $POD:9102 — the writer image is too old for a per-subject trigger."
+              rc=1
+            elif [ "${appends:-0}" = "0" ]; then
+              # Declared, but the gauge is per-subject and lazily populated: on a
+              # log with no appends yet there is no series to emit.  KEDA treats
+              # a missing series as an error and holds the pool at its fallback,
+              # which is the right behaviour for an idle bus.  The series appears
+              # with the first published command, and ehdb_verify.yaml publishes
+              # some — so this is a converge-order artefact, not a defect.
+              echo "  WARN ehdb_feed_subject_lag{subject=\"{{ workload.pool_subject }}\"} has no series yet (ehdb_l0_appends=0)."
+              echo "       Expected on a freshly created log; re-run status after any command has been published."
+            else
+              echo "  FAIL ehdb_feed_subject_lag{subject=\"{{ workload.pool_subject }}\"} missing although the log has $appends appends."
+              echo "       KEDA prefix-matches this token exactly; a missing series means the scaler reads nothing."
+              rc=1
+            fi
+          fi
+          exit $rc
+    next:
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop

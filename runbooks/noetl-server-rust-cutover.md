@@ -150,7 +150,7 @@ unnamed statements that are safe behind transaction pooling. The Rust server
 stays behind pgbouncer exactly like Python; **no pgbouncer change needed.**
 
 Operator check (optional — confirm the env made it into the running pod after
-step 4): `kubectl -n noetl exec deploy/noetl-server-rust -- env | grep STATEMENT_CACHE`
+step 4): `kubectl -n noetl run deploy/noetl-server-rust -- env | grep STATEMENT_CACHE`
 → `NOETL_PG_STATEMENT_CACHE_CAPACITY=0`. The real proof is the canary
 (step 5): a query-heavy playbook completing without `prepared statement` errors.
 
@@ -365,7 +365,7 @@ kubectl --context $PROD -n noetl scale deploy noetl-server --replicas=0
 
 ## Post-cutover follow-ups (not part of the flip)
 
-- Update [`ci/manifests/noetl/server-rust-deployment.yaml`](../ci/manifests/noetl/server-rust-deployment.yaml)
+- Update [`ci/manifests/dev/server-rust-deployment.yaml`](../ci/manifests/dev/server-rust-deployment.yaml) (moved out of the applied directory — noetl/ai-meta#309)
   header note (it still says "kind validation only").
 - Decide the fate of port 8083 (Flight) — implement in Rust or retire from the
   `noetl` Service.

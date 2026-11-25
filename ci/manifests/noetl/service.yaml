@@ -1,23 +1,42 @@
+# The `noetl` Service — PROD.  Captured from the live cluster (noetl/ai-meta#309).
+#
+# ⚠ THE PREVIOUS VERSION WOULD HAVE CUT THE GATEWAY OFF FROM THE SERVER.  It
+# declared `selector: {app: noetl-server}` -- the Python-era label -- while the live
+# Service selects `app: noetl-server-rust`.  No pod carries the old label, so
+# applying it would have left this Service with ZERO endpoints.
+#
+# That is not a cosmetic drift: the gateway reaches the control plane through this
+# Service (`NOETL_BASE_URL=http://noetl.noetl.svc.cluster.local:8082`), and so does
+# noetl-doctor.  Zero endpoints here is a product outage, and it would have failed
+# as connection-refused at the caller rather than as an error at apply time.
+#
+# ⚠ Related trap, already recorded elsewhere in this repo: `kubectl apply` cannot
+# DROP a selector key.  A selector edit that looks additive can leave a Service
+# matching nothing while every object involved reports healthy.
 apiVersion: v1
 kind: Service
 metadata:
-  name: noetl
-  namespace: noetl
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
   labels:
     app: noetl
+    app.kubernetes.io/managed-by: Helm
+  name: noetl
+  namespace: noetl
 spec:
-  type: ClusterIP
+  clusterIP: 34.118.238.249
+  clusterIPs:
+  - 34.118.238.249
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
   ports:
-    - port: 8082
-      targetPort: 8082
-      protocol: TCP
-      name: noetl
-    # R-2.3 Phase A: Arrow Flight gRPC endpoint.  In-cluster
-    # consumers (the Rust worker, Python tools) reach it via
-    # `grpc://noetl.noetl.svc.cluster.local:8083`.
-    - port: 8083
-      targetPort: 8083
-      protocol: TCP
-      name: flight-grpc
+  - name: noetl
+    port: 8082
+    protocol: TCP
+    targetPort: 8082
   selector:
-    app: noetl-server
+    app: noetl-server-rust
+  sessionAffinity: None
+  type: ClusterIP
