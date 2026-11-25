@@ -1,0 +1,109 @@
+# state-builder watchdog CronJob (noetl/ai-meta#163) — PROD.  Captured live
+# (noetl/ai-meta#267).  Mounts the script from
+# configmap-state-builder-watchdog-script.yaml, which until now was declared
+# nowhere — the CronJob was in the repo and the script it runs existed only in
+# the cluster.
+#
+# ⚠ The `autopilot.gke.io/*` annotations are CLUSTER-AUTHORED and move on GKE
+# warden upgrades; see the note in cronjob-scheduled-cleanup.yaml for why they
+# are kept rather than stripped.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  annotations:
+    autopilot.gke.io/resource-adjustment: '{"input":{"containers":[{"limits":{"cpu":"200m","ephemeral-storage":"1Gi","memory":"128Mi"},"requests":{"cpu":"10m","ephemeral-storage":"1Gi","memory":"48Mi"},"name":"watchdog"}]},"output":{"containers":[{"limits":{"cpu":"200m","ephemeral-storage":"1Gi","memory":"128Mi"},"requests":{"cpu":"50m","ephemeral-storage":"1Gi","memory":"52Mi"},"name":"watchdog"}]},"computeClassAtAdmission":"Default","modified":true}'
+    autopilot.gke.io/warden-version: 35.26.4-gke.2
+  labels:
+    app: noetl-state-builder-watchdog
+    component: system-cron
+    noetl.io/outage-guardrail: state-builder-wedge
+  name: noetl-state-builder-watchdog
+  namespace: noetl
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    metadata: {}
+    spec:
+      activeDeadlineSeconds: 180
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: noetl-state-builder-watchdog
+        spec:
+          containers:
+          - command:
+            - /bin/sh
+            - /scripts/watchdog.sh
+            env:
+            - name: NS
+              value: noetl
+            - name: DEPLOY
+              value: noetl-worker-system-pool
+            - name: METRICS_URL
+              value: http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090/metrics
+            - name: LIVEZ_URL
+              value: http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090/livez
+            - name: SAMPLES
+              value: '3'
+            - name: SAMPLE_INTERVAL_SECONDS
+              value: '2'
+            - name: COOLDOWN_SECONDS
+              value: '600'
+            - name: FLAP_WINDOW_SECONDS
+              value: '3600'
+            - name: MAX_ATTEMPTS
+              value: '3'
+            - name: FORCE_UNHEALTHY
+              value: 'false'
+            - name: DRY_RUN
+              value: 'false'
+            image: docker.io/alpine/k8s:1.31.0
+            imagePullPolicy: IfNotPresent
+            name: watchdog
+            resources:
+              limits:
+                cpu: 200m
+                ephemeral-storage: 1Gi
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                ephemeral-storage: 1Gi
+                memory: 52Mi
+            securityContext:
+              capabilities:
+                drop:
+                - NET_RAW
+            terminationMessagePath: /dev/termination-log
+            terminationMessagePolicy: File
+            volumeMounts:
+            - mountPath: /scripts
+              name: script
+              readOnly: true
+          dnsPolicy: ClusterFirst
+          restartPolicy: Never
+          schedulerName: default-scheduler
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          serviceAccount: noetl-state-builder-watchdog
+          serviceAccountName: noetl-state-builder-watchdog
+          terminationGracePeriodSeconds: 30
+          tolerations:
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Equal
+            value: amd64
+          volumes:
+          - configMap:
+              defaultMode: 420
+              items:
+              - key: watchdog.sh
+                path: watchdog.sh
+              name: noetl-state-builder-watchdog-script
+            name: script
+  schedule: '*/3 * * * *'
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 3
+  suspend: false

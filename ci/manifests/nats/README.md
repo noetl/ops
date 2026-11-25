@@ -99,7 +99,7 @@ accounts {
   }
   NOETL {
     jetstream: enabled
-    users: [ { user: noetl, password: noetl } ]
+    users: [ { user: noetl, password: REPLACE_ME_LOCAL_DEV_ONLY } ]
   }
 }
 ```

@@ -73,10 +73,10 @@ Or via the playbooks (`-r local`), with the same local registry backend:
 
 ```bash
 export NOETL_REGISTRY_BACKEND=local NOETL_REGISTRY_LOCAL_DIR=/tmp/slm_registry
-noetl exec automation/mlops/slm/finetune.yaml -r local
-noetl exec automation/mlops/slm/eval.yaml -r local \
+noetl run automation/mlops/slm/finetune.yaml -r local
+noetl run automation/mlops/slm/eval.yaml -r local \
   --set candidate=slm --set register=true --set dataset_version=v1_constrained
-noetl exec automation/mlops/slm/package.yaml -r local
+noetl run automation/mlops/slm/package.yaml -r local
 ```
 
 The validation outcome on the travel v1_constrained dataset: the stub model
@@ -133,7 +133,7 @@ python3 automation/mlops/slm/build_distributed_playbook.py \
   --out automation/mlops/slm/dataset_build_distributed.yaml \
   --path muno/slm/dataset-build-constrained
 # 2. register it to the catalog, then run on the worker pool
-noetl exec muno/slm/dataset-build-constrained -r distributed \
+noetl run muno/slm/dataset-build-constrained -r distributed \
   --set version=v1_constrained            # add --set limit=N to cap teacher spend
 ```
 
@@ -146,9 +146,9 @@ PyYAML**, so the generator packs the config as pre-parsed JSON and
 
 ```bash
 # from the ai-meta root (or any cwd whose relative paths resolve)
-noetl exec repos/ops/automation/mlops/slm/dataset_build.yaml -r local \
+noetl run repos/ops/automation/mlops/slm/dataset_build.yaml -r local \
   --set config=repos/travel/automation/mlops/slm/travel/slm.config.yaml
-noetl exec repos/ops/automation/mlops/slm/eval.yaml -r local \
+noetl run repos/ops/automation/mlops/slm/eval.yaml -r local \
   --set config=repos/travel/automation/mlops/slm/travel/slm.config.yaml
 ```
 
@@ -165,9 +165,9 @@ only its own `slm.config.yaml` + `oracle.py` + corpus + schema, running the
 **same** two playbooks with **zero** framework edits:
 
 ```bash
-noetl exec repos/ops/automation/mlops/slm/dataset_build.yaml -r local \
+noetl run repos/ops/automation/mlops/slm/dataset_build.yaml -r local \
   --set config=repos/ops/automation/mlops/slm/examples/support_triage/slm.config.yaml
-noetl exec repos/ops/automation/mlops/slm/eval.yaml -r local \
+noetl run repos/ops/automation/mlops/slm/eval.yaml -r local \
   --set config=repos/ops/automation/mlops/slm/examples/support_triage/slm.config.yaml
 ```
 

@@ -1,0 +1,58 @@
+# noetl/ai-meta#156 tail-attach scoping fixture — IN-allowlist (planner) arm.
+#
+# A trivial 3-hop python chain (no creds, kind-driveable) whose catalog
+# `path` matches the planner prefix in `NOETL_OFFSERVER_TAIL_PLAYBOOK_PREFIXES`
+# (`muno/playbooks/itinerary-planner`).  With the master flag on and the
+# allowlist set, every off-server drive for this execution must attach the
+# per-execution event tail → `noetl_offserver_tail_attached_total{outcome="attached"}`.
+#
+# Paired with validate-tail-attach-scope-auth.yaml (the OUT-of-allowlist arm),
+# which proves the auth path is scoped out.  Driven by
+# validate-tail-attach-scope.sh.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: tail_scope_planner_test
+  path: muno/playbooks/itinerary-planner-tailscope
+  description: |
+    #156 tail-attach scoping fixture (in-allowlist). 3 linear python hops;
+    no external systems; safe to register/run anywhere.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workflow:
+  - step: start
+    tool:
+      - name: s1
+        kind: python
+        input: {}
+        code: |
+          result = {"hop": 1}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: mid
+  - step: mid
+    tool:
+      - name: s2
+        kind: python
+        input:
+          prev: '{{ start.hop | default(0) }}'
+        code: |
+          result = {"hop": int(prev) + 1}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: done
+  - step: done
+    tool:
+      - name: s3
+        kind: python
+        input:
+          prev: '{{ mid.hop | default(0) }}'
+        code: |
+          result = {"hop": int(prev) + 1, "done": True}

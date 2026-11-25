@@ -436,11 +436,11 @@ POSTGRES_POD=$(kubectl get pods -n postgres -l app.kubernetes.io/instance=postgr
 
 # Create schema and apply DDL
 kubectl exec -n postgres $POSTGRES_POD -- /bin/sh -c \
-  "PGPASSWORD=demo psql -U postgres -d noetl -c 'CREATE SCHEMA IF NOT EXISTS noetl'"
+  "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -c 'CREATE SCHEMA IF NOT EXISTS noetl'"
 kubectl exec -i -n postgres $POSTGRES_POD -- /bin/sh -c \
-  "PGPASSWORD=demo psql -U postgres -d noetl" < noetl/database/ddl/postgres/schema_ddl.sql
+  "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl" < noetl/database/ddl/postgres/schema_ddl.sql
 kubectl exec -n postgres $POSTGRES_POD -- /bin/sh -c \
-  "PGPASSWORD=demo psql -U postgres -d noetl -c 'GRANT ALL ON SCHEMA noetl TO noetl; GRANT ALL ON ALL TABLES IN SCHEMA noetl TO noetl; GRANT ALL ON ALL SEQUENCES IN SCHEMA noetl TO noetl;'"
+  "PGPASSWORD=REPLACE_ME_LOCAL_DEV_ONLY psql -U postgres -d noetl -c 'GRANT ALL ON SCHEMA noetl TO noetl; GRANT ALL ON ALL TABLES IN SCHEMA noetl TO noetl; GRANT ALL ON ALL SEQUENCES IN SCHEMA noetl TO noetl;'"
 
 # Restart NoETL
 kubectl rollout restart deployment/noetl-server -n noetl

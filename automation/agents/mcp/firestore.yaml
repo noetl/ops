@@ -23,7 +23,7 @@ metadata:
 
 workload:
   gcp_auth: google_oauth
-  gcp_project: noetl-demo-19700101
+  gcp_project: shastaratech-noetl-prod
   firestore_database: "(default)"
   firestore_api_base: https://firestore.googleapis.com/v1
   method: "tools/list"
@@ -355,8 +355,27 @@ workflow:
             path = _clean_path(args.get("path"))
             if not path:
                 return _error("set_doc", "path is required")
-            data = _as_dict(args.get("data"))
+            raw_data = args.get("data")
+            # ⚠ Refuse, do not coerce. `_as_dict` turns a string/list into {}, and an
+            # empty write below is a WIPE — so a profile that reached here as a JSON
+            # string used to blank the document instead of failing.
+            if raw_data is not None and not isinstance(raw_data, dict):
+                return _error("set_doc", f"data must be an object, got {type(raw_data).__name__}")
+            data = _as_dict(raw_data)
             merge = bool(args.get("merge", False))
+            if merge and not data:
+                # ⚠ A merge of nothing changes nothing — so it must not reach Firestore.
+                # `updateMask` is only added for a non-empty `data`, and a PATCH WITHOUT
+                # a mask is a FULL REPLACE: `merge: true, data: {}` overwrote the document
+                # with zero fields. muno/playbooks/profile sent exactly that on every
+                # login read before noetl/travel#133, emptying the user's profile.
+                # Report what the store holds instead, so callers still get a document.
+                current = _get_doc({"path": path})
+                if current.get("isError"):
+                    return current
+                held = _as_dict(current.get("data"))
+                return _ok("set_doc", {"path": path, "document": held.get("document"), "noop": True},
+                           f"set_doc {path} merge of no fields: nothing written")
             params = {}
             if merge and data:
                 params["updateMask.fieldPaths"] = list(data.keys())
@@ -582,8 +601,15 @@ workflow:
             # list may be empty/omitted; the other still runs.  Ordering within
             # each list is preserved, so callers control set-doc last-writer-wins
             # and event seq ordering by list order.
-            set_items = _as_list(args.get("set_docs") or args.get("docs"))
-            event_items = _as_list(args.get("append_events") or args.get("events"))
+            # Each list is passed as a standalone `{{ expr }}` arg (the proven
+            # NoETL structured-render pattern — `items: "{{ extract_turn.turn_docs }}"`
+            # already relies on it).  `_extra` lets a caller concatenate a SECOND
+            # list per kind without needing minijinja sequence concatenation: the
+            # planner passes turn docs in `set_docs` and render docs in
+            # `set_docs_extra`, concatenated here in order so render's final
+            # slot_state doc is the last writer.
+            set_items = _as_list(args.get("set_docs") or args.get("docs")) + _as_list(args.get("set_docs_extra"))
+            event_items = _as_list(args.get("append_events") or args.get("events")) + _as_list(args.get("append_events_extra"))
             if not set_items and not event_items:
                 return _error("batch_write", "at least one of set_docs / append_events must be a non-empty list")
             set_payload = {}
@@ -876,7 +902,7 @@ workflow:
         method = str(method or "tools/list")
         tool = str(tool or "")
         arguments = _as_dict(arguments)
-        gcp_project = str(gcp_project or "noetl-demo-19700101")
+        gcp_project = str(gcp_project or "shastaratech-noetl-prod")
         firestore_database = str(firestore_database or "(default)")
         firestore_api_base = str(firestore_api_base or "https://firestore.googleapis.com/v1")
 

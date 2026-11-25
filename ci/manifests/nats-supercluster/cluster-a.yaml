@@ -47,7 +47,7 @@ data:
     \ \"b\", urls: [\"nats://nats-cluster-b.nats-supercluster.svc.cluster.local:7222\"\
     ] }\n  ]\n}\n\naccounts {\n  $SYS {\n    users: [\n      { user: sys, password:\
     \ sys }\n    ]\n  }\n  NOETL {\n    jetstream: enabled\n    users: [\n      {\
-    \ user: noetl, password: noetl }\n    ]\n  }\n}\n"
+    \ user: noetl, password: REPLACE_ME_LOCAL_DEV_ONLY }\n    ]\n  }\n}\n"
 ---
 apiVersion: apps/v1
 kind: StatefulSet

@@ -69,14 +69,14 @@ GSM:
 
 ```bash
 # before
-kubectl --context kind-noetl -n noetl exec deploy/noetl-worker-rust -- \
+kubectl --context kind-noetl -n noetl run deploy/noetl-worker-rust -- \
   sh -c 'wget -qO- http://metadata.google.internal/token | head -c 20'
 
 kubectl --context kind-noetl -n noetl delete pod -l app=noetl-worker-rust
 kubectl --context kind-noetl -n noetl rollout status deploy/noetl-worker-rust
 
 # after reschedule — still resolves (hostAliases inherited from the spec)
-kubectl --context kind-noetl -n noetl exec deploy/noetl-worker-rust -- \
+kubectl --context kind-noetl -n noetl run deploy/noetl-worker-rust -- \
   sh -c 'wget -qO- http://metadata.google.internal/token | head -c 20'
 ```
 

@@ -1,3 +1,11 @@
+# drift-audit: kind-only
+#   Never deployed to prod, by design — this exists only so the e2e script can
+#   scale it to 0 and back to simulate a downstream outage.  Without this marker
+#   `drift-audit.sh workloads` reports it as "declared but not running in prod"
+#   and asks whether it is dead legacy, a gated feature, or a fixture.  The
+#   answer is stable and belongs with the artifact rather than in a list inside
+#   the checker, which would be a second representation and would drift.
+#   See noetl/ai-meta#97.
 # Toggleable downstream for the Phase-4 spool live validation
 # (noetl/ai-meta#90, RFC §8).
 #

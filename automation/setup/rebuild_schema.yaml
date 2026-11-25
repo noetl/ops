@@ -11,7 +11,7 @@ workload:
   pg_user: "demo"
   pg_database: "noetl"
   noetl_user: "noetl"
-  noetl_password: "noetl"
+  noetl_password: "REPLACE_ME_LOCAL_DEV_ONLY"
   noetl_schema: "noetl"
 workflow:
   - step: start

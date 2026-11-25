@@ -116,17 +116,27 @@ workflow:
                 parsed = default
             return max(1, min(parsed, 10))
 
-        def _error(tool_name, message, detail=None, status_code=0):
+        PLACES_UNAVAILABLE_MSG = ("Place search is temporarily unavailable — please try again in a moment.")
+
+        # noetl/ai-meta#175 — do NOT surface the raw provider body to the end
+        # user.  `text` stays the full diagnostic (message + raw body) for logs
+        # and `_meta`/`data`; `display` is what the caller renders.  The travel
+        # planner builds `error_card.description` from this response's
+        # `summary`, so returning `text` there puts a raw Google Places body in
+        # front of the user.  Same fix as duffel.yaml (#173), hotelbeds.yaml and
+        # the two hotelbeds sibling playbooks.
+        def _error(tool_name, message, detail=None, status_code=0, user_message=None):
             text = message if detail is None else f"{message}: {str(detail)[:500]}"
+            display = user_message or text
             return {
                 "status": "error",
-                "content": [{"type": "text", "text": text}],
+                "content": [{"type": "text", "text": display}],
                 "isError": True,
                 "_meta": {"backend": "google-places", "tool": tool_name, "status_code": status_code, "error": text[:2000]},
                 "data": {"ok": False, "error": text[:2000], "items": []},
                 "control_data": {"ok": False, "error": text[:2000], "items": []},
-                "summary": text,
-                "text": text,
+                "summary": display,
+                "text": display,
             }
 
         def _ok(tool_name, data, text=None, meta=None):
@@ -544,4 +554,4 @@ workflow:
                     elif selected_tool == "place_photo_url":
                         result = _place_photo(args, project, widget_key)
                 except Exception as exc:
-                    result = _error(selected_tool, "Google Places tool failed", f"{type(exc).__name__}: {exc}")
+                    result = _error(selected_tool, "Google Places tool failed", f"{type(exc).__name__}: {exc}", user_message=PLACES_UNAVAILABLE_MSG)

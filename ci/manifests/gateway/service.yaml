@@ -1,17 +1,42 @@
+# NoETL gateway Service — PROD.  Captured live (noetl/ai-meta#267, #487).
+#
+# ClusterIP only, on purpose (noetl/ai-meta#487).  Public traffic reaches the
+# gateway through the Cloudflare Tunnel (cloudflare/noetl-gke-gateway-tunnel),
+# whose origin is http://gateway.gateway.svc.cluster.local:80, so nothing needs
+# an external IP.  This Service used to be type LoadBalancer (34.132.30.16,
+# open to 0.0.0.0/0).  Anyone could reach the gateway there without Cloudflare
+# and forge `cf-connecting-ip`, the header the per-IP guest-session limits are
+# keyed on (GATEWAY_CLIENT_IP_HEADER).
+#
+# ⚠ Do not switch this back to LoadBalancer or NodePort.  If the gateway ever
+# needs a public entry point other than the tunnel, restrict it to Cloudflare's
+# ranges (https://www.cloudflare.com/ips-v4) with loadBalancerSourceRanges.
+#
+# clusterIP is immutable and must match live.
 apiVersion: v1
 kind: Service
 metadata:
-  name: gateway
-  namespace: gateway
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
   labels:
     app: gateway
+    app.kubernetes.io/managed-by: Helm
+  name: gateway
+  namespace: gateway
 spec:
-  type: NodePort
-  selector:
-    app: gateway
+  clusterIP: 34.118.234.255
+  clusterIPs:
+  - 34.118.234.255
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
   ports:
   - name: http
-    port: 8090
-    targetPort: 8090
-    nodePort: 30090
+    port: 80
     protocol: TCP
+    targetPort: 8090
+  selector:
+    app: gateway
+  sessionAffinity: None
+  type: ClusterIP

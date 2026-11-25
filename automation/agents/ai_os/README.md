@@ -23,7 +23,7 @@ automation/agents/ai_os/
 ## Workflow
 
 ```
-$ noetl exec automation/agents/ai_os/lifecycle/deploy --runtime distributed --json
+$ noetl run automation/agents/ai_os/lifecycle/deploy --runtime distributed --json
 
   apply_ollama_manifests    → kubectl apply (Deployment + Service + PVC)
         │
@@ -59,14 +59,14 @@ noetl catalog register repos/ops/automation/agents/ai_os/runtime.yaml
 
 ```bash
 # Deploy
-noetl exec automation/agents/ai_os/lifecycle/deploy \
+noetl run automation/agents/ai_os/lifecycle/deploy \
   --runtime distributed --json
 
 # Watch progress
 noetl status <execution_id> --json | jq '.completed_steps,.current_step'
 
 # Verify
-noetl exec automation/agents/ai_os/lifecycle/status \
+noetl run automation/agents/ai_os/lifecycle/status \
   --runtime distributed --json
 ```
 
@@ -77,7 +77,7 @@ real diagnosis attached (see
 ## Tear it down
 
 ```bash
-noetl exec automation/agents/ai_os/lifecycle/undeploy \
+noetl run automation/agents/ai_os/lifecycle/undeploy \
   --runtime distributed \
   --payload '{"ollama":{"preserve_data":true}}' \
   --json

@@ -1,0 +1,42 @@
+# Gateway e2e (ci/kind/e2e_gateway_agents.sh): the same agent as echo.yaml under a path
+# the guest allowlist does NOT name, so a guest must not see, read or send to it.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: agents_hidden_echo
+  path: tests/agents/hidden_echo
+  expose:
+    mcp:
+      tool: agents_hidden_echo
+      description: Greets whoever is named. kind e2e fixture.
+      input_schema:
+        type: object
+        properties: { who: { type: string } }
+        required: [who]
+      timeout: 90
+      result_step: greet
+    agent:
+      card:
+        name: agents-hidden-echo
+        description: Greets whoever is named. kind e2e fixture.
+        version: "1"
+      result_step: greet
+workload:
+  who: nobody
+workflow:
+  - step: start
+    tool:
+      kind: noop
+    next:
+      - step: greet
+  - step: greet
+    tool:
+      kind: python
+      input:
+        who: "{{ workload.who }}"
+      code: "result = {'greeting': 'hello ' + str(who)}"
+    next:
+      - step: end
+  - step: end
+    tool:
+      kind: noop

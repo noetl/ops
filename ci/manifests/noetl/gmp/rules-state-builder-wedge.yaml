@@ -1,0 +1,114 @@
+# GMP Rules — state-builder wedge alerting (the recurring login-outage
+# guardrail, noetl/ai-meta#163).
+# =============================================================================
+# PROD-ONLY (GKE noetl-demo-19700101).  GMP-native translation of the kind
+# VictoriaMetrics rule `ci/manifests/noetl/vmrule-state-builder-wedge.yaml`.
+# Prod runs Google Managed Prometheus, so the rule object is
+# `monitoring.googleapis.com/v1 Rules` evaluated by the GMP managed
+# rule-evaluator; alerts route to the GMP managedAlertmanager.  The PromQL,
+# thresholds, and annotations are identical to the kind VMRule — keep the
+# two in lockstep when either changes.
+#
+# Background (full rationale in the VMRule header): a NATS bounce orphans
+# the system-pool worker's state_builder JetStream consumer.  Before
+# noetl/worker v5.48.1 the drain looped a 503 storm forever, the WAL index
+# froze, __orchestrate__ computed commands=0, and every off-server drive
+# (auth login + planner) wedged with NO alert (tcpSocket liveness stayed
+# green).  v5.48.1 self-heals and exposes the wedge directly via
+# noetl_worker_state_builder_healthy + _consumer_recreate_total{reason}.
+#
+# Requires the scrapes in podmonitoring-noetl.yaml + noetl/worker >= v5.48.1.
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: noetl-state-builder-wedge
+  namespace: noetl
+  labels:
+    app: noetl
+    component: state-builder
+    noetl.io/outage-guardrail: state-builder-wedge
+spec:
+  groups:
+    - name: noetl-state-builder-wedge
+      interval: 15s
+      rules:
+        # CRITICAL / page — the off-server drive is wedged (the #161 outage
+        # condition).  See the VMRule for the full rationale.
+        - alert: StateBuilderWedged
+          expr: max(noetl_worker_state_builder_healthy) == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: state-builder
+            noetl_io_outage_guardrail: state-builder-wedge
+          annotations:
+            summary: "Off-server state-builder WEDGED — drives stalled (commands=0)"
+            description: >-
+              noetl_worker_state_builder_healthy has been 0 for 2m on the
+              system pool: the off-server WAL drain cannot serve, so
+              __orchestrate__ computes commands=0 and every off-server drive
+              (auth login + planner) is wedged. The in-process self-heal
+              (consumer recreate) and the /livez liveness restart have not
+              recovered it. Check NATS (the noetl_events consumer) and the
+              system-pool worker. The system/state_builder_watchdog CronJob
+              auto-rollout-restarts the pool, but a sustained firing means
+              that has not helped — escalate.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-state-builder-wedge.md#statebuilderwedged"
+
+        # WARNING — consumer recreating repeatedly (self-heal firing; NATS
+        # unstable).
+        - alert: StateBuilderConsumerRecreateStorm
+          expr: sum(rate(noetl_worker_state_builder_consumer_recreate_total{reason="drain_dead"}[5m])) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            component: state-builder
+            noetl_io_outage_guardrail: state-builder-wedge
+          annotations:
+            summary: "State-builder consumer recreating repeatedly ({{ $value | printf \"%.3f\" }}/s)"
+            description: >-
+              noetl_worker_state_builder_consumer_recreate_total{reason=drain_dead}
+              has been climbing for 10m: the state-builder's JetStream
+              consumer keeps getting orphaned and self-healed. The drive is
+              recovering each time (good), but NATS / JetStream is unstable —
+              investigate the NATS server before a recreate fails to recover
+              and the wedge alert fires.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-state-builder-wedge.md#statebuilderconsumerrecreatestorm"
+
+        # WARNING — sustained inability to reconnect to NATS.
+        - alert: StateBuilderConnectErrors
+          expr: sum(rate(noetl_worker_state_builder_consumer_recreate_total{reason="connect_error"}[5m])) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+            component: state-builder
+            noetl_io_outage_guardrail: state-builder-wedge
+          annotations:
+            summary: "State-builder cannot reconnect to NATS ({{ $value | printf \"%.3f\" }}/s connect errors)"
+            description: >-
+              noetl_worker_state_builder_consumer_recreate_total{reason=connect_error}
+              is climbing for 10m: the state-builder drain cannot reconnect to
+              NATS / recreate its consumer. It retries with backoff and the
+              /livez backstop will restart the pod if it stays down past
+              NOETL_STATE_BUILDER_UNHEALTHY_SECS. Check NATS reachability and
+              credentials from the system pool.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-state-builder-wedge.md#statebuilderconnecterrors"
+
+        # CRITICAL / page — absent-metric backstop.
+        - alert: StateBuilderAbsent
+          expr: absent(noetl_worker_state_builder_healthy)
+          for: 5m
+          labels:
+            severity: critical
+            component: state-builder
+            noetl_io_outage_guardrail: state-builder-wedge
+          annotations:
+            summary: "State-builder metrics ABSENT — system-pool worker not scraped"
+            description: >-
+              noetl_worker_state_builder_healthy is absent for 5m: the
+              system-pool worker is not running or its /metrics endpoint is
+              down, so the wedge alert cannot evaluate. The off-server drive
+              has no host. Restore the system pool
+              (noetl-worker-system-pool) and confirm /metrics on :9090.
+            runbook_url: "https://github.com/noetl/ops/blob/main/runbooks/noetl-state-builder-wedge.md#statebuilderabsent"

@@ -1,0 +1,21 @@
+# Cross-instance e2e: A's root. Calls B's xc/target twice with a pause between
+# (the test registers v2 of target and leaf on B during the pause). MODE and
+# B_ID are substituted; PATHNAME keeps the two modes' callers apart.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: xc_caller_MODE, path: xc/caller_MODE }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: first } ]
+  - step: first
+    tool: { kind: playbook, path: "noetl://B_ID/xc/target", remote: MODE, return_result: true, result_step: call_leaf, timeout: 240 }
+    next: [ { step: hold } ]
+  - step: hold
+    tool: { kind: shell, command: "sleep 30" }
+    next: [ { step: second } ]
+  - step: second
+    tool: { kind: playbook, path: "noetl://B_ID/xc/target", remote: MODE, return_result: true, result_step: call_leaf, timeout: 240 }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

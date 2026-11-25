@@ -1,6 +1,17 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: noetl
+# Container log rotation (log-analytics stack, docs/specs/noetl-iac-log-analytics.md).
+# The kubelet owns rotation of /var/log/pods/*: it rotates at containerLogMaxSize and
+# keeps containerLogMaxFiles generations per container. These are the kubelet defaults
+# made explicit, so the bound is part of the declared cluster, not an implicit default.
+# Applies when the cluster is (re)created; `status` in
+# automation/iap/kind/log_analytics.yaml reports the live values from /configz.
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    containerLogMaxSize: 10Mi
+    containerLogMaxFiles: 5
 nodes:
   - role: control-plane
     extraPortMappings:
@@ -92,6 +103,12 @@ nodes:
       - containerPort: 30902
         hostPort: 9000
         listenAddress: "0.0.0.0"
+        protocol: TCP
+
+        # ClickHouse MCP server (log-analytics stack, streamable HTTP, bearer auth)
+      - containerPort: 30124
+        hostPort: 30124
+        listenAddress: "127.0.0.1"
         protocol: TCP
 
         # Gateway API

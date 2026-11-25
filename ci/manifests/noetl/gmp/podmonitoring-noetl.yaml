@@ -40,14 +40,24 @@ metadata:
     noetl.io/flip-guardrail: publish-only
 spec:
   selector:
+    # `worker-pool` must merely EXIST — do not enumerate `app` names here.
+    #
+    # This file carried an `app In [...]` list of four names until 2026-10-04,
+    # while the LIVE object had already been corrected to this expression.  The
+    # manifest was the stale copy, in the direction that silently loses coverage:
+    # measured on prod 2026-10-04, `worker-pool Exists` selects 11 pods and the
+    # enumerated list selects 9, dropping BOTH
+    # noetl-worker-system-pool-shard1 pods (live since noetl/ai-meta#166 phase 5).
+    # Two of its four names — noetl-worker-rust-subscription-pool and
+    # noetl-worker — selected nothing at all.
+    #
+    # That is noetl/ai-meta#238 recurring: an enumerated selector is a copy of
+    # the workload set, and nothing forces it to agree when a pool is added.
+    # Partial monitoring coverage emits no error, so it is only findable by
+    # comparing the selector against the cluster.
     matchExpressions:
-      - key: app
-        operator: In
-        values:
-          - noetl-worker-system-pool
-          - noetl-worker-rust
-          - noetl-worker-rust-subscription-pool
-          - noetl-worker
+      - key: worker-pool
+        operator: Exists
   endpoints:
     - port: metrics        # named container port (9090) on every worker pool
       path: /metrics
@@ -64,13 +74,34 @@ metadata:
     noetl.io/flip-guardrail: publish-only
 spec:
   selector:
+    # `component: server`, NOT an `app` name.
+    #
+    # This selected `app: noetl-server-rust` until 2026-10-04, which is the
+    # Deployment — and that Deployment has been scaled to 0 since the serving
+    # workload moved to StatefulSet/noetl-server-rust-embedded on 2026-09-09.
+    # So this PodMonitoring selected a workload with no pods while the pod that
+    # actually serves carried `app: noetl-server-rust-embedded` and was scraped
+    # by nothing, for 25 days.  An enumerated `app` name is a copy of the
+    # workload set; nothing forces it to agree when a workload is replaced.
+    #
+    # Both pod templates carry `component: server` — the Deployment's and the
+    # StatefulSet's — so this selector covers the current serving pod, the
+    # dormant Deployment if it is ever scaled back up, and a future variant,
+    # without naming any of them.  Verified on prod: `-l component=server`
+    # returns exactly noetl-server-rust-embedded-0 and nothing else.
+    #
+    # Same reasoning as podmonitoring-cmdbus-writer.yaml, which selects
+    # `component: cmdbus-writer` so a new shard's writer is picked up.
     matchLabels:
-      app: noetl-server-rust
+      component: server
   endpoints:
     # The server exposes Prometheus metrics on its HTTP port (8082) at
     # /metrics — including noetl_event_ingest_published_total, the
     # "gate is ON and active" signal the MaterializerStalledUnderGate /
     # MaterializerAbsentUnderGate alerts depend on.
+    #
+    # The StatefulSet's container declares the same port name `http` (8082),
+    # so only the selector needed to change.
     - port: http
       path: /metrics
       interval: 30s

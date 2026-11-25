@@ -1,262 +1,389 @@
-# noetl-worker-system-pool — PRODUCTION Rust system worker pool
-# (GKE noetl-demo-19700101).  noetl/ai-meta#96.
-# =============================================================================
-# Privileged worker pool that runs platform-internal `system/*` playbooks.
-# First job: `system/scheduled_cleanup` (retention/purge of transient noetl.*
-# rows via POST /api/internal/cleanup/purge).
+# NoETL system worker pool — PROD.  Captured from the live cluster (noetl/ai-meta#267).
 #
-# This is the PROD variant of `worker-system-pool-deployment.yaml` (which is
-# dev-shaped: localhost image, NOETL_COMMANDS stream, Python server URL).
-# Prod differences mirror `worker-rust-deployment-prod.yaml`:
-#   - prod Artifact Registry image, pinned by digest (same noetl-worker-rust
-#     image as the shared pool — the worker binary is identical; only the
-#     consumer/filter differ),
-#   - NATS_STREAM = NOETL_COMMANDS_RUST (the dedicated Rust-stack stream that
-#     owns `noetl.commands.>`, so it includes `noetl.commands.system.>`),
-#   - NOETL_SERVER_URL = the Rust server Service.
+# ⚠ Do NOT `kubectl apply -f ci/manifests/noetl/` against prod — a directory apply
+# also picks up worker-system-pool-deployment.yaml, which declares the SAME
+# Deployment and sorts BEFORE this one.  See noetl/ai-meta#309.
 #
-# Per data-access-boundary.md the system playbooks call /api/internal/* — this
-# pod mounts NOETL_INTERNAL_API_TOKEN from the K8s Secret `noetl-internal-api-token`
-# (already present in prod) and lifts it into ctx.secrets via
-# NOETL_KEYCHAIN_ENV_VARS so the playbooks' `tool: http` bearer auth resolves.
+# noetl/ai-meta#267 Tier 2 stage 5: NOETL_INTERNAL_API_TOKEN comes only from the
+# CSI-projected Secret Manager file; the secretKeyRef is gone.
 #
-# Requires `serviceaccount-worker-system-pool.yaml` applied first.
----
+# noetl/ai-meta#266: NOETL_STATE_AFFINITY_ROUTE is GONE, from here and from the
+# cluster, in one deploy.  Its only reader was AffinityConfig::from_env, which has
+# had no callers since T5 deleted the steering block — the flag was `true` in prod
+# and steered nothing.  The TYPE is deliberately retained in the worker as the
+# written spec for shard-ownership selection, and is now tested against.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: noetl-worker-system-pool
-  namespace: noetl
+  annotations:
+    autopilot.gke.io/resource-adjustment: '{"input":{"initContainers":[{"limits":{"ephemeral-storage":"1Gi"},"requests":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"wait-for-api"}],"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"768Mi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"noetl-worker"}]},"output":{"initContainers":[{"limits":{"ephemeral-storage":"1Gi"},"requests":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"128Mi"},"name":"wait-for-api"}],"containers":[{"limits":{"cpu":"2","ephemeral-storage":"1Gi","memory":"768Mi"},"requests":{"cpu":"250m","ephemeral-storage":"1Gi","memory":"256Mi"},"name":"noetl-worker"}]},"computeClassAtAdmission":"Default","modified":true}'
+    autopilot.gke.io/warden-version: 35.26.4-gke.2
+    kubernetes.io/change-cause: '#166 Phase3 step4.2: enable SHARD_READ+READ_VERIFY on system-pool 2026-07-03'
+    # noetl.io/watchdog-* : NOT DECLARED — runtime counters written by the
+    # state-builder watchdog via `kubectl annotate`.  Same class as
+    # restartedAt: a manifest that declares them fights the writer for
+    # ownership, and server-side apply refuses rather than clobbering.
   labels:
     app: noetl-worker-system-pool
     component: system-worker
     runtime: rust
     worker-pool: worker-system-pool
+  name: noetl-worker-system-pool
+  namespace: noetl
 spec:
+  progressDeadlineSeconds: 600
   replicas: 1
+  revisionHistoryLimit: 10
   selector:
     matchLabels:
       app: noetl-worker-system-pool
       worker-pool: worker-system-pool
+  # Live, and deliberate-looking: never two pods of one shard pool at once
+  # (maxSurge 0). Was the 25%/25% default here, so an apply changed it
+  # (found by `kubectl diff`, 2026-10-21).
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
   template:
     metadata:
+      annotations:
+        # kubectl.kubernetes.io/restartedAt: NOT DECLARED — a runtime annotation
+        # written by `kubectl rollout restart`.  Declaring it made this manifest
+        # fight the operator for ownership of a timestamp, and it was the ONLY
+        # server-side-apply conflict once the image pin was gone.
+        prometheus.io/path: /metrics
+        prometheus.io/port: '9090'
+        prometheus.io/scrape: 'true'
       labels:
         app: noetl-worker-system-pool
         component: system-worker
         runtime: rust
+        shard-index: '0'
         worker-pool: worker-system-pool
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/path: "/metrics"
-        prometheus.io/port: "9090"
     spec:
-      serviceAccountName: noetl-worker-system-pool
-      initContainers:
-        - name: wait-for-api
-          image: curlimages/curl:8.7.1
-          imagePullPolicy: IfNotPresent
-          command:
-            - sh
-            - -c
-            - "until curl -sf http://noetl-server-rust.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting for NoETL Rust server...'; sleep 3; done"
       containers:
-        - name: noetl-worker
-          # worker v5.40.3 (commit 6dd3449) — carries the materializer loop + the
-          # JetStream lag poller's materializer-consumer tracking (the CQRS flip
-          # guardrail's lag gauge) PLUS the off-server state builder with #117
-          # spine causal-order + #119 WAL-index restart-rehydration.  Shipped
-          # alongside the #121 system-exec off-server drive wedge fix (server-
-          # side).  Same binary as the shared Rust worker pool; only the NATS
-          # consumer + filter subject differ.  Pinned by immutable digest (AR
-          # push 2026-06-21T16:57:05Z); the :v5.40.3 / :6dd3449 tags resolve to
-          # it.  This is the LIVE prod image as of the 2026-06-21 off-server
-          # cutover.
-          image: us-central1-docker.pkg.dev/noetl-demo-19700101/noetl/noetl-worker-rust@sha256:5e80493bc496c8921d6dbf54f62abd7a732cc04bfadb951d39420d396f18170a
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: metrics
-              containerPort: 9090
-              protocol: TCP
-          env:
-            - name: WORKER_POOL_NAME
-              value: worker-system-pool
-            - name: WORKER_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: NATS_URL
-              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
-            # Dedicated Rust-stack stream (subjects noetl.commands.>), same as
-            # the shared Rust worker pool.  Includes noetl.commands.system.>.
-            - name: NATS_STREAM
-              value: NOETL_COMMANDS_RUST
-            # Distinct durable consumer for the system segment.
-            - name: NATS_CONSUMER
-              value: noetl_worker_system_rust
-            - name: NATS_FILTER_SUBJECT
-              value: noetl.commands.system.>
-            - name: NOETL_SERVER_URL
-              value: http://noetl-server-rust.noetl.svc.cluster.local:8082
-            - name: WORKER_HEARTBEAT_INTERVAL
-              value: "15"
-            # System playbooks are low-frequency; keep concurrency low.
-            - name: WORKER_MAX_CONCURRENT
-              value: "2"
-            - name: WORKER_METRICS_BIND
-              value: "0.0.0.0:9090"
-            - name: WORKER_NATS_LAG_POLL_INTERVAL
-              value: "5"
-            # Bearer token for the system playbooks' tool: http calls to
-            # /api/internal/*.  Secret already present in prod.
-            - name: NOETL_INTERNAL_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: noetl-internal-api-token
-                  key: token
-            # Lift the token into ctx.secrets under the verbatim env-var name
-            # so `auth: { type: bearer, credential: NOETL_INTERNAL_API_TOKEN }`
-            # resolves in the system playbooks.
-            - name: NOETL_KEYCHAIN_ENV_VARS
-              value: NOETL_INTERNAL_API_TOKEN
-            - name: RUST_LOG
-              value: "info,noetl_worker=info,noetl_executor=info"
-            # Arrow IPC shared-memory cache budget (noetl-arrow-cache).
-            # Pinned here next to the /dev/shm sizeLimit below so the two
-            # stay coherent: sizeLimit (320Mi) MUST exceed this budget
-            # (256Mi) or the worker SIGBUSes (exit 135) when the cache
-            # fills past the tmpfs.  worker.rs:91 / arrow-cache cache.rs:12.
-            - name: NOETL_IPC_CACHE_BUDGET_BYTES
-              value: "268435456" # 256 MiB
-            # CQRS event materializer (noetl/ai-meta#103) — ack-after-materialize
-            # sole-writer loop for noetl.event under NOETL_EVENT_INGEST_PUBLISH_ONLY.
-            # Pinned "true" to MATCH THE LIVE PROD CUTOVER (2026-06-21): the
-            # server runs with NOETL_EVENT_INGEST_PUBLISH_ONLY=true (it no longer
-            # INSERTs into noetl.event) and this loop is the SOLE noetl.event
-            # writer.  The flip was performed live behind the materializer-lag
-            # alerts and LEFT ON; this manifest records that state so apply is a
-            # no-op.  Revert (paired with the server's gate): set this back to
-            # "false" AND the server's NOETL_EVENT_INGEST_PUBLISH_ONLY to
-            # "false".
-            - name: NOETL_MATERIALIZER_ENABLED
-              value: "true"
-            # Off-server state builder (noetl/ai-meta#115 Phase 4).  Where the
-            # orchestrator drive's WorkflowState is CONSTRUCTED:
-            #   server     (default) — the server builds it in-process and ships
-            #                it to the worker plug-in (run_state). PROD BEHAVIOR.
-            #   offserver  — this system-pool worker builds the drive state from
-            #                the noetl_events WAL spine (durable consumer
-            #                `noetl_state_builder`, wasm run/from_events entry),
-            #                with the server-built state as the incomplete-chain
-            #                fallback — state construction runs off the server.
-            # Pinned "offserver" to MATCH THE LIVE PROD CUTOVER (2026-06-21): the
-            # drive plug-in runs on this system pool and builds state off the
-            # server from the WAL.  The server carries the same flag set to
-            # "offserver".  Recorded here so apply is a no-op; revert: set back
-            # to "server" on both this pool and the server.
-            - name: NOETL_STATE_BUILDER
-              value: "offserver"
-            - name: NOETL_STATE_BUILDER_CONSUMER
-              value: "noetl_state_builder"
-            # noetl/ai-meta#166 Phase 1 — bounded off-server WAL index.  The
-            # index grew O(all non-terminal event history × full-envelope) to
-            # ~1.28 GiB at idle (654 execs pinned, #163 OOM).  These knobs cap it
-            # to O(active working set).  Prod-verified 2026-06-30: idle RSS
-            # 1265Mi -> 67Mi, holding, 0 OOMKills, drives still served.
-            #   SLIM           — store a lossless projection to the orchestrate-core
-            #                    Event fields (output-equivalent from_events).
-            #   TTL_SECS=900   — evict idle/abandoned non-terminal chains (the class
-            #                    terminal eviction misses); 15min >> a Muno hop so
-            #                    active flows are never evicted mid-drive.
-            #   MAX_BYTES      — hard ceiling on the byte LEDGER (the approx
-            #                    JSON-byte estimate, ~5-7× under true resident); 256Mi
-            #                    ledger ≈ ~1.5-1.7 GiB RSS backstop, under the 2Gi limit.
-            #   REHYDRATE_ON_MISS — targeted retained-WAL re-replay on a cache miss,
-            #                    makes eviction wedge-safe with tail-attach off.
-            #   SWEEP_SECS=30  — bounded-cache sweep cadence (runs idle + busy).
-            # Instant rollback: remove these 5 vars (behavior-neutral, unbounded).
-            - name: NOETL_STATE_INDEX_SLIM
-              value: "true"
-            - name: NOETL_STATE_INDEX_TTL_SECS
-              value: "900"
-            - name: NOETL_STATE_INDEX_MAX_BYTES
-              value: "268435456"
-            - name: NOETL_STATE_INDEX_REHYDRATE_ON_MISS
-              value: "true"
-            - name: NOETL_STATE_INDEX_SWEEP_SECS
-              value: "30"
-          volumeMounts:
-            # Memory-backed /dev/shm for the Arrow IPC cache.  The k8s
-            # container-runtime default /dev/shm is a 64 MiB tmpfs; the
-            # cache writes shm regions up to NOETL_IPC_CACHE_BUDGET_BYTES
-            # and overruns 64 MiB, page-faulting into SIGBUS (exit 135).
-            - name: dshm
-              mountPath: /dev/shm
-          resources:
-            requests:
-              # noetl/ai-meta#127 — raised 100m -> 250m (matches the shared
-              # Rust worker pool + server-rust).  This single pod carries the
-              # off-server orchestrate drive AND the sole-writer CQRS
-              # materializer for the whole prod system, so it pegs CPU under a
-              # large batch the same way the step workers do.
-              cpu: "250m"
-              # noetl/ai-meta#163 — raised 128Mi -> 1Gi.  The state_builder
-              # WAL chain-index RSS grows with prod event volume and sits at
-              # ~748Mi steady (vs 9Mi on the step-worker pool that has no
-              # drive/materializer).  The old 128Mi request was far below
-              # actual usage, making this pod a top eviction candidate under
-              # node memory pressure; set the request at/above steady RSS so
-              # the scheduler guarantees the memory it always needs.
-              memory: "1Gi"
-            limits:
-              # noetl/ai-meta#127 — raised 1 -> 2 alongside the shared pool.
-              # Raising the limit only lifts the burst ceiling for this single
-              # drive+materializer pod (request stays low), protecting drive +
-              # materialize throughput under load so the off-server cutover
-              # stays healthy.  Nodes are 16-CPU and ~98% idle; pure upside.
-              cpu: "2"
-              # noetl/ai-meta#163 — raised 768Mi -> 2Gi.  At 768Mi the pod ran
-              # at ~748Mi steady (97% of limit); an execution burst that grew
-              # the state_builder WAL chain-index tipped it over -> exitCode
-              # 137 OOMKilled -> off-server drive wedged (commands=0) -> Muno
-              # turns + login stopped completing.  2Gi = ~1.3Gi headroom over
-              # steady for index growth under load, plus the 320Mi /dev/shm
-              # tmpfs (Arrow IPC cache) which is also charged to this cgroup.
-              memory: "2Gi"
-          livenessProbe:
-            tcpSocket:
-              port: 9090
-            initialDelaySeconds: 20
-            periodSeconds: 15
-            failureThreshold: 6
-          readinessProbe:
-            tcpSocket:
-              port: 9090
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            failureThreshold: 6
+      - env:
+        - name: NOETL_INTERNAL_API_TOKEN_FILE
+          value: /var/secrets/sm/token
+        - name: NOETL_SHARD_INDEX
+          value: '0'
+        - name: NOETL_SHARD_COUNT
+          value: '2'
+        - name: WORKER_POOL_NAME
+          value: worker-system-pool
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: NOETL_SERVER_URL
+          value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+        - name: WORKER_HEARTBEAT_INTERVAL
+          value: '15'
+        - name: WORKER_MAX_CONCURRENT
+          value: '2'
+        - name: WORKER_METRICS_BIND
+          value: 0.0.0.0:9090
+        - name: NOETL_KEYCHAIN_ENV_VARS
+          value: NOETL_INTERNAL_API_TOKEN
+        - name: RUST_LOG
+          value: info,noetl_worker=info,noetl_executor=info
+        - name: NOETL_IPC_CACHE_BUDGET_BYTES
+          value: '268435456'
+        - name: NOETL_RESULT_CELL_ENV
+          value: prod
+        - name: NOETL_RESULT_CELL_REGION
+          value: usc1
+        - name: NOETL_RESULT_CELL
+          value: usc1-a
+        - name: NOETL_RESULT_SHARD_COUNT
+          value: '256'
+        - name: NOETL_RESULT_MINT_AUTHORITATIVE
+          value: 'true'
+        - name: NOETL_RESULT_PRODUCER_STAGE
+          value: 'true'
+        - name: NOETL_STATE_INDEX_SLIM
+          value: 'true'
+        - name: NOETL_STATE_INDEX_TTL_SECS
+          value: '900'
+        - name: NOETL_STATE_INDEX_MAX_BYTES
+          value: '268435456'
+        - name: NOETL_STATE_INDEX_REHYDRATE_ON_MISS
+          value: 'true'
+        - name: NOETL_STATE_INDEX_SWEEP_SECS
+          value: '30'
+        - name: NOETL_STATE_SHARD_OPEN_TTL_SECS
+          value: '900'
+        - name: NOETL_STATE_SHARD_READ
+          value: 'true'
+        - name: NOETL_STATE_SHARD_READ_VERIFY
+          value: 'false'
+        - name: NOETL_COMMAND_BUS
+          value: ehdb
+        - name: NOETL_COMMAND_BUS_HOST
+          value: 'false'
+        - name: NOETL_COMMAND_SHARD_COUNT
+          value: '1'
+        - name: NOETL_COMMAND_BUS_CLAIM_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9101
+        - name: NOETL_FEED_FILTER_SUBJECT
+          value: noetl.commands.system.>
+        - name: NOETL_EVENT_BUS_CLAIM_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9104
+        - name: NOETL_EVENT_BUS_WAL_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9108
+        - name: NOETL_MATERIALIZER_ENABLED
+          value: 'true'
+        - name: NOETL_MATERIALIZER_SOURCE
+          value: ehdb
+        - name: NOETL_RESULT_MATERIALIZER_ENABLED
+          value: 'true'
+        - name: NOETL_RESULT_MATERIALIZER_SOURCE
+          value: ehdb
+        - name: NOETL_STATE_SHARD_WRITE
+          value: 'true'
+        - name: NOETL_STATE_MATERIALIZER_SOURCE
+          value: ehdb
+        - name: NOETL_STATE_BUILDER
+          value: offserver
+        - name: NOETL_STATE_BUILDER_SOURCE
+          value: ehdb
+        - name: NOETL_STATE_BUILDER_SHADOW
+          value: 'false'
+        - name: NOETL_EHDB_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_MODE
+          value: local_reference
+        # noetl/ai-meta#267: live on prod, previously declared nowhere.
+        - name: NOETL_EHDB_CATALOG_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_CLIENT_ROLE
+          value: worker
+        - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
+          value: /tmp/ehdb/ref.jsonl
+        - name: NOETL_EHDB_EVENTLOG
+          value: primary
+        - name: NOETL_EHDB_PROJECTION
+          value: shadow
+        - name: NOETL_EHDB_KV
+          value: shadow
+        - name: NOETL_EHDB_OBJECT
+          value: shadow
+        - name: NOETL_EHDB_TIER_QUERY_SOURCE
+          value: service
+        - name: NOETL_EHDB_TIER_SERVICE_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9110
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_TIER_APPEND_BATCH
+          value: 'true'
+        # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
+        # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
+        # digest back here, so every pin in this directory was BEHIND live: a
+        # re-apply rolled prod back past shipped incident fixes.  Rather than
+        # keep a copy true, the copy is removed: this file declares SHAPE.
+        # Server-side apply leaves a field this manifest does not claim, which
+        # is what makes the omission safe on an EXISTING object (proved by
+        # server-side dry-run against live).  Creating from nothing still needs
+        # a digest: that comes from the release ledger, not from here.
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /livez
+            port: 9090
+            scheme: HTTP
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: noetl-worker
+        ports:
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 6
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 9090
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: '2'
+            ephemeral-storage: 1Gi
+            memory: 3Gi
+          requests:
+            cpu: 750m
+            ephemeral-storage: 1Gi
+            memory: 3Gi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/secrets/sm
+          name: sm-token
+          readOnly: true
+        - mountPath: /dev/shm
+          name: dshm
+      dnsPolicy: ClusterFirst
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - until curl -sf http://noetl-server-rust.noetl.svc.cluster.local:8082/api/health; do echo 'Waiting
+          for NoETL Rust server...'; sleep 3; done
+        env:
+        - name: NOETL_MATERIALIZER_ENABLED
+          value: 'true'
+        - name: NOETL_RESULT_MATERIALIZER_ENABLED
+          value: 'true'
+        - name: NOETL_RESULT_MINT_AUTHORITATIVE
+          value: 'true'
+        - name: NOETL_RESULT_PRODUCER_STAGE
+          value: 'true'
+        - name: NOETL_STATE_INDEX_SLIM
+          value: 'true'
+        - name: NOETL_STATE_INDEX_TTL_SECS
+          value: '900'
+        - name: NOETL_STATE_INDEX_MAX_BYTES
+          value: '268435456'
+        - name: NOETL_STATE_INDEX_REHYDRATE_ON_MISS
+          value: 'true'
+        - name: NOETL_STATE_INDEX_SWEEP_SECS
+          value: '30'
+        - name: NOETL_STATE_SHARD_WRITE
+          value: 'true'
+        - name: NOETL_STATE_SHARD_OPEN_TTL_SECS
+          value: '900'
+        - name: NOETL_STATE_SHARD_READ
+          value: 'true'
+        - name: NOETL_STATE_SHARD_READ_VERIFY
+          value: 'false'
+        - name: NOETL_COMMAND_BUS
+          value: ehdb
+        - name: NOETL_COMMAND_SHARD_COUNT
+          value: '1'
+        - name: NOETL_COMMAND_BUS_CLAIM_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9101
+        - name: NOETL_MATERIALIZER_SOURCE
+          value: ehdb
+        - name: NOETL_EVENT_BUS_CLAIM_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9104
+        - name: NOETL_RESULT_MATERIALIZER_SOURCE
+          value: ehdb
+        - name: NOETL_STATE_MATERIALIZER_SOURCE
+          value: ehdb
+        - name: NOETL_STATE_BUILDER
+          value: offserver
+        - name: NOETL_STATE_BUILDER_SOURCE
+          value: ehdb
+        - name: NOETL_EVENT_BUS_WAL_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9108
+        - name: NOETL_FEED_FILTER_SUBJECT
+          value: noetl.commands.system.>
+        - name: NOETL_EHDB_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_MODE
+          value: local_reference
+        - name: NOETL_EHDB_CLIENT_ROLE
+          value: worker
+        - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
+          value: /tmp/ehdb/ref.jsonl
+        - name: NOETL_EHDB_EVENTLOG
+          value: primary
+        - name: NOETL_EHDB_PROJECTION
+          value: shadow
+        - name: NOETL_EHDB_KV
+          value: shadow
+        - name: NOETL_EHDB_OBJECT
+          value: shadow
+        - name: NOETL_EHDB_TIER_QUERY_SOURCE
+          value: service
+        - name: NOETL_EHDB_TIER_SERVICE_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9110
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_TIER_APPEND_BATCH
+          value: 'true'
+        image: curlimages/curl:8.7.1
+        imagePullPolicy: IfNotPresent
+        name: wait-for-api
+        resources:
+          limits:
+            ephemeral-storage: 1Gi
+            memory: 2Gi
+          requests:
+            cpu: 100m
+            ephemeral-storage: 1Gi
+            memory: 1Gi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: noetl-worker-system-pool
+      serviceAccountName: noetl-worker-system-pool
+      # noetl/ai-meta#511: a SIGTERM'd worker drains its in-flight commands
+      # (NOETL_WORKER_DRAIN_TIMEOUT_SECS, default 150 s) before exiting.
+      terminationGracePeriodSeconds: 180
+      tolerations:
+      - effect: NoSchedule
+        key: kubernetes.io/arch
+        operator: Equal
+        value: amd64
       volumes:
-        - name: dshm
-          emptyDir:
-            medium: Memory
-            # >= NOETL_IPC_CACHE_BUDGET_BYTES (256Mi) + 64Mi headroom for
-            # tmpfs page rounding / fragmentation.  tmpfs usage counts
-            # against the container memory limit above (2Gi, noetl/ai-meta#163),
-            # which covers this plus the worker RSS (state_builder index).
-            sizeLimit: 320Mi
+      - csi:
+          driver: secrets-store-gke.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: noetl-internal-api-token
+        name: sm-token
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 320Mi
+        name: dshm
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: noetl-worker-system-pool-metrics
-  namespace: noetl
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
   labels:
     app: noetl-worker-system-pool
+  name: noetl-worker-system-pool-metrics
+  namespace: noetl
 spec:
   clusterIP: None
+  clusterIPs:
+  - None
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: metrics
+    port: 9090
+    protocol: TCP
+    targetPort: 9090
   selector:
     app: noetl-worker-system-pool
-  ports:
-    - name: metrics
-      port: 9090
-      targetPort: 9090
-      protocol: TCP
+  sessionAffinity: None
+  type: ClusterIP
