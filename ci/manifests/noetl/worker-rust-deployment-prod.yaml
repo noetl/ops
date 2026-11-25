@@ -145,6 +145,22 @@ spec:
         # OFF = REMOVE this entry (never `value: ''`).
         - name: NOETL_WORKER_FUSE_LIFECYCLE
           value: 'true'
+        # ⚠ STAGED, NOT LIVE (checked read-only 2026-11-25): the live user pool does not
+        # carry this env. Applying this file ADDS it, which changes the pod template and
+        # ROLLS the user pool. Step 2 of 3 of the #199 sink-gate enablement
+        # (noetl/ai-meta#199 PROD-ENABLE-CHECKLIST); apply it only as part of that.
+        #
+        # Bearer for /api/internal/* (noetl/ai-meta#199 Slice A). Sink steps
+        # (`sink: true`) run on this pool and post /api/internal/sink-state/{mark,confirm};
+        # without a token the server answers 403 and the worker swallows it by design, so
+        # the GC gate is silently starved. Same Secret the system pool already mounts
+        # (referenced, never resolved). Inert on its own: the gate stays off until
+        # NOETL_RESULT_TIER_GC_SINK_GATE is set on the server (not set live).
+        - name: NOETL_INTERNAL_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: noetl-internal-api-token
+              key: token
         # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
         # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
         # digest back here, so every pin in this directory was BEHIND live: a
