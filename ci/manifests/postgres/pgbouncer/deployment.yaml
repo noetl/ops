@@ -10,6 +10,24 @@
 # It also carries the noetl/ai-meta#311 fix: the userlist is seeded from a
 # Secret Manager CSI mount, so a pod reschedule can no longer reinstate a stale
 # password. That outage is what surfaced this file's absence.
+#
+# ── RE-CHECKED AGAINST LIVE 2026-11-25 (read-only; no secret values read into this repo) ──
+# Matches live: image, SA, the cloud-sql-proxy args, probes, resources, volumes, the
+# pgbouncer-db-secrets CSI mount, and every pgbouncer env value (pool sizes updated above).
+# STILL DIFFERS from live, so a `kubectl apply` of this file is NOT a no-op:
+#   1. DATABASE_URLS: live is an INLINE literal; this file references Secret
+#      postgres/pgbouncer-database-urls, which DOES NOT EXIST yet. Applying before that
+#      Secret is created leaves the new pod in CreateContainerConfigError, and with
+#      replicas: 1 and maxUnavailable 25% (rounds to 0) the old pod keeps serving only
+#      until anything else restarts it. Every NoETL component goes through this pooler.
+#   2. The userlist script: live seeds only `noetl`; this file seeds noetl/demo/auth/
+#      postgres when their mounts exist (only `noetl` is mounted by pgbouncer-db-secrets,
+#      so the effective userlist is the same). It is still a pod-template change, i.e. a roll.
+#   3. Live's cloud-sql-proxy container carries 8 leftover pgbouncer env vars that this file
+#      does not declare. A client-side apply leaves them alone.
+#   4. secretproviderclass-all-users.yaml references GSM secrets noetl-demo-password,
+#      noetl-auth-password and noetl-superuser-password, which DO NOT EXIST in
+#      shastaratech-noetl-prod. Do not point the Deployment at it until they do.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -110,7 +128,7 @@ spec:
             - name: MAX_CLIENT_CONN
               value: "600"
             - name: DEFAULT_POOL_SIZE
-              value: "12"
+              value: "25"   # live 2026-11-25 (was 12 when captured 2026-08-29)
             - name: MIN_POOL_SIZE
               value: "1"
             - name: RESERVE_POOL_SIZE
@@ -118,7 +136,7 @@ spec:
             - name: RESERVE_POOL_TIMEOUT
               value: "5"
             - name: MAX_DB_CONNECTIONS
-              value: "16"
+              value: "32"   # live 2026-11-25 (was 16 when captured 2026-08-29)
             - name: SERVER_LIFETIME
               value: "21600"
             - name: SERVER_IDLE_TIMEOUT
