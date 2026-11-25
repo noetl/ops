@@ -323,7 +323,7 @@ NOETL_REGISTRY_BACKEND=local python3 lib/slm_improve_smoke.py --config <slm.conf
 
 # the loop via the playbook (-r local, file-backed registry, stub backend):
 NOETL_REGISTRY_BACKEND=local NOETL_REGISTRY_LOCAL_DIR=/tmp/slm_reg \
-noetl exec automation/mlops/slm/improve.yaml -r local \
+noetl run automation/mlops/slm/improve.yaml -r local \
   --set config=/abs/.../travel/automation/mlops/slm/travel/slm.config.yaml \
   --set shadow_corpus=<harvested slm_replay --shadow corpus> \
   --set base_corpus=<seed corpus> \

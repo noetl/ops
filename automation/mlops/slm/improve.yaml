@@ -226,7 +226,7 @@ workflow:
 #    Sundays 03:00) is the intended cadence.  A Kubernetes CronJob (or any
 #    scheduler) invokes the distributed form on the worker pool:
 #
-#      noetl exec automation/mlops/slm/improve.yaml -r distributed \
+#      noetl run automation/mlops/slm/improve.yaml -r distributed \
 #        --set config=<org slm.config.yaml> \
 #        --set base_url=http://noetl-server-rust:8082 \
 #        --set min_new_real_turns=200 \
@@ -242,7 +242,7 @@ workflow:
 #    new shadow turns have accrued.  A cheap probe runs HARVEST + GATE only and
 #    exits if the gate is closed; a scheduler runs it every hour:
 #
-#      noetl exec automation/mlops/slm/improve.yaml -r distributed \
+#      noetl run automation/mlops/slm/improve.yaml -r distributed \
 #        --set base_url=... --set min_new_real_turns=200
 #      # if run_summary.proceeded == false, nothing trained — near-zero cost.
 #
@@ -250,7 +250,7 @@ workflow:
 # the offline shape:
 #
 #   NOETL_REGISTRY_BACKEND=local NOETL_REGISTRY_LOCAL_DIR=/tmp/slm_reg \
-#   noetl exec repos/ops/automation/mlops/slm/improve.yaml -r local \
+#   noetl run repos/ops/automation/mlops/slm/improve.yaml -r local \
 #     --set config=/abs/repos/travel/automation/mlops/slm/travel/slm.config.yaml \
 #     --set shadow_corpus=<harvested shadow corpus> \
 #     --set base_corpus=<seed corpus> \
