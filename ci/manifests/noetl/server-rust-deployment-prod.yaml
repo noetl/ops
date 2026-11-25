@@ -1,5 +1,33 @@
-# NoETL control plane — PROD.  Captured from the live cluster (noetl/ai-meta#267)
-# so that `kubectl apply` of THIS FILE is a no-op rather than a mass deletion.
+# NoETL control plane — PROD.  ⚠⚠ THIS WORKLOAD IS RETIRED AND NON-SERVING.
+#
+# ════════════════════════════════════════════════════════════════════════════
+#  replicas: 0 IS LOAD-BEARING.  DO NOT RAISE IT.
+#
+#  Serving moved to StatefulSet/noetl-server-rust-embedded.  Both svc/noetl and
+#  svc/noetl-server-rust select THAT workload; this Deployment has been 0
+#  replicas in prod since the embedded cutover.
+#
+#  This file still said `replicas: 1` until 2026-09-29, and that made the very
+#  claim in the line below FALSE: `kubectl apply -f` would have scaled this
+#  Deployment 0 -> 1, producing a SECOND server process alongside the
+#  StatefulSet.  Both carry NOETL_SERVER_MACHINE_ID=2, so that is two snowflake
+#  generators on the same machine bits — DUPLICATE event_id on the append-only
+#  event log.  noetl/ai-meta#332 records why a second appending replica is
+#  forbidden; noetl/ai-meta#359 is the report of this manifest carrying the
+#  hazard.  Two runbooks instructed that apply, so it was reachable by someone
+#  following documented steps, not just by accident.
+#
+#  The invariant, stated once: THERE MUST NEVER BE TWO APPENDING SERVER
+#  PROCESSES SHARING MACHINE_ID=2.  `replicas: 0` here enforces it by
+#  construction — an apply of this file cannot create a pod at all.
+#
+#  `ci/manifests/noetl/machine-id-collision-check.sh` flags any second
+#  workload that claims the same MACHINE_ID with a non-zero replica count.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Captured from the live cluster (noetl/ai-meta#267) so that `kubectl apply` of
+# THIS FILE is a no-op rather than a mass deletion.  With replicas: 0 matching
+# the live object, that property holds again.
 #
 # ⚠ Do NOT `kubectl apply -f ci/manifests/noetl/` against prod.  A directory apply
 # also picks up server-rust-deployment.yaml, which declares the SAME Deployment and
@@ -25,7 +53,10 @@ metadata:
   namespace: noetl
 spec:
   progressDeadlineSeconds: 600
-  replicas: 1
+  # ⚠⚠ MUST STAY 0 — see the header.  Raising this creates a second appending
+  # server sharing MACHINE_ID=2 with the serving StatefulSet => duplicate
+  # event_id on the append-only log (noetl/ai-meta#332, #359).
+  replicas: 0
   revisionHistoryLimit: 10
   selector:
     matchLabels:
@@ -38,7 +69,10 @@ spec:
   template:
     metadata:
       annotations:
-        kubectl.kubernetes.io/restartedAt: '2026-08-14T22:03:31-07:00'
+        # kubectl.kubernetes.io/restartedAt: NOT DECLARED — a runtime annotation
+        # written by `kubectl rollout restart`.  Declaring it made this manifest
+        # fight the operator for ownership of a timestamp, and it was the ONLY
+        # server-side-apply conflict once the image pin was gone.
       labels:
         app: noetl-server-rust
         component: server
@@ -103,7 +137,7 @@ spec:
         - name: NOETL_ORPHAN_SWEEP_ENABLED
           value: 'true'
         - name: NOETL_AUTH_VERIFY_SIGNATURE
-          value: shadow
+          value: enforce
         - name: NOETL_AUTH0_DOMAIN
           value: mestumre-development.us.auth0.com
         - name: NOETL_AUTH0_AUDIENCE
@@ -146,7 +180,42 @@ spec:
           value: 'true'
         - name: NOETL_EHDB_PROJECTION_READ_SOURCE
           value: wal
-        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/server-rust@sha256:e911e375bda9ab43b5d8c6a72dfb58f63842f1dc69ebdac6c6157ba7dccfdd06
+        # --- noetl/ai-meta#320: the event-log mirror's delivery posture ----
+        # These were live on prod and declared NOWHERE, so a DR re-apply would
+        # have silently removed them.  DRAIN_CONCURRENCY is the dangerous one:
+        # dropping it reverts to the code default of 8, which is the config that
+        # produced ~99% relay delivery failures under load.
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_DRAIN_CONCURRENCY
+          value: '1'
+        - name: NOETL_EHDB_CROSSSTORE_PARITY_CONTENT
+          value: 'true'
+        # The retry window.  Both EQUAL the server's code defaults as of
+        # v3.101.3 and are declared anyway, so the deployed behaviour is readable
+        # here rather than inferred from the binary.  They were raised to these
+        # values because 4 retries / 250ms still dropped 11 events at realistic
+        # load -- every one the worker's tier append returning 502 "timed out
+        # after 2s" while the durable writer was slow.  At 7/500 the same load
+        # moved 1350 events with zero dropped.  `0` restores pre-fix delivery
+        # (one attempt, then drop) and is the no-redeploy rollback.
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_MAX_RETRIES
+          value: '7'
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_RETRY_BACKOFF_MS
+          value: '500'
+        # --- noetl/ai-meta#307: recovery folds from the durable tier ----------
+        # Live on prod since v3.92.0, never declared.
+        - name: NOETL_EHDB_RECOVERY_SOURCE
+          value: verify
+        - name: NOETL_EHDB_EMBEDDED
+          value: 'true'
+        # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
+        # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
+        # digest back here, so every pin in this directory was BEHIND live: a
+        # re-apply rolled prod back past shipped incident fixes.  Rather than
+        # keep a copy true, the copy is removed: this file declares SHAPE.
+        # Server-side apply leaves a field this manifest does not claim, which
+        # is what makes the omission safe on an EXISTING object (proved by
+        # server-side dry-run against live).  Creating from nothing still needs
+        # a digest: that comes from the release ledger, not from here.
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 6

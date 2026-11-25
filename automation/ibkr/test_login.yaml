@@ -125,7 +125,15 @@ workflow:
           export IBKR_PASSWORD="$password"
           export IBKR_2FA_CODE="$two_fa_code"
 
-          python /Users/akuksin/projects/noetl/noetl/scripts/ibkr/authenticate_gateway.py \
+          # Runs the script vendored into THIS repo (automation/ibkr/scripts/), by a
+          # repo-relative path. It previously pointed at
+          #   /Users/akuksin/projects/noetl/noetl/scripts/ibkr/authenticate_gateway.py
+          # which only existed on one developer's machine, and then stopped existing
+          # at all when noetl/noetl became a Rust-CLI wrapper (noetl/ai-meta#382).
+          # Recovered and vendored here: noetl/ai-meta#383.
+          script="$(dirname "$0")/scripts/authenticate_gateway.py"
+          [ -f "$script" ] || script="automation/ibkr/scripts/authenticate_gateway.py"
+          python "$script" \
             --gateway-url "$gateway_url" \
             --timeout-seconds "$timeout_seconds" \
             $paper_arg \

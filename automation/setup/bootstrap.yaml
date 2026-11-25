@@ -12,6 +12,9 @@ workload:
   image_name: noetl
   build_rust_cli: false
   deploy_gateway: true
+  # ClickHouse is a business-data store, not a NoETL core component (docs/decisions/ADR-0004).
+  # Core never needs it. Off by default; for log analytics use automation/iap/kind/log_analytics.yaml.
+  deploy_clickhouse: false
   kind_config: ci/kind/config.yaml
   objectstore_kind: seaweedfs
 workflow:
@@ -193,8 +196,10 @@ workflow:
       action: "{{ input.action }}"
   next:
   - step: deploy_clickhouse
+    when: '{{ workload.deploy_clickhouse == true }}'
+  - step: deploy_object_store
 - step: deploy_clickhouse
-  desc: Deploy ClickHouse observability stack
+  desc: Deploy the legacy ClickHouse stack (opt-in, deploy_clickhouse=true; not a core dependency)
   input:
     action: deploy
   tool:

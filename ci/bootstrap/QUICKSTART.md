@@ -150,12 +150,12 @@ EOF
 
 ```bash
 # Register playbook
-noetl register playbooks/hello_world.yaml \
-  --host localhost --port 8083
+noetl --host localhost --port 8083 \
+  register playbook -f playbooks/hello_world.yaml
 
-# Execute playbook
-noetl execute playbook hello_world \
-  --host localhost --port 8083
+# Run the playbook
+noetl --host localhost --port 8083 \
+  run hello_world -r distributed
 ```
 
 ## 9. Access Services
@@ -219,7 +219,7 @@ noetl run automation/infrastructure/kind.yaml --set action=status  # Check clust
 
 # Playbooks
 noetl register playbooks/                           # Register all playbooks
-noetl execute playbook hello_world                  # Execute specific playbook
+noetl run hello_world -r distributed               # Run a specific playbook
 
 # Logs
 kubectl logs -n noetl deployment/noetl-server       # NoETL server logs

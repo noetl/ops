@@ -1,0 +1,81 @@
+# Latency bench (ai-meta#557): the #155 probe shape: start, 10 python hops, end.
+# Adds the python subprocess cost to each hop; compare with seq10_noop.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_seq10_py, path: bench/seq10_py }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { hop: 0 } }
+    next: [ { step: s01 } ]
+  - step: s01
+    tool:
+      kind: python
+      input: { prev: '{{ start.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s02 } ]
+  - step: s02
+    tool:
+      kind: python
+      input: { prev: '{{ s01.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s03 } ]
+  - step: s03
+    tool:
+      kind: python
+      input: { prev: '{{ s02.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s04 } ]
+  - step: s04
+    tool:
+      kind: python
+      input: { prev: '{{ s03.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s05 } ]
+  - step: s05
+    tool:
+      kind: python
+      input: { prev: '{{ s04.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s06 } ]
+  - step: s06
+    tool:
+      kind: python
+      input: { prev: '{{ s05.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s07 } ]
+  - step: s07
+    tool:
+      kind: python
+      input: { prev: '{{ s06.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s08 } ]
+  - step: s08
+    tool:
+      kind: python
+      input: { prev: '{{ s07.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s09 } ]
+  - step: s09
+    tool:
+      kind: python
+      input: { prev: '{{ s08.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: s10 } ]
+  - step: s10
+    tool:
+      kind: python
+      input: { prev: '{{ s09.hop | default(0) }}' }
+      code: |
+        result = {"hop": int(prev) + 1}
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop, result: { hop: 11 } }

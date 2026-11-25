@@ -72,6 +72,39 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
+  # noetl/ehdb#332 — an INDEPENDENT failure domain for the EHDB tier store.
+  #
+  # Today NOETL_EHDB_TIER_SERVICE_DIR=/data/eventbus/ehdb-tier sits INSIDE
+  # NOETL_EVENT_BUS_WRITER_DIR=/data/eventbus, i.e. the tier and the event log
+  # it is meant to be independent of share one PVC. Losing that volume loses
+  # both, which makes "replicated" mean one disk and makes a quorum across
+  # replicas that share it a quorum of one (see ehdb#322).
+  #
+  # ⚠ Declaring and mounting this claim changes NOTHING on its own. The tier
+  # only moves when NOETL_EHDB_TIER_SERVICE_DIR is repointed AND the existing
+  # data is relocated — both owner-run, see
+  # ai-meta playbooks/324-cutover-prep/ehdb332-volume-separation.md
+  name: noetl-ehdb-tier-0-data
+  namespace: noetl
+  labels:
+    app: noetl-cmdbus-writer-0
+    component: ehdb-tier
+    managed-by: noetl
+    shard: '0'
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      # The tier held ~168 MB at the time of writing against a 50Gi shared
+      # volume. 30Gi is generous headroom without over-provisioning a claim
+      # that cannot be shrunk later.
+      storage: 30Gi
+  storageClassName: premium-rwo
+  volumeMode: Filesystem
+---
+kind: PersistentVolumeClaim
+metadata:
   name: noetl-eventbus-kv-0-data
   namespace: noetl
   annotations:

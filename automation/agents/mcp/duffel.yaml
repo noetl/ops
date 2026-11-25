@@ -38,10 +38,41 @@ metadata:
     - GSM secret `duffel-api-test` exists with the credential JSON loaded.
     - The worker pod's GSA `noetl-worker-mcp@shastaratech-noetl-prod.iam.gserviceaccount.com`
       holds roles/secretmanager.secretAccessor on `duffel-api-test`.
+
+    search_offers detail level (adiona/frontend#21). The normaliser used to keep
+    only an IATA code per segment and a single collapsed baggage verdict per
+    offer; it now carries the detail Duffel already returns and previously
+    discarded:
+    - Airline LOGOS: `logo_symbol_url` / `logo_lockup_url` on every segment
+      carrier, on the offer `owner`, and deduplicated on `offers[].airlines`.
+    - Per-segment detail: departure/arrival {iata, at, airport_name, city,
+      terminal, country_code, time_zone}, marketing AND operating carrier with
+      names, flight numbers, aircraft, cabin_class, duration, and technical
+      stops. Each leg of a connection is its own segment, as before.
+    - `baggage_options[]` / `conditions_options[]` — ARRAYS of options, each
+      tagged `scope`. "included" is the allowance the fare carries; "available"
+      is a PRICED add-on from `available_services`. The old collapsed
+      `baggage` / `conditions` DICTS are unchanged and still emitted, because
+      the itinerary planner's ranker reads them.
+    - `direction` on every offer: "one-way", or "outbound" / "inbound" for a
+      round trip. `round_trip_mode` defaults to "split" (two one-way searches,
+      each offer independently priced and bookable); "combined" runs one
+      round-trip search and returns whole-trip offers tagged "round-trip".
+      A combined fare is often cheaper than two one-ways — the default trades
+      that for per-leg selectability, and it is one argument to switch.
+    - Children are REAL aged passengers (`children: [{"age": 9}]`), which is
+      what Duffel prices a child fare from. A bare child COUNT is rejected
+      rather than silently priced as an adult.
+    - `max_offers` cap is 50 (was 10), applied per direction set.
+
+    `enrich_offers` is OFF by default and MUST stay off for the latency
+    budget: it costs one GET /air/offers/{id} per offer (~+6-7s per 10). With
+    it off, `available` baggage options and `conditions` are simply absent —
+    absent means UNKNOWN, never "not allowed", and nothing is guessed.
   agent: true
   exposes_as_mcp: true
   exposed_in_ui: false
-  version: "1.3"
+  version: "1.4"
   tags: [mcp, duffel, travel, flights, ai-os]
   terminal:
     visible: true
@@ -184,6 +215,10 @@ workflow:
                 raise RuntimeError(f"secret '{secret_name}' payload had no Duffel token (.data.token)")
             return bearer
 
+        # adiona/frontend#21 — the offer cap was 10 and hardcoded in three
+        # places.  It is one named constant now so it cannot drift again.
+        MAX_OFFERS = 50
+
         def _as_dict(value):
             return value if isinstance(value, dict) else {}
 
@@ -324,6 +359,12 @@ workflow:
                 return place.get("iata_code") or place.get("iataCode") or place.get("id") or "?"
             return "?"
 
+        # adiona/frontend#21 — airline LOGOS.  Duffel airline objects carry
+        # `logo_symbol_url` (square mark) and `logo_lockup_url` (wordmark);
+        # `_carrier()` kept ONLY the IATA code, so every downstream card had to
+        # omit the logo or invent a URL.  `_carrier_obj()` hands back the whole
+        # airline object and `_airline_card()` reduces it to the fields a card
+        # needs.  `_carrier()` is untouched so existing callers keep working.
         def _carrier(segment):
             for key in ("marketing_carrier", "operating_carrier"):
                 carrier = segment.get(key)
@@ -331,51 +372,309 @@ workflow:
                     return carrier.get("iata_code")
             return segment.get("marketing_carrier_iata_code") or segment.get("operating_carrier_iata_code") or "?"
 
+        def _carrier_obj(segment):
+            for key in ("marketing_carrier", "operating_carrier"):
+                carrier = segment.get(key)
+                if isinstance(carrier, dict) and carrier.get("iata_code"):
+                    return carrier
+            return {}
+
+        def _airline_card(carrier):
+            # Returns None when Duffel gave us nothing — an empty-string logo is
+            # a real "provider has no logo", None is "there was no airline
+            # object at all".  The caller can tell those apart; a {} cannot.
+            carrier = carrier if isinstance(carrier, dict) else {}
+            if not carrier.get("iata_code") and not carrier.get("name"):
+                return None
+            return {
+                "iata_code": carrier.get("iata_code") or "",
+                "name": carrier.get("name") or "",
+                "logo_symbol_url": carrier.get("logo_symbol_url") or "",
+                "logo_lockup_url": carrier.get("logo_lockup_url") or "",
+                "conditions_of_carriage_url": carrier.get("conditions_of_carriage_url") or "",
+                "id": carrier.get("id") or "",
+            }
+
+        def _place_card(place):
+            # adiona/frontend#21 — Duffel origin/destination objects already carry
+            # `name` (airport name) and `city_name`; `_normalise_segment` threw
+            # both away and kept the bare IATA code, so a segment could only ever
+            # render "JFK -> LHR".
+            place = place if isinstance(place, dict) else {}
+            city = place.get("city") if isinstance(place.get("city"), dict) else {}
+            return {
+                "iataCode": _iata(place),
+                "iata": _iata(place),
+                "airport_name": place.get("name") or "",
+                "city": place.get("city_name") or city.get("name") or "",
+                "city_iata": city.get("iata_code") or place.get("iata_city_code") or "",
+                "country_code": place.get("iata_country_code") or city.get("iata_country_code") or "",
+                "time_zone": place.get("time_zone") or "",
+                "type": place.get("type") or "",
+            }
+
+        def _segment_baggages(segment):
+            # ⚠ Duffel puts baggage allowances at
+            # slices[].segments[].passengers[].baggages — NOT on the offer's
+            # top-level `passengers`.  Reading the top level yields nothing and
+            # every offer then reads as "unknown baggage", which looks exactly
+            # like a provider that does not supply it.
+            out = []
+            for _p in _as_list(segment.get("passengers")):
+                if not isinstance(_p, dict):
+                    continue
+                for _b in _as_list(_p.get("baggages")):
+                    if isinstance(_b, dict):
+                        out.append(_b)
+            return out
+
         def _normalise_segment(segment):
             origin = segment.get("origin") if isinstance(segment.get("origin"), dict) else {}
             destination = segment.get("destination") if isinstance(segment.get("destination"), dict) else {}
+            marketing = segment.get("marketing_carrier") if isinstance(segment.get("marketing_carrier"), dict) else {}
+            operating = segment.get("operating_carrier") if isinstance(segment.get("operating_carrier"), dict) else {}
+            aircraft = segment.get("aircraft") if isinstance(segment.get("aircraft"), dict) else {}
+            departure = _place_card(origin)
+            arrival = _place_card(destination)
+            departure["at"] = segment.get("departing_at") or segment.get("departure_time") or "?"
+            arrival["at"] = segment.get("arriving_at") or segment.get("arrival_time") or "?"
+            departure["terminal"] = _text(segment.get("origin_terminal"))
+            arrival["terminal"] = _text(segment.get("destination_terminal"))
+            marketing_card = _airline_card(marketing)
+            operating_card = _airline_card(operating)
+            # A "technical stop" — the aircraft touches down mid-segment without
+            # the passenger changing plane.  Distinct from a connection, which is
+            # an extra SEGMENT.  Both are real; conflating them undercounts.
+            technical = []
+            for _s in _as_list(segment.get("stops")):
+                if not isinstance(_s, dict):
+                    continue
+                technical.append({
+                    "airport": _place_card(_s.get("airport")),
+                    "arriving_at": _s.get("arriving_at") or "",
+                    "departing_at": _s.get("departing_at") or "",
+                    "duration": _duration(_s.get("duration")),
+                })
             return {
-                "departure": {"iataCode": _iata(origin), "at": segment.get("departing_at") or segment.get("departure_time") or "?"},
-                "arrival": {"iataCode": _iata(destination), "at": segment.get("arriving_at") or segment.get("arrival_time") or "?"},
+                "id": segment.get("id") or "",
+                "departure": departure,
+                "arrival": arrival,
                 "carrierCode": _carrier(segment),
+                "carrier": marketing_card.get("iata_code") if marketing_card else _carrier(segment),
+                "carrier_name": (marketing_card or {}).get("name") or (operating_card or {}).get("name") or "",
+                "marketing_carrier": marketing_card,
+                "operating_carrier": operating_card,
+                "operating_carrier_name": (operating_card or {}).get("name") or "",
                 "number": _text(segment.get("marketing_carrier_flight_number") or segment.get("flight_number")),
+                "operating_flight_number": _text(segment.get("operating_carrier_flight_number")),
+                "aircraft": {"iata_code": aircraft.get("iata_code") or "", "name": aircraft.get("name") or ""} if aircraft else None,
+                "cabin_class": _text(segment.get("cabin_class")) or None,
                 "duration": _duration(segment.get("duration")),
-                "numberOfStops": 0,
+                "distance": _text(segment.get("distance")) or None,
+                "technical_stops": technical,
+                "numberOfStops": len(technical),
             }
 
-        def _normalise_offer(offer):
+        # adiona/frontend#21 Tier A — baggage and fare conditions as ARRAYS of
+        # options rather than a single collapsed verdict.  Two scopes appear:
+        #   "included"  — the allowance the fare already carries
+        #                 (slices[].segments[].passengers[].baggages)
+        #   "available" — a PRICED add-on from `available_services`, which only
+        #                 exists on the single-offer GET /air/offers/{id}.  With
+        #                 enrichment off this scope is simply absent; it is never
+        #                 guessed.
+        BAGGAGE_TYPES = ("checked", "carry_on")
+
+        def _collect_included_baggages(offer):
+            # `_baggages` is set ONLY by enrichment, from the single-offer GET.
+            # When it is present it is authoritative and used ALONE: merging it
+            # with whatever the list response carried would emit two
+            # contradictory allowances for the same bag type (the list's stale
+            # "checked: 0" next to the enriched "checked: 1") and a reader has
+            # no way to tell which one the fare actually grants.
+            enriched = [b for b in _as_list(offer.get("_baggages")) if isinstance(b, dict)]
+            if enriched:
+                return enriched
+            bags = []
+            for _p in _as_list(offer.get("passengers")):
+                if isinstance(_p, dict):
+                    bags.extend(b for b in _as_list(_p.get("baggages")) if isinstance(b, dict))
+            for _sl in _as_list(offer.get("slices")):
+                if not isinstance(_sl, dict):
+                    continue
+                for _sg in _as_list(_sl.get("segments")):
+                    if isinstance(_sg, dict):
+                        bags.extend(_segment_baggages(_sg))
+            return [b for b in bags if isinstance(b, dict)]
+
+        def _baggage_options(offer):
+            out = []
+            seen = set()
+
+            def _push(entry):
+                key = (entry.get("scope"), entry.get("type"), entry.get("quantity"),
+                       str(entry.get("amount")), entry.get("service_id"))
+                if key in seen:
+                    return
+                seen.add(key)
+                out.append(entry)
+
+            for _b in _collect_included_baggages(offer):
+                _t = str(_b.get("type") or "")
+                if _t not in BAGGAGE_TYPES:
+                    continue
+                try:
+                    _q = int(_b.get("quantity") or 0)
+                except (TypeError, ValueError):
+                    _q = 0
+                _push({
+                    "scope": "included",
+                    "type": _t,
+                    "quantity": _q,
+                    "amount": None,
+                    "currency": None,
+                    "service_id": None,
+                })
+            for _svc in _as_list(offer.get("available_services")):
+                if not isinstance(_svc, dict) or str(_svc.get("type") or "") != "baggage":
+                    continue
+                meta = _svc.get("metadata") if isinstance(_svc.get("metadata"), dict) else {}
+                try:
+                    _q = int(_svc.get("maximum_quantity") or 1)
+                except (TypeError, ValueError):
+                    _q = 1
+                _push({
+                    "scope": "available",
+                    "type": str(meta.get("type") or "checked"),
+                    "quantity": _q,
+                    "amount": _svc.get("total_amount"),
+                    "currency": _svc.get("total_currency"),
+                    "service_id": _svc.get("id"),
+                    "max_weight_kg": meta.get("maximum_weight_kg"),
+                    "max_height_cm": meta.get("maximum_height_cm"),
+                    "max_length_cm": meta.get("maximum_length_cm"),
+                    "max_depth_cm": meta.get("maximum_depth_cm"),
+                    "segment_ids": _as_list(_svc.get("segment_ids")),
+                    "passenger_ids": _as_list(_svc.get("passenger_ids")),
+                })
+            return out
+
+        CONDITION_TERMS = (("change_before_departure", "change"), ("refund_before_departure", "refund"))
+
+        def _conditions_options(offer):
+            # A null term means the fare does not STATE it: unknown, NOT
+            # "not allowed".  `allowed: None` is carried through so a caller can
+            # tell unknown from known-false and never claims a term Duffel did
+            # not give.  When the container is absent entirely we emit nothing.
+            out = []
+
+            def _emit(scope, container, extra):
+                if not isinstance(container, dict):
+                    return
+                for key, kind in CONDITION_TERMS:
+                    term = container.get(key)
+                    entry = {"scope": scope, "type": kind, "key": key,
+                             "allowed": None, "penalty_amount": None, "penalty_currency": None}
+                    if isinstance(term, dict):
+                        entry["allowed"] = bool(term.get("allowed"))
+                        entry["penalty_amount"] = term.get("penalty_amount")
+                        entry["penalty_currency"] = term.get("penalty_currency")
+                    entry.update(extra)
+                    out.append(entry)
+
+            _emit("offer", offer.get("conditions"), {})
+            for _sl in _as_list(offer.get("slices")):
+                if isinstance(_sl, dict):
+                    _emit("slice", _sl.get("conditions"), {"slice_id": _sl.get("id"), "slice_direction": _sl.get("_direction") or ""})
+            return out
+
+        def _normalise_offer(offer, direction=""):
             slices = _as_list(offer.get("slices"))
             itineraries = []
             validating = []
+            airlines = []
+            airline_codes = set()
             for item in slices:
-                segments = [_normalise_segment(seg) for seg in _as_list(item.get("segments")) if isinstance(seg, dict)]
+                raw_segments = [seg for seg in _as_list(item.get("segments")) if isinstance(seg, dict)]
+                segments = [_normalise_segment(seg) for seg in raw_segments]
                 for seg in segments:
                     code = seg.get("carrierCode")
                     if code and code != "?" and code not in validating:
                         validating.append(code)
+                    for card in (seg.get("marketing_carrier"), seg.get("operating_carrier")):
+                        if card and card.get("iata_code") and card["iata_code"] not in airline_codes:
+                            airline_codes.add(card["iata_code"])
+                            airlines.append(card)
+                item_origin = item.get("origin") if isinstance(item.get("origin"), dict) else {}
+                item_destination = item.get("destination") if isinstance(item.get("destination"), dict) else {}
                 itineraries.append({
+                    "id": item.get("id") or "",
+                    "direction": item.get("_direction") or direction or "",
+                    "origin": _place_card(item_origin),
+                    "destination": _place_card(item_destination),
                     "duration": _duration(item.get("duration")),
+                    # A connection is an extra SEGMENT; 3 segments == 2 stops.
+                    "stops": max(0, len(segments) - 1),
                     "segments": segments,
                 })
+            # Tier A dict form — kept BYTE-COMPATIBLE with the itinerary
+            # planner's ranker, which reads baggage.checked / conditions.refundable.
+            # The richer arrays live alongside it in `baggage_options` /
+            # `conditions_options`; changing these two in place would have
+            # silently broken the planner's exclusion logic.
+            _bag = {"checked": 0, "carry_on": 0, "known": False}
+            for _b in _collect_included_baggages(offer):
+                _t = str(_b.get("type") or "")
+                try:
+                    _q = int(_b.get("quantity") or 0)
+                except (TypeError, ValueError):
+                    _q = 0
+                if _t in _bag:
+                    _bag[_t] = max(_bag[_t], _q)
+                    _bag["known"] = True
+            _cond = offer.get("conditions") if isinstance(offer.get("conditions"), dict) else {}
+
+            def _term(v):
+                if isinstance(v, dict):
+                    return bool(v.get("allowed"))
+                return None
+
+            owner = _airline_card(offer.get("owner"))
+            baggage_options = _baggage_options(offer)
+            conditions_options = _conditions_options(offer)
             return {
                 "id": offer.get("id"),
                 "source": "duffel",
+                "direction": offer.get("_direction") or direction or "",
                 "price": {
                     "total": offer.get("total_amount") or offer.get("base_amount") or "?",
                     "currency": offer.get("total_currency") or offer.get("base_currency") or "USD",
+                    "base": offer.get("base_amount"),
+                    "tax": offer.get("tax_amount"),
                 },
                 "itineraries": itineraries,
                 "validatingAirlineCodes": validating,
+                "airlines": airlines,
+                "owner": owner,
                 "expires_at": offer.get("expires_at"),
                 "live_mode": offer.get("live_mode"),
+                "passenger_count": len(_as_list(offer.get("passengers"))) or None,
+                "baggage": {"checked": _bag["checked"], "carry_on": _bag["carry_on"],
+                            "known": _bag["known"]},
+                "conditions": {"changeable": _term(_cond.get("change_before_departure")),
+                               "refundable": _term(_cond.get("refund_before_departure"))},
+                "baggage_options": baggage_options,
+                "baggage_known": bool(baggage_options),
+                "conditions_options": conditions_options,
+                "conditions_known": bool(conditions_options),
+                "fare_brand": offer.get("fare_brand_name"),
             }
-
         def _tools_list():
             tools = [
                 {
                     "name": "search_offers",
                     "title": "Search flight offers",
-                    "description": "Duffel flight offers search. Required: origin, destination, departure_date. Optional: return_date, adults, cabin_class.",
+                    "description": "Duffel flight offers search. Required: origin, destination, departure_date. Optional: return_date, adults, children (aged), cabin_class, max_offers, round_trip_mode, enrich_offers.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["origin", "destination", "departure_date"],
@@ -384,8 +683,26 @@ workflow:
                             "destination": {"type": "string", "description": "IATA airport or city code"},
                             "departure_date": {"type": "string", "description": "YYYY-MM-DD"},
                             "return_date": {"type": "string", "description": "YYYY-MM-DD"},
-                            "adults": {"type": "integer", "minimum": 1, "default": 1},
+                            "adults": {"type": "integer", "minimum": 1, "maximum": 9, "default": 1},
+                            "children": {
+                                "type": "array",
+                                "description": "Child passengers as real aged travellers. A bare count is REJECTED: Duffel prices a child fare from the age and this provider will not invent one.",
+                                "items": {"type": "object", "required": ["age"], "properties": {"age": {"type": "integer", "minimum": 0, "maximum": 17}}},
+                            },
                             "cabin_class": {"type": "string", "enum": ["economy", "premium_economy", "business", "first"], "default": "economy"},
+                            "max_offers": {"type": "integer", "minimum": 1, "maximum": 50, "default": 50, "description": "Cap per direction set."},
+                            "max_connections": {"type": "integer", "minimum": 0, "description": "Duffel search parameter (0 = nonstop only)."},
+                            "round_trip_mode": {
+                                "type": "string",
+                                "enum": ["split", "combined"],
+                                "default": "split",
+                                "description": "split = two one-way searches, each offer independently priced and tagged outbound/inbound. combined = one round-trip search, whole-trip offers tagged round-trip.",
+                            },
+                            "enrich_offers": {
+                                "type": "string",
+                                "default": "0",
+                                "description": "\"1\" adds one GET /air/offers/{id} per offer for priced baggage/conditions options. OFF by default — it costs ~+6-7s per 10 offers.",
+                            },
                         },
                     },
                 },
@@ -482,63 +799,213 @@ workflow:
             ]
             return _ok("tools/list", {"tools": tools, "tool_count": len(tools)}, f"Duffel MCP - {len(tools)} tools available", {"tool_count": len(tools)})
 
+        # adiona/frontend#21 — children are REAL aged passengers.
+        # Duffel prices a child fare from the AGE; the previous
+        # `[{"type": "adult"} for _ in range(adults)]` priced a family of four
+        # as four adults, which overstates the fare.  There is no safe default
+        # age, so a bare child COUNT is rejected rather than guessed.
+        def _passenger_payload(args):
+            explicit = args.get("passengers")
+            if isinstance(explicit, list) and explicit:
+                return explicit, None
+            adults = _cap(args.get("adults"), default=1, maximum=9)
+            pax = [{"type": "adult"} for _ in range(adults)]
+            raw_children = args.get("children")
+            if isinstance(raw_children, bool):
+                raw_children = []
+            elif isinstance(raw_children, (int, float)):
+                if int(raw_children) > 0:
+                    return None, ("children must carry an age: pass "
+                                  "children: [{\"age\": 9}], not a count. Duffel prices a "
+                                  "child fare from the age and this provider will not invent one.")
+                raw_children = []
+            for child in _as_list(raw_children):
+                age = child.get("age") if isinstance(child, dict) else child
+                try:
+                    age = int(age)
+                except (TypeError, ValueError):
+                    return None, "each child needs an integer age between 0 and 17"
+                if age < 0 or age > 17:
+                    return None, "child age must be between 0 and 17"
+                pax.append({"age": age})
+            if not pax:
+                return None, "at least one passenger is required"
+            if len(pax) > 9:
+                return None, "Duffel accepts at most 9 passengers per search"
+            return pax, None
+
+        def _offer_request(slices, pax, cabin, max_connections=None):
+            payload = {"data": {"slices": slices, "passengers": pax, "cabin_class": cabin}}
+            if max_connections is not None:
+                payload["data"]["max_connections"] = max_connections
+            # search_offers is idempotent-safe (it only creates a throwaway
+            # offer_request — no booking, no charge), so retry transient 5xx.
+            ok, status_code, body = _request("POST", "/air/offer_requests", payload=payload,
+                                             params={"return_offers": "true"}, retryable=True)
+            data = body.get("data") if isinstance(body, dict) else {}
+            data = data if isinstance(data, dict) else {}
+            return ok, status_code, body, data, _as_list(data.get("offers"))
+
+        # adiona/frontend#21 Tier A — enrich one offer with GET /air/offers/{id}.
+        #
+        # The offer_requests LIST response carries neither
+        # `passengers[].baggages`, `conditions`, nor `available_services`; only
+        # the single-offer GET does.  OFF by default: it costs one GET per
+        # offer and measured +6-7s for 10 offers, so the default search latency
+        # is unchanged.  Strictly BEST-EFFORT — a failed enrichment leaves the
+        # offer's fields absent, which every reader already treats as
+        # "unknown", so a search never fails because enrichment failed.
+        def _enrich_offer(offer):
+            oid = offer.get("id")
+            if not oid:
+                return False, ""
+            try:
+                eok, _esc, ebody = _request("GET", "/air/offers/" + urllib.parse.quote(str(oid), safe=""),
+                                            params={"return_available_services": "true"}, retryable=True)
+            except Exception as exc:  # noqa: BLE001 — enrichment never breaks search
+                return False, "%s: %s" % (type(exc).__name__, exc)
+            if not eok or not isinstance(ebody, dict):
+                return False, "enrich HTTP %s" % _esc
+            full = ebody.get("data")
+            if not isinstance(full, dict):
+                return False, "enrich payload had no data"
+            # Only the fields we need; pricing and itineraries stay as the list
+            # response gave them, so enrichment cannot alter what was quoted.
+            bags = []
+            for sl in _as_list(full.get("slices")):
+                if not isinstance(sl, dict):
+                    continue
+                for sg in _as_list(sl.get("segments")):
+                    if isinstance(sg, dict):
+                        bags.extend(_segment_baggages(sg))
+            if bags:
+                offer["_baggages"] = bags
+            for key in ("passengers", "conditions", "fare_brand_name", "available_services"):
+                if full.get(key) is not None:
+                    offer[key] = full.get(key)
+            return True, ""
+
         def _search_offers(args):
             origin = _text(args.get("origin")).upper()
             destination = _text(args.get("destination")).upper()
             departure_date = _text(args.get("departure_date") or args.get("departureDate"))
             if not origin or not destination or not departure_date:
                 return _error("search_offers", "origin, destination, and departure_date are required")
-            adults = _cap(args.get("adults"), default=1, maximum=9)
+            pax, pax_error = _passenger_payload(args)
+            if pax_error:
+                return _error("search_offers", pax_error, code="validation_error")
             cabin = _text(args.get("cabin_class") or args.get("cabin") or "economy").lower()
             if cabin == "premium-economy":
                 cabin = "premium_economy"
             if cabin not in ("economy", "premium_economy", "business", "first"):
                 cabin = "economy"
-            slices = [{"origin": origin, "destination": destination, "departure_date": departure_date}]
             return_date = _text(args.get("return_date") or args.get("returnDate"))
-            if return_date:
-                slices.append({"origin": destination, "destination": origin, "departure_date": return_date})
-            payload = {
-                "data": {
-                    "slices": slices,
-                    "passengers": [{"type": "adult"} for _ in range(adults)],
-                    "cabin_class": cabin,
-                }
-            }
-            # search_offers is idempotent-safe (it only creates a throwaway
-            # offer_request — no booking, no charge), so retry transient 5xx.
-            ok, status_code, body = _request("POST", "/air/offer_requests", payload=payload, params={"return_offers": "true"}, retryable=True)
-            data = body.get("data") if isinstance(body, dict) else {}
-            offers = _as_list(data.get("offers") if isinstance(data, dict) else [])
-            cap = _cap(args.get("max_offers"), default=10, maximum=10)
-            normalised = [_normalise_offer(offer) for offer in offers[:cap] if isinstance(offer, dict)]
-            if not ok:
-                if _is_transient_provider_error(status_code, body):
-                    return _error("search_offers", "Duffel search_offers failed", body, status_code,
-                                  code="provider_unavailable", user_message=PROVIDER_UNAVAILABLE_MSG)
-                return _error("search_offers", "Duffel search_offers failed", body, status_code)
+            out_slice = {"origin": origin, "destination": destination, "departure_date": departure_date}
+            in_slice = {"origin": destination, "destination": origin, "departure_date": return_date}
+            # adiona/frontend#21 — a round trip is returned as TWO DIRECTION SETS by
+            # default (`round_trip_mode: "split"`): two independent one-way
+            # searches, so every offer is priced and bookable on its own and can
+            # carry a truthful `direction`.  A Duffel round-trip offer prices both
+            # slices TOGETHER and that total cannot be split per leg without
+            # inventing the split, which is why `combined` is opt-in: it runs one
+            # round-trip search and returns whole-trip offers tagged
+            # `direction: "round-trip"` carrying both slices.  Combined fares are
+            # often cheaper than two one-ways — that is the trade-off of the
+            # default, not a bug.
+            mode = _text(args.get("round_trip_mode") or "split").lower()
+            if mode not in ("split", "combined"):
+                mode = "split"
+            if return_date and mode == "combined":
+                legs = [("round-trip", [out_slice, in_slice])]
+            elif return_date:
+                legs = [("outbound", [out_slice]), ("inbound", [in_slice])]
+            else:
+                legs = [("one-way", [out_slice])]
+            max_connections = None
+            if args.get("max_connections") is not None:
+                try:
+                    max_connections = max(0, int(args.get("max_connections")))
+                except (TypeError, ValueError):
+                    max_connections = None
+            # adiona/frontend#21 — cap raised 10 -> 50.  The cap is per direction
+            # set, so a round trip returns up to 50 outbound and 50 inbound.
+            cap = _cap(args.get("max_offers"), default=MAX_OFFERS, maximum=MAX_OFFERS)
+            enrich_on = _text(args.get("enrich_offers") or "0").lower() not in ("0", "false", "no", "")
+            normalised = []
+            by_direction = {}
+            raw_total = 0
+            last_status = 0
+            request_ids = []
+            enrich_ok = 0
+            enrich_err = 0
+            enrich_last = ""
+            for direction, slices in legs:
+                ok, status_code, body, data, offers = _offer_request(slices, pax, cabin, max_connections)
+                last_status = status_code
+                if not ok:
+                    # A half-result silently missing the return flights is worse
+                    # than a clean failure, so a failed leg fails the search and
+                    # names which leg failed.
+                    detail = {"leg": direction, "body": body}
+                    if _is_transient_provider_error(status_code, body):
+                        return _error("search_offers", "Duffel search_offers failed on the %s leg" % direction,
+                                      detail, status_code, code="provider_unavailable",
+                                      user_message=PROVIDER_UNAVAILABLE_MSG)
+                    return _error("search_offers", "Duffel search_offers failed on the %s leg" % direction,
+                                  detail, status_code)
+                if data.get("id"):
+                    request_ids.append(data.get("id"))
+                raw_total += len(offers)
+                shown = [offer for offer in offers[:cap] if isinstance(offer, dict)]
+                for offer in shown:
+                    offer["_direction"] = direction
+                    for sl, slice_payload in zip(_as_list(offer.get("slices")), slices):
+                        if isinstance(sl, dict):
+                            sl["_direction"] = direction if direction != "round-trip" else (
+                                "outbound" if slice_payload is out_slice else "inbound")
+                    if enrich_on:
+                        eok, eerr = _enrich_offer(offer)
+                        if eok:
+                            enrich_ok += 1
+                        else:
+                            enrich_err += 1
+                            if eerr:
+                                enrich_last = eerr
+                leg_offers = [_normalise_offer(offer, direction) for offer in shown]
+                by_direction[direction] = len(leg_offers)
+                normalised.extend(leg_offers)
             currency = None
             for offer in normalised:
                 currency = (offer.get("price") or {}).get("currency")
                 if currency:
                     break
+            trip_type = "round_trip" if return_date else "one_way"
             return _ok(
                 "search_offers",
                 {
                     "source": "duffel",
                     "duffel_env": duffel_env,
                     "ok": True,
-                    "status_code": status_code,
-                    "offer_request_id": data.get("id") if isinstance(data, dict) else None,
+                    "status_code": last_status,
+                    "offer_request_id": request_ids[0] if request_ids else None,
+                    "offer_request_ids": request_ids,
                     "offers": normalised,
                     "offers_total": len(normalised),
-                    "raw_offers_total": len(offers),
-                    "meta": {"count": len(normalised), "source": "duffel", "currency": currency},
+                    "raw_offers_total": raw_total,
+                    "trip_type": trip_type,
+                    "round_trip_mode": mode if return_date else None,
+                    "directions": [direction for direction, _ in legs],
+                    "offers_by_direction": by_direction,
+                    "enriched": enrich_on,
+                    "enrich_ok": enrich_ok,
+                    "enrich_err": enrich_err,
+                    "enrich_last_error": enrich_last,
+                    "meta": {"count": len(normalised), "source": "duffel", "currency": currency,
+                             "max_offers": cap, "passengers": len(pax)},
                 },
                 f"{len(normalised)} Duffel flight offer(s)",
-                {"status_code": status_code, "offers_total": len(normalised)},
+                {"status_code": last_status, "offers_total": len(normalised)},
             )
-
         def _get_offer(args):
             offer_id = _text(args.get("offer_id") or args.get("id"))
             if not offer_id:
@@ -770,8 +1237,21 @@ workflow:
             "_duration": _duration,
             "_iata": _iata,
             "_carrier": _carrier,
+            "_carrier_obj": _carrier_obj,
+            "_airline_card": _airline_card,
+            "_place_card": _place_card,
+            "_segment_baggages": _segment_baggages,
+            "_collect_included_baggages": _collect_included_baggages,
+            "_baggage_options": _baggage_options,
+            "_conditions_options": _conditions_options,
             "_normalise_segment": _normalise_segment,
             "_normalise_offer": _normalise_offer,
+            "_passenger_payload": _passenger_payload,
+            "_offer_request": _offer_request,
+            "_enrich_offer": _enrich_offer,
+            "MAX_OFFERS": MAX_OFFERS,
+            "BAGGAGE_TYPES": BAGGAGE_TYPES,
+            "CONDITION_TERMS": CONDITION_TERMS,
             "_tools_list": _tools_list,
             "_search_offers": _search_offers,
             "_get_offer": _get_offer,

@@ -1,0 +1,13 @@
+# The embedded ehgraph `noetl-cluster` graph as a catalog MCP server (RFC interop/AI-MCP
+# Phase 2). A `kind: mcp` step that says `server: mcp/noetl-cluster` and no endpoint is
+# resolved by the worker to `spec.url` at dispatch.
+apiVersion: noetl.io/v2
+kind: Mcp
+metadata:
+  name: noetl-cluster
+  path: mcp/noetl-cluster
+  description: The server's embedded ehgraph topology graph (noetl/ehgraph E2/E4).
+spec:
+  url: http://noetl-server-rust.noetl.svc.cluster.local:8082/ehgraph/noetl-cluster/mcp
+  protocol: mcp/1.0
+  tools: []

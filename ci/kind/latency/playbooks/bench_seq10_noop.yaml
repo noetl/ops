@@ -1,0 +1,41 @@
+# Latency bench (ai-meta#557): 12 sequential noop steps (start, s01..s10, end).
+# Tool time ~0, so every millisecond between steps is orchestration.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_seq10_noop, path: bench/seq10_noop }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { hop: 0 } }
+    next: [ { step: s01 } ]
+  - step: s01
+    tool: { kind: noop, result: { hop: 1 } }
+    next: [ { step: s02 } ]
+  - step: s02
+    tool: { kind: noop, result: { hop: 2 } }
+    next: [ { step: s03 } ]
+  - step: s03
+    tool: { kind: noop, result: { hop: 3 } }
+    next: [ { step: s04 } ]
+  - step: s04
+    tool: { kind: noop, result: { hop: 4 } }
+    next: [ { step: s05 } ]
+  - step: s05
+    tool: { kind: noop, result: { hop: 5 } }
+    next: [ { step: s06 } ]
+  - step: s06
+    tool: { kind: noop, result: { hop: 6 } }
+    next: [ { step: s07 } ]
+  - step: s07
+    tool: { kind: noop, result: { hop: 7 } }
+    next: [ { step: s08 } ]
+  - step: s08
+    tool: { kind: noop, result: { hop: 8 } }
+    next: [ { step: s09 } ]
+  - step: s09
+    tool: { kind: noop, result: { hop: 9 } }
+    next: [ { step: s10 } ]
+  - step: s10
+    tool: { kind: noop, result: { hop: 10 } }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop, result: { hop: 11 } }

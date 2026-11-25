@@ -1,0 +1,10 @@
+# Hot-reload e2e (noetl/ai-meta#548 Phase 3): a slow child, re-registered mid-loop.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: catalog_hot_child, path: tests/catalog_hot/child }
+workflow:
+  - step: start
+    tool: { kind: shell, command: "sleep 3" }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop, result: { says: "SAYS" } }

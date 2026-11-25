@@ -1,0 +1,173 @@
+# NoETL dedicated AUTH worker pool — PROD (noetl/ai-meta#562).
+# Serves ONLY noetl.commands.auth.> : executions the server routes there via
+# NOETL_POOL_ROUTES=api_integration/auth0/=auth (server v3.164+). Isolates the
+# auth fallback (check_playbook_access etc.) from the shared user pool, which
+# KEDA scales under load. Fixed 2 replicas (HA, no autoscaler; auth is light).
+# Same image/env as noetl-worker-rust except pool name + filter subject.
+# Rollback: unset NOETL_POOL_ROUTES on the server FIRST, let in-flight auth runs
+# drain (seconds), then delete this deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-worker-auth-pool
+  namespace: noetl
+  annotations:
+    kubernetes.io/change-cause: 'ai-meta#562 dedicated auth pool: serves noetl.commands.auth.> (server NOETL_POOL_ROUTES=api_integration/auth0/=auth)'
+  labels:
+    app: noetl-worker-auth-pool
+    component: worker
+    runtime: rust
+    worker-pool: worker-auth-pool
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 2
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: noetl-worker-auth-pool
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: noetl-worker-auth-pool
+        component: worker
+        runtime: rust
+        worker-pool: worker-auth-pool
+    spec:
+      containers:
+      - env:
+        - name: WORKER_POOL_NAME
+          value: worker-auth-pool
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: NOETL_SERVER_URL
+          value: http://noetl-server-rust.noetl.svc.cluster.local:8082
+        - name: WORKER_HEARTBEAT_INTERVAL
+          value: '15'
+        - name: WORKER_MAX_CONCURRENT
+          value: '4'
+        - name: WORKER_METRICS_BIND
+          value: 0.0.0.0:9090
+        - name: RUST_LOG
+          value: info,noetl_worker=info,noetl_executor=info
+        - name: NOETL_IPC_CACHE_BUDGET_BYTES
+          value: '268435456'
+        - name: NOETL_RESULT_URI_RESOLVE
+          value: 'true'
+        - name: NOETL_RESULT_PRODUCER_STAGE
+          value: 'true'
+        - name: NOETL_COMMAND_BUS
+          value: ehdb
+        - name: NOETL_COMMAND_BUS_HOST
+          value: 'false'
+        - name: NOETL_COMMAND_SHARD_COUNT
+          value: '1'
+        - name: NOETL_COMMAND_BUS_CLAIM_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9101
+        - name: NOETL_FEED_FILTER_SUBJECT
+          value: noetl.commands.auth.>
+        - name: NOETL_EHDB_ENABLED
+          value: 'true'
+        - name: NOETL_EHDB_MODE
+          value: local_reference
+        - name: NOETL_EHDB_CLIENT_ROLE
+          value: worker
+        - name: NOETL_EHDB_LOCAL_REFERENCE_LOG
+          value: /tmp/ehdb/ref.jsonl
+        - name: NOETL_EHDB_EVENTLOG
+          value: primary
+        - name: NOETL_EHDB_PROJECTION
+          value: shadow
+        - name: NOETL_EHDB_KV
+          value: shadow
+        - name: NOETL_EHDB_OBJECT
+          value: shadow
+        - name: NOETL_EHDB_TIER_QUERY_SOURCE
+          value: service
+        - name: NOETL_EHDB_TIER_SERVICE_ADDR
+          value: noetl-cmdbus-writer-0.noetl.svc.cluster.local:9110
+        - name: NOETL_EHDB_EVENTLOG_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+          value: server
+        - name: NOETL_EXECUTION_FAIL_ON_STEP_ERROR
+          value: 'true'
+        - name: NOETL_WORKER_AGENT_TOOL
+          value: 'true'
+        - name: NOETL_WORKER_LOCAL_DRIVE
+          value: 'true'
+        - name: NOETL_EXECUTION_WAIT
+          value: 'true'
+        - name: NOETL_PLAYBOOK_AWAIT_PARK
+          value: 'true'
+        - name: NOETL_WARM_ORCHESTRATE_PLUGIN
+          value: 'true'
+        - name: NOETL_WASM_RESOLVE_TTL_MS
+          value: '30000'
+        image: us-central1-docker.pkg.dev/shastaratech-noetl-prod/noetl/noetl-worker-rust@sha256:e5b1d72c2a2f32d3e09f192c0898acaa16039398cfbc0fa31888f65d278adea0
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          successThreshold: 1
+          tcpSocket:
+            port: 9090
+          timeoutSeconds: 1
+        name: noetl-worker
+        ports:
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 6
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 9090
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: '2'
+            ephemeral-storage: 1Gi
+            memory: 768Mi
+          requests:
+            cpu: 250m
+            ephemeral-storage: 1Gi
+            memory: 256Mi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: noetl-worker
+      serviceAccountName: noetl-worker
+      terminationGracePeriodSeconds: 180
+      tolerations:
+      - effect: NoSchedule
+        key: kubernetes.io/arch
+        operator: Equal
+        value: amd64
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 320Mi
+        name: dshm
