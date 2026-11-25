@@ -1,0 +1,20 @@
+# Latency bench (ai-meta#557/#558): one step with an ordered 4-tool list.
+# The list compiles to ONE task_sequence command, run in-process by the worker
+# (orchestrate-core commands.rs; tools task_sequence.rs): one command.issued /
+# command.claimed for `work`, not four. report.py's per-step counts prove it.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_toollist, path: bench/toollist }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: work } ]
+  - step: work
+    tool:
+      - a: { kind: noop, result: { v: 1 } }
+      - b: { kind: rhai, code: "#{ v: 2 }" }
+      - c: { kind: noop, result: { v: 3 } }
+      - d: { kind: rhai, code: "#{ v: 4 }" }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

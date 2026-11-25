@@ -1,0 +1,53 @@
+# kind: mcp end to end (RFC interop/AI-MCP Phase 2). Two authenticated calls against the
+# embedded ehgraph MCP endpoint, found through the catalog:
+#   upsert  `auth: <keychain alias>`   (worker resolves the bearer credential)
+#   read    `headers:` with a `{{ keychain.<alias>.token }}` template
+# Both set `on_provider_error: fail`, so a refused call fails the run instead of
+# completing it with an error buried in the result.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: mcp_ehgraph_roundtrip
+  path: tests/mcp/ehgraph_roundtrip
+workload:
+  node_id: "e2e:mcp-phase2"
+workflow:
+  - step: start
+    tool:
+      kind: noop
+    next:
+      - step: upsert
+  - step: upsert
+    tool:
+      kind: mcp
+      server: mcp/noetl-cluster
+      auth: e2e_ehgraph_mcp
+      on_provider_error: fail
+      tool: graph.upsert
+      arguments:
+        namespace: e2e
+        source: noetl-e2e
+        execution_id: "e2e-{{ execution_id }}"
+        nodes:
+          - id: "{{ workload.node_id }}"
+            type: E2E
+            props:
+              phase: 2
+    next:
+      - step: read
+  - step: read
+    tool:
+      kind: mcp
+      server: mcp/noetl-cluster
+      headers:
+        Authorization: "Bearer {{ keychain.e2e_ehgraph_mcp.token }}"
+      on_provider_error: fail
+      tool: graph.node
+      arguments:
+        namespace: e2e
+        id: "{{ workload.node_id }}"
+    next:
+      - step: end
+  - step: end
+    tool:
+      kind: noop

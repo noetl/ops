@@ -1,0 +1,33 @@
+# Build plan item 8: an agent whose tools are PLAYBOOKS, run on the cluster.
+# The worker hosts the loop; each tool call is a child execution on the pools.
+# The stub model calls every offered tool on turn 1 (string inputs = "from-model")
+# and echoes the tool_results on turn 2.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: agents_d8_playbook_tools, path: tests/agents/d8_playbook_tools }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: ask } ]
+  - step: ask
+    tool:
+      kind: agent
+      framework: claude
+      model: stub
+      prompt: greet someone, then try the broken tool
+      endpoint: http://agents-stubs.noetl.svc.cluster.local:8081
+      auth: { type: api_key, credential: e2e_agents_model }
+      max_turns: 4
+      tools:
+        - name: greet
+          description: Greets whoever is named.
+          input_schema: { type: object, properties: { who: { type: string } }, required: [who] }
+          playbook: tests/agents/echo
+          result_step: greet
+        - name: broken
+          description: Always fails.
+          input_schema: { type: object, properties: { why: { type: string } } }
+          playbook: tests/agents/d8_broken
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

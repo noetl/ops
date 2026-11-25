@@ -1,5 +1,10 @@
 # ClickHouse Integration for NoETL
 
+> **Superseded for local kind by [`../log-analytics/`](../log-analytics/README.md)**, which is
+> provisioned by `automation/iap/kind/log_analytics.yaml`: ClickHouse community edition, Vector
+> pod-log capture and the ClickHouse MCP server, with plan/apply/verify/drift/destroy. Both
+> stacks use NodePort 30123, so run only one.
+
 This directory contains Kubernetes manifests for deploying ClickHouse observability stack:
 
 ## Components

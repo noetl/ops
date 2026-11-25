@@ -1,0 +1,231 @@
+# ClickHouse community edition (official clickhouse/clickhouse-server image, Apache-2.0),
+# single replica, persistent volume. No operator: the StatefulSet is the whole server.
+#
+# Users are declared in config (users.d), not created with SQL, so they are part of the
+# desired state that `plan`/`drift` compare. Passwords come from the Secret
+# log-analytics-credentials, which the playbook generates once (never committed):
+#   default     localhost only, no password  -> schema converge via `kubectl exec`
+#   ingest      INSERT/SELECT on logs.*      -> Vector, the qnetmon edge shipper
+#   mcp_reader  SELECT on logs.*, readonly=2     -> the ClickHouse MCP server
+#   admin       full access, for humans      -> clickhouse-client / port-forward
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-config
+  namespace: log-analytics
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: clickhouse
+    noetl.io/stack: log-analytics
+data:
+  # Server logs go to stdout only, so the kubelet rotates them like any container log.
+  # System log tables are the other unbounded growth in a ClickHouse server: keep the
+  # query log for 3 days and switch off the high-volume profiling logs.
+  logging.xml: |
+    <clickhouse>
+      <logger>
+        <level>warning</level>
+        <console>1</console>
+        <log remove="remove"/>
+        <errorlog remove="remove"/>
+      </logger>
+      <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+      </query_log>
+      <part_log>
+        <database>system</database>
+        <table>part_log</table>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+      </part_log>
+      <metric_log remove="remove"/>
+      <asynchronous_metric_log remove="remove"/>
+      <trace_log remove="remove"/>
+      <text_log remove="remove"/>
+      <query_thread_log remove="remove"/>
+      <query_metric_log remove="remove"/>
+      <processors_profile_log remove="remove"/>
+      <latency_log remove="remove"/>
+      <error_log remove="remove"/>
+      <mark_cache_size>268435456</mark_cache_size>
+    </clickhouse>
+  users.xml: |
+    <clickhouse>
+      <profiles>
+        <logs_reader>
+          <!-- readonly=2: reads only, but the client may still set query settings
+               (mcp-clickhouse sets readonly/max_execution_time per query). -->
+          <readonly>2</readonly>
+          <max_execution_time>30</max_execution_time>
+          <max_result_rows>100000</max_result_rows>
+        </logs_reader>
+      </profiles>
+      <users>
+        <default>
+          <networks replace="replace">
+            <ip>127.0.0.1</ip>
+            <ip>::1</ip>
+          </networks>
+        </default>
+        <admin>
+          <password from_env="CH_ADMIN_PASSWORD"/>
+          <networks><ip>::/0</ip></networks>
+          <profile>default</profile>
+          <quota>default</quota>
+          <access_management>1</access_management>
+        </admin>
+        <ingest>
+          <password from_env="CH_INGEST_PASSWORD"/>
+          <networks><ip>::/0</ip></networks>
+          <profile>default</profile>
+          <quota>default</quota>
+          <grants>
+            <query>GRANT INSERT, SELECT ON logs.*</query>
+          </grants>
+        </ingest>
+        <mcp_reader>
+          <password from_env="CH_READER_PASSWORD"/>
+          <networks><ip>::/0</ip></networks>
+          <profile>logs_reader</profile>
+          <quota>default</quota>
+          <grants>
+            <query>GRANT SELECT ON logs.*</query>
+          </grants>
+        </mcp_reader>
+      </users>
+    </clickhouse>
+---
+# Headless service: stable DNS for the StatefulSet pod, used by Vector and the MCP server.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: log-analytics
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: clickhouse
+    noetl.io/stack: log-analytics
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: clickhouse
+    noetl.io/stack: log-analytics
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+    - name: native
+      port: 9000
+      targetPort: native
+---
+# Host access for the edge shipper and humans: kind maps hostPort 30123 -> this NodePort
+# (ci/kind/config.yaml). The legacy ci/manifests/clickhouse stack uses the same port;
+# the playbook's preflight refuses to apply while that one holds it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-external
+  namespace: log-analytics
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: clickhouse
+    noetl.io/stack: log-analytics
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: clickhouse
+    noetl.io/stack: log-analytics
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+      nodePort: 30123
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: log-analytics
+  labels:
+    app.kubernetes.io/managed-by: noetl
+    app.kubernetes.io/part-of: log-analytics
+    app.kubernetes.io/name: clickhouse
+    noetl.io/stack: log-analytics
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clickhouse
+      noetl.io/stack: log-analytics
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: noetl
+        app.kubernetes.io/part-of: log-analytics
+        app.kubernetes.io/name: clickhouse
+        noetl.io/stack: log-analytics
+    spec:
+      securityContext:
+        fsGroup: 101
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:26.8.36.3
+          imagePullPolicy: IfNotPresent
+          env:
+            # Users come from users.d/users.xml; skip the entrypoint's own user setup.
+            - name: CLICKHOUSE_SKIP_USER_SETUP
+              value: "1"
+            - name: CH_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: log-analytics-credentials, key: admin-password } }
+            - name: CH_INGEST_PASSWORD
+              valueFrom: { secretKeyRef: { name: log-analytics-credentials, key: ingest-password } }
+            - name: CH_READER_PASSWORD
+              valueFrom: { secretKeyRef: { name: log-analytics-credentials, key: reader-password } }
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { cpu: "1", memory: 1536Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: config
+              mountPath: /etc/clickhouse-server/config.d/logging.xml
+              subPath: logging.xml
+            - name: config
+              mountPath: /etc/clickhouse-server/users.d/users.xml
+              subPath: users.xml
+      volumes:
+        - name: config
+          configMap:
+            name: clickhouse-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/managed-by: noetl
+          app.kubernetes.io/part-of: log-analytics
+          app.kubernetes.io/name: clickhouse
+          noetl.io/stack: log-analytics
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi

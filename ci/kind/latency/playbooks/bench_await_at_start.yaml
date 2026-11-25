@@ -1,0 +1,12 @@
+# Latency bench (ai-meta#559): an awaited child in the ENTRY step. The entry
+# step is dispatched without step.enter, so it must never be parked (a parked
+# entry step was re-issued in a loop on kind); it waits on its slot as today.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_await_at_start, path: bench/await_at_start }
+workflow:
+  - step: start
+    tool: { kind: playbook, path: bench/child, return_result: true, result_step: end, timeout: 60 }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }

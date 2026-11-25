@@ -1,0 +1,10 @@
+# Rendered by e2e_catalog_pinning.sh with a distinct SAYS per registration.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: catalog_pin_child, path: tests/catalog_pin/child }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { says: "SAYS" } }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop, result: { says: "SAYS" } }

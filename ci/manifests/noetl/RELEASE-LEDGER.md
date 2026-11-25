@@ -34,9 +34,32 @@ correct precisely by not updating. `representation-drift.md`'s exemption.
 DR then reads the last row (or a named row, to rebuild at a point in time) and
 supplies it to the apply:
 
+⚠⚠ **The commands below restore a RETIRED workload and no longer describe DR for
+the serving control plane.** Serving moved to
+`StatefulSet/noetl-server-rust-embedded`; `Deployment/noetl-server-rust` has been
+0 replicas in prod since the embedded cutover and its manifest is now pinned at
+`replicas: 0` so an apply cannot resurrect it (noetl/ai-meta#359 — it previously
+said `replicas: 1`, which would have produced a second server sharing
+`MACHINE_ID=2` and therefore duplicate `event_id`s on the append-only log).
+
+Following these as written would apply a 0-replica Deployment and set an image on
+a workload that serves no traffic — i.e. DR would appear to succeed and restore
+nothing.
+
 ```
+# ⚠ RETIRED — kept for historical DR of the pre-embedded topology only.
 kubectl apply -f server-rust-deployment-prod.yaml
 kubectl set image deploy/noetl-server-rust noetl-server=<repo>@<digest-from-ledger>
+```
+
+**DR for the serving workload** targets `sts/noetl-server-rust-embedded`. A
+committed manifest for it does not exist yet — that is the open half of
+noetl/ai-meta#359. Until it lands, DR must capture the STS from a live cluster or
+a backup, and the ledger row still supplies the correct image digest:
+
+```
+kubectl -n noetl set image sts/noetl-server-rust-embedded \
+    noetl-server=<repo>@<digest-from-ledger>
 ```
 
 ## Why not have DR read the cluster instead

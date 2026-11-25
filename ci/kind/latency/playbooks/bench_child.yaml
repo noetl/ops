@@ -1,0 +1,11 @@
+# Latency bench (ai-meta#557): the awaited child. Two noop steps; `end` carries
+# the value the parent reads.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: bench_child, path: bench/child }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { child: true } }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop, result: { answer: 42 } }

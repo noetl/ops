@@ -1,0 +1,56 @@
+# ai-meta#561 lifecycle-fusion correctness: a step whose ORDERED TOOL LIST has
+# several tools of DIFFERENT runtimes (python subprocess, rhai, noop), one with a
+# task_sequence `do: jump` loop, plus single-tool steps on either side. The
+# multi-tool steps must keep per-event writes; the single-tool ones may fuse.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: fuse_multitool, path: bench/fuse_multitool }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { seed: 5 } }
+    next: [ { step: single_py } ]
+  - step: single_py
+    tool:
+      kind: python
+      input: { s: '{{ start.seed }}' }
+      code: |
+        result = {"x": int(s) * 2}
+    next: [ { step: mixed } ]
+  - step: mixed
+    tool:
+      - a:
+          kind: python
+          input: { x: '{{ single_py.x }}' }
+          code: |
+            result = {"py": int(x) + 1}
+          set: { py_out: '{{ output.data.py }}' }
+      - b: { kind: rhai, code: "#{ rh: 40 + 2 }" }
+      - c: { kind: noop, result: { tail: "ok" } }
+    next: [ { step: looped } ]
+  - step: looped
+    tool:
+      - claim:
+          kind: python
+          input: { counter: '{{ iter.counter | default(3) }}' }
+          code: |
+            result = {"remaining": int(counter) - 1, "work": 1 if int(counter) > 0 else 0}
+          spec:
+            policy:
+              rules:
+                - when: '{{ output.data.work == 0 }}'
+                  then: { do: break }
+                - else:
+                    then: { do: continue, set: { iter.counter: '{{ output.data.remaining }}' } }
+      - save:
+          kind: rhai
+          code: "#{ saved: true }"
+          spec:
+            policy:
+              rules:
+                - else: { then: { do: jump, to: claim } }
+    next: [ { step: single_rhai } ]
+  - step: single_rhai
+    tool: { kind: rhai, code: "#{ done: true }" }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop }
