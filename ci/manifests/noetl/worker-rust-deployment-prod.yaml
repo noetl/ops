@@ -39,9 +39,10 @@ spec:
       app: noetl-worker-rust
       worker-pool: worker-rust-pool
   strategy:
+    # Live is surge-free (0/1), matching the system pools; declared 2026-11-25.
     rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 25%
+      maxSurge: 0
+      maxUnavailable: 1
     type: RollingUpdate
   template:
     metadata:
@@ -59,30 +60,6 @@ spec:
       - env:
         - name: WORKER_POOL_NAME
           value: worker-rust-pool
-        # noetl/ai-meta#558/#559 — enabled in prod 2026-11-15 on worker 6.17.0 (latency-prod/README.md).
-        - name: NOETL_WORKER_LOCAL_DRIVE
-          value: 'true'
-        - name: NOETL_EXECUTION_WAIT
-          value: 'true'
-        - name: NOETL_PLAYBOOK_AWAIT_PARK
-          value: 'true'
-        # noetl/ai-meta#561: compile system/orchestrate at boot. Without it a fresh
-        # local-drive pod paid a 4.75 s compile on its first drive (post-rollout /
-        # scale-out stall). Default-on for local-drive workers from noetl/worker#405.
-        - name: NOETL_WARM_ORCHESTRATE_PLUGIN
-          value: 'true'
-        # noetl/ai-meta#561 lifecycle fusion (worker 6.19.0 + server >= 3.165.0):
-        # one tool's call.done + command.completed in one POST /api/events/seq;
-        # multi-tool steps, cases, jumps, sinks, failures and parked steps stay
-        # per event. ON in prod 2026-11-17T06:53Z after two interleaved A/Bs.
-        # OFF = REMOVE this entry (never `value: ''`).
-        - name: NOETL_WORKER_FUSE_LIFECYCLE
-          value: 'true'
-        # noetl/ai-meta#561 (worker 6.18.0): reuse the system/orchestrate digest
-        # resolution for 30 s instead of re-fetching the module on every drive
-        # (prod: 61 ms per drive; drive p50 65.7 -> 34.3 ms).
-        - name: NOETL_WASM_RESOLVE_TTL_MS
-          value: '30000'
         - name: WORKER_ID
           valueFrom:
             fieldRef:
@@ -138,6 +115,36 @@ spec:
           value: server
         - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
           value: server
+        - name: NOETL_EXECUTION_FAIL_ON_STEP_ERROR
+          value: 'true'
+        # kind: agent on the user pool (build plan item 4, noetl/ai-meta#330). Worker
+        # >= 6.12.0. Enabled 2026-11-11; the server gate NOETL_TOOL_KIND_AGENT is separate.
+        - name: NOETL_WORKER_AGENT_TOOL
+          value: 'true'
+        # noetl/ai-meta#558/#559 — enabled in prod 2026-11-15 on worker 6.17.0 (latency-prod/README.md).
+        - name: NOETL_WORKER_LOCAL_DRIVE
+          value: 'true'
+        - name: NOETL_EXECUTION_WAIT
+          value: 'true'
+        - name: NOETL_PLAYBOOK_AWAIT_PARK
+          value: 'true'
+        # noetl/ai-meta#561: compile system/orchestrate at boot. Without it a fresh
+        # local-drive pod paid a 4.75 s compile on its first drive (post-rollout /
+        # scale-out stall). Default-on for local-drive workers from noetl/worker#405.
+        - name: NOETL_WARM_ORCHESTRATE_PLUGIN
+          value: 'true'
+        # noetl/ai-meta#561 (worker 6.18.0): reuse the system/orchestrate digest
+        # resolution for 30 s instead of re-fetching the module on every drive
+        # (prod: 61 ms per drive; drive p50 65.7 -> 34.3 ms).
+        - name: NOETL_WASM_RESOLVE_TTL_MS
+          value: '30000'
+        # noetl/ai-meta#561 lifecycle fusion (worker 6.19.0 + server >= 3.165.0):
+        # one tool's call.done + command.completed in one POST /api/events/seq;
+        # multi-tool steps, cases, jumps, sinks, failures and parked steps stay
+        # per event. ON in prod 2026-11-17T06:53Z after two interleaved A/Bs.
+        # OFF = REMOVE this entry (never `value: ''`).
+        - name: NOETL_WORKER_FUSE_LIFECYCLE
+          value: 'true'
         # image: DECLARED BY THE DEPLOY, NOT HERE — noetl/ai-meta#323.
         # Prod is rolled by digest (`kubectl set image`), and nothing wrote that
         # digest back here, so every pin in this directory was BEHIND live: a
