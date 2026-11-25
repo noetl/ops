@@ -39,12 +39,15 @@ workload:
   # Vertex-specific knobs. `vertex_project` is required for real calls;
   # callers may pass either `vertex_model` or the MCP `model` argument.
   vertex_project: ""
-  vertex_region: "us-central1"
-  # gemini-2.5-flash, not 2.0: the entire 2.0 and 1.5 generation returns HTTP
-  # 404 for noetl-demo-19700101 in BOTH us-central1 and global.  Only 2.5-flash
-  # and 2.5-pro resolve.  Flash matches the itinerary planner's verified
+  vertex_region: "global"
+  # gemini-3.8-flash on the GLOBAL endpoint.  gemini-2.5-flash retires
+  # 2026-10-16; the whole 3.x line 404s in us-central1 and resolves only on
+  # `global` (probed 2026-09-23).  There is no gemini-4.*  -- 3.8-flash is the
+  # newest GA flash.  Rollback pin: gemini-2.5-flash / us-central1.
+  # (historical) the entire 2.0 and 1.5 generation returned HTTP 404 for
+  # noetl-demo-19700101 in BOTH us-central1 and global.  Flash matches the itinerary planner's verified
   # config; callers needing headroom pass model: gemini-2.5-pro.
-  vertex_model: "gemini-2.5-flash"
+  vertex_model: "gemini-3.8-flash"
   vertex_credential: ""
 
 workflow:
