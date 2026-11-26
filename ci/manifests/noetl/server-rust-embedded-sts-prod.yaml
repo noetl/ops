@@ -152,6 +152,12 @@ spec:
           value: https://storage.googleapis.com
         - name: NOETL_OBJECT_STORE_GCS_AUTH
           value: auto
+        # G3 model/dataset/eval/release registry (noetl/ai-meta#146) — mounts
+        # /api/internal/registry/* (internal-token gated) and creates
+        # noetl.registry at startup. Rides the GCS object backend above.
+        # ROLLBACK: delete this variable (do not set it empty/false) and re-apply.
+        - name: NOETL_REGISTRY_ENABLED
+          value: "true"
         - name: NOETL_RESULT_CELL_ENV
           value: prod
         - name: NOETL_RESULT_CELL_REGION
