@@ -86,6 +86,8 @@ workload:
   # ── THRESHOLD GATE ──
   min_new_real_turns: "25"    # retrain only when >= this many NEW real turns arrived
   force: ""                   # set to "1" to bypass the threshold (manual kick)
+  probe_only: ""              # set => stop after the gate (HARVEST+GATE+REPORT only;
+                              # train/eval no-op). The scheduled probe uses this.
   cadence_days: ""            # set => also proceed if this many days elapsed since last run
   last_run_unix: ""           # last successful run epoch (the trigger supplies it)
 
@@ -95,6 +97,8 @@ workload:
 
   # ── EVAL + PROMOTION GATE ──
   constrained_decode: "true"
+  promote: "true"             # "false" => eval + decide, but never write the release
+                              # (champion) record — the hold for attended/scheduled runs
   # first-run champion bootstrap (used only when no release exists yet)
   champion_eval_ref: ""       # e.g. registry://muno/travel/eval/travel_slm_multitask/3 (v3)
   champion_model_ref: ""      # e.g. registry://muno/travel/model/travel_slm_multitask/3
@@ -166,6 +170,7 @@ workflow:
           ARGS="train --config {{ workload.config }} --run-dir {{ workload.run_dir }}"
           ARGS="${ARGS} --backend {{ workload.mode }}"
           ARGS="${ARGS} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          if [ -n '{{ workload.probe_only }}' ]; then echo "SLM improve :: TRAIN skipped (probe_only)"; exit 0; fi
           [ '{{ workload.augment_teacher }}' != 'true' ] && ARGS="${ARGS} --no-augment-teacher"
           echo "SLM improve :: TRAIN (backend={{ workload.mode }})"
           python3 "${LIB}/slm_improve.py" ${ARGS}
@@ -185,7 +190,9 @@ workflow:
           LIB='{{ workload.slm_lib }}'
           ARGS="eval-promote --config {{ workload.config }} --run-dir {{ workload.run_dir }}"
           ARGS="${ARGS} --tenant {{ workload.tenant }} --project {{ workload.project }}"
+          if [ -n '{{ workload.probe_only }}' ]; then echo "SLM improve :: EVAL skipped (probe_only)"; exit 0; fi
           [ '{{ workload.constrained_decode }}' != 'true' ] && ARGS="${ARGS} --no-constrained-decode"
+          [ '{{ workload.promote }}' != 'true' ] && ARGS="${ARGS} --no-promote"
           [ -n '{{ workload.champion_eval_ref }}' ]  && ARGS="${ARGS} --champion-eval-ref {{ workload.champion_eval_ref }}"
           [ -n '{{ workload.champion_model_ref }}' ] && ARGS="${ARGS} --champion-model-ref {{ workload.champion_model_ref }}"
           echo "SLM improve :: EVAL + PROMOTION GATE"

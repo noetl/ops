@@ -338,3 +338,11 @@ cron) or a data-threshold trigger; an operator wires it — see the
 gate makes a cadence run cheap when no new traffic arrived: it harvests, sees
 < N new turns, and no-ops before training. Nothing is scheduled on prod by this
 work.
+
+The travel cadence is staged **suspended** as a weekly *probe* in
+`ci/manifests/noetl/cronjob-slm-improve-travel.yaml` (HARVEST + GATE + REPORT
+via `probe_only`, `promote: "false"`): travel trains with local MLX, which can't
+run in a pod, so a retrain stays an attended step. Two workload knobs support
+this — `probe_only` (stop after the gate) and `promote: "false"` (eval and
+decide, but never write the release/champion record). The manifest header lists
+the prerequisites before it may be unsuspended.
