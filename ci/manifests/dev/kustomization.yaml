@@ -1,0 +1,13 @@
+# Kustomize base for the kind (local dev) NoETL control plane + worker pools.
+#
+# Lists only the Rust-era objects that kind actually runs.  The Python-era
+# server-deployment.yaml / worker-deployment.yaml and the optional
+# subscription pool stay in this directory for reference but are not part of
+# the base.  Consumed by ../kind/noetl (the kind overlay), which layers the
+# EHDB command-bus topology on top.  Never applied to production.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - server-rust-deployment.yaml
+  - worker-rust-deployment.yaml
+  - worker-system-pool-deployment.yaml

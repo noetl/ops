@@ -1,0 +1,68 @@
+# Server env for the EHDB command/event bus topology on kind.
+#
+# Without NOETL_COMMAND_BUS=ehdb + the writer address the server has no command
+# transport (NATS is removed); without NOETL_STATE_BUILDER=offserver on the system
+# pool (see patch-worker-system-pool.yaml) runs stall after their first step.
+# Values mirror the prod server (../../noetl/server-rust-deployment-prod.yaml),
+# scaled to one shard.  NOETL_ENCRYPTION_KEY is NOT set here: it stays a
+# secretKeyRef to noetl-secret (declared in the dev base) and the playbook never
+# writes that Secret once it exists.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-server-rust
+  namespace: noetl
+spec:
+  template:
+    spec:
+      containers:
+        - name: noetl-server
+          env:
+            - name: NOETL_COMMAND_BUS
+              value: "ehdb"
+            - name: NOETL_COMMAND_BUS_WRITER_ADDRS
+              value: "0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9100"
+            - name: NOETL_COMMAND_SHARD_COUNT
+              value: "1"
+            - name: NOETL_EVENT_BUS
+              value: "ehdb"
+            - name: NOETL_EVENT_BUS_WRITER_ADDRS
+              value: "0@noetl-cmdbus-writer-0.noetl.svc.cluster.local:9103"
+            - name: NOETL_EVENT_SHARD_COUNT
+              value: "1"
+            - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
+              value: "true"
+            - name: NOETL_STATE_BUILDER
+              value: "offserver"
+            - name: NOETL_EVENT_READ_PATH
+              value: "event_scan"
+            - name: NOETL_RESULT_MINT_AUTHORITATIVE
+              value: "true"
+            - name: NOETL_RESULT_STORE_DUAL_WRITE
+              value: "false"
+            - name: NOETL_OFFSERVER_ATTACH_TAIL
+              value: "false"
+            - name: NOETL_ORPHAN_SWEEP_ENABLED
+              value: "true"
+            - name: NOETL_SHARD_SUBJECT_ROUTE
+              value: "true"
+            - name: NOETL_PERMANENT_LOG_LEAN
+              value: "true"
+            - name: NOETL_ORCH_RETRIGGER_ON_CLEAR
+              value: "true"
+            - name: NOETL_EHDB_WORKER_QUERY_URL
+              value: "http://noetl-worker-system-pool-metrics.noetl.svc.cluster.local:9090"
+            - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+              value: "server"
+            - name: NOETL_EHDB_PROJECTION_PARITY_ENABLED
+              value: "true"
+            - name: NOETL_EHDB_PROJECTION_READ_SOURCE
+              value: "wal"
+            - name: NOETL_EHDB_EVENTLOG_MIRROR_DRAIN_CONCURRENCY
+              value: "1"
+            - name: NOETL_EHDB_EVENTLOG_MIRROR_MAX_RETRIES
+              value: "7"
+            - name: NOETL_EHDB_EVENTLOG_MIRROR_RETRY_BACKOFF_MS
+              value: "500"
+            - name: NOETL_EHDB_RECOVERY_SOURCE
+              value: "verify"

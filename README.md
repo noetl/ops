@@ -65,11 +65,23 @@ noetl run automation/infrastructure/kind.yaml --runtime local --set action=creat
 noetl run automation/development/docker.yaml --runtime local --set action=build --set noetl_repo_dir=../noetl
 ```
 
-3. Deploy/redeploy NoETL:
+3. Deploy/redeploy NoETL (Rust server + worker pools + EHDB command-bus writer; works on
+   macOS arm64 with the `noetl-dev` podman machine and on Linux amd64/arm64 with native podman;
+   the image platform comes from `uname -m`):
 
 ```bash
-noetl run automation/development/noetl.yaml --runtime local --set action=redeploy --set noetl_repo_dir=../noetl
+# build from the sibling ../server and ../worker working trees, load into kind, deploy
+noetl run automation/development/noetl.yaml --runtime local --set action=redeploy
+# or build exact release tags
+noetl run automation/development/noetl.yaml --runtime local --set action=redeploy \
+  --set server_ref=v3.151.4 --set worker_ref=v6.11.9
+# preview what deploy would change
+noetl run automation/development/noetl.yaml --runtime local --set action=deploy --set dry_run=true
 ```
+
+Manifests come from the kind overlay `ci/manifests/kind/noetl` (base: `ci/manifests/dev`).
+The playbook never overwrites `noetl-secret` (NOETL_ENCRYPTION_KEY), never re-applies an existing
+Postgres / its PV, and never prunes podman storage unless asked (`--set podman_prune=true`).
 
 4. Build/deploy gateway (optional):
 

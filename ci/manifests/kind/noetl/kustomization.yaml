@@ -1,0 +1,30 @@
+# kind overlay for NoETL (local dev, Mac arm64 and Linux amd64 alike).
+#
+#   kubectl kustomize ci/manifests/kind/noetl          # render
+#   noetl run automation/development/noetl.yaml --runtime local --set action=deploy
+#
+# Base: ../../dev (Rust server, user worker pool, system pool, their Services).
+# Adds what a working kind stack needs on top of the dev specs and that used to
+# exist only as hand-applied, in-cluster fixes:
+#   - the EHDB command/event bus writer StatefulSet (NATS is removed),
+#   - the worker / system-pool ServiceAccounts + RBAC (no GKE annotations),
+#   - the `noetl` / `noetl-ext` Services pointing at the Rust server,
+#   - bus + off-server state-builder env on server, worker and system pool.
+# Images stay `localhost/noetl-server-rust:dev` / `localhost/noetl-worker:dev`
+# here; the deploy playbook rewrites them to the tags it built and loaded.
+#
+# NOT managed here, on purpose (the playbook never overwrites them once present):
+#   - Secret noetl-secret (NOETL_ENCRYPTION_KEY) and noetl-internal-api-token,
+#   - Postgres / NATS / their PVs and data.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: noetl
+resources:
+  - ../../dev
+  - rbac.yaml
+  - services.yaml
+  - cmdbus-writer-statefulset.yaml
+patches:
+  - path: patch-server-rust.yaml
+  - path: patch-worker-rust.yaml
+  - path: patch-worker-system-pool.yaml

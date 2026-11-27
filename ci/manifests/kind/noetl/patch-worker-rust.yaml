@@ -1,0 +1,32 @@
+# User worker pool: claim commands from the kind cmdbus writer (shard 0).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-worker-rust
+  namespace: noetl
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          env:
+            - name: NOETL_COMMAND_BUS_HOST
+              value: "false"
+            - name: NOETL_COMMAND_BUS_CLAIM_ADDR
+              value: "noetl-cmdbus-writer-0.noetl.svc.cluster.local:9101"
+            - name: NOETL_COMMAND_SHARD_COUNT
+              value: "1"
+            - name: NOETL_EXECUTION_WAIT
+              value: "true"
+            - name: NOETL_PLAYBOOK_AWAIT_PARK
+              value: "true"
+            - name: NOETL_RESULT_PRODUCER_STAGE
+              value: "true"
+            - name: NOETL_RESULT_URI_RESOLVE
+              value: "true"
+            - name: NOETL_WARM_ORCHESTRATE_PLUGIN
+              value: "true"
+            - name: NOETL_WORKER_FUSE_LIFECYCLE
+              value: "true"
+            - name: NOETL_WORKER_LOCAL_DRIVE
+              value: "true"

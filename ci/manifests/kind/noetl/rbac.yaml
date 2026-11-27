@@ -1,0 +1,91 @@
+# ServiceAccounts + namespaced RBAC for the kind worker pools.
+#
+# Same rules as ../../noetl/rbac.yaml and ../../noetl/serviceaccount-worker-system-pool.yaml,
+# WITHOUT the GKE Workload Identity annotations (iam.gke.io/gcp-service-account) and
+# Helm labels, which mean nothing on kind.  The dev worker manifests reference
+# both ServiceAccounts but never created them, so a fresh kind deploy used to
+# leave the system pool stuck on "serviceaccount not found".
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: noetl-worker
+  namespace: noetl
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: noetl-worker-role
+  namespace: noetl
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: noetl-worker-rolebinding
+  namespace: noetl
+subjects:
+  - kind: ServiceAccount
+    name: noetl-worker
+    namespace: noetl
+roleRef:
+  kind: Role
+  name: noetl-worker-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: noetl-worker-system-pool
+  namespace: noetl
+  labels:
+    app: noetl-worker-system-pool
+    component: system-worker
+    worker-pool: worker-system-pool
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: noetl-worker-system-pool-role
+  namespace: noetl
+  labels:
+    app: noetl-worker-system-pool
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["noetl-internal-api-token"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: noetl-worker-system-pool-rolebinding
+  namespace: noetl
+subjects:
+  - kind: ServiceAccount
+    name: noetl-worker-system-pool
+    namespace: noetl
+roleRef:
+  kind: Role
+  name: noetl-worker-system-pool-role
+  apiGroup: rbac.authorization.k8s.io
