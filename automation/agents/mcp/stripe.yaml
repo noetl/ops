@@ -1,0 +1,454 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: stripe_mcp
+  path: automation/agents/mcp/stripe
+  description: |
+    Stripe MCP server playbook: PaymentIntents (manual capture), refunds and
+    event retrieval for the Muno checkout (Adiona is the merchant of record;
+    authorize, then book with the provider, then capture or cancel).
+
+    TEST MODE ONLY. Two guards, both enforced in code:
+      - the key read from Secret Manager must start with `sk_test_` or
+        `rk_test_`; anything else is refused BEFORE any request is sent
+        (code `live_key_refused`);
+      - any Stripe response carrying `livemode: true` is refused
+        (code `livemode_refused`) and its body is not returned.
+    Live keys are an owner action and need a reviewed change to this file.
+
+    Auth: the Stripe secret key is NEVER in this file, a workload, or a log.
+    It lives in the GCP Secret Manager secret `stripe-api-test` and is read at
+    runtime with the worker pod's GKE Workload Identity, the same library-free
+    pattern as duffel.yaml (metadata-server token, Secret Manager REST
+    `versions/latest:access`). The payload may be a bare key string,
+    `{"token": "sk_test_…"}`, or `{"data": {"token": "sk_test_…"}}`.
+
+    Operator prerequisites (until these land, calls return a clear
+    `credential_unavailable` error):
+    - GSM secret `stripe-api-test` exists in `shastaratech-noetl-prod` with a
+      Stripe TEST secret key (prefer a restricted `rk_test_` key limited to
+      PaymentIntents write, Refunds write, Events read).
+    - The worker pod's GSA `noetl-worker-mcp@shastaratech-noetl-prod.iam.gserviceaccount.com`
+      holds roles/secretmanager.secretAccessor on `stripe-api-test`.
+
+    Tools (method tools/call, tool <name>, arguments {...}):
+      create_payment_intent   amount (int, minor units), currency, idempotency_key,
+                              capture_method (default manual), metadata {}, description,
+                              automatic_payment_methods (default true). Returns client_secret
+                              (the ONLY tool that does).
+      retrieve_payment_intent payment_intent_id
+      capture_payment_intent  payment_intent_id, idempotency_key, amount_to_capture (optional)
+      cancel_payment_intent   payment_intent_id, idempotency_key, cancellation_reason (optional)
+      create_refund           payment_intent_id, idempotency_key, amount (optional), reason, metadata
+      retrieve_event          event_id
+    Every POST tool requires `idempotency_key` (sent as the Idempotency-Key header).
+
+    scopes: [/mcp/stripe]
+
+workload:
+  stripe_api_base: https://api.stripe.com
+  stripe_api_version: "2024-06-20"
+  google_project: "shastaratech-noetl-prod"
+  # GSM secret holding the Stripe TEST secret key. Loaded out-of-band by the
+  # owner; this playbook only references the name.
+  stripe_secret_name: "stripe-api-test"
+  method: "tools/list"
+  tool: ""
+  arguments: {}
+
+workflow:
+  - step: start
+    desc: Entry point — the Rust runtime requires a step named `start`; routes to stripe_dispatch
+    tool:
+      kind: noop
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: stripe_dispatch
+
+  - step: stripe_dispatch
+    desc: Dispatch Stripe MCP tools (Workload-Identity GSM secret read for the test key)
+    tool:
+      kind: python
+      input:
+        method: "{{ workload.method }}"
+        tool: "{{ workload.tool }}"
+        arguments: "{{ workload.arguments }}"
+        stripe_api_base: "{{ workload.stripe_api_base | default('https://api.stripe.com') }}"
+        stripe_api_version: "{{ workload.stripe_api_version | default('2024-06-20') }}"
+        google_project: "{{ workload.google_project | default('shastaratech-noetl-prod') }}"
+        stripe_secret_name: "{{ workload.stripe_secret_name | default('stripe-api-test') }}"
+      code: |
+        import base64
+        import json
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        METADATA_TOKEN_URL = (
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/token"
+        )
+        TEST_KEY_PREFIXES = ("sk_test_", "rk_test_")
+        VALID_TOOLS = (
+            "create_payment_intent", "retrieve_payment_intent", "capture_payment_intent",
+            "cancel_payment_intent", "create_refund", "retrieve_event",
+        )
+        POST_TOOLS = ("create_payment_intent", "capture_payment_intent", "cancel_payment_intent", "create_refund")
+
+        def _text(value, default=""):
+            value = default if value is None else value
+            return str(value).strip()
+
+        def _as_dict(value):
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    return {}
+            return value if isinstance(value, dict) else {}
+
+        def _error(tool_name, message, detail=None, status_code=0, code=None, extra=None):
+            text = message if detail is None else f"{message}: {str(detail)[:500]}"
+            payload = {"ok": False, "status": "error", "error": text[:1000], "status_code": status_code}
+            if code:
+                payload["code"] = code
+            if isinstance(extra, dict):
+                payload.update(extra)
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+                "_meta": {"backend": "stripe", "tool": tool_name, "status_code": status_code, "code": code},
+                "data": payload,
+                "control_data": payload,
+                "summary": text,
+                "text": text,
+            }
+
+        def _ok(tool_name, data, text=None):
+            payload = data if isinstance(data, dict) else {"value": data}
+            payload.setdefault("ok", True)
+            summary = text or f"Stripe {tool_name} ok"
+            return {
+                "status": "ok",
+                "content": [{"type": "text", "text": summary}],
+                "isError": False,
+                "_meta": {"backend": "stripe", "tool": tool_name, "livemode": False},
+                "data": payload,
+                "control_data": payload,
+                "summary": summary,
+                "text": summary,
+            }
+
+        def _metadata_token():
+            req = urllib.request.Request(METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"}, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(
+                    f"metadata token mint failed HTTP {exc.code}: Workload Identity is not bound to a GCP "
+                    "service account with Secret Manager access for this worker pod")
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    f"metadata server unreachable ({getattr(exc, 'reason', exc)}): the worker pod has no GKE "
+                    "Workload Identity metadata endpoint (expected off-cluster, e.g. kind)")
+            token = payload.get("access_token") if isinstance(payload, dict) else None
+            if not token:
+                raise RuntimeError("metadata token endpoint returned no access_token")
+            return token
+
+        def _extract_key(raw):
+            # Bare key, {"token": …}, or {"data": {"token": …}}. Never logged.
+            s = "" if raw is None else str(raw).strip()
+            if s.startswith("{"):
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    return s
+                if isinstance(obj, dict):
+                    data = obj.get("data")
+                    if isinstance(data, dict) and data.get("token"):
+                        return str(data["token"]).strip()
+                    if obj.get("token"):
+                        return str(obj["token"]).strip()
+                return ""
+            return s
+
+        def _secret_key(project, secret_name):
+            token = _metadata_token()
+            name = f"projects/{project}/secrets/{secret_name}/versions/latest:access"
+            req = urllib.request.Request(
+                f"https://secretmanager.googleapis.com/v1/{name}",
+                headers={"Authorization": f"Bearer {token}"}, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(
+                    f"secret manager access HTTP {exc.code} for '{secret_name}': the worker GSA lacks "
+                    "secretmanager.secretAccessor on this secret, or the secret is not loaded yet")
+            encoded = ((payload.get("payload") or {}).get("data") or "").strip()
+            if not encoded:
+                raise RuntimeError(f"secret '{secret_name}' has no payload data")
+            key = _extract_key(base64.b64decode(encoded).decode("utf-8").strip())
+            if not key:
+                raise RuntimeError(f"secret '{secret_name}' payload had no Stripe key")
+            return key
+
+        def _flatten(value, prefix, out):
+            # Stripe form encoding: a[b]=c, a[0]=x, booleans as true/false.
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    _flatten(v, f"{prefix}[{k}]" if prefix else str(k), out)
+            elif isinstance(value, (list, tuple)):
+                for i, v in enumerate(value):
+                    _flatten(v, f"{prefix}[{i}]", out)
+            elif value is None:
+                return
+            elif isinstance(value, bool):
+                out.append((prefix, "true" if value else "false"))
+            else:
+                out.append((prefix, str(value)))
+            return out
+
+        def _form(params):
+            return urllib.parse.urlencode(_flatten(params or {}, "", []) or [])
+
+        class StripeRefusal(Exception):
+            pass
+
+        def _request(http_method, path, key, params=None, idempotency_key=None):
+            # Returns (ok, status_code, body). Raises StripeRefusal on livemode.
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Stripe-Version": api_version,
+                "Accept": "application/json",
+            }
+            data = None
+            url = api_base.rstrip("/") + path
+            if http_method == "POST":
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                if idempotency_key:
+                    headers["Idempotency-Key"] = idempotency_key
+                data = _form(params).encode("utf-8")
+            elif params:
+                url = url + "?" + _form(params)
+            req = urllib.request.Request(url, data=data, headers=headers, method=http_method)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    status_code = getattr(resp, "status", 200)
+                    body = json.loads(resp.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                status_code = exc.code
+                try:
+                    body = json.loads(exc.read().decode("utf-8", errors="replace") or "{}")
+                except Exception:
+                    body = {}
+            except urllib.error.URLError as exc:
+                return False, 0, {"error": {"type": "api_connection_error", "message": str(getattr(exc, "reason", exc))}}
+            if isinstance(body, dict) and body.get("livemode") is True:
+                raise StripeRefusal("Stripe returned a livemode object; test mode only")
+            return 200 <= status_code < 300, status_code, body
+
+        def _stripe_error(tool_name, status_code, body):
+            err = _as_dict(_as_dict(body).get("error"))
+            etype = _text(err.get("type")) or "api_error"
+            extra = {"stripe_type": etype}
+            for field in ("code", "decline_code", "param", "payment_intent_status"):
+                if err.get(field):
+                    extra["stripe_" + field] = err.get(field)
+            pi = _as_dict(err.get("payment_intent"))
+            if pi.get("status"):
+                extra["stripe_payment_intent_status"] = pi.get("status")
+            return _error(tool_name, f"Stripe {tool_name} failed ({etype})", err.get("message"),
+                          status_code, code=_text(err.get("code")) or etype, extra=extra)
+
+        def _safe_pi(pi, include_secret=False):
+            pi = _as_dict(pi)
+            charges = pi.get("latest_charge")
+            out = {
+                "id": pi.get("id"),
+                "status": pi.get("status"),
+                "amount": pi.get("amount"),
+                "amount_capturable": pi.get("amount_capturable"),
+                "amount_received": pi.get("amount_received"),
+                "currency": pi.get("currency"),
+                "capture_method": pi.get("capture_method"),
+                "metadata": pi.get("metadata") or {},
+                "latest_charge": charges if isinstance(charges, str) else _as_dict(charges).get("id"),
+                "last_payment_error": {
+                    k: _as_dict(pi.get("last_payment_error")).get(k)
+                    for k in ("code", "decline_code", "message", "type")
+                } if pi.get("last_payment_error") else None,
+                "livemode": pi.get("livemode", False),
+            }
+            if include_secret:
+                out["client_secret"] = pi.get("client_secret")
+            return out
+
+        def _safe_refund(r):
+            r = _as_dict(r)
+            return {k: r.get(k) for k in ("id", "status", "amount", "currency", "payment_intent", "reason", "livemode")}
+
+        def _safe_event(e):
+            e = _as_dict(e)
+            obj = _as_dict(_as_dict(e.get("data")).get("object"))
+            obj.pop("client_secret", None)
+            return {"id": e.get("id"), "type": e.get("type"), "created": e.get("created"),
+                    "livemode": e.get("livemode", False), "object": obj}
+
+        def _need(args, name):
+            value = _text(args.get(name))
+            if not value:
+                raise ValueError(f"{name} is required")
+            return value
+
+        def _call(tool_name, args, key):
+            idem = _text(args.get("idempotency_key"))
+            if tool_name in POST_TOOLS and not idem:
+                return _error(tool_name, "idempotency_key is required for Stripe POST tools", code="validation_error")
+            if tool_name == "create_payment_intent":
+                try:
+                    amount = int(args.get("amount"))
+                except (TypeError, ValueError):
+                    return _error(tool_name, "amount must be an integer in minor units", code="validation_error")
+                currency = _text(args.get("currency")).lower()
+                if amount <= 0 or len(currency) != 3:
+                    return _error(tool_name, "amount > 0 and a 3-letter currency are required", code="validation_error")
+                params = {
+                    "amount": amount,
+                    "currency": currency,
+                    "capture_method": _text(args.get("capture_method")) or "manual",
+                    "metadata": _as_dict(args.get("metadata")),
+                }
+                if args.get("description"):
+                    params["description"] = _text(args.get("description"))[:500]
+                if args.get("automatic_payment_methods", True) not in (False, "false", "0"):
+                    params["automatic_payment_methods"] = {"enabled": True}
+                ok, sc, body = _request("POST", "/v1/payment_intents", key, params, idem)
+                if not ok:
+                    return _stripe_error(tool_name, sc, body)
+                return _ok(tool_name, {"payment_intent": _safe_pi(body, include_secret=True)},
+                           f"PaymentIntent {body.get('id')} created ({body.get('status')})")
+            if tool_name == "retrieve_payment_intent":
+                pid = _need(args, "payment_intent_id")
+                ok, sc, body = _request("GET", "/v1/payment_intents/" + urllib.parse.quote(pid, safe=""), key)
+                if not ok:
+                    return _stripe_error(tool_name, sc, body)
+                return _ok(tool_name, {"payment_intent": _safe_pi(body)}, f"PaymentIntent {pid} is {body.get('status')}")
+            if tool_name == "capture_payment_intent":
+                pid = _need(args, "payment_intent_id")
+                params = {}
+                if args.get("amount_to_capture") not in (None, ""):
+                    params["amount_to_capture"] = int(args.get("amount_to_capture"))
+                ok, sc, body = _request("POST", f"/v1/payment_intents/{urllib.parse.quote(pid, safe='')}/capture", key, params, idem)
+                if not ok:
+                    return _stripe_error(tool_name, sc, body)
+                return _ok(tool_name, {"payment_intent": _safe_pi(body)}, f"PaymentIntent {pid} captured")
+            if tool_name == "cancel_payment_intent":
+                pid = _need(args, "payment_intent_id")
+                params = {}
+                if args.get("cancellation_reason"):
+                    params["cancellation_reason"] = _text(args.get("cancellation_reason"))
+                ok, sc, body = _request("POST", f"/v1/payment_intents/{urllib.parse.quote(pid, safe='')}/cancel", key, params, idem)
+                if not ok:
+                    return _stripe_error(tool_name, sc, body)
+                return _ok(tool_name, {"payment_intent": _safe_pi(body)}, f"PaymentIntent {pid} cancelled")
+            if tool_name == "create_refund":
+                pid = _need(args, "payment_intent_id")
+                params = {"payment_intent": pid}
+                if args.get("amount") not in (None, ""):
+                    params["amount"] = int(args.get("amount"))
+                if args.get("reason"):
+                    params["reason"] = _text(args.get("reason"))
+                if args.get("metadata"):
+                    params["metadata"] = _as_dict(args.get("metadata"))
+                ok, sc, body = _request("POST", "/v1/refunds", key, params, idem)
+                if not ok:
+                    return _stripe_error(tool_name, sc, body)
+                return _ok(tool_name, {"refund": _safe_refund(body)}, f"Refund {body.get('id')} {body.get('status')}")
+            eid = _need(args, "event_id")
+            ok, sc, body = _request("GET", "/v1/events/" + urllib.parse.quote(eid, safe=""), key)
+            if not ok:
+                return _stripe_error(tool_name, sc, body)
+            return _ok(tool_name, {"event": _safe_event(body)}, f"Event {eid} ({body.get('type')})")
+
+        def _tools_list():
+            pi_id = {"payment_intent_id": {"type": "string"}}
+            idem = {"idempotency_key": {"type": "string", "description": "Required. Sent as Idempotency-Key."}}
+            tools = [
+                {"name": "create_payment_intent", "title": "Create PaymentIntent",
+                 "description": "Create a TEST-mode PaymentIntent (manual capture by default). Returns client_secret.",
+                 "inputSchema": {"type": "object", "required": ["amount", "currency", "idempotency_key"],
+                                 "properties": {"amount": {"type": "integer"}, "currency": {"type": "string"},
+                                                "capture_method": {"type": "string", "default": "manual"},
+                                                "metadata": {"type": "object"}, "description": {"type": "string"},
+                                                "automatic_payment_methods": {"type": "boolean", "default": True}, **idem}}},
+                {"name": "retrieve_payment_intent", "title": "Retrieve PaymentIntent",
+                 "description": "Fetch a PaymentIntent's status (no client_secret).",
+                 "inputSchema": {"type": "object", "required": ["payment_intent_id"], "properties": pi_id}},
+                {"name": "capture_payment_intent", "title": "Capture PaymentIntent",
+                 "description": "Capture an authorized (requires_capture) PaymentIntent.",
+                 "inputSchema": {"type": "object", "required": ["payment_intent_id", "idempotency_key"],
+                                 "properties": {**pi_id, **idem, "amount_to_capture": {"type": "integer"}}}},
+                {"name": "cancel_payment_intent", "title": "Cancel PaymentIntent",
+                 "description": "Cancel a PaymentIntent, releasing any authorization hold.",
+                 "inputSchema": {"type": "object", "required": ["payment_intent_id", "idempotency_key"],
+                                 "properties": {**pi_id, **idem, "cancellation_reason": {"type": "string"}}}},
+                {"name": "create_refund", "title": "Create refund",
+                 "description": "Refund a captured PaymentIntent (full, or partial with amount).",
+                 "inputSchema": {"type": "object", "required": ["payment_intent_id", "idempotency_key"],
+                                 "properties": {**pi_id, **idem, "amount": {"type": "integer"},
+                                                "reason": {"type": "string"}, "metadata": {"type": "object"}}}},
+                {"name": "retrieve_event", "title": "Retrieve event",
+                 "description": "Fetch a Stripe event by id (webhook handlers re-fetch instead of trusting the body).",
+                 "inputSchema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+            ]
+            return _ok("tools/list", {"tools": tools, "tool_count": len(tools)}, f"Stripe MCP - {len(tools)} tools available")
+
+        api_base = _text(stripe_api_base) or "https://api.stripe.com"
+        api_version = _text(stripe_api_version) or "2024-06-20"
+        project = _text(google_project) or "shastaratech-noetl-prod"
+        secret_name = _text(stripe_secret_name) or "stripe-api-test"
+        method_name = _text(method) or "tools/list"
+        tool_name = _text(tool)
+        args = _as_dict(arguments)
+
+        result = None
+        if method_name == "tools/list":
+            result = _tools_list()
+        elif method_name != "tools/call":
+            result = _error(method_name, f"Unsupported method: {method_name}", code="validation_error")
+        elif tool_name not in VALID_TOOLS:
+            result = _error(tool_name or "unknown", f"Unknown tool: {tool_name}. Run tools/list to see the catalog.", code="validation_error")
+        else:
+            try:
+                stripe_key = _secret_key(project, secret_name)
+            except Exception as exc:
+                stripe_key = None
+                result = _error(tool_name, "Stripe credential unavailable", f"{type(exc).__name__}: {exc}", code="credential_unavailable")
+            if result is None and not stripe_key.startswith(TEST_KEY_PREFIXES):
+                # Refused before any request: live (or malformed) keys never reach Stripe.
+                result = _error(tool_name, "Refusing non-test Stripe key: this agent is TEST MODE ONLY "
+                                "(expected sk_test_ or rk_test_)", code="live_key_refused")
+            if result is None:
+                try:
+                    result = _call(tool_name, args, stripe_key)
+                except StripeRefusal as exc:
+                    result = _error(tool_name, str(exc), code="livemode_refused")
+                except ValueError as exc:
+                    result = _error(tool_name, str(exc), code="validation_error")
+                except Exception as exc:
+                    result = _error(tool_name, "Stripe tool failed", f"{type(exc).__name__}: {exc}")
+            stripe_key = None
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Done
+    tool:
+      kind: noop
