@@ -629,12 +629,17 @@ workflow:
               fi
               kubectl rollout status deployment/paginated-api -n test-server --timeout=180s
             fi
-            # The contract check exercises the e2e fixture, not NoETL; an
-            # e2e checkout that predates the 410 batch contract fails it.
-            # Report it loudly but do not abort the NoETL deploy over it.
+            # Hard check again: noetl/e2e restored the PFT batch 410 contract
+            # (it had been broken on e2e main by an accidental commit, which is
+            # why this was briefly a warning). It runs before any NoETL
+            # manifest is applied, so a failure changes nothing in noetl.
             if is_truthy "$VERIFY_TEST_SERVER_CONTRACT"; then
               if ! verify_test_server_contract; then
-                echo "WARNING: test-server contract check failed (e2e fixture out of date?); continuing."
+                echo "ERROR: test-server contract check failed: the batch endpoint must answer 410"
+                echo "       and single MDS detail must return one row. Update the e2e checkout"
+                echo "       at $E2E_REPO to a main that includes the 410 contract fix, or pass"
+                echo "       --set verify_test_server_contract=false to skip the check."
+                exit 1
               fi
             fi
           }
