@@ -3,7 +3,7 @@ kind: Playbook
 metadata:
   name: noetl_development_deploy
   path: automation/development/noetl
-  description: Build/load/deploy helpers for NoETL in local kind
+  description: Build/load/deploy helpers for NoETL in local kind (macOS arm64 and Linux amd64)
 
 executor:
   profile: local
@@ -11,22 +11,71 @@ executor:
 
 workload:
   action: help # build, load, deploy, redeploy, status, reset
-  registry: local
-  image_name: noetl
-  image_tag: ""
-  image_pull_policy: "Never"
-  noetl_repo_dir: "../noetl"
+
+  # Source repos (relative to the ops repo root, where this playbook is run).
+  server_repo_dir: "../server"
+  worker_repo_dir: "../worker"
   e2e_repo_dir: "../e2e"
+  # Legacy Python repo; only consulted as a fallback for the Postgres schema DDL.
+  noetl_repo_dir: "../noetl"
+
+  # What to build. A git ref (tag/branch/sha) builds from a clean `git archive`
+  # export of that ref instead of the working tree. A semver tag (v3.151.4) is
+  # also stamped into Cargo.toml with the repo's ci/stamp-version.sh, exactly
+  # like release CI, so the binary reports the right version.
+  server_ref: ""
+  worker_ref: ""
+  components: "server,worker" # subset to build/load: server, worker
+  # Image tags. Empty = derived: <version> for a semver ref, otherwise
+  # <Cargo version>-g<short sha>[-dirty]. image_tag_suffix is appended to both.
+  server_image_tag: ""
+  worker_image_tag: ""
+  image_tag_suffix: ""
+  # Full image references to deploy WITHOUT building (e.g. a registry image).
+  # When set, build/load skip that component.
+  server_image: ""
+  worker_image: ""
+  image_pull_policy: "Never"
+
+  # Container platform for podman build. Empty = from `uname -m`
+  # (x86_64 -> linux/amd64, arm64/aarch64 -> linux/arm64).
+  platform: ""
+
+  kind_cluster_name: "noetl"
   expected_kube_context: "kind-noetl"
+  # Kustomize overlay with the kind NoETL stack (server, worker pools, EHDB
+  # command-bus writer, RBAC, Services).
+  manifests_dir: "ci/manifests/kind/noetl"
+  # Extra manifest files/dirs to apply after the overlay (space separated).
+  # Opt-in only; nothing from ci/manifests/noetl/ (GKE prod) is applied by default.
+  extra_manifests: ""
+  # Postgres / test-server / NATS bootstrap:
+  #   missing - create only what does not exist yet (default; never touches a
+  #             running Postgres, its PV/PVC or data)
+  #   never   - skip entirely
+  #   force   - re-apply their manifests (still never re-applies an existing
+  #             PV/PVC and never touches data)
+  infra_mode: "missing"
+  with_nats: "false" # NATS is removed from the NoETL data path; opt in for legacy tests
   force_test_server_build: "false"
   verify_test_server_contract: "true"
+  # Rollout-restart server and worker pools after apply even if their spec did
+  # not change (the cmdbus writer is never force-restarted).
+  restart: "false"
+  # deploy: render + server-side dry-run + diff only, change nothing.
+  dry_run: "false"
+  # `podman system prune -f` before builds. Off by default: on a shared host it
+  # also deletes stopped containers and unused networks/images of other projects.
+  podman_prune: "false"
+  # reset deletes the noetl/postgres/nats/test-server namespaces; requires true.
+  confirm_reset: "false"
+  health_url: "http://localhost:8082/api/health"
+  # The local runtime captures shell output instead of streaming it, so every
+  # run is also appended here (gitignored via *.log). "" disables the log.
+  log_file: ".noetl_kind_deploy.log"
 
-  # Podman machine name to require when running build/load/deploy on
-  # macOS. Set to the empty string ("") to skip the check entirely —
-  # useful for setups where kind runs on Podman Desktop, native podman,
-  # or directly inside Linux without a separate Podman machine.
-  # The default preserves the in-tree expectation that has shipped
-  # since the deploy helper was authored.
+  # Podman machine name to require on macOS (ignored on Linux, where podman is
+  # native). Set to the empty string ("") to skip the check entirely.
   podman_machine: "noetl-dev"
 
 workflow:
@@ -38,22 +87,98 @@ workflow:
         - |
           set -euo pipefail
           ACTION="{{ workload.action }}"
-          NOETL_REPO="{{ workload.noetl_repo_dir }}"
+          SERVER_REPO="{{ workload.server_repo_dir }}"
+          WORKER_REPO="{{ workload.worker_repo_dir }}"
           E2E_REPO="{{ workload.e2e_repo_dir }}"
-          REGISTRY="{{ workload.registry }}"
-          IMAGE_NAME="{{ workload.image_name }}"
-          IMAGE_TAG_OVERRIDE="{{ workload.image_tag }}"
+          NOETL_REPO="{{ workload.noetl_repo_dir }}"
+          SERVER_REF="{{ workload.server_ref }}"
+          WORKER_REF="{{ workload.worker_ref }}"
+          COMPONENTS="{{ workload.components }}"
+          SERVER_TAG_OVERRIDE="{{ workload.server_image_tag }}"
+          WORKER_TAG_OVERRIDE="{{ workload.worker_image_tag }}"
+          TAG_SUFFIX="{{ workload.image_tag_suffix }}"
+          SERVER_IMAGE_OVERRIDE="{{ workload.server_image }}"
+          WORKER_IMAGE_OVERRIDE="{{ workload.worker_image }}"
           IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
+          PLATFORM_OVERRIDE="{{ workload.platform }}"
+          KIND_CLUSTER="{{ workload.kind_cluster_name }}"
           EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
-          PODMAN_MACHINE="{{ workload.podman_machine }}"
+          MANIFESTS_DIR="{{ workload.manifests_dir }}"
+          EXTRA_MANIFESTS="{{ workload.extra_manifests }}"
+          INFRA_MODE="{{ workload.infra_mode }}"
+          WITH_NATS="{{ workload.with_nats }}"
           FORCE_TEST_SERVER_BUILD="{{ workload.force_test_server_build }}"
           VERIFY_TEST_SERVER_CONTRACT="{{ workload.verify_test_server_contract }}"
+          RESTART="{{ workload.restart }}"
+          DRY_RUN="{{ workload.dry_run }}"
+          PODMAN_PRUNE="{{ workload.podman_prune }}"
+          CONFIRM_RESET="{{ workload.confirm_reset }}"
+          HEALTH_URL="{{ workload.health_url }}"
+          LOG_FILE="{{ workload.log_file }}"
+          PODMAN_MACHINE="{{ workload.podman_machine }}"
+
+          STATE_FILE=".noetl_kind_images.env"   # *.env is gitignored
+          if [ -n "$LOG_FILE" ]; then
+            exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
+            echo "===== $(date '+%Y-%m-%dT%H:%M:%S%z') action=$ACTION host=$(uname -sm) ====="
+          fi
+          HOST_OS="$(uname -s)"
+          WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/noetl-kind.XXXXXX")"
+          trap 'rm -rf "$WORK_DIR"' EXIT
 
           is_truthy() {
             case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
               1|true|yes|y|on) return 0 ;;
               *) return 1 ;;
             esac
+          }
+
+          has_component() {
+            case ",$(printf '%s' "$COMPONENTS" | tr -d ' ')," in
+              *",$1,"*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          ensure_ops_root() {
+            if [ ! -f "$MANIFESTS_DIR/kustomization.yaml" ]; then
+              echo "ERROR: $MANIFESTS_DIR/kustomization.yaml not found."
+              echo "       Run this playbook from the root of the ops repo."
+              exit 1
+            fi
+          }
+
+          detect_platform() {
+            if [ -n "$PLATFORM_OVERRIDE" ]; then
+              echo "$PLATFORM_OVERRIDE"
+              return
+            fi
+            case "$(uname -m)" in
+              x86_64|amd64) echo "linux/amd64" ;;
+              arm64|aarch64) echo "linux/arm64" ;;
+              *)
+                echo "ERROR: unsupported host architecture '$(uname -m)'; set --set platform=linux/<arch>" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          # kind needs to know it is talking to podman. Interactive shells usually
+          # export this from a profile, but `noetl run` over ssh / from an agent does not
+          # source one, and kind then looks for docker and fails.
+          ensure_kind_provider() {
+            if [ -z "${KIND_EXPERIMENTAL_PROVIDER:-}" ]; then
+              if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+                :
+              else
+                export KIND_EXPERIMENTAL_PROVIDER=podman
+              fi
+            fi
+          }
+
+          kind_provider() {
+            ensure_kind_provider
+            echo "${KIND_EXPERIMENTAL_PROVIDER:-docker}"
           }
 
           detect_lan_host() {
@@ -74,246 +199,6 @@ workflow:
               echo "$host"
             else
               echo "${host}.local"
-            fi
-          }
-
-          prepare_podman_storage() {
-            podman system prune -f >/dev/null 2>&1 || true
-          }
-
-          resolve_latest_local_tag() {
-            local tag=""
-            tag="$(podman image ls "$REGISTRY/$IMAGE_NAME" --format '{{.Tag}}' | grep -v '<none>' | head -n1 || true)"
-            if [ -z "$tag" ]; then
-              tag="$(podman image ls "localhost/$REGISTRY/$IMAGE_NAME" --format '{{.Tag}}' | grep -v '<none>' | head -n1 || true)"
-            fi
-            echo "$tag"
-          }
-
-          ensure_local_image_aliases() {
-            # Podman often stores unqualified local images as localhost/<name>.
-            # Keep both aliases available so manifests and kind load use a stable reference.
-            local image="$1"
-            local alt="localhost/$image"
-            local has_image=0
-            local has_alt=0
-
-            if podman image inspect "$image" >/dev/null 2>&1; then
-              has_image=1
-            fi
-
-            if podman image inspect "$alt" >/dev/null 2>&1; then
-              has_alt=1
-            fi
-
-            if [ "$has_image" -eq 0 ] && [ "$has_alt" -eq 0 ]; then
-              return 1
-            fi
-
-            if [ "$has_image" -eq 1 ] && [ "$has_alt" -eq 0 ]; then
-              podman image tag "$image" "$alt"
-            elif [ "$has_image" -eq 0 ] && [ "$has_alt" -eq 1 ]; then
-              podman image tag "$alt" "$image"
-            fi
-
-            return 0
-          }
-
-          kind_load_one_image() {
-            local image="$1"
-
-            if kind load docker-image "$image" --name noetl >/tmp/noetl-kind-load-image.log 2>&1; then
-              rm -f /tmp/noetl-kind-load-image.log
-              return 0
-            fi
-
-            # Fallback: load image archive when direct load fails under podman provider.
-            echo "Direct kind image load did not find $image; falling back to podman image archive."
-            local archive="/tmp/$(echo "$image" | tr '/:' '__').tar"
-            podman save -o "$archive" "$image"
-            kind load image-archive "$archive" --name noetl
-            rm -f "$archive"
-            rm -f /tmp/noetl-kind-load-image.log
-          }
-
-          kind_load_image() {
-            local image="$1"
-            local alt="localhost/$image"
-
-            if ! ensure_local_image_aliases "$image"; then
-              echo "ERROR: image '$image' not present locally (or as localhost/$image)"
-              exit 1
-            fi
-
-            # Load both aliases to avoid ErrImageNeverPull due to name mismatch.
-            kind_load_one_image "$image"
-            kind_load_one_image "$alt"
-          }
-
-          resolve_deploy_image() {
-            local image="$1"
-            local alt="localhost/$image"
-
-            if [ "${image#localhost/}" != "$image" ]; then
-              echo "$image"
-              return
-            fi
-
-            if podman image inspect "$alt" >/dev/null 2>&1; then
-              echo "$alt"
-              return
-            fi
-
-            echo "$image"
-          }
-
-          ensure_repo() {
-            if [ ! -d "$NOETL_REPO" ]; then
-              echo "ERROR: NoETL repository not found: $NOETL_REPO"
-              exit 1
-            fi
-          }
-
-          ensure_podman_running() {
-            if ! command -v podman >/dev/null 2>&1; then
-              echo "ERROR: Podman is required but is not installed."
-              echo "Install with: brew install podman"
-              exit 1
-            fi
-            # Empty PODMAN_MACHINE means "skip the machine check" —
-            # we're running against native podman, Podman Desktop, or a
-            # Linux host without a separate VM. Podman
-            # is still required (above), we just don't insist on a
-            # specific machine being running.
-            if [ -z "$PODMAN_MACHINE" ]; then
-              return 0
-            fi
-            if ! podman machine list 2>/dev/null | grep -q "${PODMAN_MACHINE}.*running"; then
-              echo "ERROR: Podman machine '${PODMAN_MACHINE}' is not running."
-              echo "Start it:    podman machine start ${PODMAN_MACHINE}"
-              echo "Or override: --set podman_machine=<your-machine-name>"
-              echo "Or disable:  --set podman_machine=\"\"  (skip the machine check entirely)"
-              exit 1
-            fi
-          }
-
-          # This playbook is the kind-cluster install path only. The GKE
-          # install path lives under automation/gcp_gke/ and uses the
-          # Helm chart at automation/helm/noetl/. See
-          # https://github.com/noetl/ops/wiki/automation-gcp-gke.
-          looks_like_managed_kubernetes() {
-            # Match the well-known prefixes the major managed-Kubernetes
-            # providers stamp into kubeconfig contexts. Conservative on
-            # purpose — false positives here are a friendly redirect to
-            # the right install path, not a data-loss event.
-            case "${1:-}" in
-              gke_*|arn:aws:eks:*|*.aks*|aks-*|do-*-k8s-*|*-doks-*) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
-
-          ensure_kind_profile() {
-            # Refuse to run kind-shaped build/load/deploy actions when the
-            # operator points at a managed-Kubernetes cluster, whether by
-            # overriding expected_kube_context or by leaving the live
-            # context pointing at one.
-            local override="${EXPECTED_CONTEXT:-}"
-            local current="$(kubectl config current-context 2>/dev/null || true)"
-
-            if looks_like_managed_kubernetes "$override"; then
-              echo "ERROR: expected_kube_context='$override' looks like a managed-Kubernetes cluster."
-              echo "       This playbook is the kind-cluster install path only."
-              echo "       For GKE, use automation/gcp_gke/noetl_gke_fresh_stack.yaml."
-              echo "       See https://github.com/noetl/ops/wiki/automation-gcp-gke."
-              exit 1
-            fi
-
-            if [ -n "$current" ] && looks_like_managed_kubernetes "$current"; then
-              echo "ERROR: Active kubectl context '$current' looks like a managed-Kubernetes cluster."
-              echo "       This playbook is the kind-cluster install path only."
-              echo "       For GKE, use automation/gcp_gke/noetl_gke_fresh_stack.yaml."
-              echo "       See https://github.com/noetl/ops/wiki/automation-gcp-gke."
-              echo "       Switch contexts first: kubectl config use-context $override"
-              exit 1
-            fi
-          }
-
-          ensure_kind_context() {
-            ensure_kind_profile
-            CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
-            if [ -z "$CURRENT_CONTEXT" ]; then
-              echo "ERROR: No active kubectl context found."
-              echo "Set context to $EXPECTED_CONTEXT before deploy/status actions."
-              exit 1
-            fi
-            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
-              echo "ERROR: Refusing to run local kind deploy against context '$CURRENT_CONTEXT'."
-              echo "Expected context: '$EXPECTED_CONTEXT'"
-              echo "Run: kubectl config use-context $EXPECTED_CONTEXT"
-              exit 1
-            fi
-          }
-
-          ensure_local_dependencies() {
-            ensure_repo
-            ensure_podman_running
-            ensure_kind_context
-
-            SCHEMA_DDL="$NOETL_REPO/noetl/database/ddl/postgres/schema_ddl.sql"
-            TEST_SERVER_REPO="$NOETL_REPO"
-            TEST_SERVER_DOCKERFILE="$NOETL_REPO/docker/test-server/Dockerfile"
-            if [ -f "$E2E_REPO/docker/test-server/Dockerfile" ]; then
-              TEST_SERVER_REPO="$E2E_REPO"
-              TEST_SERVER_DOCKERFILE="$E2E_REPO/docker/test-server/Dockerfile"
-            fi
-            if [ ! -f "$SCHEMA_DDL" ]; then
-              echo "ERROR: PostgreSQL schema DDL not found at $SCHEMA_DDL"
-              exit 1
-            fi
-            if [ ! -f "$TEST_SERVER_DOCKERFILE" ]; then
-              echo "ERROR: Test server Dockerfile not found."
-              echo "Checked preferred e2e repo: $E2E_REPO/docker/test-server/Dockerfile"
-              echo "Checked fallback noetl repo: $NOETL_REPO/docker/test-server/Dockerfile"
-              exit 1
-            fi
-
-            kubectl apply -f "ci/manifests/noetl/namespace/"
-
-            kubectl apply -f "ci/manifests/postgres/namespace/namespace.yaml"
-            kubectl create configmap postgres-schema-ddl --namespace postgres \
-              --from-file=schema_ddl.sql.norun="$SCHEMA_DDL" \
-              --dry-run=client -o yaml | kubectl apply -f -
-            kubectl apply -f "ci/manifests/postgres/config-files.yaml"
-            kubectl apply -f "ci/manifests/postgres/configmap.yaml"
-            kubectl apply -f "ci/manifests/postgres/secret.yaml"
-            kubectl apply -f "ci/manifests/postgres/persistent-volume.yaml"
-            kubectl apply -f "ci/manifests/postgres/service.yaml"
-            kubectl apply -f "ci/manifests/postgres/service-external.yaml"
-            kubectl apply -f "ci/manifests/postgres/deployment.yaml"
-
-            kubectl apply -f "ci/manifests/nats/namespace.yaml"
-            kubectl apply -f "ci/manifests/nats/nats.yaml"
-
-            if is_truthy "$FORCE_TEST_SERVER_BUILD" || ! podman image inspect local/test-server:latest >/dev/null 2>&1; then
-              echo "Building local test-server from $TEST_SERVER_REPO"
-              podman build --platform linux/arm64 \
-                -t local/test-server:latest \
-                -f "$TEST_SERVER_DOCKERFILE" "$TEST_SERVER_REPO"
-            else
-              echo "Using existing local/test-server:latest (set force_test_server_build=true to refresh)"
-            fi
-            kind_load_image local/test-server:latest
-            kubectl apply -f "ci/manifests/test-server/namespace.yaml"
-            kubectl apply -f "ci/manifests/test-server/deployment.yaml"
-            kubectl set image deployment/paginated-api -n test-server api=localhost/local/test-server:latest
-            kubectl rollout restart deployment/paginated-api -n test-server
-
-            kubectl rollout status deployment/postgres -n postgres --timeout=180s
-            kubectl rollout status statefulset/nats -n nats --timeout=180s
-            kubectl rollout status deployment/paginated-api -n test-server --timeout=180s
-
-            if is_truthy "$VERIFY_TEST_SERVER_CONTRACT"; then
-              verify_test_server_contract
             fi
           }
 
@@ -401,100 +286,491 @@ workflow:
           PY
           }
 
+          prepare_podman_storage() {
+            # Opt-in only (podman_prune=true). Never prune implicitly: on a shared
+            # host it also removes other projects' stopped containers and images.
+            if is_truthy "$PODMAN_PRUNE"; then
+              echo "podman_prune=true: running podman system prune -f"
+              podman system prune -f >/dev/null 2>&1 || true
+            fi
+          }
+
+          ensure_podman_running() {
+            if ! command -v podman >/dev/null 2>&1; then
+              echo "ERROR: Podman is required but is not installed."
+              if [ "$HOST_OS" = "Darwin" ]; then
+                echo "Install with: brew install podman"
+              else
+                echo "Install it with your distribution's package manager."
+              fi
+              exit 1
+            fi
+            # A podman machine (VM) only exists on macOS. On Linux podman is native.
+            if [ "$HOST_OS" = "Darwin" ] && [ -n "$PODMAN_MACHINE" ]; then
+              if ! podman machine list 2>/dev/null | grep -q "${PODMAN_MACHINE}.*running"; then
+                echo "ERROR: Podman machine '${PODMAN_MACHINE}' is not running."
+                echo "Start it:    podman machine start ${PODMAN_MACHINE}"
+                echo "Or override: --set podman_machine=<your-machine-name>"
+                echo "Or disable:  --set podman_machine=\"\"  (skip the machine check entirely)"
+                exit 1
+              fi
+            fi
+            if ! podman info >/dev/null 2>&1; then
+              echo "ERROR: podman is installed but 'podman info' fails (service/machine not reachable)."
+              exit 1
+            fi
+          }
+
+          # This playbook is the kind-cluster install path only. The GKE
+          # install path lives under automation/gcp_gke/ and uses the
+          # Helm chart at automation/helm/noetl/. See
+          # https://github.com/noetl/ops/wiki/automation-gcp-gke.
+          looks_like_managed_kubernetes() {
+            case "${1:-}" in
+              gke_*|arn:aws:eks:*|*.aks*|aks-*|do-*-k8s-*|*-doks-*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          ensure_kind_profile() {
+            local override="${EXPECTED_CONTEXT:-}"
+            local current
+            current="$(kubectl config current-context 2>/dev/null || true)"
+            if looks_like_managed_kubernetes "$override"; then
+              echo "ERROR: expected_kube_context='$override' looks like a managed-Kubernetes cluster."
+              echo "       This playbook is the kind-cluster install path only."
+              echo "       For GKE, use automation/gcp_gke/noetl_gke_fresh_stack.yaml."
+              exit 1
+            fi
+            if [ -n "$current" ] && looks_like_managed_kubernetes "$current"; then
+              echo "ERROR: Active kubectl context '$current' looks like a managed-Kubernetes cluster."
+              echo "       This playbook is the kind-cluster install path only."
+              echo "       Switch contexts first: kubectl config use-context $override"
+              exit 1
+            fi
+          }
+
+          ensure_kind_context() {
+            ensure_kind_profile
+            CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+            if [ -z "$CURRENT_CONTEXT" ]; then
+              echo "ERROR: No active kubectl context found."
+              echo "Set context to $EXPECTED_CONTEXT before deploy/status actions."
+              exit 1
+            fi
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: Refusing to run local kind deploy against context '$CURRENT_CONTEXT'."
+              echo "Expected context: '$EXPECTED_CONTEXT'"
+              echo "Run: kubectl config use-context $EXPECTED_CONTEXT"
+              exit 1
+            fi
+          }
+
+          ensure_kind_cluster() {
+            ensure_kind_provider
+            if ! kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
+              echo "ERROR: kind cluster '$KIND_CLUSTER' not found (provider: $(kind_provider))."
+              echo "       This playbook never creates or recreates the cluster; see automation/infrastructure/kind.yaml."
+              exit 1
+            fi
+          }
+
+          # ---------------------------------------------------------------- build --
+
+          cargo_version() {
+            grep -E '^version = ' "$1/Cargo.toml" | head -1 | cut -d'"' -f2
+          }
+
+          # build_component <name> <repo> <ref> <tag-override> <image-repo>
+          # Prints nothing on stdout except the final image reference (last line).
+          build_component() {
+            local name="$1" repo="$2" ref="$3" tag_override="$4" image_repo="$5"
+            local src version tag platform
+            platform="$(detect_platform)"
+            if [ ! -d "$repo" ]; then
+              echo "ERROR: $name repo not found: $repo" >&2
+              exit 1
+            fi
+            if [ -n "$ref" ]; then
+              src="$WORK_DIR/$name-src"
+              rm -rf "$src"
+              mkdir -p "$src"
+              if ! git -C "$repo" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+                echo "ERROR: $name ref '$ref' not found in $repo (fetch tags first)" >&2
+                exit 1
+              fi
+              git -C "$repo" archive --format=tar "$ref" | tar -x -C "$src"
+              if [[ "$ref" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+                version="${ref#v}"
+                if [ -f "$src/ci/stamp-version.sh" ]; then
+                  (cd "$src" && bash ci/stamp-version.sh "$version") >&2
+                else
+                  echo "WARNING: $name $ref has no ci/stamp-version.sh; Cargo.toml version left as committed" >&2
+                fi
+                tag="$version"
+              else
+                version="$(cargo_version "$src")"
+                tag="${version}-g$(git -C "$repo" rev-parse --short "$ref^{commit}")"
+              fi
+            else
+              src="$repo"
+              version="$(cargo_version "$src")"
+              tag="${version}-g$(git -C "$repo" rev-parse --short HEAD)"
+              if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+                tag="${tag}-dirty"
+              fi
+            fi
+            if [ -n "$tag_override" ]; then
+              tag="$tag_override"
+            fi
+            tag="${tag}${TAG_SUFFIX}"
+            if [ ! -f "$src/Dockerfile" ]; then
+              echo "ERROR: $src/Dockerfile not found" >&2
+              exit 1
+            fi
+            echo "=== building $image_repo:$tag ($platform) from ${ref:-working tree} in $repo ===" >&2
+            podman build --platform "$platform" -t "$image_repo:$tag" -f "$src/Dockerfile" "$src" >&2
+            echo "$image_repo:$tag"
+          }
+
+          write_state() {
+            {
+              echo "SERVER_IMAGE=$SERVER_IMAGE"
+              echo "WORKER_IMAGE=$WORKER_IMAGE"
+            } > "$STATE_FILE"
+          }
+
+          read_state() {
+            SERVER_IMAGE="${SERVER_IMAGE:-}"
+            WORKER_IMAGE="${WORKER_IMAGE:-}"
+            if [ -f "$STATE_FILE" ]; then
+              local s w
+              s="$(grep '^SERVER_IMAGE=' "$STATE_FILE" | cut -d= -f2- || true)"
+              w="$(grep '^WORKER_IMAGE=' "$STATE_FILE" | cut -d= -f2- || true)"
+              [ -z "$SERVER_IMAGE" ] && SERVER_IMAGE="$s"
+              [ -z "$WORKER_IMAGE" ] && WORKER_IMAGE="$w"
+            fi
+            [ -n "$SERVER_IMAGE_OVERRIDE" ] && SERVER_IMAGE="$SERVER_IMAGE_OVERRIDE"
+            [ -n "$WORKER_IMAGE_OVERRIDE" ] && WORKER_IMAGE="$WORKER_IMAGE_OVERRIDE"
+            return 0
+          }
+
           build() {
-            ensure_repo
+            ensure_ops_root
             ensure_podman_running
             prepare_podman_storage
-            PREV_TAG=""
-            if [ -f .noetl_last_build_tag.txt ]; then
-              PREV_TAG="$(cat .noetl_last_build_tag.txt)"
+            read_state
+            if has_component server && [ -z "$SERVER_IMAGE_OVERRIDE" ]; then
+              SERVER_IMAGE="$(build_component server "$SERVER_REPO" "$SERVER_REF" "$SERVER_TAG_OVERRIDE" localhost/noetl-server-rust | tail -n1)"
+              echo "Built $SERVER_IMAGE"
             fi
-
-            IMAGE_TAG=$(date +%Y-%m-%d-%H-%M)
-            if podman build --platform linux/arm64 \
-              -t "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" \
-              -f "$NOETL_REPO/docker/noetl/dev/Dockerfile" "$NOETL_REPO"; then
-              ensure_local_image_aliases "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
-              echo "$IMAGE_TAG" > .noetl_last_build_tag.txt
-              echo "Built $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
-              return
+            if has_component worker && [ -z "$WORKER_IMAGE_OVERRIDE" ]; then
+              WORKER_IMAGE="$(build_component worker "$WORKER_REPO" "$WORKER_REF" "$WORKER_TAG_OVERRIDE" localhost/noetl-worker | tail -n1)"
+              echo "Built $WORKER_IMAGE"
             fi
+            write_state
+            echo "Image state written to $STATE_FILE"
+          }
 
-            echo "WARNING: build failed; trying last known image tag"
-            if [ -n "$PREV_TAG" ] && podman image inspect "$REGISTRY/$IMAGE_NAME:$PREV_TAG" >/dev/null 2>&1; then
-              echo "$PREV_TAG" > .noetl_last_build_tag.txt
-              echo "Using existing image $REGISTRY/$IMAGE_NAME:$PREV_TAG"
-              return
+          # ----------------------------------------------------------------- load --
+
+          kind_load_image() {
+            local image="$1"
+            if ! podman image inspect "$image" >/dev/null 2>&1; then
+              echo "ERROR: image '$image' not present in local podman storage"
+              exit 1
             fi
-
-            FALLBACK_TAG="$(resolve_latest_local_tag)"
-            if [ -n "$FALLBACK_TAG" ] && podman image inspect "$REGISTRY/$IMAGE_NAME:$FALLBACK_TAG" >/dev/null 2>&1; then
-              echo "$FALLBACK_TAG" > .noetl_last_build_tag.txt
-              echo "Using latest available image $REGISTRY/$IMAGE_NAME:$FALLBACK_TAG"
-              return
+            if [ "$(kind_provider)" = "podman" ]; then
+              # `kind load docker-image` does not work with the podman provider
+              # (it looks for the image via docker / fails under rootless podman).
+              # An image archive works for rootful, rootless and podman-machine alike.
+              local archive
+              archive="$WORK_DIR/$(echo "$image" | tr '/:' '__').tar"
+              podman save -o "$archive" "$image"
+              kind load image-archive "$archive" --name "$KIND_CLUSTER"
+              rm -f "$archive"
+            else
+              kind load docker-image "$image" --name "$KIND_CLUSTER"
             fi
-
-            echo "ERROR: build failed and no previous image is available"
-            exit 1
+            echo "Loaded $image into kind cluster '$KIND_CLUSTER'"
           }
 
           load() {
+            ensure_ops_root
             ensure_kind_profile
             ensure_podman_running
-            if [ ! -f .noetl_last_build_tag.txt ]; then
-              FALLBACK_TAG="$(resolve_latest_local_tag)"
-              if [ -z "$FALLBACK_TAG" ]; then
-                echo "ERROR: .noetl_last_build_tag.txt not found and no local image tag available. Run action=build first."
-                exit 1
-              fi
-              echo "$FALLBACK_TAG" > .noetl_last_build_tag.txt
+            ensure_kind_cluster
+            read_state
+            if [ -z "$SERVER_IMAGE" ] && [ -z "$WORKER_IMAGE" ]; then
+              echo "ERROR: no images recorded in $STATE_FILE. Run action=build first,"
+              echo "       or pass --set server_image=... --set worker_image=..."
+              exit 1
             fi
-            prepare_podman_storage
-            IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
-            IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
-            kind_load_image "$IMAGE"
-            echo "Loaded $IMAGE into kind"
+            for image in "$SERVER_IMAGE" "$WORKER_IMAGE"; do
+              case "$image" in
+                "") ;;
+                localhost/*) kind_load_image "$image" ;;
+                *) echo "Skipping kind load for registry image $image (pulled by the node)" ;;
+              esac
+            done
+          }
+
+          # ---------------------------------------------------------------- infra --
+
+          ns_resource_exists() {
+            kubectl get "$2" "$3" -n "$1" >/dev/null 2>&1
+          }
+
+          resolve_schema_ddl() {
+            local c
+            for c in "$SERVER_REPO/db/ddl/postgres/schema_ddl.sql" "$NOETL_REPO/noetl/database/ddl/postgres/schema_ddl.sql"; do
+              if [ -f "$c" ]; then
+                echo "$c"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          bootstrap_postgres() {
+            local fresh=0
+            if ns_resource_exists postgres deployment postgres; then
+              if [ "$INFRA_MODE" != "force" ]; then
+                echo "postgres: present, left untouched (infra_mode=$INFRA_MODE)"
+                return 0
+              fi
+              echo "postgres: infra_mode=force, re-applying config/service/deployment manifests (PV/PVC/data untouched)"
+            else
+              fresh=1
+              echo "postgres: not found, bootstrapping"
+            fi
+            local ddl
+            if ! ddl="$(resolve_schema_ddl)"; then
+              echo "ERROR: PostgreSQL schema DDL not found in $SERVER_REPO/db/ddl/postgres/ or $NOETL_REPO/noetl/database/ddl/postgres/"
+              exit 1
+            fi
+            kubectl apply -f "ci/manifests/postgres/namespace/namespace.yaml"
+            kubectl create configmap postgres-schema-ddl --namespace postgres \
+              --from-file=schema_ddl.sql.norun="$ddl" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -f "ci/manifests/postgres/config-files.yaml"
+            kubectl apply -f "ci/manifests/postgres/configmap.yaml"
+            if ! ns_resource_exists postgres secret postgres-secret; then
+              kubectl apply -f "ci/manifests/postgres/secret.yaml"
+            fi
+            # Static PV + PVC: create only when absent. Re-applying a bound PV is
+            # never needed and is how a kind dev DB gets detached from its data.
+            if ! kubectl get pv postgres >/dev/null 2>&1 && ! ns_resource_exists postgres pvc postgres; then
+              kubectl apply -f "ci/manifests/postgres/persistent-volume.yaml"
+            elif ! ns_resource_exists postgres pvc postgres; then
+              echo "postgres: PV exists without PVC; creating only the PVC (existing PV is not modified)"
+              kubectl create -f "ci/manifests/postgres/persistent-volume.yaml" 2>&1 | grep -v 'AlreadyExists' || true
+            fi
+            kubectl apply -f "ci/manifests/postgres/service.yaml"
+            kubectl apply -f "ci/manifests/postgres/service-external.yaml"
+            kubectl apply -f "ci/manifests/postgres/deployment.yaml"
+            kubectl rollout status deployment/postgres -n postgres --timeout=300s
+            if [ "$fresh" -eq 1 ]; then
+              # The dev server manifest connects as noetl/noetl; the init script
+              # creates the role with the postgres-secret password. Align it, once,
+              # on a database this run just created.
+              for _ in $(seq 1 30); do
+                if kubectl exec -n postgres deploy/postgres -- sh -c \
+                  'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres -qc "ALTER USER noetl PASSWORD '"'"'noetl'"'"'"' >/dev/null 2>&1; then
+                  echo "postgres: role noetl password aligned with the kind server manifest"
+                  break
+                fi
+                sleep 2
+              done
+            fi
+          }
+
+          bootstrap_nats() {
+            if ! is_truthy "$WITH_NATS"; then
+              echo "nats: skipped (with_nats=false; NoETL uses the EHDB command bus)"
+              return 0
+            fi
+            if kubectl get statefulset nats -n nats >/dev/null 2>&1 && [ "$INFRA_MODE" != "force" ]; then
+              echo "nats: present, left untouched"
+              return 0
+            fi
+            kubectl apply -f "ci/manifests/nats/namespace.yaml"
+            kubectl apply -f "ci/manifests/nats/nats.yaml"
+            kubectl rollout status statefulset/nats -n nats --timeout=180s
+          }
+
+          bootstrap_test_server() {
+            local platform built=0 dockerfile="" context=""
+            if [ -f "$E2E_REPO/docker/test-server/Dockerfile" ]; then
+              dockerfile="$E2E_REPO/docker/test-server/Dockerfile"; context="$E2E_REPO"
+            elif [ -f "$NOETL_REPO/docker/test-server/Dockerfile" ]; then
+              dockerfile="$NOETL_REPO/docker/test-server/Dockerfile"; context="$NOETL_REPO"
+            fi
+            if ns_resource_exists test-server deployment paginated-api && [ "$INFRA_MODE" != "force" ] && ! is_truthy "$FORCE_TEST_SERVER_BUILD"; then
+              echo "test-server: present, left untouched (contract check skipped)"
+              return 0
+            else
+              if is_truthy "$FORCE_TEST_SERVER_BUILD" || ! podman image inspect localhost/local/test-server:latest >/dev/null 2>&1; then
+                if [ -z "$dockerfile" ]; then
+                  echo "ERROR: test-server Dockerfile not found in $E2E_REPO or $NOETL_REPO"
+                  exit 1
+                fi
+                platform="$(detect_platform)"
+                echo "Building local test-server ($platform) from $context"
+                podman build --platform "$platform" -t localhost/local/test-server:latest -f "$dockerfile" "$context"
+                built=1
+              fi
+              kind_load_image localhost/local/test-server:latest
+              kubectl apply -f "ci/manifests/test-server/namespace.yaml"
+              kubectl apply -f "ci/manifests/test-server/deployment.yaml"
+              kubectl set image deployment/paginated-api -n test-server api=localhost/local/test-server:latest
+              if [ "$built" -eq 1 ]; then
+                kubectl rollout restart deployment/paginated-api -n test-server
+              fi
+              kubectl rollout status deployment/paginated-api -n test-server --timeout=180s
+            fi
+            # The contract check exercises the e2e fixture, not NoETL; an
+            # e2e checkout that predates the 410 batch contract fails it.
+            # Report it loudly but do not abort the NoETL deploy over it.
+            if is_truthy "$VERIFY_TEST_SERVER_CONTRACT"; then
+              if ! verify_test_server_contract; then
+                echo "WARNING: test-server contract check failed (e2e fixture out of date?); continuing."
+              fi
+            fi
+          }
+
+          bootstrap_infra() {
+            case "$INFRA_MODE" in
+              never)
+                echo "infra: skipped (infra_mode=never)"
+                return 0
+                ;;
+              missing|force) ;;
+              *)
+                echo "ERROR: infra_mode must be missing, never or force (got '$INFRA_MODE')"
+                exit 1
+                ;;
+            esac
+            bootstrap_postgres
+            bootstrap_nats
+            bootstrap_test_server
+          }
+
+          # ------------------------------------------------------------- secrets --
+
+          # Create the NoETL Secrets only when they do not exist. An existing
+          # noetl-secret holds the NOETL_ENCRYPTION_KEY every stored credential is
+          # sealed with; replacing it makes all credentials undecryptable, so it is
+          # never rewritten. Values are generated in-pipe and never printed.
+          ensure_noetl_secrets() {
+            if kubectl get secret noetl-secret -n noetl >/dev/null 2>&1; then
+              if kubectl get secret noetl-secret -n noetl -o jsonpath='{.data.NOETL_ENCRYPTION_KEY}' | grep -q .; then
+                echo "secret noetl-secret: present (NOETL_ENCRYPTION_KEY kept as is)"
+              else
+                echo "WARNING: secret noetl-secret exists but has no NOETL_ENCRYPTION_KEY; not modifying it."
+              fi
+            else
+              echo "secret noetl-secret: not found, creating with a new random NOETL_ENCRYPTION_KEY"
+              openssl rand -base64 32 | tr -d '\n' | kubectl create secret generic noetl-secret -n noetl \
+                --from-file=NOETL_ENCRYPTION_KEY=/dev/stdin >/dev/null
+            fi
+            if kubectl get secret noetl-internal-api-token -n noetl >/dev/null 2>&1; then
+              echo "secret noetl-internal-api-token: present (kept as is)"
+            else
+              echo "secret noetl-internal-api-token: not found, creating a random token"
+              openssl rand -hex 32 | tr -d '\n' | kubectl create secret generic noetl-internal-api-token -n noetl \
+                --from-file=token=/dev/stdin >/dev/null
+            fi
+          }
+
+          # --------------------------------------------------------------- deploy --
+
+          render_manifests() {
+            local out="$1"
+            kubectl kustomize "$MANIFESTS_DIR" \
+              | sed \
+                -e "s|localhost/noetl-server-rust:dev|$SERVER_IMAGE|g" \
+                -e "s|localhost/noetl-worker:dev|$WORKER_IMAGE|g" \
+                -e "s|imagePullPolicy: Never|imagePullPolicy: $IMAGE_PULL_POLICY|g" \
+              > "$out"
+            # Guard rails: the overlay must never carry Secrets, storage or
+            # namespaces (those hold the encryption key and the data).
+            if grep -Eq '^kind: (Secret|PersistentVolume|PersistentVolumeClaim|Namespace)$' "$out"; then
+              echo "ERROR: rendered overlay contains a Secret/PV/PVC/Namespace; refusing to apply."
+              exit 1
+            fi
+          }
+
+          wait_health() {
+            local body=""
+            for _ in $(seq 1 60); do
+              if body="$(curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null)"; then
+                echo "health: $body"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "ERROR: $HEALTH_URL did not answer within 120s"
+            return 1
           }
 
           deploy() {
+            ensure_ops_root
             ensure_kind_context
-            ensure_local_dependencies
-            if [ -n "$IMAGE_TAG_OVERRIDE" ]; then
-              IMAGE_TAG="$IMAGE_TAG_OVERRIDE"
-            elif [ -f .noetl_last_build_tag.txt ]; then
-              IMAGE_TAG=$(cat .noetl_last_build_tag.txt)
-            else
-              echo "ERROR: .noetl_last_build_tag.txt not found. Run action=build first."
-              echo "       Or provide --set image_tag=<tag> for a registry image deploy."
+            ensure_kind_cluster
+            read_state
+            if [ -z "$SERVER_IMAGE" ] || [ -z "$WORKER_IMAGE" ]; then
+              echo "ERROR: server/worker image unknown. Run action=build (and load) first,"
+              echo "       or pass --set server_image=<ref> --set worker_image=<ref>."
               exit 1
             fi
+            echo "Deploying server=$SERVER_IMAGE worker=$WORKER_IMAGE (pullPolicy=$IMAGE_PULL_POLICY) from $MANIFESTS_DIR"
+            local rendered="$WORK_DIR/noetl-kind.yaml"
+            render_manifests "$rendered"
+
+            if is_truthy "$DRY_RUN"; then
+              echo "=== dry_run=true: server-side dry-run + diff, nothing is changed ==="
+              kubectl apply --dry-run=server -f "$rendered"
+              kubectl diff -f "$rendered" || true
+              return 0
+            fi
+
             kubectl apply -f "ci/manifests/noetl/namespace/"
-            IMAGE="$(resolve_deploy_image "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG")"
-            for manifest in ci/manifests/noetl/*.yaml; do
-              if [ -f "$manifest" ]; then
-                sed \
-                  -e "s|image_name:image_tag|$IMAGE|g" \
-                  "$manifest" | kubectl apply -f -
-              fi
+            ensure_noetl_secrets
+            ensure_podman_running
+            bootstrap_infra
+
+            kubectl apply -f "$rendered"
+            local m
+            for m in $EXTRA_MANIFESTS; do
+              echo "extra manifest (opt-in): $m"
+              kubectl apply -f "$m"
             done
-            for deployment in $(kubectl get deployments -n noetl -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
-              for container in $(kubectl get deployment "$deployment" -n noetl -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}'); do
-                kubectl patch deployment "$deployment" -n noetl --type=strategic \
-                  -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$container\",\"imagePullPolicy\":\"$IMAGE_PULL_POLICY\"}]}}}}"
-              done
-            done
-            kubectl rollout restart deployment/noetl-server -n noetl 2>/dev/null || true
-            kubectl rollout restart deployment/noetl-worker -n noetl 2>/dev/null || true
-            kubectl rollout status deployment/noetl-server -n noetl --timeout=180s
-            kubectl rollout status deployment/noetl-worker -n noetl --timeout=180s
+
+            if is_truthy "$RESTART"; then
+              kubectl rollout restart deployment/noetl-server-rust deployment/noetl-worker-rust deployment/noetl-worker-system-pool -n noetl
+            fi
+            # Writer first: the server and both pools connect to it.
+            kubectl rollout status statefulset/noetl-cmdbus-writer -n noetl --timeout=300s
+            kubectl rollout status deployment/noetl-server-rust -n noetl --timeout=300s
+            kubectl rollout status deployment/noetl-worker-rust -n noetl --timeout=300s
+            kubectl rollout status deployment/noetl-worker-system-pool -n noetl --timeout=300s
+            wait_health
           }
 
           status() {
             ensure_kind_context
-            kubectl get pods -n noetl
+            read_state
+            kubectl get pods -n noetl -o wide
             echo ""
             kubectl get svc -n noetl
             echo ""
+            echo "Images in use:"
+            kubectl get deploy,statefulset -n noetl \
+              -o jsonpath='{range .items[*]}{.kind}/{.metadata.name}: {.spec.template.spec.containers[*].image}{"\n"}{end}'
+            echo "Recorded in $STATE_FILE: server=${SERVER_IMAGE:-<none>} worker=${WORKER_IMAGE:-<none>}"
+            echo ""
+            curl -fsS --max-time 5 "$HEALTH_URL" && echo "" || echo "health: $HEALTH_URL not reachable"
             LAN_HOST="$(detect_lan_host)"
             echo "Preferred NoETL endpoint: http://${LAN_HOST}:8082"
             echo "Local fallback endpoint: http://localhost:8082"
@@ -502,15 +778,18 @@ workflow:
 
           reset() {
             ensure_kind_context
+            if ! is_truthy "$CONFIRM_RESET"; then
+              echo "ERROR: reset deletes the noetl, nats, postgres and test-server namespaces."
+              echo "       Static PVs are Retain (data on the host survives), but every"
+              echo "       Secret goes, including noetl-secret's NOETL_ENCRYPTION_KEY."
+              echo "       Back it up first, then re-run with --set confirm_reset=true."
+              exit 1
+            fi
             echo "=== tearing down NoETL-deployed namespaces ==="
             kubectl delete ns noetl nats postgres test-server --wait=false --ignore-not-found 2>&1 || true
             echo "=== waiting for namespaces to drain (up to 120s) ==="
             local attempts=0
             while [ "$attempts" -lt 24 ]; do
-              # `kubectl get` returns non-zero when no resources match,
-              # which would trip `set -e`; `|| true` keeps the loop alive
-              # so the wait terminates by attempt count rather than the
-              # first "all-gone" tick.
               local remaining
               remaining="$( (kubectl get ns noetl nats postgres test-server -o name 2>/dev/null || true) | wc -l | tr -d ' ')"
               if [ "$remaining" = "0" ]; then
@@ -520,19 +799,8 @@ workflow:
               sleep 5
               attempts=$((attempts + 1))
             done
-
             # Static PVs use reclaimPolicy: Retain so data persists across
-            # teardowns. After the bound PVC is deleted, the PV still
-            # carries a `spec.claimRef` pointing at the now-gone claim,
-            # which blocks rebinding to a fresh PVC during the next
-            # deploy. Clear claimRef on every static PV the deploy
-            # provisions so the next `deploy` action can rebind cleanly.
-            #
-            # Without this, the operator has to manually patch each PV
-            # ('kubectl patch pv <name> --type=json -p
-            # [{"op":"remove","path":"/spec/claimRef"}]') after every
-            # reset, which is the kind of footgun that derails repeated
-            # local dev cycles.
+            # teardowns. Clear the stale claimRef so the next deploy can rebind.
             echo "=== unbinding static PVs (clearing claimRefs so deploy can rebind) ==="
             for pv in postgres noetl-data noetl-logs noetl-data-pv; do
               if kubectl get pv "$pv" >/dev/null 2>&1; then
@@ -567,25 +835,31 @@ workflow:
               reset
               ;;
             help|*)
-              echo "Usage:"
+              echo "Usage (from the ops repo root):"
               echo "  noetl run automation/development/noetl.yaml --runtime local --set action=<action>"
               echo ""
-              echo "Profile: kind-cluster install path only."
+              echo "Profile: kind-cluster install path only (macOS arm64 + podman machine, Linux amd64/arm64 + native podman)."
               echo "For GKE see automation/gcp_gke/noetl_gke_fresh_stack.yaml or"
               echo "https://github.com/noetl/ops/wiki/automation-gcp-gke."
               echo ""
-              echo "Actions: build, load, deploy, redeploy, status, reset"
-              echo "Optional: --set noetl_repo_dir=../noetl"
-              echo "Optional: --set e2e_repo_dir=../e2e"
-              echo "Optional: --set force_test_server_build=true"
-              echo "Optional: --set verify_test_server_contract=false"
-              echo "Registry deploy without building:"
-              echo "  --set registry=ghcr.io/noetl --set image_name=noetl --set image_tag=v2.23.2 --set image_pull_policy=Always"
+              echo "Actions: build, load, deploy, redeploy (= build+load+deploy+status), status, reset"
               echo ""
-              echo "Podman machine (macOS only):"
-              echo "  --set podman_machine=<name>  default: noetl-dev"
-              echo "  --set podman_machine=\"\"     skip the machine check"
-              echo "                                (Podman Desktop / native podman / Linux)"
+              echo "Build (Rust server + worker; platform from uname -m unless --set platform=...):"
+              echo "  --set server_ref=v3.151.4 --set worker_ref=v6.11.9   build exact release tags"
+              echo "  --set components=server        build/load only the server"
+              echo "  --set image_tag_suffix=-local  appended to derived tags"
+              echo "Deploy without building:"
+              echo "  --set server_image=ghcr.io/noetl/server:<tag> --set worker_image=... --set image_pull_policy=IfNotPresent"
+              echo "Deploy safety:"
+              echo "  --set dry_run=true             server-side dry-run + kubectl diff only"
+              echo "  --set infra_mode=missing|never|force   Postgres/test-server bootstrap (default: missing)"
+              echo "  --set with_nats=true           also bootstrap legacy NATS"
+              echo "  --set extra_manifests='a.yaml b/'      opt-in extra manifests"
+              echo "  noetl-secret / noetl-internal-api-token are created if missing, never overwritten."
+              echo "Podman machine (macOS only; ignored on Linux):"
+              echo "  --set podman_machine=<name>  default: noetl-dev; \"\" skips the check"
+              echo "Podman prune before build (off by default): --set podman_prune=true"
+              echo "Reset (destructive): --set action=reset --set confirm_reset=true"
               echo ""
               echo "LAN access:"
               echo "  This workflow expects kind config listenAddress=0.0.0.0"

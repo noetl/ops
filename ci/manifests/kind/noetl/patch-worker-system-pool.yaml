@@ -1,0 +1,80 @@
+# System pool: off-server state builder + EHDB materializers on kind (one shard).
+#
+# NOETL_STATE_BUILDER=offserver is load-bearing: the dev base still says
+# `server`, and with the server also in offserver mode nothing drives the state
+# machine, so executions hang after their first step.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noetl-worker-system-pool
+  namespace: noetl
+spec:
+  template:
+    spec:
+      containers:
+        - name: noetl-worker
+          env:
+            - name: NOETL_STATE_BUILDER
+              value: "offserver"
+            - name: NOETL_STATE_BUILDER_SOURCE
+              value: "ehdb"
+            - name: NOETL_STATE_BUILDER_SHADOW
+              value: "false"
+            - name: NOETL_COMMAND_BUS_HOST
+              value: "false"
+            - name: NOETL_COMMAND_BUS_CLAIM_ADDR
+              value: "noetl-cmdbus-writer-0.noetl.svc.cluster.local:9101"
+            - name: NOETL_COMMAND_SHARD_COUNT
+              value: "1"
+            - name: NOETL_EVENT_BUS_CLAIM_ADDR
+              value: "noetl-cmdbus-writer-0.noetl.svc.cluster.local:9104"
+            - name: NOETL_EVENT_BUS_WAL_ADDR
+              value: "noetl-cmdbus-writer-0.noetl.svc.cluster.local:9108"
+            - name: NOETL_SHARD_COUNT
+              value: "1"
+            - name: NOETL_SHARD_INDEX
+              value: "0"
+            - name: NOETL_RESULT_SHARD_COUNT
+              value: "256"
+            - name: NOETL_EHDB_CATALOG_MIRROR_SOURCE
+              value: "server"
+            - name: NOETL_EHDB_PROJECTION_MIRROR_SOURCE
+              value: "server"
+            - name: NOETL_MATERIALIZER_SOURCE
+              value: "ehdb"
+            - name: NOETL_RESULT_MATERIALIZER_SOURCE
+              value: "ehdb"
+            - name: NOETL_STATE_MATERIALIZER_SOURCE
+              value: "ehdb"
+            - name: NOETL_STATE_INDEX_MAX_BYTES
+              value: "268435456"
+            - name: NOETL_STATE_INDEX_REHYDRATE_ON_MISS
+              value: "true"
+            - name: NOETL_STATE_INDEX_SLIM
+              value: "true"
+            - name: NOETL_STATE_INDEX_SWEEP_SECS
+              value: "30"
+            - name: NOETL_STATE_INDEX_TTL_SECS
+              value: "900"
+            - name: NOETL_STATE_SHARD_OPEN_TTL_SECS
+              value: "900"
+            - name: NOETL_STATE_SHARD_READ
+              value: "true"
+            - name: NOETL_STATE_SHARD_READ_VERIFY
+              value: "false"
+            - name: NOETL_STATE_SHARD_WRITE
+              value: "true"
+            - name: NOETL_EXECUTION_WAIT
+              value: "true"
+            - name: NOETL_PLAYBOOK_AWAIT_PARK
+              value: "true"
+            - name: NOETL_RESULT_PRODUCER_STAGE
+              value: "true"
+            - name: NOETL_RESULT_URI_RESOLVE
+              value: "true"
+            - name: NOETL_WARM_ORCHESTRATE_PLUGIN
+              value: "true"
+            - name: NOETL_WORKER_FUSE_LIFECYCLE
+              value: "true"
+            - name: NOETL_WORKER_LOCAL_DRIVE
+              value: "true"

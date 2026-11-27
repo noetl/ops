@@ -12,3 +12,9 @@ every `-prod` file individually diffed clean, which is why per-file checking nev
 saw it (noetl/ai-meta#309).
 
 They are separated rather than deleted because kind still uses them.
+
+`kustomization.yaml` here lists only the Rust-era objects kind runs (server, user
+worker pool, system pool). It is the base of the kind overlay in
+`../kind/noetl/`, which adds the EHDB command-bus writer, RBAC, Services and the
+bus / off-server state-builder env; `automation/development/noetl.yaml` deploys
+that overlay.
