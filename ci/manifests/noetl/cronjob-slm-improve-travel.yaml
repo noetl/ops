@@ -1,0 +1,94 @@
+# SLM continuous-improvement loop — weekly PROBE for the travel domain — PROD.
+# (noetl/ops#223 improve.yaml; noetl/ai-meta#150; cadence from travel's
+# slm.config.yaml `improvement.schedule: "0 3 * * 0"` — Sundays 03:00 UTC.)
+#
+# STAGED SUSPENDED (`suspend: true`). Do NOT flip it until the owner has seen a
+# clean attended run that actually trains + evals a candidate (first attended run
+# 2026-11-25 stopped at the threshold gate: 0 new shadow turns, see the PR).
+#
+# What it does once unsuspended: triggers improve.yaml in PROBE shape —
+# HARVEST (read-only shadow replay) → THRESHOLD GATE → REPORT. `probe_only`
+# makes TRAIN / EVAL no-op and `promote: "false"` means even a full run never
+# writes the release (= champion) record. The probe's run summary says whether
+# an attended retrain is warranted (>= 200 new real shadow turns).
+#
+# Why a probe, not the full loop: travel trains with `mode: mlx` (local Apple
+# Silicon LoRA), which cannot run in a GKE pod, and `mode=container` needs a GPU
+# node pool that does not exist. Training stays an attended, local MLX step.
+#
+# Prerequisites before unsuspending (none of these are true on 2026-11-25):
+#   1. SLM shadow mode ON in itinerary-planner (`workload.slm_shadow.enabled`
+#      is false, endpoint "") — otherwise every probe harvests 0 turns.
+#   2. improve.yaml registered in the prod catalog at
+#      automation/mlops/slm/improve (it is not), with the slm lib + travel
+#      config reachable from the worker that runs it.
+#   3. G3 registry enabled on the server (NOETL_REGISTRY_ENABLED=true is not
+#      set; /api/internal/registry/* returns 404) — harvest's dataset register
+#      fails soft without it.
+#
+# Not applied by merging. Apply only with an explicit go, per
+# agents/rules/apply-safety.md:
+#   kubectl --context <prod> -n noetl diff --server-side -f <this file>
+# Applying it suspended is inert; unsuspend with a reviewed change to this file.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  labels:
+    app: noetl-slm-improve-travel
+    component: system-cron
+  name: noetl-slm-improve-travel
+  namespace: noetl
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 120
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: noetl-slm-improve-travel
+        spec:
+          containers:
+          - command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "Triggering automation/mlops/slm/improve (travel, probe_only, no promote) ..."
+              curl -fsS -X POST \
+                http://noetl-server-rust.noetl.svc.cluster.local:8082/api/execute \
+                -H 'Content-Type: application/json' \
+                -d '{"path": "automation/mlops/slm/improve", "payload": {"base_url": "http://noetl-server-rust.noetl.svc.cluster.local:8082", "min_new_real_turns": "200", "probe_only": "1", "promote": "false", "tenant": "muno", "project": "travel"}}'
+              echo
+              echo "Triggered."
+            image: curlimages/curl:8.7.1
+            imagePullPolicy: IfNotPresent
+            name: trigger
+            resources:
+              limits:
+                cpu: 100m
+                ephemeral-storage: 1Gi
+                memory: 64Mi
+              requests:
+                cpu: 50m
+                ephemeral-storage: 1Gi
+                memory: 52Mi
+            securityContext:
+              capabilities:
+                drop:
+                - NET_RAW
+          restartPolicy: Never
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          tolerations:
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Equal
+            value: amd64
+  schedule: 0 3 * * 0
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  suspend: true
